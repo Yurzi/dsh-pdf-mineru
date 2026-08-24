@@ -1,9 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.0.2
 
 ### Added
 
+- Multi-file document parsing support across tools and provider adapters.
+- GitHub Actions workflow for automated npm publishing on tagged releases.
 - Bounded, abort-aware retries for idempotent Provider GET operations and official presigned PUT uploads.
 - Retry-After handling, exponential backoff with jitter, live retry settings, and typed structured diagnostics.
 - An opt-in official v4 smoke command that executes the built `mineru_parse_document` tool chain.
