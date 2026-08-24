@@ -61,7 +61,6 @@
   },
   "dependencies": {
     "form-data": "^4.0.6",
-    "schemastery": "^3.18.0",
     "yauzl": "^3.4.0"
   },
   "peerDependencies": {
@@ -73,6 +72,7 @@
     "@deepseek-ai/dsh-client-ui-settings": "^0.1.1-rc.2",
     "@deepseek-ai/dsh-client-ui-slots": "^0.1.1-rc.2",
     "@deepseek-ai/dsh-tools": "^0.1.1-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.1",
     "cordis": "^4.0.0-rc.7",
     "react": "^18.2.0"
   },
@@ -109,6 +109,7 @@
     }
   },
   "devDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1",
     "@types/node": "^22.0.0",
     "@types/react": "~18.3.1",
     "@types/yauzl": "^3.4.0",

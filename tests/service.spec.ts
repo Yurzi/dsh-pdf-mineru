@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { defaultMinerUConfig, type MinerUConfig, type ProviderConfig } from '../src/config.js'
+import { failure } from '../src/domain/errors.js'
 import { asCacheKey, asProviderConfigId, asSessionId, type SessionId } from '../src/domain/ids.js'
 import type { CanonicalParseRequest, PreparedSourceFile } from '../src/domain/request.js'
 import type {
@@ -46,13 +47,16 @@ class MockProvider implements MinerUProvider {
     supportsTable: true,
     supportsPageRanges: true,
     supportedArtifacts: ['markdown', 'layout', 'model-output', 'content-list', 'images'],
-    maxFilesPerSubmission: 1,
+    maxFilesPerSubmission: 10,
     maxFileBytes: 200 * 1024 * 1024,
   }
   submitCount = 0
   inspectCount = 0
   collectCount = 0
   complete = false
+  completeAfterInspect: number | undefined
+  readonly failedNames = new Set<string>()
+  readonly submittedRequests: CanonicalParseRequest[] = []
   markdown = '# parsed\n'
   submitGate: Promise<void> = Promise.resolve()
   retryOptions?: ProviderRetryOptions
@@ -70,9 +74,10 @@ class MockProvider implements MinerUProvider {
   ): Promise<ProviderSubmission> {
     this.submitCount++
     this.retryOptions = context.retry
+    this.submittedRequests.push(request)
     const ref: ProviderJobRef = {
       provider: this.id,
-      taskId: 'upstream-task-1',
+      taskId: `upstream-task-${String(this.submitCount)}`,
       files: request.files.map(file => ({ dataId: `data_${file.fileId}`, fileId: file.fileId, name: file.name })),
     }
     await context.onAccepted?.(ref)
@@ -86,8 +91,25 @@ class MockProvider implements MinerUProvider {
 
   inspect(ref: ProviderJobRef, _context: ProviderCallContext): Promise<ProviderJobSnapshot> {
     this.inspectCount++
-    const files = ref.files.map(file => ({ fileId: file.fileId, state: this.complete ? 'completed' as const : 'processing' as const }))
-    return Promise.resolve({ state: this.complete ? 'completed' : 'processing', files })
+    if (this.completeAfterInspect !== undefined && this.inspectCount >= this.completeAfterInspect) this.complete = true
+    const files = ref.files.map(file => {
+      if (this.failedNames.has(file.name)) {
+        return {
+          fileId: file.fileId,
+          state: 'failed' as const,
+          failure: failure('REMOTE_PARSE_FAILED', `Mock parse failed for ${file.name}`, false, { provider: this.id, fileId: file.fileId }),
+        }
+      }
+      return { fileId: file.fileId, state: this.complete ? 'completed' as const : 'processing' as const }
+    })
+    const state = files.every(file => file.state === 'completed')
+      ? 'completed'
+      : files.every(file => file.state === 'failed')
+        ? 'failed'
+        : files.every(file => file.state === 'completed' || file.state === 'failed')
+          ? 'partially-completed'
+          : 'processing'
+    return Promise.resolve({ state, files })
   }
 
   async collect(
@@ -111,6 +133,8 @@ class MockProviderRegistry extends ProviderRegistry {
 interface Harness {
   readonly root: string
   readonly file: string
+  readonly fileTwo: string
+  readonly fileThree: string
   readonly provider: MockProvider
   readonly config: MinerUConfig
   readonly jobs: JobRepository
@@ -129,13 +153,20 @@ function session(id: string): ServiceSession {
 async function harness(): Promise<Harness> {
   const root = await mkdtemp(join(tmpdir(), 'mineru-service-'))
   const file = join(root, 'input.pdf')
-  await writeFile(file, '%PDF-1.4 service fixture')
+  const fileTwo = join(root, 'input-two.pdf')
+  const fileThree = join(root, 'input-three.pdf')
+  await Promise.all([
+    writeFile(file, '%PDF-1.4 service fixture'),
+    writeFile(fileTwo, '%PDF-1.4 service fixture two'),
+    writeFile(fileThree, '%PDF-1.4 service fixture three'),
+  ])
   const base = defaultMinerUConfig()
   const config: MinerUConfig = {
     ...base,
     storage: { ...base.storage, storageRoot: join(root, 'store') },
     polling: { ...base.polling, pollIntervalMs: 2, pollTimeoutMs: 100, operationTimeoutMs: 5000 },
     output: { maxInlineChars: 2048 },
+    limits: { ...base.limits, maxFilesPerRequest: 10 },
   }
   const paths = new StoragePaths(config.storage.storageRoot)
   const jobs = new JobRepository(paths)
@@ -148,7 +179,7 @@ async function harness(): Promise<Harness> {
     getConfig: () => config, providers, jobs, results, operations, diagnostics: event => diagnostics.push(event),
     resolveCredential: () => Promise.resolve(undefined),
   })
-  const result = { root, file, provider, config, jobs, results, operations, diagnostics, service }
+  const result = { root, file, fileTwo, fileThree, provider, config, jobs, results, operations, diagnostics, service }
   harnesses.push(result)
   return result
 }
@@ -368,5 +399,161 @@ describe('MinerUService cache, sessions, concurrency, and recovery', () => {
     expect(parsed.state).toBe('completed')
     expect(JSON.stringify(parsed).length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
     expect('preview_truncated' in parsed && parsed.preview_truncated).toBe(true)
+  })
+
+  it('batches all cache misses while persisting isolated one-file jobs and manifests', async () => {
+    const h = await harness()
+    const owner = session('session-batch-misses')
+    h.provider.completeAfterInspect = 1
+    const submitted = await h.service.submit(owner, { file_paths: [h.file, h.fileTwo] }, new AbortController().signal)
+
+    expect(h.provider.submitCount).toBe(1)
+    expect(h.provider.submittedRequests[0]?.files.map(file => file.name)).toEqual(['input.pdf', 'input-two.pdf'])
+    expect(submitted).toMatchObject({ kind: 'batch', jobs: [{ job_id: expect.any(String) }, { job_id: expect.any(String) }] })
+    expect('job_id' in submitted).toBe(false)
+    expect('result_id' in submitted).toBe(false)
+    expect('manifest_path' in submitted).toBe(false)
+    expect('cache_hit' in submitted).toBe(false)
+
+    const jobs = await h.jobs.list(owner)
+    expect(jobs).toHaveLength(2)
+    const dataIds = new Set<string>()
+    for (const job of jobs) {
+      expect(job.request.files).toHaveLength(1)
+      expect(job.sourceFiles).toHaveLength(1)
+      expect(job.files).toHaveLength(1)
+      const ref = job.resolution.kind === 'cache-hit' ? undefined : job.resolution.ref
+      expect(ref?.files).toHaveLength(1)
+      expect(ref?.files[0]).toMatchObject({ fileId: job.request.files[0]?.fileId, name: job.request.files[0]?.name })
+      dataIds.add(ref?.files[0]?.dataId ?? '')
+    }
+    expect(dataIds.size).toBe(2)
+
+    await Promise.all(jobs.map(async job => {
+      const operation = h.operations.get(job.cacheKey, job.providerConfigId)
+      if (operation !== undefined) await operation.waitForOutcome(new AbortController().signal)
+    }))
+    for (const job of jobs) {
+      const manifest = await h.results.get(job.cacheKey, job.request.requiredArtifacts, new AbortController().signal)
+      expect(manifest?.files).toHaveLength(1)
+      expect(manifest?.request.files).toHaveLength(1)
+    }
+    expect(h.provider.inspectCount).toBe(1)
+    expect(h.provider.collectCount).toBe(1)
+  })
+
+  it('does not upload cache-hit sources when another source misses', async () => {
+    const h = await harness()
+    const owner = session('session-mixed-cache')
+    h.provider.complete = true
+    await h.service.parseDocument(owner, { file_paths: [h.file] }, new AbortController().signal, 1000)
+    const submissionsBefore = h.provider.submitCount
+
+    const submitted = await h.service.submit(owner, { file_paths: [h.file, h.fileTwo] }, new AbortController().signal)
+    expect(h.provider.submitCount).toBe(submissionsBefore + 1)
+    expect(h.provider.submittedRequests.at(-1)?.files.map(file => file.name)).toEqual(['input-two.pdf'])
+    expect(submitted).toMatchObject({ kind: 'batch' })
+    if (!('kind' in submitted)) throw new TypeError('Expected batch envelope')
+    const cached = submitted.jobs.find(job => job.files[0]?.name === 'input.pdf')
+    expect(cached).toMatchObject({ state: 'completed', job_id: expect.any(String) })
+    const jobs = await h.jobs.list(owner)
+    const cachedJob = jobs.find(job => job.id === cached?.job_id)
+    expect(cachedJob?.resolution).toEqual({ kind: 'cache-hit' })
+  })
+
+  it('keeps batch partial success and failures isolated per source', async () => {
+    const h = await harness()
+    const owner = session('session-batch-partial')
+    h.provider.complete = true
+    h.provider.failedNames.add('input-two.pdf')
+
+    const parsed = await h.service.parseDocument(owner, { file_paths: [h.file, h.fileTwo] }, new AbortController().signal, 1000)
+    expect(parsed).toMatchObject({ kind: 'batch', state: 'partially-completed' })
+    expect('job_id' in parsed).toBe(false)
+    expect('result_id' in parsed).toBe(false)
+    expect('manifest_path' in parsed).toBe(false)
+    expect('cache_hit' in parsed).toBe(false)
+    if (!('kind' in parsed)) throw new TypeError('Expected batch envelope')
+    const success = parsed.jobs.find(job => job.files[0]?.name === 'input.pdf')
+    const failed = parsed.jobs.find(job => job.files[0]?.name === 'input-two.pdf')
+    expect(success).toMatchObject({ state: 'completed', result_id: expect.any(String), manifest_path: expect.any(String) })
+    expect(failed).toMatchObject({ state: 'failed', failure: { code: 'REMOTE_PARSE_FAILED' } })
+
+    const jobs = await h.jobs.list(owner)
+    const successfulJob = jobs.find(job => job.sourceFiles[0]?.name === 'input.pdf')!
+    const failedJob = jobs.find(job => job.sourceFiles[0]?.name === 'input-two.pdf')!
+    expect(successfulJob.resultId).toBeDefined()
+    expect(failedJob.resultId).toBeUndefined()
+    const manifest = await h.results.get(successfulJob.cacheKey, successfulJob.request.requiredArtifacts, new AbortController().signal)
+    expect(manifest?.files).toHaveLength(1)
+    expect(h.provider.collectCount).toBe(1)
+  })
+
+  it('continues a background batch after synchronous parse waiting is cancelled', async () => {
+    const h = await harness()
+    const owner = session('session-batch-cancel')
+    h.provider.completeAfterInspect = 1
+    const controller = new AbortController()
+    const parsing = h.service.parseDocument(
+      owner, { file_paths: [h.file, h.fileTwo] }, controller.signal, 1000,
+    )
+    await new Promise(resolve => setTimeout(resolve, 5))
+    controller.abort(new DOMException('Caller stopped waiting', 'AbortError'))
+    await expect(parsing).rejects.toMatchObject({ name: 'AbortError' })
+
+    const jobs = await h.jobs.list(owner)
+    expect(jobs).toHaveLength(2)
+    await Promise.all(jobs.map(async job => {
+      const operation = h.operations.get(job.cacheKey, job.providerConfigId)
+      if (operation !== undefined) await operation.waitForOutcome(new AbortController().signal)
+    }))
+    const completed = await Promise.all(jobs.map(job => h.jobs.require(owner, job.id)))
+    expect(completed.every(job => job.state === 'completed')).toBe(true)
+    expect(h.provider.submitCount).toBe(1)
+    expect(h.provider.collectCount).toBe(1)
+  })
+
+  it('disposes an entire batch and settles every unfinished job', async () => {
+    const h = await harness()
+    const owner = session('session-batch-dispose')
+    h.provider.submitGate = new Promise(() => undefined)
+    const submittedPromise = h.service.submit(
+      owner, { file_paths: [h.file, h.fileTwo] }, new AbortController().signal,
+    )
+    await new Promise(resolve => setTimeout(resolve, 10))
+    h.operations.dispose()
+    await submittedPromise.catch(() => undefined)
+    await new Promise(resolve => setTimeout(resolve, 10))
+
+    const jobs = await h.jobs.list(owner)
+    expect(jobs).toHaveLength(2)
+    expect(jobs.every(job => job.state === 'failed')).toBe(true)
+    expect(jobs.every(job => job.failure?.code === 'CANCELLED')).toBe(true)
+  })
+
+  it('shares an overlapping source producer even when its batch position changes', async () => {
+    const h = await harness()
+    const ownerA = session('session-overlap-a')
+    const ownerB = session('session-overlap-b')
+    let release!: () => void
+    h.provider.submitGate = new Promise(resolve => { release = resolve })
+    const first = h.service.submit(ownerA, { file_paths: [h.file, h.fileTwo] }, new AbortController().signal)
+    await new Promise(resolve => setTimeout(resolve, 10))
+    const second = h.service.submit(ownerB, { file_paths: [h.fileTwo, h.fileThree] }, new AbortController().signal)
+    await new Promise(resolve => setTimeout(resolve, 10))
+
+    expect(h.provider.submitCount).toBe(2)
+    expect(h.provider.submittedRequests.map(request => request.files.map(file => file.name))).toEqual([
+      ['input.pdf', 'input-two.pdf'],
+      ['input-three.pdf'],
+    ])
+    release()
+    await Promise.all([first, second])
+
+    const overlapping = (await h.jobs.list(ownerB)).find(job => job.sourceFiles[0]?.name === 'input-two.pdf')!
+    expect(overlapping.resolution).toMatchObject({
+      kind: 'shared-operation',
+      ref: { files: [{ fileId: overlapping.request.files[0]?.fileId, name: 'input-two.pdf' }] },
+    })
   })
 })

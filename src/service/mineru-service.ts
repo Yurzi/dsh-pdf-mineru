@@ -20,8 +20,9 @@ import {
   type MinerUJobState,
 } from '../domain/job.js'
 import type { ParseRequestInput, PreparedParseRequest } from '../domain/request.js'
+import { BatchCoordinator, type BatchParticipant } from './batch-coordinator.js'
 import type { ArtifactRef, MinerUResultManifest } from '../domain/result.js'
-import type { ProviderCallContext, ProviderJobRef, ProviderJobSnapshot, ProviderRetryEvent } from '../providers/provider.js'
+import type { ProviderCallContext, ProviderCollectedFile, ProviderJobRef, ProviderJobSnapshot, ProviderRetryEvent } from '../providers/provider.js'
 import { validateProviderCapabilities } from '../providers/provider.js'
 import { ProviderRegistry, type ResolvedProvider } from '../providers/registry.js'
 import { computeCacheKey } from './cache-key.js'
@@ -29,6 +30,7 @@ import { RequestNormalizer, assertSourcesUnchanged } from './request-normalizer.
 import { SharedOperationRegistry, type SharedOperation, type SharedOutcome, type SharedSubmission } from './shared-operations.js'
 import type { JobRepository, SessionIdentifier } from '../storage/job-repository.js'
 import type { ResultRepository, ResultTransaction } from '../storage/result-repository.js'
+import { BatchArtifactRouter } from '../storage/batch-artifact-router.js'
 import { emitDiagnostic, type MinerUDiagnosticEvent, type MinerUDiagnosticSink } from '../observability.js'
 
 export interface ServiceSession extends SessionIdentifier {
@@ -44,6 +46,8 @@ export interface FileStatusView {
   readonly file_id: string
   readonly name: string
   readonly state: string
+  /** Present only in a multi-file submission; single-file output remains unchanged. */
+  readonly job_id?: string
   readonly progress?: { readonly completed: number; readonly total: number }
   readonly failure?: MinerUFailure
 }
@@ -73,6 +77,13 @@ export interface ResultFileView {
   readonly file_id: string
   readonly name: string
   readonly artifacts: readonly ArtifactView[]
+  /** Present only in a multi-file folded result. */
+  readonly job_id?: string
+  readonly state?: string
+  readonly result_id?: string
+  readonly manifest_path?: string
+  readonly cache_hit?: boolean
+  readonly failure?: MinerUFailure
   readonly artifacts_truncated?: boolean
 }
 
@@ -104,7 +115,21 @@ export interface ProbeView {
   readonly diagnostics?: string
 }
 
-export type ParseDocumentView = ResultView | (StatusView & { readonly poll_timed_out?: true })
+export interface BatchSubmitView {
+  readonly kind: 'batch'
+  readonly state: MinerUJobState
+  readonly jobs: readonly SubmitView[]
+}
+
+export interface BatchParseDocumentView {
+  readonly kind: 'batch'
+  readonly state: MinerUJobState
+  readonly jobs: readonly (ResultView | StatusView)[]
+  readonly poll_timed_out?: true
+}
+
+export type SubmitDocumentView = SubmitView | BatchSubmitView
+export type ParseDocumentView = ResultView | (StatusView & { readonly poll_timed_out?: true }) | BatchParseDocumentView
 
 export interface MinerUServiceOptions {
   readonly getConfig: () => MinerUConfig
@@ -149,11 +174,12 @@ function sourceForJob(job: MinerUJobRecord): SubmissionSource {
   return 'provider'
 }
 
-function fileViews(job: MinerUJobRecord): readonly FileStatusView[] {
+function fileViews(job: MinerUJobRecord, includeJobId = false): readonly FileStatusView[] {
   return job.files.map(file => ({
     file_id: file.fileId,
     name: file.name,
     state: file.state,
+    ...(includeJobId ? { job_id: job.id } : {}),
     ...(file.progress === undefined ? {} : { progress: file.progress }),
     ...(file.failure === undefined ? {} : { failure: file.failure }),
   }))
@@ -184,6 +210,68 @@ function submitView(job: MinerUJobRecord): SubmitView {
     result_available: status.result_available,
     ...(status.failure === undefined ? {} : { failure: status.failure }),
   }
+}
+
+function aggregateState(jobs: readonly MinerUJobRecord[]): MinerUJobState {
+  if (jobs.every(job => job.state === 'completed')) return 'completed'
+  if (jobs.every(job => isTerminalJobState(job.state))) {
+    return jobs.some(job => job.state === 'completed' || job.state === 'partially-completed')
+      ? 'partially-completed'
+      : 'failed'
+  }
+  if (jobs.some(job => job.state === 'collecting')) return 'collecting'
+  if (jobs.some(job => job.state === 'processing')) return 'processing'
+  if (jobs.some(job => job.state === 'uploading')) return 'uploading'
+  return 'queued'
+}
+
+function aggregateSource(jobs: readonly MinerUJobRecord[]): SubmissionSource {
+  if (jobs.some(job => job.resolution.kind === 'provider')) return 'provider'
+  if (jobs.some(job => job.resolution.kind === 'shared-operation')) return 'shared-operation'
+  return 'cache'
+}
+
+function aggregateSubmitView(jobs: readonly MinerUJobRecord[]): SubmitView {
+  if (jobs.length === 1) return submitView(jobs[0]!)
+  const state = aggregateState(jobs)
+  const failed = jobs.filter(job => job.state === 'failed')
+  return {
+    job_id: jobs[0]!.id,
+    state,
+    source: aggregateSource(jobs),
+    provider: jobs[0]!.providerId,
+    files: jobs.flatMap(job => fileViews(job, true)),
+    result_available: jobs.every(job => job.resultId !== undefined),
+    ...(state === 'failed' && failed[0]?.failure !== undefined ? { failure: failed[0].failure } : {}),
+  }
+}
+
+function aggregateStatusView(jobs: readonly MinerUJobRecord[]): StatusView {
+  if (jobs.length === 1) return statusView(jobs[0]!)
+  const submitted = aggregateSubmitView(jobs)
+  return {
+    ...submitted,
+    created_at: Math.min(...jobs.map(job => job.createdAt)),
+    updated_at: Math.max(...jobs.map(job => job.updatedAt)),
+  }
+}
+
+function singlePreparedRequest(prepared: PreparedParseRequest, index: number): PreparedParseRequest {
+  const file = prepared.request.files[index]
+  const source = prepared.sources[index]
+  if (file === undefined || source === undefined) throw new TypeError('Prepared request source mapping is incomplete')
+  return {
+    request: { ...prepared.request, files: [file] },
+    sources: [source],
+  }
+}
+
+interface PendingFileSubmission {
+  readonly prepared: PreparedParseRequest
+  readonly cacheKey: CacheKey
+  job: MinerUJobRecord
+  operation?: SharedOperation
+  created?: boolean
 }
 
 export class MinerUService {
@@ -263,71 +351,118 @@ export class MinerUService {
     }
   }
 
-  async submit(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal): Promise<SubmitView> {
+  async submit(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal): Promise<SubmitDocumentView> {
+    const jobs = await this.submitJobs(session, input, signal)
+    if (jobs.length === 1) return submitView(jobs[0]!)
+    return { kind: 'batch', state: aggregateState(jobs), jobs: jobs.map(submitView) }
+  }
+
+  private async submitJobs(
+    session: ServiceSession, input: ParseRequestInput, signal: AbortSignal,
+  ): Promise<readonly MinerUJobRecord[]> {
     const sessionId = asSessionId(String(session.header.id))
     const active = this.options.providers.active()
     const current = this.config()
     const normalizer = new RequestNormalizer({
       defaults: current.defaults,
       cwd: session.header.cwd,
-      maxFiles: 1,
+      maxFiles: Math.min(current.limits.maxFilesPerRequest, active.provider.capabilities.maxFilesPerSubmission),
       maxFileBytes: Math.min(current.limits.maxFileBytes, active.provider.capabilities.maxFileBytes ?? current.limits.maxFileBytes),
     })
     const prepared = await normalizer.normalize(input, signal)
-    if (prepared.request.files.length !== 1) {
-      throw new MinerUError(failure('INVALID_REQUEST', 'This release accepts exactly one file per model tool submission'))
+    const maxTotalRequestBytes = current.limits.maxFileBytes * current.limits.maxFilesPerRequest
+    const totalRequestBytes = prepared.request.files.reduce((total, file) => total + file.bytes, 0)
+    if (!Number.isSafeInteger(maxTotalRequestBytes) || totalRequestBytes > maxTotalRequestBytes) {
+      throw new MinerUError(failure('FILE_TOO_LARGE', 'Combined request files exceed the derived total byte limit'))
     }
     validateProviderCapabilities(prepared.request, active.provider.capabilities)
     const compatibility = await active.provider.compatibilityKey(prepared.request, {
       configuredVersion: 'configuredVersion' in active.config ? active.config.configuredVersion : undefined,
     })
-    const file = prepared.request.files[0]
-    const cacheKey = computeCacheKey(prepared.request, file, compatibility)
+    const pending: PendingFileSubmission[] = []
 
-    if (current.storage.cacheEnabled) {
-      const hit = await this.options.results.get(cacheKey, prepared.request.requiredArtifacts, signal)
-      if (hit !== undefined) {
-        const job = this.newJob(sessionId, prepared, active, compatibility, cacheKey, { kind: 'cache-hit' }, hit.id, 'completed')
-        await this.options.jobs.create(session, job)
-        this.diagnostic({
-          level: 'info', phase: 'cache-hit', provider: active.provider.id, jobId: job.id,
-          bytes: prepared.request.files.reduce((total, source) => total + source.bytes, 0), cacheHit: true,
-        })
-        return submitView(job)
+    for (let index = 0; index < prepared.request.files.length; index++) {
+      const one = singlePreparedRequest(prepared, index)
+      const file = one.request.files[0]!
+      const cacheKey = computeCacheKey(one.request, file, compatibility)
+      const hit = current.storage.cacheEnabled
+        ? await this.options.results.get(cacheKey, one.request.requiredArtifacts, signal)
+        : undefined
+      const job = hit === undefined
+        ? this.newJob(sessionId, one, active, compatibility, cacheKey, { kind: 'provider' }, undefined, 'queued')
+        : this.newJob(sessionId, one, active, compatibility, cacheKey, { kind: 'cache-hit' }, hit.id, 'completed')
+      await this.options.jobs.create(session, job)
+      this.diagnostic({
+        level: 'info', phase: hit === undefined ? 'job-created' : 'cache-hit',
+        provider: active.provider.id, jobId: job.id, bytes: file.bytes, cacheHit: hit !== undefined,
+      })
+      pending.push({ prepared: one, cacheKey, job })
+    }
+
+    const misses = pending.filter(item => item.job.resolution.kind !== 'cache-hit')
+    for (const item of misses) {
+      const reserved = this.options.operations.reserve(
+        item.cacheKey, active.config.id, current.polling.operationTimeoutMs,
+      )
+      item.operation = reserved.operation
+      item.created = reserved.created
+    }
+
+    await Promise.all(misses.map(async item => {
+      const operation = item.operation
+      if (operation === undefined) throw new TypeError('Missed submission has no shared operation')
+      if (!item.created) {
+        item.job = await this.options.jobs.update(session, item.job.id, record => ({
+          ...record, resolution: { kind: 'shared-operation', operationId: operation.id },
+        }))
       }
-    }
+      operation.attach({ jobId: item.job.id, session })
+      item.job = await this.replayOperation(session, item.job.id, operation)
+      this.diagnostic({
+        level: 'debug', phase: 'shared-operation', provider: active.provider.id, jobId: item.job.id,
+        operationId: operation.id, waiterCount: operation.waiters.size,
+      })
+    }))
 
-    let job = this.newJob(sessionId, prepared, active, compatibility, cacheKey, { kind: 'provider' }, undefined, 'queued')
-    await this.options.jobs.create(session, job)
-    this.diagnostic({
-      level: 'info', phase: 'job-created', provider: active.provider.id, jobId: job.id,
-      bytes: prepared.request.files.reduce((total, source) => total + source.bytes, 0), cacheHit: false,
-    })
-    const acquired = this.options.operations.acquire(
-      cacheKey, active.config.id, current.polling.operationTimeoutMs,
-      operation => this.runOperation(operation, prepared, active, compatibility),
-    )
-    if (!acquired.created) {
-      job = await this.options.jobs.update(session, job.id, record => ({
-        ...record,
-        resolution: { kind: 'shared-operation', operationId: acquired.operation.id },
+    const created = misses.filter(item => item.created)
+    const producers: PendingFileSubmission[] = []
+    for (const item of created) {
+      const operation = item.operation!
+      const cached = current.storage.cacheEnabled
+        ? await this.options.results.get(item.cacheKey, item.prepared.request.requiredArtifacts, signal)
+        : undefined
+      if (cached === undefined) {
+        producers.push(item)
+        continue
+      }
+      await this.updateWaiters(operation, job => ({
+        ...job, state: 'completed', resolution: { kind: 'cache-hit' }, resultId: cached.id,
+        files: job.files.map(file => ({ ...file, state: 'completed', resultId: cached.id })),
       }))
+      operation.resolve({ state: 'completed', resultId: cached.id })
+      this.options.operations.start(operation, async () => ({ state: 'completed', resultId: cached.id }))
     }
-    acquired.operation.attach({ jobId: job.id, session })
-    job = await this.replayOperation(session, job.id, acquired.operation)
-    this.diagnostic({
-      level: 'debug', phase: 'shared-operation', provider: active.provider.id, jobId: job.id,
-      operationId: acquired.operation.id, waiterCount: acquired.operation.waiters.size,
-    })
+    if (producers.length === 1) {
+      const item = producers[0]!
+      this.options.operations.start(item.operation!, operation => this.runOperation(
+        operation, item.prepared, active, compatibility,
+      ))
+    } else if (producers.length > 1) {
+      this.startBatch(producers, active, compatibility, current)
+    }
 
-    try {
-      const submitted = await acquired.operation.waitForSubmission(signal)
-      job = await this.syncSubmission(session, job.id, submitted)
-    } catch (error) {
-      if (signal.aborted) throw error
-      job = await this.options.jobs.require(session, job.id)
-    }
-    return submitView(job)
+    await Promise.all(misses.map(async item => {
+      const operation = item.operation
+      if (operation === undefined) throw new TypeError('Missed submission has no shared operation')
+      try {
+        const submitted = await operation.waitForSubmission(signal)
+        item.job = await this.syncSubmission(session, item.job.id, submitted)
+      } catch (error) {
+        if (signal.aborted) throw error
+        item.job = await this.options.jobs.require(session, item.job.id)
+      }
+    }))
+    return await Promise.all(pending.map(item => this.options.jobs.require(session, item.job.id)))
   }
 
   private newJob(
@@ -450,6 +585,90 @@ export class MinerUService {
     })
   }
 
+  private startBatch(
+    items: readonly PendingFileSubmission[], resolved: ResolvedProvider, compatibility: string, current: MinerUConfig,
+  ): void {
+    const transactions = new Map<string, ResultTransaction>()
+    for (const item of items) {
+      const operation = item.operation!
+      const fileId = item.prepared.request.files[0]!.fileId
+      transactions.set(fileId, this.options.results.beginTransaction(
+        operation.id, item.prepared.request,
+        { providerId: resolved.provider.id, providerConfigId: resolved.config.id, compatibilityKey: compatibility },
+      ))
+    }
+    const router = new BatchArtifactRouter(items.map(item => ({
+      fileId: item.prepared.request.files[0]!.fileId, transaction: transactions.get(item.prepared.request.files[0]!.fileId)!,
+    })))
+    let unregister = (): void => undefined
+    const coordinator = new BatchCoordinator({
+      participants: items.map(item => {
+        const operation = item.operation!
+        const file = item.prepared.request.files[0]!
+        const transaction = transactions.get(file.fileId)!
+        const fail = async (error: unknown): Promise<SharedOutcome> => {
+          await transaction.abort().catch(() => undefined)
+          const normalized = toMinerUFailure(error)
+          await this.updateWaiters(operation, job => isTerminalJobState(job.state) ? job : ({
+            ...job, state: 'failed', failure: normalized,
+            files: job.files.map(status => ({ ...status, state: 'failed', failure: normalized })),
+          }))
+          return { state: 'failed' }
+        }
+        return {
+          request: item.prepared.request, source: item.prepared.sources[0]!, operation,
+          accepted: async ref => {
+            await this.updateWaiters(operation, job => isTerminalJobState(job.state) ? job : ({
+              ...job, state: 'uploading', resolution: withProviderRef(job.resolution, ref),
+              files: job.files.map(status => ({ ...status, state: 'uploading' })),
+            }))
+          },
+          snapshot: async snapshot => {
+            const snapshotFailure = snapshot.files[0]?.failure
+            await this.updateWaiters(operation, job => isTerminalJobState(job.state) ? job : ({
+              ...job, state: snapshot.state === 'failed' ? 'failed' : snapshot.state === 'completed' ? 'collecting' : 'processing',
+              files: this.snapshotFiles(job, snapshot),
+              ...(snapshotFailure === undefined ? {} : { failure: snapshotFailure }),
+            }))
+          },
+          collected: async collected => {
+            if (collected.failure !== undefined) return fail(new MinerUError(collected.failure))
+            const manifest = transaction.buildManifest(file, collected.artifacts)
+            const published = await this.options.results.commitTransaction(transaction, manifest, coordinator.controller.signal)
+            await this.updateWaiters(operation, job => {
+              if (isTerminalJobState(job.state)) return job
+              const { failure: _failure, ...stable } = job
+              return {
+                ...stable, state: 'completed', resultId: published.resultId,
+                files: job.files.map(status => {
+                  const { failure: _fileFailure, progress: _progress, ...rest } = status
+                  return { ...rest, state: 'completed', resultId: published.resultId }
+                }),
+              }
+            })
+            return { state: 'completed', resultId: published.resultId }
+          },
+          failed: fail,
+        } satisfies BatchParticipant
+      }),
+      resolved, sink: router, pollIntervalMs: current.polling.pollIntervalMs, timeoutMs: current.polling.operationTimeoutMs,
+      createContext: signal => this.callContext(resolved.config, signal, items[0]!.operation!.id),
+      unregister: () => unregister(),
+    })
+    unregister = this.options.operations.registerCoordinator(() => coordinator.abort(
+      new MinerUError(failure('CANCELLED', 'MinerU plugin disposed', true)),
+    ))
+    for (const item of items) {
+      const operation = item.operation!
+      this.options.operations.start(operation, async () => {
+        await coordinator.run().catch(() => undefined)
+        const settled = operation.settledValue
+        if (settled === undefined) throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Batch participant did not settle'))
+        return settled
+      })
+    }
+  }
+
   private async runOperation(
     operation: SharedOperation,
     prepared: PreparedParseRequest,
@@ -491,23 +710,23 @@ export class MinerUService {
           bytes: requestBytes, waiterCount: operation.waiters.size,
         })
         const submission = await resolved.provider.submit(
-          prepared.request, prepared.sources,
-          await this.callContext(
-            resolved.config, operation.controller.signal, operation.id,
-            async accepted => {
-              ref = accepted
-              operation.markAccepted(accepted)
-              await this.updateWaiters(operation, current => isTerminalJobState(current.state) ? current : ({
-                ...current,
-                state: current.state === 'queued' ? 'uploading' : current.state,
-                resolution: withProviderRef(current.resolution, accepted),
-                files: current.files.map(file => ({
-                  ...file, state: file.state === 'queued' ? 'uploading' : file.state,
-                })),
-              }))
-            },
-          ),
-        )
+            prepared.request, prepared.sources,
+            await this.callContext(
+              resolved.config, operation.controller.signal, operation.id,
+              async accepted => {
+                ref = accepted
+                operation.markAccepted(accepted)
+                await this.updateWaiters(operation, current => isTerminalJobState(current.state) ? current : ({
+                  ...current,
+                  state: current.state === 'queued' ? 'uploading' : current.state,
+                  resolution: withProviderRef(current.resolution, accepted),
+                  files: current.files.map(file => ({
+                    ...file, state: file.state === 'queued' ? 'uploading' : file.state,
+                  })),
+                }))
+              },
+            ),
+          )
         ref = submission.ref
         snapshot = { state: submission.state, files: submission.files }
       } else {
@@ -619,6 +838,7 @@ export class MinerUService {
       return { state: 'completed', resultId: published.resultId }
     } catch (error) {
       await transaction?.abort().catch(() => undefined)
+      ref ??= operation.acceptedRef
       const normalized = ref === undefined && operation.controller.signal.aborted
         ? failure('INTERRUPTED_UPLOAD', 'Upload was interrupted before a recoverable provider reference was stored', true)
         : toMinerUFailure(error)
@@ -692,9 +912,7 @@ export class MinerUService {
   }
 
   private fitResult(view: ResultView, limit: number): ResultView {
-    type MutableFile = {
-      file_id: string
-      name: string
+    type MutableFile = Omit<ResultFileView, 'artifacts' | 'artifacts_truncated'> & {
       artifacts: ArtifactView[]
       artifacts_truncated?: boolean
     }
@@ -777,10 +995,69 @@ export class MinerUService {
     return this.fitResult(view, limit)
   }
 
+  private async batchEnvelope(
+    jobs: readonly MinerUJobRecord[], signal: AbortSignal, timedOut = false,
+  ): Promise<BatchParseDocumentView> {
+    const children = await Promise.all(jobs.map(async job => {
+      if (job.resultId !== undefined && (job.state === 'completed' || job.state === 'partially-completed')) {
+        const manifest = await this.options.results.get(job.cacheKey, job.request.requiredArtifacts, signal)
+        if (manifest === undefined || manifest.id !== job.resultId) {
+          throw new MinerUError(failure('CACHE_EVICTED', 'Published MinerU result is missing or corrupt'))
+        }
+        return this.projectResult(job, manifest)
+      }
+      return statusView(job)
+    }))
+    return { kind: 'batch', state: aggregateState(jobs), jobs: children, ...(timedOut ? { poll_timed_out: true } : {}) }
+  }
+
+  private async parseBatchDocument(
+    session: ServiceSession, initial: readonly MinerUJobRecord[], signal: AbortSignal, pollTimeoutMs?: number,
+  ): Promise<BatchParseDocumentView> {
+    let jobs = initial
+    if (jobs.every(job => isTerminalJobState(job.state))) return this.batchEnvelope(jobs, signal)
+    const operations = await Promise.all(jobs.filter(job => !isTerminalJobState(job.state)).map(async job => {
+      let operation = this.options.operations.get(job.cacheKey, job.providerConfigId)
+      if (operation === undefined) {
+        await this.status(session, job.id, signal)
+        operation = this.options.operations.get(job.cacheKey, job.providerConfigId)
+      }
+      return operation
+    }))
+    const active = operations.filter((operation): operation is SharedOperation => operation !== undefined)
+    if (active.length === 0) {
+      jobs = await Promise.all(jobs.map(job => this.options.jobs.require(session, job.id)))
+      return this.batchEnvelope(jobs, signal)
+    }
+
+    const timeout = pollTimeoutMs ?? this.config().polling.pollTimeoutMs
+    if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > MAX_POLL_TIMEOUT_MS) {
+      throw new MinerUError(failure('INVALID_REQUEST', 'poll timeout is outside the supported range'))
+    }
+    const waitController = new AbortController()
+    const onAbort = (): void => waitController.abort(signal.reason)
+    signal.addEventListener('abort', onAbort, { once: true })
+    const timer = setTimeout(() => waitController.abort(
+      new MinerUError(failure('POLL_TIMEOUT', 'Synchronous MinerU wait timed out', true)),
+    ), timeout)
+    try {
+      await Promise.all(active.map(operation => operation.waitForOutcome(waitController.signal)))
+    } catch (error) {
+      if (signal.aborted) throw error
+    } finally {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', onAbort)
+    }
+    jobs = await Promise.all(jobs.map(job => this.options.jobs.require(session, job.id)))
+    return this.batchEnvelope(jobs, signal, waitController.signal.aborted && jobs.some(job => !isTerminalJobState(job.state)))
+  }
+
   async parseDocument(
     session: ServiceSession, input: ParseRequestInput, signal: AbortSignal, pollTimeoutMs?: number,
   ): Promise<ParseDocumentView> {
-    const submitted = await this.submit(session, input, signal)
+    const jobs = await this.submitJobs(session, input, signal)
+    if (jobs.length > 1) return this.parseBatchDocument(session, jobs, signal, pollTimeoutMs)
+    const submitted = submitView(jobs[0]!)
     if (submitted.state === 'completed' || submitted.state === 'partially-completed') return this.result(session, submitted.job_id, signal)
     if (submitted.state === 'failed') return this.status(session, submitted.job_id, signal)
     const job = await this.options.jobs.require(session, submitted.job_id)

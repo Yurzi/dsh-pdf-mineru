@@ -1,230 +1,6 @@
+import z from "@deepseek-ai/schemastery";
 import { Readable } from "node:stream";
 import { Context } from "cordis";
-//#region node_modules/.pnpm/cosmokit@1.8.1/node_modules/cosmokit/lib/index.d.ts
-type Dict<T = any, K extends string | symbol = string> = { [key in K]: T; };
-declare function isArrayBufferLike(value: any): value is ArrayBufferLike;
-declare function isArrayBufferSource(value: any): value is Binary.Source;
-declare namespace Binary {
-  type Source<T extends ArrayBufferLike = ArrayBufferLike> = T | ArrayBufferView<T>;
-  const is: typeof isArrayBufferLike;
-  const isSource: typeof isArrayBufferSource;
-  function fromSource<T extends ArrayBufferLike>(source: Source<T>): T;
-  function toBase64(source: Source): string;
-  function fromBase64(source: string): ArrayBuffer | Uint8Array<ArrayBuffer>;
-  function toHex(source: Source): string;
-  function fromHex(source: string): ArrayBuffer;
-}
-//#endregion
-//#region node_modules/.pnpm/@standard-schema+spec@1.1.0/node_modules/@standard-schema/spec/dist/index.d.ts
-/** The Standard Typed interface. This is a base type extended by other specs. */
-interface StandardTypedV1<Input = unknown, Output = Input> {
-  /** The Standard properties. */
-  readonly "~standard": StandardTypedV1.Props<Input, Output>;
-}
-declare namespace StandardTypedV1 {
-  /** The Standard Typed properties interface. */
-  interface Props<Input = unknown, Output = Input> {
-    /** The version number of the standard. */
-    readonly version: 1;
-    /** The vendor name of the schema library. */
-    readonly vendor: string;
-    /** Inferred types associated with the schema. */
-    readonly types?: Types<Input, Output> | undefined;
-  }
-  /** The Standard Typed types interface. */
-  interface Types<Input = unknown, Output = Input> {
-    /** The input type of the schema. */
-    readonly input: Input;
-    /** The output type of the schema. */
-    readonly output: Output;
-  }
-  /** Infers the input type of a Standard Typed. */
-  type InferInput<Schema extends StandardTypedV1> = NonNullable<Schema["~standard"]["types"]>["input"];
-  /** Infers the output type of a Standard Typed. */
-  type InferOutput<Schema extends StandardTypedV1> = NonNullable<Schema["~standard"]["types"]>["output"];
-}
-/** The Standard Schema interface. */
-interface StandardSchemaV1<Input = unknown, Output = Input> {
-  /** The Standard Schema properties. */
-  readonly "~standard": StandardSchemaV1.Props<Input, Output>;
-}
-declare namespace StandardSchemaV1 {
-  /** The Standard Schema properties interface. */
-  interface Props<Input = unknown, Output = Input> extends StandardTypedV1.Props<Input, Output> {
-    /** Validates unknown input values. */
-    readonly validate: (value: unknown, options?: StandardSchemaV1.Options | undefined) => Result<Output> | Promise<Result<Output>>;
-  }
-  /** The result interface of the validate function. */
-  type Result<Output> = SuccessResult<Output> | FailureResult;
-  /** The result interface if validation succeeds. */
-  interface SuccessResult<Output> {
-    /** The typed output value. */
-    readonly value: Output;
-    /** A falsy value for `issues` indicates success. */
-    readonly issues?: undefined;
-  }
-  interface Options {
-    /** Explicit support for additional vendor-specific parameters, if needed. */
-    readonly libraryOptions?: Record<string, unknown> | undefined;
-  }
-  /** The result interface if validation fails. */
-  interface FailureResult {
-    /** The issues of failed validation. */
-    readonly issues: ReadonlyArray<Issue>;
-  }
-  /** The issue interface of the failure output. */
-  interface Issue {
-    /** The error message of the issue. */
-    readonly message: string;
-    /** The path of the issue, if any. */
-    readonly path?: ReadonlyArray<PropertyKey | PathSegment> | undefined;
-  }
-  /** The path segment interface of the issue. */
-  interface PathSegment {
-    /** The key representing a path segment. */
-    readonly key: PropertyKey;
-  }
-  /** The Standard types interface. */
-  interface Types<Input = unknown, Output = Input> extends StandardTypedV1.Types<Input, Output> {}
-  /** Infers the input type of a Standard. */
-  type InferInput<Schema extends StandardTypedV1> = StandardTypedV1.InferInput<Schema>;
-  /** Infers the output type of a Standard. */
-  type InferOutput<Schema extends StandardTypedV1> = StandardTypedV1.InferOutput<Schema>;
-}
-//#endregion
-//#region node_modules/.pnpm/schemastery@3.18.0/node_modules/schemastery/lib/index.d.ts
-declare const kSchema: unique symbol;
-declare global {
-  namespace Schemastery {
-    type From<X> = X extends string | number | boolean ? Schema<X> : X extends Schema ? X : X extends typeof String ? Schema<string> : X extends typeof Number ? Schema<number> : X extends typeof Boolean ? Schema<boolean> : X extends typeof Function ? Schema<Function, (...args: any[]) => any> : X extends Constructor<infer S> ? Schema<S> : never;
-    type TypeS1<X> = X extends Schema<infer S, unknown> ? S : never;
-    type Inverse<X> = X extends Schema<any, infer Y> ? (arg: Y) => void : never;
-    type TypeS<X> = TypeS1<From<X>>;
-    type TypeT<X> = ReturnType<From<X>>;
-    type Resolve = (data: any, schema: Schema, options: Options, strict?: boolean) => [any, any?];
-    type IntersectS<X> = From<X> extends Schema<infer S, unknown> ? S : never;
-    type IntersectT<X> = Inverse<From<X>> extends ((arg: infer T) => void) ? T : never;
-    type TupleS<X extends readonly any[]> = X extends readonly [infer L, ...infer R] ? [TypeS<L>?, ...TupleS<R>] : any[];
-    type TupleT<X extends readonly any[]> = X extends readonly [infer L, ...infer R] ? [TypeT<L>?, ...TupleT<R>] : any[];
-    type ObjectS<X extends Dict> = { [K in keyof X]?: TypeS<X[K]> | null; } & Dict;
-    type ObjectT<X extends Dict> = { [K in keyof X]: TypeT<X[K]>; } & Dict;
-    type Constructor<T = any> = new (...args: any[]) => T;
-    interface Static {
-      <T = any>(options: Partial<Schema<T>>): Schema<T>;
-      new <T = any>(options: Partial<Schema<T>>): Schema<T>;
-      prototype: Schema;
-      resolve: Resolve;
-      from<X = any>(source?: X): From<X>;
-      extend(type: string, resolve: Resolve): void;
-      any<T = any>(): Schema<T>;
-      never(): Schema<never>;
-      const<const T>(value: T): Schema<T>;
-      string(): Schema<string>;
-      number(): Schema<number>;
-      natural(): Schema<number>;
-      percent(): Schema<number>;
-      boolean(): Schema<boolean>;
-      date(): Schema<string | Date, Date>;
-      regExp(flag?: string): Schema<string | RegExp, RegExp>;
-      arrayBuffer(): Schema<Binary.Source, ArrayBufferLike>;
-      arrayBuffer(encoding: 'hex' | 'base64'): Schema<Binary.Source | string, ArrayBufferLike>;
-      bitset<K extends string>(bits: Partial<Record<K, number>>): Schema<number | readonly K[], number>;
-      function(): Schema<Function, (...args: any[]) => any>;
-      is(constructor: string): Schema;
-      is<T>(constructor: Constructor<T>): Schema<T>;
-      array<X>(inner: X): Schema<TypeS<X>[], TypeT<X>[]>;
-      dict<X, Y extends Schema<any, string> = Schema<string>>(inner: X, sKey?: Y): Schema<Dict<TypeS<X>, TypeS<Y>>, Dict<TypeT<X>, TypeT<Y>>>;
-      tuple<const X extends readonly any[]>(list: X): Schema<TupleS<X>, TupleT<X>>;
-      object<X extends Dict>(dict: X): Schema<ObjectS<X>, ObjectT<X>>;
-      union<const X>(list: readonly X[]): Schema<TypeS<X>, TypeT<X>>;
-      intersect<const X>(list: readonly X[]): Schema<IntersectS<X>, IntersectT<X>>;
-      transform<X, T>(inner: X, callback: (value: TypeS<X>, options: Schemastery.Options) => T, preserve?: boolean): Schema<TypeS<X>, T>;
-      lazy<X extends Schema>(callback: () => X): X;
-      ValidationError: typeof ValidationError;
-    }
-    interface Options {
-      autofix?: boolean;
-      ignore?(data: any, schema: Schema): boolean;
-      path?: (keyof any)[];
-    }
-    interface Meta<T = any> {
-      default?: T extends {} ? Partial<T> : T;
-      required?: boolean;
-      disabled?: boolean;
-      collapse?: boolean;
-      badges?: {
-        text: string;
-        type: string;
-      }[];
-      hidden?: boolean;
-      loose?: boolean;
-      role?: string;
-      extra?: any;
-      link?: string;
-      description?: string | Dict<string>;
-      comment?: string;
-      pattern?: {
-        source: string;
-        flags?: string;
-      };
-      max?: number;
-      min?: number;
-      step?: number;
-    }
-  }
-  interface Schemastery<S = any, T = S> {
-    (data?: S | null, options?: Schemastery.Options): T;
-    new (data?: S | null, options?: Schemastery.Options): T;
-    [kSchema]: true;
-    uid: number;
-    meta: Schemastery.Meta<T>;
-    type: string;
-    sKey?: Schema;
-    inner?: Schema;
-    list?: Schema[];
-    dict?: Dict<Schema>;
-    bits?: Dict<number>;
-    callback?: Function;
-    constructor?: string | Function;
-    builder?: Function;
-    value?: T;
-    refs?: Dict<Schema>;
-    preserve?: boolean;
-    '~standard': StandardSchemaV1.Props;
-    toString(inline?: boolean): string;
-    toJSON(): Schema<S, T>;
-    required(value?: boolean): Schema<S, T>;
-    hidden(value?: boolean): Schema<S, T>;
-    loose(value?: boolean): Schema<S, T>;
-    role(text: string, extra?: any): Schema<S, T>;
-    link(link: string): Schema<S, T>;
-    default(value: T): Schema<S, T>;
-    comment(text: string): Schema<S, T>;
-    description(text: string): Schema<S, T>;
-    disabled(value?: boolean): Schema<S, T>;
-    collapse(value?: boolean): Schema<S, T>;
-    deprecated(): Schema<S, T>;
-    experimental(): Schema<S, T>;
-    pattern(regexp: RegExp): Schema<S, T>;
-    max(value: number): Schema<S, T>;
-    min(value: number): Schema<S, T>;
-    step(value: number): Schema<S, T>;
-    set(key: string, value: Schema): Schema<S, T>;
-    push(value: Schema): Schema<S, T>;
-    simplify(value?: any): any;
-    i18n(messages: Dict): Schema<S, T>;
-    extra<K extends keyof Schemastery.Meta>(key: K, value: Schemastery.Meta[K]): Schema<S, T>;
-  }
-}
-declare class ValidationError extends TypeError {
-  options: Schemastery.Options;
-  name: string;
-  constructor(message: string, options: Schemastery.Options);
-  static is(error: any): error is ValidationError;
-}
-type Schema<S = any, T = S> = Schemastery<S, T>;
-declare const Schema: Schemastery.Static;
-//#endregion
 //#region src/domain/ids.d.ts
 type Brand<T, Name extends string> = T & {
   readonly __brand: Name;
@@ -813,10 +589,20 @@ declare class SharedOperation {
 declare class SharedOperationRegistry {
   private readonly operations;
   private disposed;
+  private readonly coordinatorDisposers;
+  private readonly operationKeys;
+  private readonly operationTimeouts;
+  private readonly started;
+  reserve(cacheKey: CacheKey, authority: ProviderConfigId, timeoutMs: number): {
+    readonly operation: SharedOperation;
+    readonly created: boolean;
+  };
+  start(operation: SharedOperation, runner: (operation: SharedOperation) => Promise<SharedOutcome>): void;
   acquire(cacheKey: CacheKey, authority: ProviderConfigId, timeoutMs: number, runner: (operation: SharedOperation) => Promise<SharedOutcome>): {
     readonly operation: SharedOperation;
     readonly created: boolean;
   };
+  registerCoordinator(dispose: () => void): () => void;
   get(cacheKey: CacheKey, authority: ProviderConfigId): SharedOperation | undefined;
   activeOperationIds(): ReadonlySet<OperationId>;
   dispose(): void;
@@ -971,6 +757,8 @@ interface FileStatusView {
   readonly file_id: string;
   readonly name: string;
   readonly state: string;
+  /** Present only in a multi-file submission; single-file output remains unchanged. */
+  readonly job_id?: string;
   readonly progress?: {
     readonly completed: number;
     readonly total: number;
@@ -999,6 +787,13 @@ interface ResultFileView {
   readonly file_id: string;
   readonly name: string;
   readonly artifacts: readonly ArtifactView[];
+  /** Present only in a multi-file folded result. */
+  readonly job_id?: string;
+  readonly state?: string;
+  readonly result_id?: string;
+  readonly manifest_path?: string;
+  readonly cache_hit?: boolean;
+  readonly failure?: MinerUFailure;
   readonly artifacts_truncated?: boolean;
 }
 interface ResultView {
@@ -1027,9 +822,21 @@ interface ProbeView {
   };
   readonly diagnostics?: string;
 }
+interface BatchSubmitView {
+  readonly kind: 'batch';
+  readonly state: MinerUJobState;
+  readonly jobs: readonly SubmitView[];
+}
+interface BatchParseDocumentView {
+  readonly kind: 'batch';
+  readonly state: MinerUJobState;
+  readonly jobs: readonly (ResultView | StatusView)[];
+  readonly poll_timed_out?: true;
+}
+type SubmitDocumentView = SubmitView | BatchSubmitView;
 type ParseDocumentView = ResultView | (StatusView & {
   readonly poll_timed_out?: true;
-});
+}) | BatchParseDocumentView;
 interface MinerUServiceOptions {
   readonly getConfig: () => MinerUConfig;
   readonly providers: ProviderRegistry;
@@ -1046,19 +853,23 @@ declare class MinerUService {
   private diagnostic;
   private callContext;
   probe(signal: AbortSignal, draft?: ProviderConfig): Promise<ProbeView>;
-  submit(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal): Promise<SubmitView>;
+  submit(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal): Promise<SubmitDocumentView>;
+  private submitJobs;
   private newJob;
   private syncAcceptedRef;
   private syncSubmission;
   private replayOperation;
   private updateWaiters;
   private snapshotFiles;
+  private startBatch;
   private runOperation;
   status(session: ServiceSession, jobId: string, signal: AbortSignal): Promise<StatusView>;
   private markdownPreview;
   private fitResult;
   result(session: ServiceSession, jobId: string, signal: AbortSignal): Promise<ResultView>;
   private projectResult;
+  private batchEnvelope;
+  private parseBatchDocument;
   parseDocument(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal, pollTimeoutMs?: number): Promise<ParseDocumentView>;
 }
 //#endregion
@@ -1255,7 +1066,7 @@ declare class StorageMaintenanceService {
 //#region src/index.d.ts
 declare const name = "dsh-pdf-mineru";
 declare const inject: string[];
-declare const Config: Schema<unknown>;
+declare const Config: z<unknown>;
 declare function apply(ctx: Context, entryConfig?: unknown): Promise<() => Promise<void>>;
 //#endregion
-export { ARTIFACT_KINDS, ArtifactInput, ArtifactKind, ArtifactRef, ArtifactSink, ArtifactView, ArtifactWriteOptions, CACHE_KEY_SPEC_VERSION, CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, CacheIntegrityScanReport, CacheKey, CanonicalParseRequest, CanonicalSourceFile, Config, CredentialResolver, DEFAULT_RETRY_POLICY, FileStatusView, GcCandidate, GcDryRunOptions, GcDryRunReport, IntegrityScanOptions, JobReferenceScan, JobResolution, JobSourceFile, MINERU_JOB_SCHEMA_VERSION, MINERU_RESULT_MANIFEST_SCHEMA_VERSION, MinerUConfig, MinerUDiagnosticEvent, MinerUDiagnosticLevel, MinerUDiagnosticPhase, MinerUDiagnosticSink, MinerUError, MinerUErrorCode, MinerUFailure, MinerUFileId, MinerUFileState, MinerUFileStatus, MinerUJobId, MinerUJobRecord, MinerUJobState, MinerUModel, MinerUProvider, MinerUProviderId, MinerUResultId, MinerUResultManifest, MinerUService, MinerUServiceOptions, MinerUStructuredLogger, OfficialV4Config, OfficialV4Provider, OperationId, OutputConfig, ParseDefaults, ParseDocumentView, ParseMethod, ParseRequestInput, ParseSemantics, ParsedDocumentManifest, PollingConfig, PreparedParseRequest, PreparedSourceFile, ProbeView, ProviderCallContext, ProviderCallLimits, ProviderCapabilities, ProviderCollectedFile, ProviderCollection, ProviderCompatibilityContext, ProviderConfig, ProviderConfigId, ProviderFileSnapshot, ProviderJobRef, ProviderJobSnapshot, ProviderOptions, ProviderProbeResult, ProviderRetryEvent, ProviderRetryHook, ProviderRetryHooks, ProviderRetryOperation, ProviderRetryOptions, ProviderRetryPolicy, ProviderSubmission, ProviderSubmittedFile, QuarantineCleanupOptions, QuarantineCleanupReport, QuarantineEntry, QuarantineListOptions, QuarantineListReport, RESULT_SCHEMA_VERSION, ResultFileView, ResultProducer, ResultView, RetryConfig, RetryExecutionContext, ScanMetadata, SecurityLimits, SelfHostedFileParseResult, SelfHostedHealthResponse, SelfHostedTaskResultResponse, SelfHostedTaskSubmitResponse, SelfHostedV2Config, SelfHostedV2Provider, SelfHostedV2ProviderConfig, ServiceSession, SessionId, StatusView, StorageAreaStatistics, StorageConfig, StorageMaintenanceArea, StorageMaintenanceDiagnostic, StorageMaintenanceDiagnosticCode, StorageMaintenanceService, StorageStatistics, SubmissionSource, SubmitView, TemporaryArtifact, apply, asCacheKey, asFileId, asJobId, asOperationId, asProviderConfigId, asResultId, asSessionId, assertJobTransition, assertSafePathSegment, calculateBackoffDelay, createFileId, createJobId, createOperationId, createStructuredDiagnosticSink, defaultMinerUConfig, defaultSleep, emitDiagnostic, executeWithRetry, failure, inject, isRetryableError, isRetryableHttpStatus, isTerminalJobState, mergeRetryOptions, migrateConfig, name, normalizeArtifactKinds, normalizePageRanges, parseRetryAfter, providerById, readBoundedResponseText, resolveRetryPolicy, resultIdForCacheKey, sanitizeDiagnostic, throwMinerU, toMinerUFailure, validateProviderCapabilities };
+export { ARTIFACT_KINDS, ArtifactInput, ArtifactKind, ArtifactRef, ArtifactSink, ArtifactView, ArtifactWriteOptions, BatchParseDocumentView, BatchSubmitView, CACHE_KEY_SPEC_VERSION, CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, CacheIntegrityScanReport, CacheKey, CanonicalParseRequest, CanonicalSourceFile, Config, CredentialResolver, DEFAULT_RETRY_POLICY, FileStatusView, GcCandidate, GcDryRunOptions, GcDryRunReport, IntegrityScanOptions, JobReferenceScan, JobResolution, JobSourceFile, MINERU_JOB_SCHEMA_VERSION, MINERU_RESULT_MANIFEST_SCHEMA_VERSION, MinerUConfig, MinerUDiagnosticEvent, MinerUDiagnosticLevel, MinerUDiagnosticPhase, MinerUDiagnosticSink, MinerUError, MinerUErrorCode, MinerUFailure, MinerUFileId, MinerUFileState, MinerUFileStatus, MinerUJobId, MinerUJobRecord, MinerUJobState, MinerUModel, MinerUProvider, MinerUProviderId, MinerUResultId, MinerUResultManifest, MinerUService, MinerUServiceOptions, MinerUStructuredLogger, OfficialV4Config, OfficialV4Provider, OperationId, OutputConfig, ParseDefaults, ParseDocumentView, ParseMethod, ParseRequestInput, ParseSemantics, ParsedDocumentManifest, PollingConfig, PreparedParseRequest, PreparedSourceFile, ProbeView, ProviderCallContext, ProviderCallLimits, ProviderCapabilities, ProviderCollectedFile, ProviderCollection, ProviderCompatibilityContext, ProviderConfig, ProviderConfigId, ProviderFileSnapshot, ProviderJobRef, ProviderJobSnapshot, ProviderOptions, ProviderProbeResult, ProviderRetryEvent, ProviderRetryHook, ProviderRetryHooks, ProviderRetryOperation, ProviderRetryOptions, ProviderRetryPolicy, ProviderSubmission, ProviderSubmittedFile, QuarantineCleanupOptions, QuarantineCleanupReport, QuarantineEntry, QuarantineListOptions, QuarantineListReport, RESULT_SCHEMA_VERSION, ResultFileView, ResultProducer, ResultView, RetryConfig, RetryExecutionContext, ScanMetadata, SecurityLimits, SelfHostedFileParseResult, SelfHostedHealthResponse, SelfHostedTaskResultResponse, SelfHostedTaskSubmitResponse, SelfHostedV2Config, SelfHostedV2Provider, SelfHostedV2ProviderConfig, ServiceSession, SessionId, StatusView, StorageAreaStatistics, StorageConfig, StorageMaintenanceArea, StorageMaintenanceDiagnostic, StorageMaintenanceDiagnosticCode, StorageMaintenanceService, StorageStatistics, SubmissionSource, SubmitDocumentView, SubmitView, TemporaryArtifact, apply, asCacheKey, asFileId, asJobId, asOperationId, asProviderConfigId, asResultId, asSessionId, assertJobTransition, assertSafePathSegment, calculateBackoffDelay, createFileId, createJobId, createOperationId, createStructuredDiagnosticSink, defaultMinerUConfig, defaultSleep, emitDiagnostic, executeWithRetry, failure, inject, isRetryableError, isRetryableHttpStatus, isTerminalJobState, mergeRetryOptions, migrateConfig, name, normalizeArtifactKinds, normalizePageRanges, parseRetryAfter, providerById, readBoundedResponseText, resolveRetryPolicy, resultIdForCacheKey, sanitizeDiagnostic, throwMinerU, toMinerUFailure, validateProviderCapabilities };

@@ -331,23 +331,16 @@ describe('StorageMaintenanceService GC dry run', () => {
     const orphanTwo = await publish(results, 'd'.repeat(64), '# orphan two')
 
     const session = asSessionId('gc-session')
-    const request = sampleRequest('a'.repeat(64))
-    const job = sampleJob(session, request, sampleProducer())
-    const extraFileId = createFileId('e'.repeat(64), 1)
-    const secondSource = {
-      fileId: extraFileId, name: 'second.pdf', bytes: 1, sha256: 'e'.repeat(64),
-    }
-    const multiReference: MinerUJobRecord = {
-      ...job,
-      sourceFiles: [...job.sourceFiles, secondSource],
-      request: { ...request, files: [...request.files, secondSource] },
-      files: [
-        { ...job.files[0]!, cacheKey: firstReferenced.cacheKey },
-        { fileId: extraFileId, name: 'second.pdf', cacheKey: secondReferenced.cacheKey, state: 'completed' },
-      ],
-      cacheKey: firstReferenced.cacheKey,
-    }
-    await jobs.create(sessionObject(session), multiReference)
+    const firstJob = sampleJob(session, sampleRequest('a'.repeat(64)), sampleProducer())
+    const secondJob = sampleJob(session, sampleRequest('b'.repeat(64)), sampleProducer())
+    await jobs.create(sessionObject(session), {
+      ...firstJob, cacheKey: firstReferenced.cacheKey,
+      files: firstJob.files.map(file => ({ ...file, cacheKey: firstReferenced.cacheKey })),
+    })
+    await jobs.create(sessionObject(session), {
+      ...secondJob, cacheKey: secondReferenced.cacheKey,
+      files: secondJob.files.map(file => ({ ...file, cacheKey: secondReferenced.cacheKey })),
+    })
 
     const report = await maintenance.gcDryRun({ candidateLimit: 1 })
     expect(report.dryRun).toBe(true)

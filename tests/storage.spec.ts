@@ -43,6 +43,7 @@ import { computeCacheKey } from '../src/service/cache-key.js'
 import {
   JobRepository,
   ProcessLock,
+  BatchArtifactRouter,
   ResultRepository,
   StagingArtifactSink,
   StoragePaths,
@@ -669,6 +670,36 @@ describe('ResultRepository (Transactions, Publishing, Cache Hits & Quarantine)',
     })
     await expect(stat(paths.stagingDir(tx.operationId))).rejects.toThrow()
     await expect(stat(paths.resultDir(manifest.cacheKey))).rejects.toThrow()
+  })
+
+  it('routes batch artifacts to isolated transactions and preserves committed siblings', async () => {
+    const root = await createTempRoot()
+    const paths = new StoragePaths(root)
+    const repo = new ResultRepository(paths)
+    const requestA = sampleRequest('a'.repeat(64))
+    const requestB = sampleRequest('b'.repeat(64))
+    const fileA = requestA.files[0]!
+    const fileB = requestB.files[0]!
+    const txA = repo.beginTransaction(createOperationId(), requestA, sampleProducer())
+    const txB = repo.beginTransaction(createOperationId(), requestB, sampleProducer())
+    const router = new BatchArtifactRouter([
+      { fileId: fileA.fileId, transaction: txA },
+      { fileId: fileB.fileId, transaction: txB },
+    ])
+
+    const artifactA = await router.writeArtifact(fileA.fileId, 'markdown', '# A', { mediaType: 'text/markdown' })
+    await router.writeArtifact(fileB.fileId, 'markdown', '# B', { mediaType: 'text/markdown' })
+    expect(() => router.writeArtifact(asFileId('mf_ffffffffffffffffffffffffffff_0'), 'markdown', '# unknown', {
+      mediaType: 'text/markdown',
+    })).toThrow(/unknown batch fileId/)
+
+    const manifestA = txA.buildManifest(fileA, [artifactA])
+    await repo.commitTransaction(txA, manifestA)
+    await router.abortUncommitted(new Set([fileA.fileId]))
+
+    expect(await repo.get(manifestA.cacheKey)).toMatchObject({ id: manifestA.id })
+    await expect(stat(txB.stagingDir)).rejects.toThrow()
+    expect(manifestA.files).toHaveLength(1)
   })
 
   it('cleans up expired staging directories while preserving active operations', async () => {

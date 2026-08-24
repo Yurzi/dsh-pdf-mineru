@@ -595,6 +595,53 @@ describe('OfficialV4Provider', () => {
       expect(snapshot4.state).toBe('failed')
     })
 
+    it('maps reversed same-name results strictly by data_id', async () => {
+      const fileId1 = asFileId('mf_0123456789abcdef0123456789_0')
+      const fileId2 = asFileId('mf_fedcba9876543210fedcba9876_1')
+      const ref: ProviderJobRef = {
+        provider: 'official-v4', batchId: 'batch_same_name',
+        files: [
+          { fileId: fileId1, dataId: 'data_first', name: 'duplicate.pdf' },
+          { fileId: fileId2, dataId: 'data_second', name: 'duplicate.pdf' },
+        ],
+      }
+      globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+        code: 0, msg: 'ok', data: { batch_id: 'batch_same_name', extract_result: [
+          { data_id: 'data_second', file_name: 'duplicate.pdf', state: 'failed', err_msg: 'second failed' },
+          { data_id: 'data_first', file_name: 'duplicate.pdf', state: 'done' },
+        ] },
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+
+      const snapshot = await new OfficialV4Provider(makeConfig()).inspect(ref, makeContext())
+      expect(snapshot.files).toEqual([
+        expect.objectContaining({ fileId: fileId1, state: 'completed' }),
+        expect.objectContaining({ fileId: fileId2, state: 'failed' }),
+      ])
+      expect(snapshot.files[1]?.failure?.message).toContain('second failed')
+    })
+
+    it.each([
+      ['duplicate', [
+        { data_id: 'data_1', file_name: 'doc.pdf', state: 'done' },
+        { data_id: 'data_1', file_name: 'doc.pdf', state: 'done' },
+      ]],
+      ['unknown', [{ data_id: 'unexpected', file_name: 'doc.pdf', state: 'done' }]],
+      ['missing', [{ file_name: 'doc.pdf', state: 'done' }]],
+    ])('rejects %s data_id values in status responses', async (_label, extractResult) => {
+      const fileId = asFileId('mf_0123456789abcdef0123456789_0')
+      const ref: ProviderJobRef = {
+        provider: 'official-v4', batchId: 'batch_bad_mapping',
+        files: [{ fileId, dataId: 'data_1', name: 'doc.pdf' }],
+      }
+      globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+        code: 0, msg: 'ok', data: { batch_id: 'batch_bad_mapping', extract_result: extractResult },
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+
+      await expect(new OfficialV4Provider(makeConfig()).inspect(ref, makeContext())).rejects.toMatchObject({
+        failure: expect.objectContaining({ code: 'REMOTE_PARSE_FAILED' }),
+      })
+    })
+
     it('matches results strictly by data_id and ignores file_name differences', async () => {
       const fileId = asFileId('mf_0123456789abcdef0123456789_0')
       const ref: ProviderJobRef = {

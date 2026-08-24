@@ -66,6 +66,9 @@ export class JobRepository {
     }
 
     const validated = parseMinerUJobRecord(job)
+    if (validated.request.files.length !== 1 || validated.sourceFiles.length !== 1 || validated.files.length !== 1) {
+      throw new TypeError('New MinerU jobs must contain exactly one file')
+    }
     await this.atomicWrite(sessionId, validated.id, validated)
     return validated
   }

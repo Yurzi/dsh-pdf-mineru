@@ -113,24 +113,35 @@ export class SharedOperationRegistry {
   private readonly operations = new Map<string, SharedOperation>()
   private disposed = false
 
-  acquire(
-    cacheKey: CacheKey,
-    authority: ProviderConfigId,
-    timeoutMs: number,
-    runner: (operation: SharedOperation) => Promise<SharedOutcome>,
-  ): {
-    readonly operation: SharedOperation
-    readonly created: boolean
-  } {
+  private readonly coordinatorDisposers = new Set<() => void>()
+  private readonly operationKeys = new WeakMap<SharedOperation, string>()
+  private readonly operationTimeouts = new WeakMap<SharedOperation, number>()
+  private readonly started = new WeakSet<SharedOperation>()
+
+  reserve(
+    cacheKey: CacheKey, authority: ProviderConfigId, timeoutMs: number,
+  ): { readonly operation: SharedOperation; readonly created: boolean } {
     if (this.disposed) throw new MinerUError(failure('PROVIDER_UNAVAILABLE', 'MinerU service is shutting down', true))
     const operationKey = `${cacheKey}:${authority}`
     const existing = this.operations.get(operationKey)
     if (existing !== undefined) return { operation: existing, created: false }
     const operation = new SharedOperation(cacheKey)
     this.operations.set(operationKey, operation)
+    this.operationKeys.set(operation, operationKey)
+    this.operationTimeouts.set(operation, timeoutMs)
+    return { operation, created: true }
+  }
+
+  start(operation: SharedOperation, runner: (operation: SharedOperation) => Promise<SharedOutcome>): void {
+    const operationKey = this.operationKeys.get(operation)
+    if (operationKey === undefined || this.operations.get(operationKey) !== operation) {
+      throw new TypeError('Shared operation is not reserved in this registry')
+    }
+    if (this.started.has(operation)) throw new TypeError('Shared operation has already been started')
+    this.started.add(operation)
     const timeout = setTimeout(() => {
       operation.abort(new MinerUError(failure('POLL_TIMEOUT', 'Shared MinerU operation timed out', true)))
-    }, timeoutMs)
+    }, this.operationTimeouts.get(operation) ?? 1)
     timeout.unref?.()
     void Promise.resolve()
       .then(() => runner(operation))
@@ -139,7 +150,21 @@ export class SharedOperationRegistry {
         clearTimeout(timeout)
         if (this.operations.get(operationKey) === operation) this.operations.delete(operationKey)
       })
-    return { operation, created: true }
+  }
+
+  acquire(
+    cacheKey: CacheKey, authority: ProviderConfigId, timeoutMs: number,
+    runner: (operation: SharedOperation) => Promise<SharedOutcome>,
+  ): { readonly operation: SharedOperation; readonly created: boolean } {
+    const reserved = this.reserve(cacheKey, authority, timeoutMs)
+    if (reserved.created) this.start(reserved.operation, runner)
+    return reserved
+  }
+
+  registerCoordinator(dispose: () => void): () => void {
+    if (this.disposed) { dispose(); return () => undefined }
+    this.coordinatorDisposers.add(dispose)
+    return () => { this.coordinatorDisposers.delete(dispose) }
   }
 
   get(cacheKey: CacheKey, authority: ProviderConfigId): SharedOperation | undefined {
@@ -153,6 +178,8 @@ export class SharedOperationRegistry {
   dispose(): void {
     this.disposed = true
     const error = new MinerUError(failure('CANCELLED', 'MinerU plugin disposed', true))
+    for (const dispose of this.coordinatorDisposers) dispose()
+    this.coordinatorDisposers.clear()
     for (const operation of this.operations.values()) operation.abort(error)
   }
 }

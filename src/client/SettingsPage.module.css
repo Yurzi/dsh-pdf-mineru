@@ -113,6 +113,7 @@
 
 .input,
 .select {
+  box-sizing: border-box;
   height: 32px;
   border: 1px solid var(--dsw-alias-border-l2);
   border-radius: 6px;
@@ -127,6 +128,16 @@
 .input:focus,
 .select:focus {
   border-color: var(--dsw-alias-brand-primary);
+}
+
+.input::placeholder {
+  color: var(--dsw-alias-label-dimmed);
+}
+
+.input:disabled,
+.select:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .checkboxGroup {
@@ -145,6 +156,12 @@
   cursor: pointer;
 }
 
+.checkboxField input[type="checkbox"],
+.checkboxOption input[type="checkbox"] {
+  cursor: pointer;
+  accent-color: var(--dsw-alias-state-business-primary);
+}
+
 .actionBar {
   display: flex;
   align-items: center;
@@ -154,30 +171,38 @@
 }
 
 .primaryButton {
+  box-sizing: border-box;
   height: 34px;
   padding: 0 16px;
   border: none;
   border-radius: 6px;
-  background: var(--dsw-alias-brand-primary);
-  color: #fff;
+  background: var(--dsw-alias-button-primary-fill);
+  color: var(--dsw-alias-label-primary-foreground);
   font-size: 13px;
   font-weight: 500;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  transition: background-color 0.15s ease, opacity 0.15s ease;
 }
 
 .primaryButton:hover:not(:disabled) {
-  opacity: 0.9;
+  background: var(--dsw-alias-button-primary-hover);
 }
 
 .primaryButton:disabled {
-  opacity: 0.5;
+  opacity: 0.4;
   cursor: not-allowed;
 }
 
+.primaryButton:focus-visible {
+  box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);
+  outline: none;
+}
+
 .secondaryButton {
+  box-sizing: border-box;
   height: 34px;
   padding: 0 14px;
   border: 1px solid var(--dsw-alias-border-l2);
@@ -190,15 +215,21 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  transition: background-color 0.15s ease, opacity 0.15s ease;
 }
 
 .secondaryButton:hover:not(:disabled) {
-  background: var(--dsw-alias-bg-layer-2);
+  background: var(--dsw-alias-interactive-bg-hover-solid);
 }
 
 .secondaryButton:disabled {
-  opacity: 0.5;
+  opacity: 0.4;
   cursor: not-allowed;
+}
+
+.secondaryButton:focus-visible {
+  box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);
+  outline: none;
 }
 
 .testResult {
@@ -212,15 +243,15 @@
 }
 
 .testResultHealthy {
-  background: var(--dsw-alias-state-success-bg, rgba(46, 160, 67, 0.1));
-  border: 1px solid var(--dsw-alias-state-success-primary, #2ea043);
-  color: var(--dsw-alias-state-success-primary, #2ea043);
+  background: var(--dsw-alias-state-success-tertiary);
+  border: 1px solid var(--dsw-alias-state-success-primary);
+  color: var(--dsw-alias-state-success-primary);
 }
 
 .testResultError {
-  background: var(--dsw-alias-state-error-bg, rgba(248, 81, 73, 0.1));
-  border: 1px solid var(--dsw-alias-state-error-primary, #f85149);
-  color: var(--dsw-alias-state-error-primary, #f85149);
+  background: var(--dsw-alias-interactive-bg-hover-danger);
+  border: 1px solid var(--dsw-alias-state-error-primary);
+  color: var(--dsw-alias-state-error-primary);
 }
 
 .testResultTesting {
@@ -234,7 +265,7 @@
 }
 
 .testDetails {
-  font-family: monospace;
+  font-family: var(--ds-font-family-code, monospace);
   font-size: 11px;
   color: var(--dsw-alias-label-secondary);
 }
@@ -364,9 +395,14 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--dsw-alias-label-primary);
+  font-family: var(--ds-font-family-code, monospace);
+  background: var(--dsw-alias-markdown-inline-code);
+  border-radius: 4px;
+  padding: 1px 4px;
 }
 
 .dangerButton {
+  box-sizing: border-box;
   height: 34px;
   padding: 0 14px;
   border: 1px solid var(--dsw-alias-state-error-primary);
@@ -376,6 +412,10 @@
   font-size: 13px;
   font-weight: 500;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 0.15s ease, opacity 0.15s ease;
 }
 
 .dangerButton:hover:not(:disabled) {
@@ -383,8 +423,13 @@
 }
 
 .dangerButton:disabled {
-  opacity: 0.5;
+  opacity: 0.4;
   cursor: not-allowed;
+}
+
+.dangerButton:focus-visible {
+  box-shadow: 0 0 0 2px var(--dsw-alias-state-error-primary);
+  outline: none;
 }
 
 @media (max-width: 520px) {

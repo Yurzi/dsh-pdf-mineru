@@ -84,7 +84,6 @@ async function hashFile(path: string, signal: AbortSignal): Promise<string> {
 
 async function prepareSource(
   rawPath: string,
-  index: number,
   cwd: string | undefined,
   maxFileBytes: number | undefined,
   signal: AbortSignal,
@@ -109,7 +108,7 @@ async function prepareSource(
     throw new MinerUError(failure('INVALID_REQUEST', `${basename(path)} changed while it was being hashed`, true))
   }
   return {
-    fileId: createFileId(sha256, index),
+    fileId: createFileId(sha256),
     name: basename(path),
     bytes: after.size,
     sha256,
@@ -158,9 +157,17 @@ export class RequestNormalizer {
     const formula = input.formula ?? this.options.defaults.formula
     const table = input.table ?? this.options.defaults.table
     const pages = input.pages === undefined ? undefined : normalizePages(input.pages)
-    const sources = await Promise.all(paths.map((path, index) => prepareSource(
-      path, index, this.options.cwd, this.options.maxFileBytes, signal,
+    const unhashedSources = await Promise.all(paths.map(path => prepareSource(
+      path, this.options.cwd, this.options.maxFileBytes, signal,
     )))
+    // File IDs must remain stable when the same source moves within an overlapping
+    // batch. The ordinal is therefore per content hash rather than request index.
+    const occurrences = new Map<string, number>()
+    const sources = unhashedSources.map(source => {
+      const occurrence = occurrences.get(source.sha256) ?? 0
+      occurrences.set(source.sha256, occurrence + 1)
+      return { ...source, fileId: createFileId(source.sha256, occurrence) }
+    })
     return {
       sources,
       request: {

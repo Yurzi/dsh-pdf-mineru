@@ -8,6 +8,8 @@ import { registerTools, renderHealth, renderSubmit, renderStatus, renderResult, 
 import type { Context } from 'cordis'
 import type { DefineToolOptions, ObjectValueSchemaSpec, ToolRunContext, ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
 import type {
+  BatchParseDocumentView,
+  BatchSubmitView,
   MinerUService,
   ParseDocumentView,
   ProbeView,
@@ -198,6 +200,35 @@ describe('MinerU Tool Layer', () => {
       expect(rendered[0]?.text).toContain('doc.pdf')
     })
 
+  })
+
+  it('renders explicit batch submit envelopes with real child job IDs only', () => {
+    const child: SubmitView = {
+      job_id: 'mj_child_1', state: 'processing', source: 'provider', provider: 'official-v4',
+      files: [{ file_id: 'mf_1', name: 'one.pdf', state: 'processing' }], result_available: false,
+    }
+    const batch: BatchSubmitView = { kind: 'batch', state: 'processing', jobs: [child, { ...child, job_id: 'mj_child_2' }] }
+    expect(batch).not.toHaveProperty('job_id')
+    expect(batch).not.toHaveProperty('result_id')
+    expect(batch).not.toHaveProperty('manifest_path')
+    expect(batch).not.toHaveProperty('cache_hit')
+    const rendered = renderSubmit(batch)[0]?.text ?? ''
+    expect(rendered).toContain('mj_child_1')
+    expect(rendered).toContain('mj_child_2')
+  })
+
+  it('renders batch parse envelopes without folded result identifiers', () => {
+    const child: StatusView = {
+      job_id: 'mj_waiting', state: 'processing', source: 'provider', provider: 'official-v4',
+      files: [{ file_id: 'mf_1', name: 'one.pdf', state: 'processing' }], result_available: false,
+      created_at: 1, updated_at: 2,
+    }
+    const batch: BatchParseDocumentView = { kind: 'batch', state: 'processing', jobs: [child], poll_timed_out: true }
+    expect(batch).not.toHaveProperty('job_id')
+    expect(batch).not.toHaveProperty('result_id')
+    const rendered = renderParseDocument(batch)[0]?.text ?? ''
+    expect(rendered).toContain('mj_waiting')
+    expect(rendered).toContain('Poll Timed Out: Yes')
   })
 
   describe('mineru_get_parse_status', () => {

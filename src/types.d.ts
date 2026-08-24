@@ -247,9 +247,3 @@ declare module '@deepseek-ai/dsh-client-ui-settings/client' {
 declare module '@deepseek-ai/dsh-client-locale/client' {
   export interface LocaleHost {}
 }
-
-declare module '@deepseek-ai/schemastery' {
-  import Schema from 'schemastery'
-  export default Schema
-  export * from 'schemastery'
-}

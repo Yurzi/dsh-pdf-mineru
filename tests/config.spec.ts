@@ -10,6 +10,7 @@ describe('MinerU config parsing and validation', () => {
     expect(config.providers[0]).toMatchObject({ type: 'self-hosted-v2', allowInsecureHttp: true })
     expect(config.defaults).toMatchObject({ model: 'pipeline', parseMethod: 'auto', ocr: false })
     expect(config.retry).toEqual({ maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 10000 })
+    expect(config.limits.maxFilesPerRequest).toBe(1)
     expect(config.storage.storageRoot).toMatch(/[\\/]dsh-pdf-mineru[\\/]v1$/)
   })
 

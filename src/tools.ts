@@ -28,6 +28,8 @@ import type {
 import { MinerUError, failure } from './domain/errors.js'
 import type { ParseRequestInput } from './domain/request.js'
 import type {
+  BatchParseDocumentView,
+  BatchSubmitView,
   MinerUService,
   ParseDocumentView,
   ProbeView,
@@ -62,6 +64,7 @@ const fileStatusSchema: ObjectValueSchemaSpec = {
     file_id: { type: 'string', description: 'Stable internal file identifier.' },
     name: { type: 'string', description: 'File display name.' },
     state: { type: 'string', description: 'File lifecycle state.' },
+    job_id: { type: 'string', description: 'Per-file MinerU job ID for a multi-file submission.' },
     progress: {
       type: 'object',
       description: 'Page-level processing progress if available.',
@@ -98,7 +101,38 @@ const resultFileViewSchema: ObjectValueSchemaSpec = {
       description: 'List of published artifact files.',
       items: artifactViewSchema,
     },
+    job_id: { type: 'string', description: 'Per-file MinerU job ID in a folded multi-file result.' },
+    state: { type: 'string', description: 'Per-file final state in a folded multi-file result.' },
+    result_id: { type: 'string', description: 'Published single-file result ID.' },
+    manifest_path: { type: 'string', description: 'Published single-file manifest path.' },
+    cache_hit: { type: 'boolean', description: 'Whether this individual file result came from cache.' },
+    failure: failureSchema,
     artifacts_truncated: { type: 'boolean', description: 'Whether artifact list was truncated to fit limit.' },
+  },
+  additionalProperties: false,
+}
+
+
+const submitOutputProperties = {
+  job_id: { type: 'string' as const, description: 'Unique MinerU job ID (mj_...).' },
+  state: { type: 'string' as const, enum: ['queued', 'uploading', 'processing', 'collecting', 'completed', 'partially-completed', 'failed'] },
+  source: { type: 'string' as const, enum: ['cache', 'shared-operation', 'provider'] },
+  provider: { type: 'string' as const, enum: ['self-hosted-v2', 'official-v4'] },
+  files: { type: 'array' as const, items: fileStatusSchema },
+  result_available: { type: 'boolean' as const },
+  failure: failureSchema,
+}
+
+const submitChildSchema: ObjectValueSchemaSpec = { type: 'object', properties: submitOutputProperties, additionalProperties: false }
+const parseChildSchema: ObjectValueSchemaSpec = {
+  type: 'object',
+  properties: {
+    ...submitOutputProperties, cache_hit: { type: 'boolean' }, result_id: { type: 'string' },
+    files: { type: 'array', items: { type: 'object', properties: {
+      ...resultFileViewSchema.properties, state: { type: 'string' }, progress: { type: 'object', properties: { completed: { type: 'integer' }, total: { type: 'integer' } }, additionalProperties: false }, failure: failureSchema,
+    }, additionalProperties: false } },
+    markdown_preview: { type: 'string' }, preview_truncated: { type: 'boolean' }, manifest_path: { type: 'string' },
+    output_limit_chars: { type: 'integer' }, created_at: { type: 'number' }, updated_at: { type: 'number' },
   },
   additionalProperties: false,
 }
@@ -107,7 +141,7 @@ const parseParameters: ParameterSchemaSpec = {
   file_paths: {
     type: 'array',
     items: { type: 'string' },
-    description: 'Local filesystem paths of the documents to parse (single document per submission in current release).',
+    description: 'Local filesystem paths of the documents to parse. Each source receives an independent job and immutable single-file result.',
   },
   model: {
     type: 'string',
@@ -193,7 +227,15 @@ export function renderHealth(value: ProbeView): ContentBlock[] {
   return [{ type: 'text', text: clampRenderText(lines.join('\n')) }]
 }
 
-export function renderSubmit(value: SubmitView): ContentBlock[] {
+export function renderSubmit(value: SubmitView | BatchSubmitView): ContentBlock[] {
+  if ('kind' in value) {
+    const sections = value.jobs.map(job => renderSubmit(job)[0]?.text ?? '')
+    return [{ type: 'text', text: clampRenderText(`**MinerU Batch Submitted**
+- State: ${value.state}
+- Jobs: ${String(value.jobs.length)}
+
+${sections.join('\n\n')}`) }]
+  }
   const lines: string[] = [
     `**MinerU Job Submitted**: \`${value.job_id}\``,
     `- State: ${value.state}`,
@@ -204,7 +246,7 @@ export function renderSubmit(value: SubmitView): ContentBlock[] {
   if (value.files.length > 0) {
     lines.push('- Files:')
     for (const file of value.files) {
-      lines.push(`  - ${file.name} (${file.state})`)
+      lines.push(`  - ${file.name} (${file.state})${file.job_id === undefined ? '' : ` [job: \`${file.job_id}\`]`}`)
     }
   }
   if (value.failure !== undefined) {
@@ -225,7 +267,7 @@ export function renderStatus(value: StatusView): ContentBlock[] {
     lines.push('- Files:')
     for (const file of value.files) {
       const progress = file.progress !== undefined ? ` (progress: ${String(file.progress.completed)}/${String(file.progress.total)})` : ''
-      lines.push(`  - ${file.name}: ${file.state}${progress}`)
+      lines.push(`  - ${file.name}: ${file.state}${progress}${file.job_id === undefined ? '' : ` [job: \`${file.job_id}\`]`}`)
     }
   }
   if (value.failure !== undefined) {
@@ -247,6 +289,11 @@ export function renderResult(value: ResultView): ContentBlock[] {
     lines.push('\n### Artifact Files:')
     for (const file of value.files) {
       lines.push(`- **${file.name}**:`)
+      if (file.job_id !== undefined) lines.push(`  - Job: \`${file.job_id}\``)
+      if (file.state !== undefined) lines.push(`  - State: ${file.state}`)
+      if (file.result_id !== undefined) lines.push(`  - Result: \`${file.result_id}\``)
+      if (file.manifest_path !== undefined) lines.push(`  - Manifest: \`${file.manifest_path}\``)
+      if (file.failure !== undefined) lines.push(`  - Failure: [${file.failure.code}] ${file.failure.message}`)
       for (const artifact of file.artifacts) {
         lines.push(`  - ${artifact.kind} (${String(artifact.bytes)} bytes): \`${artifact.path}\``)
       }
@@ -267,10 +314,16 @@ export function renderResult(value: ResultView): ContentBlock[] {
 }
 
 export function renderParseDocument(value: ParseDocumentView): ContentBlock[] {
-  if ('manifest_path' in value && (value.state === 'completed' || value.state === 'partially-completed')) {
-    return renderResult(value as ResultView)
+  if ('kind' in value) {
+    const sections = value.jobs.map(job => 'result_id' in job ? renderResult(job)[0]?.text ?? '' : renderStatus(job)[0]?.text ?? '')
+    const timeout = value.poll_timed_out === true ? '\n- Poll Timed Out: Yes' : ''
+    return [{ type: 'text', text: clampRenderText(`**MinerU Batch Result**
+- State: ${value.state}
+- Jobs: ${String(value.jobs.length)}${timeout}
+
+${sections.join('\n\n')}`) }]
   }
-  return renderStatus(value as StatusView)
+  return 'result_id' in value ? renderResult(value) : renderStatus(value)
 }
 
 // ============================================================================
@@ -365,6 +418,8 @@ export function registerTools(
           schema: {
             type: 'object',
             properties: {
+              kind: { type: 'string', enum: ['batch'], description: 'Present only for a multi-file batch envelope.' },
+              jobs: { type: 'array', description: 'Independent per-file submission jobs.', items: submitChildSchema },
               job_id: { type: 'string', description: 'Unique MinerU job ID (mj_...).' },
               state: {
                 type: 'string',
@@ -387,7 +442,7 @@ export function registerTools(
             },
             additionalProperties: false,
           },
-          render: (_args: unknown, value: unknown) => renderSubmit(value as SubmitView),
+          render: (_args: unknown, value: unknown) => renderSubmit(value as SubmitView | BatchSubmitView),
         },
         execute: async (args: unknown, exec: ToolRunContext) => {
           const { session, signal } = requireAgentSession(exec)
@@ -510,6 +565,8 @@ export function registerTools(
           schema: {
             type: 'object',
             properties: {
+              kind: { type: 'string', enum: ['batch'], description: 'Present only for a multi-file batch envelope.' },
+              jobs: { type: 'array', description: 'Independent per-file parse views.', items: parseChildSchema },
               job_id: { type: 'string', description: 'MinerU job ID.' },
               state: {
                 type: 'string',
@@ -532,7 +589,11 @@ export function registerTools(
                   properties: {
                     file_id: { type: 'string', description: 'File identifier.' },
                     name: { type: 'string', description: 'File name.' },
+                    job_id: { type: 'string', description: 'Per-file MinerU job ID in a multi-file response.' },
                     state: { type: 'string', description: 'File state if in status view.' },
+                    result_id: { type: 'string', description: 'Published single-file result ID.' },
+                    manifest_path: { type: 'string', description: 'Published single-file manifest path.' },
+                    cache_hit: { type: 'boolean', description: 'Whether this individual file result came from cache.' },
                     progress: {
                       type: 'object',
                       properties: {

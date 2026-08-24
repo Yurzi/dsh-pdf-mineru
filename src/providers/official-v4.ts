@@ -142,6 +142,30 @@ function parseProgress(extractProgress: unknown): { completed: number; total: nu
   return undefined
 }
 
+function indexExtractResults(
+  extractResults: readonly OfficialV4ExtractResultItem[],
+  ref: Extract<ProviderJobRef, { readonly provider: 'official-v4' }>,
+): ReadonlyMap<string, OfficialV4ExtractResultItem> {
+  const expected = new Set(ref.files.map(file => file.dataId))
+  if (expected.size !== ref.files.length) {
+    throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Official provider reference contains duplicate data_id mappings', false, { provider: 'official-v4' }))
+  }
+  const results = new Map<string, OfficialV4ExtractResultItem>()
+  for (const item of extractResults) {
+    if (typeof item.data_id !== 'string' || item.data_id.trim() === '') {
+      throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Official result item is missing data_id', false, { provider: 'official-v4' }))
+    }
+    if (!expected.has(item.data_id)) {
+      throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Official result contains an unknown data_id', false, { provider: 'official-v4' }))
+    }
+    if (results.has(item.data_id)) {
+      throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Official result contains a duplicate data_id', false, { provider: 'official-v4' }))
+    }
+    results.set(item.data_id, item)
+  }
+  return results
+}
+
 export class OfficialV4Provider implements MinerUProvider {
   readonly id = 'official-v4' as const
   readonly config: OfficialV4Config
@@ -365,12 +389,7 @@ export class OfficialV4Provider implements MinerUProvider {
     }
 
     const extractResults = Array.isArray(data.data?.extract_result) ? data.data.extract_result : []
-    const resultsByDataId = new Map<string, OfficialV4ExtractResultItem>()
-    for (const item of extractResults) {
-      if (item.data_id && typeof item.data_id === 'string') {
-        resultsByDataId.set(item.data_id, item)
-      }
-    }
+    const resultsByDataId = indexExtractResults(extractResults, ref)
 
     const fileSnapshots: ProviderFileSnapshot[] = []
     let hasNonTerminal = false
@@ -464,12 +483,7 @@ export class OfficialV4Provider implements MinerUProvider {
     }
 
     const extractResults = Array.isArray(data.data?.extract_result) ? data.data.extract_result : []
-    const resultsByDataId = new Map<string, OfficialV4ExtractResultItem>()
-    for (const item of extractResults) {
-      if (item.data_id && typeof item.data_id === 'string') {
-        resultsByDataId.set(item.data_id, item)
-      }
-    }
+    const resultsByDataId = indexExtractResults(extractResults, ref)
 
     const completedFilesByZipUrl = new Map<string, ProviderSubmittedFile[]>()
     const collectedFiles: ProviderCollectedFile[] = []

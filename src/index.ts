@@ -1,4 +1,4 @@
-import z from 'schemastery'
+import z from '@deepseek-ai/schemastery'
 import type { Context } from 'cordis'
 import { migrateConfig, type MinerUConfig, type ProviderConfig } from './config.js'
 import { ProviderRegistry } from './providers/registry.js'
