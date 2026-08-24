@@ -1,5 +1,5 @@
+import z from "@deepseek-ai/schemastery";
 import { Readable } from "node:stream";
-import z from "schemastery";
 import { Context } from "cordis";
 //#region src/domain/ids.d.ts
 type Brand<T, Name extends string> = T & {

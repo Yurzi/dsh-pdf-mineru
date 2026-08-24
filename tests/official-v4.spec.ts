@@ -23,6 +23,7 @@ import type { OfficialV4Config } from '../src/config.js'
 
 const SHA256_A = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 const SHA256_B = 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210'
+const tempDirs: string[] = []
 
 class MockArtifactSink implements ArtifactSink {
   readonly written: Array<{
@@ -45,13 +46,22 @@ class MockArtifactSink implements ArtifactSink {
     input: ArtifactInput,
     options: ArtifactWriteOptions,
   ): Promise<ArtifactRef> {
-    this.written.push({ fileId, kind, input, options })
-    const bytes = typeof input === 'string'
-      ? Buffer.byteLength(input)
-      : input instanceof Uint8Array
-        ? input.byteLength
-        : Buffer.isBuffer(input)
-          ? input.length
+    let stored: ArtifactInput = input
+    if (typeof input !== 'string' && !(input instanceof Uint8Array)) {
+      const readable = input instanceof Readable
+        ? input
+        : Readable.fromWeb(input as import('node:stream/web').ReadableStream<Uint8Array>)
+      const chunks: Buffer[] = []
+      for await (const chunk of readable) chunks.push(Buffer.from(chunk as Uint8Array))
+      stored = Buffer.concat(chunks)
+    }
+    this.written.push({ fileId, kind, input: stored, options })
+    const bytes = typeof stored === 'string'
+      ? Buffer.byteLength(stored)
+      : stored instanceof Uint8Array
+        ? stored.byteLength
+        : Buffer.isBuffer(stored)
+          ? stored.length
           : 100
 
     return {
@@ -65,6 +75,7 @@ class MockArtifactSink implements ArtifactSink {
 
   async writeTemporary(name: string, input: ArtifactInput, maxBytes: number): Promise<TemporaryArtifact> {
     const dir = await mkdtemp(join(tmpdir(), 'mineru-temp-sink-'))
+    tempDirs.push(dir)
     const filePath = join(dir, name)
 
     if (typeof input === 'string') {
@@ -90,7 +101,6 @@ class MockArtifactSink implements ArtifactSink {
 }
 
 describe('OfficialV4Provider', () => {
-  const tempDirs: string[] = []
   const originalFetch = globalThis.fetch
 
   function makeContext(overrides: Partial<ProviderCallContext> = {}): ProviderCallContext {

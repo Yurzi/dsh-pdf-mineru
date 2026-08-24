@@ -18,7 +18,7 @@ const libConfig: UserConfig = {
     ],
     alwaysBundle: (id: string) => !id.startsWith('@deepseek-ai/') && !id.startsWith('node:'),
     onlyBundle: false,
-    dts: { neverBundle: [/^@deepseek-ai\//, /^node:/, 'schemastery'] },
+    dts: { neverBundle: [/^@deepseek-ai\//, /^node:/] },
   },
 }
 
