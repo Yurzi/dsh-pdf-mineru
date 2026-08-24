@@ -7,3 +7,5 @@ autoInstallPeers: false
 # consumers installing from git must allow it or `prepare` fails.
 allowBuilds:
   esbuild: true
+
+storeDir: .pnpm-store
