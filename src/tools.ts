@@ -25,7 +25,7 @@ import type {
   ParameterSchemaSpec,
   ToolRunContext,
 } from '@deepseek-ai/dsh-tools'
-import type { MinerUConfig } from './config.js'
+import { MinerUError, failure } from './domain/errors.js'
 import type { ParseRequestInput } from './domain/request.js'
 import type {
   MinerUService,
@@ -109,10 +109,6 @@ const parseParameters: ParameterSchemaSpec = {
     items: { type: 'string' },
     description: 'Local filesystem paths of the documents to parse (single document per submission in current release).',
   },
-  file_path: {
-    type: 'string',
-    description: 'Deprecated: Single local file path. Use file_paths instead.',
-  },
   model: {
     type: 'string',
     enum: ['pipeline', 'vlm'],
@@ -146,65 +142,33 @@ const parseParameters: ParameterSchemaSpec = {
     },
     description: 'Artifact kinds to retain and publish in the global result (default: ["markdown"]).',
   },
-  backend: {
-    type: 'string',
-    description: 'Deprecated: Legacy backend string (pipeline, vlm-engine, hybrid-engine). Use model instead.',
-  },
-  parse_method: {
-    type: 'string',
-    enum: ['auto', 'txt', 'ocr'],
-    description: 'Deprecated: Legacy parse method. Use ocr instead.',
-  },
-  lang_list: {
-    type: 'array',
-    items: { type: 'string' },
-    description: 'Deprecated: Legacy language code array. Use language instead.',
-  },
-  formula_enable: {
-    type: 'boolean',
-    description: 'Deprecated: Legacy formula flag. Use formula instead.',
-  },
-  table_enable: {
-    type: 'boolean',
-    description: 'Deprecated: Legacy table flag. Use table instead.',
-  },
-  return_middle_json: {
-    type: 'boolean',
-    description: 'Deprecated: Include layout middle JSON. Use artifacts: ["layout"] instead.',
-  },
-  return_model_output: {
-    type: 'boolean',
-    description: 'Deprecated: Include model output JSON. Use artifacts: ["model-output"] instead.',
-  },
-  return_content_list: {
-    type: 'boolean',
-    description: 'Deprecated: Include content list JSON. Use artifacts: ["content-list"] instead.',
-  },
-  return_images: {
-    type: 'boolean',
-    description: 'Deprecated: Include extracted images. Use artifacts: ["images"] instead.',
-  },
-  start_page_id: {
-    type: 'integer',
-    description: 'Deprecated: 0-based start page index. Use pages instead.',
-  },
-  end_page_id: {
-    type: 'integer',
-    description: 'Deprecated: 0-based end page index. Use pages instead.',
-  },
+
 }
 
 // ============================================================================
 // Render Helpers
 // ============================================================================
 
-function clampRenderText(rendered: string, limit?: number): string {
-  if (limit === undefined || limit <= 0 || rendered.length <= limit) {
-    return rendered
-  }
+const DEFAULT_RENDER_LIMIT = 16_384
+const MAX_POLL_TIMEOUT_MS = 24 * 60 * 60 * 1000
+
+function clampRenderText(rendered: string, limit = DEFAULT_RENDER_LIMIT): string {
+  if (!Number.isSafeInteger(limit) || limit <= 0) return ''
+  if (rendered.length <= limit) return rendered
   const suffix = '\n\n[Output truncated to limit]'
-  const sliceLen = Math.max(0, limit - suffix.length)
-  return rendered.slice(0, sliceLen) + suffix
+  if (suffix.length >= limit) return suffix.slice(0, limit)
+  return rendered.slice(0, limit - suffix.length) + suffix
+}
+
+function parsePollTimeout(value: unknown): number | undefined {
+  if (value === undefined) return undefined
+  if (!Number.isSafeInteger(value) || (value as number) <= 0 || (value as number) > MAX_POLL_TIMEOUT_MS) {
+    throw new MinerUError(failure(
+      'INVALID_REQUEST',
+      `poll_timeout_ms must be a positive integer no greater than ${String(MAX_POLL_TIMEOUT_MS)}`,
+    ))
+  }
+  return value as number
 }
 
 export function renderHealth(value: ProbeView): ContentBlock[] {
@@ -226,7 +190,7 @@ export function renderHealth(value: ProbeView): ContentBlock[] {
   if (value.diagnostics !== undefined) {
     lines.push(`- Diagnostics: ${value.diagnostics}`)
   }
-  return [{ type: 'text', text: lines.join('\n') }]
+  return [{ type: 'text', text: clampRenderText(lines.join('\n')) }]
 }
 
 export function renderSubmit(value: SubmitView): ContentBlock[] {
@@ -246,7 +210,7 @@ export function renderSubmit(value: SubmitView): ContentBlock[] {
   if (value.failure !== undefined) {
     lines.push(`- Failure: [${value.failure.code}] ${value.failure.message}`)
   }
-  return [{ type: 'text', text: lines.join('\n') }]
+  return [{ type: 'text', text: clampRenderText(lines.join('\n')) }]
 }
 
 export function renderStatus(value: StatusView): ContentBlock[] {
@@ -267,7 +231,7 @@ export function renderStatus(value: StatusView): ContentBlock[] {
   if (value.failure !== undefined) {
     lines.push(`- Error: [${value.failure.code}] ${value.failure.message}`)
   }
-  return [{ type: 'text', text: lines.join('\n') }]
+  return [{ type: 'text', text: clampRenderText(lines.join('\n')) }]
 }
 
 export function renderResult(value: ResultView): ContentBlock[] {
@@ -286,6 +250,7 @@ export function renderResult(value: ResultView): ContentBlock[] {
       for (const artifact of file.artifacts) {
         lines.push(`  - ${artifact.kind} (${String(artifact.bytes)} bytes): \`${artifact.path}\``)
       }
+      if (file.artifacts_truncated) lines.push('  - *(Artifact list truncated to output limit)*')
     }
   }
 
@@ -313,20 +278,33 @@ export function renderParseDocument(value: ParseDocumentView): ContentBlock[] {
 // ============================================================================
 
 function requireAgentSession(exec: ToolRunContext) {
-  const agent = exec.agent
-  if (agent === undefined) {
-    throw new Error('MinerU operations require an authenticated agent session (UNAUTHENTICATED_SESSION)')
+  const session = exec.agent?.session
+  if (session === undefined) {
+    throw new MinerUError(failure(
+      'UNAUTHENTICATED_SESSION',
+      'MinerU operations require an authenticated agent session (UNAUTHENTICATED_SESSION)',
+    ))
   }
-  return {
-    session: agent.session,
-    signal: exec.signal,
+  return { session, signal: exec.signal }
+}
+
+function requireJobId(args: unknown): string {
+  if (typeof args !== 'object' || args === null || Array.isArray(args)) {
+    throw new MinerUError(failure('INVALID_REQUEST', 'Tool arguments must be an object'))
   }
+  for (const key of Object.keys(args)) {
+    if (key !== 'job_id') throw new MinerUError(failure('INVALID_REQUEST', `Unsupported tool argument ${key}`))
+  }
+  const { job_id: jobId } = args as { job_id?: unknown }
+  if (typeof jobId !== 'string' || jobId.trim() === '') {
+    throw new MinerUError(failure('INVALID_REQUEST', 'job_id is required'))
+  }
+  return jobId
 }
 
 export function registerTools(
   ctx: Context,
   getService: () => MinerUService,
-  _getConfig?: () => MinerUConfig,
 ): () => void {
   const disposers: Array<() => void> = []
 
@@ -430,10 +408,6 @@ export function registerTools(
             type: 'string',
             description: 'MinerU job ID (mj_...) returned by submit or parse_document.',
           },
-          task_id: {
-            type: 'string',
-            description: 'Deprecated: Alias for job_id. Only accepts plugin job_id (mj_...).',
-          },
         },
         output: {
           schema: {
@@ -467,12 +441,7 @@ export function registerTools(
         },
         execute: async (args: unknown, exec: ToolRunContext) => {
           const { session, signal } = requireAgentSession(exec)
-          const typedArgs = args as { job_id?: string; task_id?: string }
-          const jobId = typedArgs.job_id ?? typedArgs.task_id
-          if (typeof jobId !== 'string' || jobId.trim() === '') {
-            throw new Error('job_id is required')
-          }
-          return await getService().status(session, jobId, signal)
+          return await getService().status(session, requireJobId(args), signal)
         },
       }),
     ) as () => void,
@@ -488,10 +457,6 @@ export function registerTools(
           job_id: {
             type: 'string',
             description: 'MinerU job ID of a completed parse job.',
-          },
-          task_id: {
-            type: 'string',
-            description: 'Deprecated: Alias for job_id. Only accepts plugin job_id (mj_...).',
           },
         },
         output: {
@@ -522,12 +487,7 @@ export function registerTools(
         },
         execute: async (args: unknown, exec: ToolRunContext) => {
           const { session, signal } = requireAgentSession(exec)
-          const typedArgs = args as { job_id?: string; task_id?: string }
-          const jobId = typedArgs.job_id ?? typedArgs.task_id
-          if (typeof jobId !== 'string' || jobId.trim() === '') {
-            throw new Error('job_id is required')
-          }
-          return await getService().result(session, jobId, signal)
+          return await getService().result(session, requireJobId(args), signal)
         },
       }),
     ) as () => void,
@@ -607,8 +567,11 @@ export function registerTools(
         },
         execute: async (args: unknown, exec: ToolRunContext) => {
           const { session, signal } = requireAgentSession(exec)
-          const typedArgs = args as ParseRequestInput & { poll_timeout_ms?: number }
-          return await getService().parseDocument(session, typedArgs, signal, typedArgs.poll_timeout_ms)
+          if (typeof args !== 'object' || args === null || Array.isArray(args)) {
+            throw new MinerUError(failure('INVALID_REQUEST', 'Tool arguments must be an object'))
+          }
+          const { poll_timeout_ms: rawPollTimeout, ...input } = args as ParseRequestInput & { poll_timeout_ms?: unknown }
+          return await getService().parseDocument(session, input, signal, parsePollTimeout(rawPollTimeout))
         },
       }),
     ) as () => void,

@@ -41,7 +41,7 @@ const validCanonicalRequest: CanonicalParseRequest = {
   semantics: {
     model: 'pipeline',
     ocr: true,
-    parseMethod: 'auto',
+    parseMethod: 'ocr',
     language: 'ch',
     formula: true,
     table: true,
@@ -203,13 +203,30 @@ describe('Domain Schemas Runtime Parsers', () => {
       ).toThrow(/non-empty array/)
     })
 
+
+    it('rejects contradictory or noncanonical persisted semantics', () => {
+      expect(() => parseCanonicalParseRequest({
+        ...validCanonicalRequest,
+        semantics: { ...validCanonicalRequest.semantics, ocr: false, parseMethod: 'ocr' },
+      })).toThrow(/must agree/)
+      for (const pages of ['15,1-3', '1-3,4-5', '0-2', '3-2']) {
+        expect(() => parseCanonicalParseRequest({
+          ...validCanonicalRequest, semantics: { ...validCanonicalRequest.semantics, pages },
+        })).toThrow(/page/i)
+      }
+      for (const requiredArtifacts of [['layout'], ['layout', 'markdown']] as const) {
+        expect(() => parseCanonicalParseRequest({ ...validCanonicalRequest, requiredArtifacts }))
+          .toThrow(/canonical|markdown/)
+      }
+    })
+
     it('rejects invalid page ranges in ParseSemantics', () => {
       expect(() =>
         parseParseSemantics({
           ...validCanonicalRequest.semantics,
           pages: 'invalid-range',
         }),
-      ).toThrow(/invalid ParseSemantics.pages format/)
+      ).toThrow(/pages|page range/)
     })
   })
 

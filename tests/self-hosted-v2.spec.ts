@@ -102,6 +102,12 @@ describe('SelfHostedV2Provider', () => {
         maxZipTotalBytes: 20 * 1024 * 1024,
         maxZipCompressionRatio: 10,
       },
+      retry: {
+        initialDelayMs: 1,
+        maxDelayMs: 5,
+        jitter: false,
+        sleep: async () => {},
+      },
       ...overrides,
     }
   }
@@ -213,19 +219,18 @@ describe('SelfHostedV2Provider', () => {
       }
 
       const key = await provider.compatibilityKey(request, {})
-      expect(key).toMatch(/^self-hosted-v2:[a-f0-9]{16}:v3\.4\.4:pipeline$/)
+      expect(key).toMatch(/^self-hosted-v2:[a-f0-9]{24}$/)
       expect(key).not.toContain('secret-internal-host')
       expect(key).not.toContain('https://')
     })
 
-    it('uses config ID as fallback version when configuredVersion is absent', async () => {
-      const provider = new SelfHostedV2Provider({
+    it('changes when the mapped upstream backend changes', async () => {
+      const config = {
         id: asProviderConfigId('mp_custom_v1'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-v2' as const,
         baseURL: 'https://mineru.example.com',
         modelMap: { vlm: 'vlm-engine' },
-      })
-
+      }
       const request: CanonicalParseRequest = {
         schemaVersion: 1,
         files: [{ fileId: createFileId(SHA256_A), name: 'doc.pdf', bytes: 100, sha256: SHA256_A }],
@@ -233,8 +238,12 @@ describe('SelfHostedV2Provider', () => {
         requiredArtifacts: ['markdown'],
       }
 
-      const key = await provider.compatibilityKey(request, {})
-      expect(key).toMatch(/^self-hosted-v2:[a-f0-9]{16}:mp_custom_v1:vlm$/)
+      const first = await new SelfHostedV2Provider(config).compatibilityKey(request, {})
+      const changed = await new SelfHostedV2Provider({
+        ...config, modelMap: { vlm: 'another-vlm-engine' },
+      }).compatibilityKey(request, {})
+      expect(first).toMatch(/^self-hosted-v2:[a-f0-9]{24}$/)
+      expect(changed).not.toBe(first)
     })
   })
 
@@ -847,6 +856,37 @@ describe('SelfHostedV2Provider', () => {
       expect(imageArtifacts[2]?.options.relativeName).toBe('images/index.json')
     })
 
+
+    it('returns a terminal per-file failure when any required artifact is missing', async () => {
+      server = createServer((_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ results: { document: { md_content: '# only markdown' } } }))
+      })
+      await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
+      const provider = new SelfHostedV2Provider({
+        id: asProviderConfigId('mp_local'), type: 'self-hosted-v2',
+        baseURL: `http://127.0.0.1:${getPort(server!)}`,
+        modelMap: { pipeline: 'pipeline' }, allowInsecureHttp: true,
+      })
+      const fileId = createFileId(SHA256_A)
+      const ref = {
+        provider: 'self-hosted-v2' as const, taskId: 'partial',
+        files: [{ dataId: 'd1', fileId, name: 'document.pdf' }],
+      }
+      const request: CanonicalParseRequest = {
+        schemaVersion: 1,
+        files: [{ fileId, name: 'document.pdf', bytes: 100, sha256: SHA256_A }],
+        semantics: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true },
+        requiredArtifacts: ['markdown', 'layout'],
+      }
+
+      const collection = await provider.collect(ref, request, new MockArtifactSink(), makeContext())
+      expect(collection.files[0]).toMatchObject({
+        failure: { code: 'REMOTE_PARSE_FAILED', retryable: false },
+      })
+      expect(collection.files[0]?.failure?.message).toContain('layout')
+    })
+
     it('matches multi-file results unambiguously and rejects ambiguous stem guesses', async () => {
       server = createServer((req, res) => {
         res.writeHead(200, { 'content-type': 'application/json' })
@@ -906,7 +946,7 @@ describe('SelfHostedV2Provider', () => {
       server = createServer((req, res) => {
         res.writeHead(500, { 'content-type': 'application/json' })
         res.end(JSON.stringify({
-          detail: 'Failed upstream with Bearer secret-token-xyz at https://api.upstream.com/path?token=supersecret&key=123#frag',
+          detail: 'Invalid key plain-secret-credential; Bearer secret-token-xyz at https://api.upstream.com/path?token=supersecret&key=123#frag',
         }))
       })
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
@@ -927,13 +967,14 @@ describe('SelfHostedV2Provider', () => {
       }
 
       try {
-        await provider.inspect(ref, makeContext())
+        await provider.inspect(ref, makeContext({ credential: 'plain-secret-credential' }))
         expect.unreachable('Should have thrown MinerUError')
       } catch (err: unknown) {
         expect(err).toBeInstanceOf(MinerUError)
         const minerUErr = err as MinerUError
         expect(minerUErr.failure.message).toContain('Bearer [REDACTED]')
         expect(minerUErr.failure.message).not.toContain('secret-token-xyz')
+        expect(minerUErr.failure.message).not.toContain('plain-secret-credential')
         expect(minerUErr.failure.message).not.toContain('supersecret')
       }
     })
@@ -996,6 +1037,399 @@ describe('SelfHostedV2Provider', () => {
       await expect(provider.inspect(ref, makeContext({ timeoutMs: 100 }))).rejects.toMatchObject({
         failure: { code: 'PROVIDER_UNAVAILABLE' },
       })
+    })
+  })
+
+  describe('Stage 2 Provider Reliability & Bounded Retry', () => {
+    it('retries probe on transient 500 and recovers when healthy', async () => {
+      let probeCount = 0
+      server = createServer((req, res) => {
+        probeCount++
+        if (probeCount === 1) {
+          res.writeHead(500, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ detail: 'Temporary internal server error' }))
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ status: 'healthy', version: '2.1.0' }))
+      })
+      await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
+      const port = getPort(server!)
+
+      const events: any[] = []
+      const provider = new SelfHostedV2Provider({
+        id: asProviderConfigId('mp_local'),
+        type: 'self-hosted-v2',
+        baseURL: `http://127.0.0.1:${port}`,
+        modelMap: { pipeline: 'pipeline' },
+        allowInsecureHttp: true,
+      })
+
+      const probeResult = await provider.probe(makeContext({
+        retry: {
+          maxRetries: 3,
+          initialDelayMs: 20,
+          jitter: false,
+          sleep: async () => {},
+          onRetry: e => events.push(e),
+        },
+      }))
+
+      expect(probeResult.available).toBe(true)
+      expect(probeCount).toBe(2)
+      expect(events).toHaveLength(1)
+      expect(events[0]).toMatchObject({
+        provider: 'self-hosted-v2',
+        operation: 'probe',
+        attempt: 1,
+        status: 500,
+      })
+    })
+
+    it('retries inspect on transient 500 and recovers task status', async () => {
+      let inspectCount = 0
+      server = createServer((req, res) => {
+        inspectCount++
+        if (inspectCount === 1) {
+          res.writeHead(503, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ detail: 'Service busy' }))
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ task_id: 'task_retry_1', status: 'completed' }))
+      })
+      await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
+      const port = getPort(server!)
+
+      const events: any[] = []
+      const provider = new SelfHostedV2Provider({
+        id: asProviderConfigId('mp_local'),
+        type: 'self-hosted-v2',
+        baseURL: `http://127.0.0.1:${port}`,
+        modelMap: { pipeline: 'pipeline' },
+        allowInsecureHttp: true,
+      })
+
+      const ref = {
+        provider: 'self-hosted-v2' as const,
+        taskId: 'task_retry_1',
+        files: [{ dataId: 'd1', fileId: createFileId(SHA256_A), name: 'doc.pdf' }],
+      }
+
+      const snapshot = await provider.inspect(ref, makeContext({
+        retry: {
+          maxRetries: 2,
+          sleep: async () => {},
+          onRetry: e => events.push(e),
+        },
+      }))
+
+      expect(snapshot.state).toBe('completed')
+      expect(inspectCount).toBe(2)
+      expect(events).toHaveLength(1)
+      expect(events[0]).toMatchObject({
+        provider: 'self-hosted-v2',
+        operation: 'inspect',
+        status: 503,
+      })
+    })
+
+    it('honors Retry-After header on 429 in inspect', async () => {
+      let inspectCount = 0
+      server = createServer((req, res) => {
+        inspectCount++
+        if (inspectCount === 1) {
+          res.writeHead(429, {
+            'Content-Type': 'application/json',
+            'Retry-After': '2',
+          })
+          res.end(JSON.stringify({ detail: 'Rate limit exceeded' }))
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ task_id: 'task_429', status: 'processing' }))
+      })
+      await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
+      const port = getPort(server!)
+
+      const events: any[] = []
+      const provider = new SelfHostedV2Provider({
+        id: asProviderConfigId('mp_local'),
+        type: 'self-hosted-v2',
+        baseURL: `http://127.0.0.1:${port}`,
+        modelMap: { pipeline: 'pipeline' },
+        allowInsecureHttp: true,
+      })
+
+      const ref = {
+        provider: 'self-hosted-v2' as const,
+        taskId: 'task_429',
+        files: [{ dataId: 'd1', fileId: createFileId(SHA256_A), name: 'doc.pdf' }],
+      }
+
+      const snapshot = await provider.inspect(ref, makeContext({
+        retry: {
+          maxRetries: 2,
+          sleep: async () => {},
+          onRetry: e => events.push(e),
+        },
+      }))
+
+      expect(snapshot.state).toBe('processing')
+      expect(inspectCount).toBe(2)
+      expect(events).toHaveLength(1)
+      expect(events[0]).toMatchObject({
+        provider: 'self-hosted-v2',
+        operation: 'inspect',
+        status: 429,
+        retryAfterMs: 2000,
+        delayMs: 2000,
+      })
+    })
+
+    it('exhausts retries on persistent 500 during inspect and throws PROVIDER_UNAVAILABLE', async () => {
+      let inspectCount = 0
+      server = createServer((req, res) => {
+        inspectCount++
+        res.writeHead(500, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ detail: 'Fatal server crash' }))
+      })
+      await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
+      const port = getPort(server!)
+
+      const events: any[] = []
+      const provider = new SelfHostedV2Provider({
+        id: asProviderConfigId('mp_local'),
+        type: 'self-hosted-v2',
+        baseURL: `http://127.0.0.1:${port}`,
+        modelMap: { pipeline: 'pipeline' },
+        allowInsecureHttp: true,
+      })
+
+      const ref = {
+        provider: 'self-hosted-v2' as const,
+        taskId: 'task_exhaust',
+        files: [{ dataId: 'd1', fileId: createFileId(SHA256_A), name: 'doc.pdf' }],
+      }
+
+      await expect(
+        provider.inspect(ref, makeContext({
+          retry: {
+            maxRetries: 2,
+            sleep: async () => {},
+            onRetry: e => events.push(e),
+          },
+        })),
+      ).rejects.toMatchObject({
+        failure: expect.objectContaining({
+          code: 'PROVIDER_UNAVAILABLE',
+          retryable: true,
+        }),
+      })
+
+      // 1 initial + 2 retries = 3 attempts
+      expect(inspectCount).toBe(3)
+      expect(events).toHaveLength(2)
+    })
+
+    it('does NOT retry non-retryable 401 / 404 / 413 during inspect', async () => {
+      let inspectCount = 0
+      server = createServer((req, res) => {
+        inspectCount++
+        res.writeHead(404, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ detail: 'Task not found' }))
+      })
+      await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
+      const port = getPort(server!)
+
+      const provider = new SelfHostedV2Provider({
+        id: asProviderConfigId('mp_local'),
+        type: 'self-hosted-v2',
+        baseURL: `http://127.0.0.1:${port}`,
+        modelMap: { pipeline: 'pipeline' },
+        allowInsecureHttp: true,
+      })
+
+      const ref = {
+        provider: 'self-hosted-v2' as const,
+        taskId: 'task_404',
+        files: [{ dataId: 'd1', fileId: createFileId(SHA256_A), name: 'doc.pdf' }],
+      }
+
+      await expect(provider.inspect(ref, makeContext())).rejects.toMatchObject({
+        failure: expect.objectContaining({
+          code: 'JOB_NOT_FOUND',
+          retryable: false,
+        }),
+      })
+
+      // Must NOT retry 404
+      expect(inspectCount).toBe(1)
+    })
+
+    it('does NOT retry multipart submission POST /tasks on 500 error (exactly 1 request)', async () => {
+      let postCount = 0
+      server = createServer((req, res) => {
+        if (req.method === 'POST' && req.url === '/tasks') {
+          postCount++
+          req.on('data', () => {})
+          req.on('end', () => {
+            res.writeHead(500, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ detail: 'Submission queue overloaded' }))
+          })
+          return
+        }
+        res.writeHead(404)
+        res.end()
+      })
+      await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
+      const port = getPort(server!)
+
+      const provider = new SelfHostedV2Provider({
+        id: asProviderConfigId('mp_local'),
+        type: 'self-hosted-v2',
+        baseURL: `http://127.0.0.1:${port}`,
+        modelMap: { pipeline: 'pipeline' },
+        allowInsecureHttp: true,
+      })
+
+      const file = await createTestFile('test.pdf')
+      const request: CanonicalParseRequest = {
+        schemaVersion: 1,
+        files: [{ fileId: file.fileId, name: file.name, bytes: file.bytes, sha256: file.sha256 }],
+        semantics: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true },
+        requiredArtifacts: ['markdown'],
+      }
+
+      const events: any[] = []
+      await expect(
+        provider.submit(request, [file], makeContext({
+          retry: {
+            maxRetries: 3,
+            onRetry: e => events.push(e),
+          },
+        })),
+      ).rejects.toMatchObject({
+        failure: expect.objectContaining({
+          code: 'PROVIDER_UNAVAILABLE',
+        }),
+      })
+
+      // Must NOT retry POST
+      expect(postCount).toBe(1)
+      expect(events).toHaveLength(0)
+    })
+
+    it('retries collect on transient 500 and collects artifacts successfully', async () => {
+      let collectCount = 0
+      server = createServer((req, res) => {
+        if (req.method === 'GET' && req.url === '/tasks/task_col/result') {
+          collectCount++
+          if (collectCount === 1) {
+            res.writeHead(500, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ detail: 'Result buffer temporary lock' }))
+            return
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({
+            results: {
+              'doc.pdf': {
+                md_content: '# Recovered result markdown',
+              },
+            },
+          }))
+          return
+        }
+        res.writeHead(404)
+        res.end()
+      })
+      await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
+      const port = getPort(server!)
+
+      const provider = new SelfHostedV2Provider({
+        id: asProviderConfigId('mp_local'),
+        type: 'self-hosted-v2',
+        baseURL: `http://127.0.0.1:${port}`,
+        modelMap: { pipeline: 'pipeline' },
+        allowInsecureHttp: true,
+      })
+
+      const fileId = createFileId(SHA256_A)
+      const ref = {
+        provider: 'self-hosted-v2' as const,
+        taskId: 'task_col',
+        files: [{ dataId: 'd1', fileId, name: 'doc.pdf' }],
+      }
+
+      const request: CanonicalParseRequest = {
+        schemaVersion: 1,
+        files: [{ fileId, name: 'doc.pdf', bytes: 100, sha256: SHA256_A }],
+        semantics: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true },
+        requiredArtifacts: ['markdown'],
+      }
+
+      const sink = new MockArtifactSink()
+      const events: any[] = []
+      const collection = await provider.collect(ref, request, sink, makeContext({
+        retry: {
+          maxRetries: 2,
+          sleep: async () => {},
+          onRetry: e => events.push(e),
+        },
+      }))
+
+      expect(collection.files).toHaveLength(1)
+      expect(collection.files[0]?.artifacts).toHaveLength(1)
+      expect(collectCount).toBe(2)
+      expect(events).toHaveLength(1)
+      expect(events[0]).toMatchObject({
+        provider: 'self-hosted-v2',
+        operation: 'collect',
+        status: 500,
+      })
+    })
+
+    it('aborts immediately and throws CANCELLED when caller aborts during backoff delay', async () => {
+      let inspectCount = 0
+      server = createServer((req, res) => {
+        inspectCount++
+        res.writeHead(500, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ detail: 'Temporary error' }))
+      })
+      await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
+      const port = getPort(server!)
+
+      const provider = new SelfHostedV2Provider({
+        id: asProviderConfigId('mp_local'),
+        type: 'self-hosted-v2',
+        baseURL: `http://127.0.0.1:${port}`,
+        modelMap: { pipeline: 'pipeline' },
+        allowInsecureHttp: true,
+      })
+
+      const controller = new AbortController()
+      const ref = {
+        provider: 'self-hosted-v2' as const,
+        taskId: 'task_abort_backoff',
+        files: [{ dataId: 'd1', fileId: createFileId(SHA256_A), name: 'doc.pdf' }],
+      }
+
+      await expect(
+        provider.inspect(ref, makeContext({
+          signal: controller.signal,
+          retry: {
+            maxRetries: 3,
+            sleep: async (_, signal) => {
+              controller.abort()
+              signal.throwIfAborted()
+            },
+          },
+        })),
+      ).rejects.toMatchObject({
+        failure: expect.objectContaining({ code: 'CANCELLED' }),
+      })
+
+      expect(inspectCount).toBe(1)
     })
   })
 })

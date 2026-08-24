@@ -1,18 +1,19 @@
-import { MinerUError, failure } from '../domain/errors.js'
-import type { CacheKey, MinerUJobId, MinerUResultId, OperationId, SessionId } from '../domain/ids.js'
+import { MinerUError, failure, type MinerUFailure } from '../domain/errors.js'
+import type { CacheKey, MinerUJobId, MinerUResultId, OperationId, ProviderConfigId, SessionId } from '../domain/ids.js'
 import { createOperationId } from '../domain/ids.js'
 import type { MinerUJobState } from '../domain/job.js'
 import type { ProviderJobRef } from '../providers/provider.js'
 
 export interface SharedWaiter {
   readonly jobId: MinerUJobId
-  readonly sessionId: SessionId
   readonly session: { readonly header: { readonly id: SessionId | string } }
 }
 
 export interface SharedSubmission {
   readonly ref?: ProviderJobRef
   readonly state: MinerUJobState
+  readonly resultId?: MinerUResultId
+  readonly failure?: MinerUFailure
 }
 
 export interface SharedOutcome {
@@ -50,6 +51,9 @@ export class SharedOperation {
   private readonly outcome = deferred<SharedOutcome>()
   private submitted = false
   private settled = false
+  private accepted: ProviderJobRef | undefined
+  private submissionValue: SharedSubmission | undefined
+  private outcomeValue: SharedOutcome | undefined
 
   constructor(readonly cacheKey: CacheKey) {
     // Mark rejections handled even when an asynchronous submit caller goes away.
@@ -61,16 +65,27 @@ export class SharedOperation {
     this.waiters.set(waiter.jobId, waiter)
   }
 
+  get acceptedRef(): ProviderJobRef | undefined { return this.accepted }
+  get submittedValue(): SharedSubmission | undefined { return this.submissionValue }
+  get settledValue(): SharedOutcome | undefined { return this.outcomeValue }
+
+  markAccepted(ref: ProviderJobRef): void {
+    if (this.accepted === undefined) this.accepted = ref
+  }
+
   markSubmitted(value: SharedSubmission): void {
     if (this.submitted) return
     this.submitted = true
+    this.submissionValue = value
+    if (value.ref !== undefined) this.markAccepted(value.ref)
     this.submission.resolve(value)
   }
 
   resolve(value: SharedOutcome): void {
     if (this.settled) return
     this.settled = true
-    if (!this.submitted) this.markSubmitted({ state: value.state })
+    this.outcomeValue = value
+    if (!this.submitted) this.markSubmitted({ state: value.state, ...(value.resultId === undefined ? {} : { resultId: value.resultId }) })
     this.outcome.resolve(value)
   }
 
@@ -95,18 +110,24 @@ export class SharedOperation {
 }
 
 export class SharedOperationRegistry {
-  private readonly operations = new Map<CacheKey, SharedOperation>()
+  private readonly operations = new Map<string, SharedOperation>()
   private disposed = false
 
-  acquire(cacheKey: CacheKey, timeoutMs: number, runner: (operation: SharedOperation) => Promise<SharedOutcome>): {
+  acquire(
+    cacheKey: CacheKey,
+    authority: ProviderConfigId,
+    timeoutMs: number,
+    runner: (operation: SharedOperation) => Promise<SharedOutcome>,
+  ): {
     readonly operation: SharedOperation
     readonly created: boolean
   } {
     if (this.disposed) throw new MinerUError(failure('PROVIDER_UNAVAILABLE', 'MinerU service is shutting down', true))
-    const existing = this.operations.get(cacheKey)
+    const operationKey = `${cacheKey}:${authority}`
+    const existing = this.operations.get(operationKey)
     if (existing !== undefined) return { operation: existing, created: false }
     const operation = new SharedOperation(cacheKey)
-    this.operations.set(cacheKey, operation)
+    this.operations.set(operationKey, operation)
     const timeout = setTimeout(() => {
       operation.abort(new MinerUError(failure('POLL_TIMEOUT', 'Shared MinerU operation timed out', true)))
     }, timeoutMs)
@@ -116,13 +137,13 @@ export class SharedOperationRegistry {
       .then(outcome => operation.resolve(outcome), error => operation.reject(error))
       .finally(() => {
         clearTimeout(timeout)
-        if (this.operations.get(cacheKey) === operation) this.operations.delete(cacheKey)
+        if (this.operations.get(operationKey) === operation) this.operations.delete(operationKey)
       })
     return { operation, created: true }
   }
 
-  get(cacheKey: CacheKey): SharedOperation | undefined {
-    return this.operations.get(cacheKey)
+  get(cacheKey: CacheKey, authority: ProviderConfigId): SharedOperation | undefined {
+    return this.operations.get(`${cacheKey}:${authority}`)
   }
 
   activeOperationIds(): ReadonlySet<OperationId> {

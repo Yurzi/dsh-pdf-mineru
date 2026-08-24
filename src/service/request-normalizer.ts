@@ -8,14 +8,18 @@ import {
   ARTIFACT_KINDS,
   CANONICAL_PARSE_REQUEST_SCHEMA_VERSION,
   normalizeArtifactKinds,
+  normalizePageRanges,
   type ArtifactKind,
-  type MinerUModel,
   type ParseDefaults,
   type ParseMethod,
   type ParseRequestInput,
   type PreparedParseRequest,
   type PreparedSourceFile,
 } from '../domain/request.js'
+
+const REQUEST_FIELDS = new Set([
+  'file_paths', 'model', 'ocr', 'language', 'formula', 'table', 'pages', 'artifacts',
+])
 
 const SUPPORTED_EXTENSIONS = new Set([
   '.pdf', '.png', '.jpg', '.jpeg', '.jp2', '.webp', '.gif', '.bmp', '.tif', '.tiff',
@@ -27,48 +31,21 @@ export interface RequestNormalizerOptions {
   readonly cwd?: string
   readonly maxFiles?: number
   readonly maxFileBytes?: number
-  /** Explicit reverse mapping used only by the legacy backend alias. */
-  readonly legacyBackendModels?: Readonly<Record<string, MinerUModel>>
 }
-
-interface PageInterval { start: number; end: number }
 
 export function normalizePages(input: string): string {
-  const intervals: PageInterval[] = []
-  for (const token of input.split(',')) {
-    const trimmed = token.trim()
-    const match = /^(\d+)(?:-(\d+))?$/.exec(trimmed)
-    if (match === null) throw new MinerUError(failure('INVALID_REQUEST', `Invalid page range token: ${trimmed}`))
-    const start = Number(match[1])
-    const end = match[2] === undefined ? start : Number(match[2])
-    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start || end > 99999) {
-      throw new MinerUError(failure('INVALID_REQUEST', `Invalid page range token: ${trimmed}`))
-    }
-    intervals.push({ start, end })
+  try {
+    return normalizePageRanges(input)
+  } catch (error) {
+    throw new MinerUError(failure(
+      'INVALID_REQUEST',
+      error instanceof Error ? error.message : 'Invalid page range',
+    ), { cause: error })
   }
-  if (intervals.length === 0) throw new MinerUError(failure('INVALID_REQUEST', 'Page range cannot be empty'))
-  intervals.sort((left, right) => left.start - right.start || left.end - right.end)
-  const merged: PageInterval[] = []
-  for (const current of intervals) {
-    const previous = merged.at(-1)
-    if (previous !== undefined && current.start <= previous.end + 1) previous.end = Math.max(previous.end, current.end)
-    else merged.push({ ...current })
-  }
-  return merged.map(({ start, end }) => start === end ? String(start) : `${String(start)}-${String(end)}`).join(',')
-}
-
-function compatibleValue<T>(modern: T | undefined, legacy: T | undefined, label: string): T | undefined {
-  if (modern !== undefined && legacy !== undefined && modern !== legacy) {
-    throw new MinerUError(failure('INVALID_REQUEST', `Conflicting ${label} and legacy alias`))
-  }
-  return modern ?? legacy
 }
 
 function resolvePaths(input: ParseRequestInput, maxFiles: number): readonly string[] {
-  if (input.file_path !== undefined && input.file_paths !== undefined) {
-    throw new MinerUError(failure('INVALID_REQUEST', 'Use file_paths or legacy file_path, not both'))
-  }
-  const paths = input.file_paths ?? (input.file_path === undefined ? [] : [input.file_path])
+  const paths = input.file_paths ?? []
   if (paths.length === 0) throw new MinerUError(failure('INVALID_REQUEST', 'Exactly one local document path is required'))
   if (paths.length > maxFiles) throw new MinerUError(failure('INVALID_REQUEST', `At most ${String(maxFiles)} file(s) may be submitted`))
   if (paths.some(path => typeof path !== 'string' || path.trim() === '')) {
@@ -77,27 +54,8 @@ function resolvePaths(input: ParseRequestInput, maxFiles: number): readonly stri
   return paths
 }
 
-function resolveLegacyPages(input: ParseRequestInput): string | undefined {
-  if (input.pages !== undefined && (input.start_page_id !== undefined || input.end_page_id !== undefined)) {
-    throw new MinerUError(failure('INVALID_REQUEST', 'Use pages or legacy page indexes, not both'))
-  }
-  if (input.pages !== undefined) return normalizePages(input.pages)
-  if (input.start_page_id === undefined && input.end_page_id === undefined) return undefined
-  const start = input.start_page_id ?? 0
-  const end = input.end_page_id ?? 99999
-  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) {
-    throw new MinerUError(failure('INVALID_REQUEST', 'Legacy page indexes must be non-negative and ordered'))
-  }
-  if (start === 0 && end === 99999) return undefined
-  return normalizePages(`${String(start + 1)}-${String(end + 1)}`)
-}
-
 function resolveArtifacts(input: ParseRequestInput, defaults: ParseDefaults): readonly ArtifactKind[] {
   const artifacts = [...(input.artifacts ?? defaults.artifacts)]
-  if (input.return_middle_json) artifacts.push('layout')
-  if (input.return_model_output) artifacts.push('model-output')
-  if (input.return_content_list) artifacts.push('content-list')
-  if (input.return_images) artifacts.push('images')
   for (const artifact of artifacts) {
     if (!(ARTIFACT_KINDS as readonly string[]).includes(artifact)) {
       throw new MinerUError(failure('INVALID_REQUEST', `Unknown artifact kind: ${String(artifact)}`))
@@ -163,9 +121,14 @@ async function prepareSource(
 export async function assertSourcesUnchanged(sources: readonly PreparedSourceFile[], signal: AbortSignal): Promise<void> {
   for (const source of sources) {
     signal.throwIfAborted()
-    const current = await stat(source.path)
+    let current
+    try {
+      current = await stat(source.path)
+    } catch (error) {
+      throw new MinerUError(failure('FILE_NOT_FOUND', `${source.name} disappeared after hashing and before upload`), { cause: error })
+    }
     const expected = source.fingerprint
-    if (current.size !== expected.size || current.mtimeMs !== expected.mtimeMs || current.dev !== expected.device || current.ino !== expected.inode) {
+    if (!current.isFile() || current.size !== expected.size || current.mtimeMs !== expected.mtimeMs || current.dev !== expected.device || current.ino !== expected.inode) {
       throw new MinerUError(failure('INVALID_REQUEST', `${source.name} changed after hashing and before upload`, true))
     }
   }
@@ -176,30 +139,25 @@ export class RequestNormalizer {
 
   async normalize(input: ParseRequestInput, signal: AbortSignal): Promise<PreparedParseRequest> {
     signal.throwIfAborted()
-    const paths = resolvePaths(input, this.options.maxFiles ?? 1)
-    const legacyLanguage = input.lang_list === undefined ? undefined : (() => {
-      if (input.lang_list.length !== 1 || input.lang_list[0] === undefined) {
-        throw new MinerUError(failure('INVALID_REQUEST', 'Legacy lang_list must contain exactly one language'))
+    if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+      throw new MinerUError(failure('INVALID_REQUEST', 'Parse request must be an object'))
+    }
+    for (const key of Object.keys(input)) {
+      if (!REQUEST_FIELDS.has(key)) {
+        throw new MinerUError(failure('INVALID_REQUEST', `Parse request contains unsupported property ${key}`))
       }
-      return input.lang_list[0]
-    })()
-    const language = compatibleValue(input.language, legacyLanguage, 'language') ?? this.options.defaults.language
+    }
+    const paths = resolvePaths(input, this.options.maxFiles ?? 1)
+    const language = input.language ?? this.options.defaults.language
     if (language.trim() === '') throw new MinerUError(failure('INVALID_REQUEST', 'Language cannot be empty'))
-
-    const legacyModel = input.backend === undefined ? undefined : this.options.legacyBackendModels?.[input.backend]
-    if (input.backend !== undefined && legacyModel === undefined) {
-      throw new MinerUError(failure('UNSUPPORTED_OPTION', `Legacy backend is not mapped: ${input.backend}`))
-    }
-    const model = compatibleValue(input.model, legacyModel, 'model') ?? this.options.defaults.model
-    const parseMethod: ParseMethod = input.parse_method
-      ?? (input.ocr === undefined ? this.options.defaults.parseMethod : input.ocr ? 'ocr' : 'auto')
+    const model = input.model ?? this.options.defaults.model
+    const parseMethod: ParseMethod = input.ocr === undefined
+      ? this.options.defaults.parseMethod
+      : input.ocr ? 'ocr' : 'auto'
     const ocr = parseMethod === 'ocr'
-    if (input.ocr !== undefined && input.ocr !== ocr) {
-      throw new MinerUError(failure('INVALID_REQUEST', 'Conflicting ocr and legacy parse_method'))
-    }
-    const formula = compatibleValue(input.formula, input.formula_enable, 'formula') ?? this.options.defaults.formula
-    const table = compatibleValue(input.table, input.table_enable, 'table') ?? this.options.defaults.table
-    const pages = resolveLegacyPages(input)
+    const formula = input.formula ?? this.options.defaults.formula
+    const table = input.table ?? this.options.defaults.table
+    const pages = input.pages === undefined ? undefined : normalizePages(input.pages)
     const sources = await Promise.all(paths.map((path, index) => prepareSource(
       path, index, this.options.cwd, this.options.maxFileBytes, signal,
     )))

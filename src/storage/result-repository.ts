@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { createReadStream } from 'node:fs'
-import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { chmod, lstat, mkdir, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { TextDecoder } from 'node:util'
 import {
   asCacheKey,
   asOperationId,
+  assertSafePathSegment,
   resultIdForCacheKey,
   type CacheKey,
   type MinerUFileId,
@@ -22,20 +23,138 @@ import { StagingArtifactSink } from './artifact-sink.js'
 import type { StoragePaths } from './paths.js'
 
 const DEFAULT_MAX_JSON_VALIDATION_BYTES = 64 * 1024 * 1024
+const DEFAULT_MAX_MANIFEST_BYTES = 16 * 1024 * 1024
+
+type ResultInspectionStatus = 'valid' | 'missing' | 'corrupt' | 'unreadable'
+type ResultInspectionReason =
+  | 'absent'
+  | 'missing-entry'
+  | 'unsafe-entry'
+  | 'manifest-invalid'
+  | 'artifact-invalid'
+  | 'io-error'
+
+/**
+ * A non-mutating verification outcome for one published content-addressed result.
+ * inspectPublished never quarantines; callers that need isolation must invoke it
+ * separately after receiving a non-valid outcome.
+ */
+export type PublishedResultInspection =
+  | { readonly status: 'valid'; readonly manifest: MinerUResultManifest }
+  | {
+    readonly status: Exclude<ResultInspectionStatus, 'valid'>
+    readonly reason: ResultInspectionReason
+  }
+
+function errnoCode(error: unknown): string | undefined {
+  return (error as NodeJS.ErrnoException | undefined)?.code
+}
+
+function isAbort(error: unknown, signal?: AbortSignal): boolean {
+  return signal?.aborted === true || (error instanceof Error && error.name === 'AbortError')
+}
+
+function inspectionFailure(error: unknown, fallback: ResultInspectionReason): Exclude<PublishedResultInspection, { readonly status: 'valid' }> {
+  const code = errnoCode(error)
+  if (code === 'ENOENT') return { status: 'missing', reason: 'missing-entry' }
+  if (code === 'EACCES' || code === 'EPERM' || code === 'EIO' || code === 'EBUSY') {
+    return { status: 'unreadable', reason: 'io-error' }
+  }
+  return { status: 'corrupt', reason: fallback }
+}
+
+function containedSegments(root: string, candidate: string): readonly string[] | undefined {
+  const relativePath = relative(root, candidate)
+  if (relativePath === '' || isAbsolute(relativePath) || relativePath === '..' || relativePath.startsWith('..' + sep)) {
+    return undefined
+  }
+  return relativePath.split(sep)
+}
+
+function assertQuarantineSourcePath(paths: StoragePaths, sourcePath: string): string {
+  const candidate = resolve(sourcePath)
+  const staging = containedSegments(paths.stagingDir(), candidate)
+  if (staging?.length === 1) {
+    const operationId = asOperationId(staging[0]!)
+    if (candidate === paths.stagingDir(operationId)) return candidate
+  }
+
+  const published = containedSegments(paths.resultsDir(), candidate)
+  if (published?.length === 2 && /^[a-f0-9]{2}$/.test(published[0]!)) {
+    const cacheKey = asCacheKey(published[1]!)
+    if (published[0] === cacheKey.slice(0, 2) && candidate === paths.resultDir(cacheKey)) return candidate
+  }
+  throw new TypeError('Only a complete staging operation or published result directory can be quarantined')
+}
+
+async function assertRegularDirectoryWithin(rootDir: string, directoryPath: string): Promise<void> {
+  const relativePath = relative(rootDir, directoryPath)
+  if (relativePath === '' || isAbsolute(relativePath) || relativePath === '..' || relativePath.startsWith('..' + sep)) {
+    throw new TypeError('Result directory escapes its storage root')
+  }
+
+  const root = await lstat(rootDir)
+  if (root.isSymbolicLink() || !root.isDirectory()) {
+    throw new TypeError('Result storage root is not a regular directory')
+  }
+
+  let current = rootDir
+  for (const segment of relativePath.split(sep)) {
+    if (segment === '') throw new TypeError('Result directory contains an empty segment')
+    current = join(current, segment)
+    const details = await lstat(current)
+    if (details.isSymbolicLink() || !details.isDirectory()) {
+      throw new TypeError('Result storage must not contain symlinked directories')
+    }
+  }
+}
+
+/** Refuse symlinked path components before opening a published artifact. */
+async function assertRegularFileWithin(rootDir: string, filePath: string): Promise<void> {
+  const relativePath = relative(rootDir, filePath)
+  if (relativePath === '' || isAbsolute(relativePath) || relativePath === '..' || relativePath.startsWith('..' + sep)) {
+    throw new TypeError('Artifact path escapes its result directory')
+  }
+
+  const root = await lstat(rootDir)
+  if (root.isSymbolicLink() || !root.isDirectory()) {
+    throw new TypeError('Result directory is not a regular directory')
+  }
+
+  const segments = relativePath.split(sep)
+  let current = rootDir
+  for (let index = 0; index < segments.length; index++) {
+    const segment = segments[index]
+    if (segment === undefined || segment === '') throw new TypeError('Artifact path contains an empty segment')
+    current = join(current, segment)
+    const details = await lstat(current)
+    if (details.isSymbolicLink()) throw new TypeError('Result data must not contain symlinks')
+    if (index === segments.length - 1) {
+      if (!details.isFile()) throw new TypeError('Artifact is not a regular file')
+    } else if (!details.isDirectory()) {
+      throw new TypeError('Artifact parent is not a regular directory')
+    }
+  }
+}
 
 async function setReadOnlyRecursive(dirPath: string): Promise<void> {
   try {
+    const root = await lstat(dirPath)
+    if (root.isSymbolicLink() || !root.isDirectory()) return
     const items = await readdir(dirPath, { withFileTypes: true })
     for (const item of items) {
+      if (item.isSymbolicLink()) continue
       const full = join(dirPath, item.name)
-      if (item.isDirectory()) {
+      const details = await lstat(full)
+      if (details.isSymbolicLink()) continue
+      if (details.isDirectory()) {
         await setReadOnlyRecursive(full)
         await chmod(full, 0o555).catch(() => undefined)
-      } else if (item.isFile()) {
-        await chmod(full, 0o444).catch(() => undefined)
+      } else if (details.isFile()) {
+        await chmod(full, 0o400).catch(() => undefined)
       }
     }
-    await chmod(dirPath, 0o555).catch(() => undefined)
+    await chmod(dirPath, 0o500).catch(() => undefined)
   } catch {
     // Read-only permissions are a secondary guard; content addressing is authoritative.
   }
@@ -53,6 +172,32 @@ async function sha256File(path: string, signal?: AbortSignal): Promise<string> {
       digest.update(chunk as Buffer)
     }
     return digest.digest('hex')
+  } finally {
+    signal?.removeEventListener('abort', onAbort)
+    stream.destroy()
+  }
+}
+
+async function readUtf8Bounded(path: string, maxBytes: number, label: string, signal?: AbortSignal): Promise<string> {
+  const decoder = new TextDecoder('utf-8', { fatal: true })
+  const stream = createReadStream(path)
+  const onAbort = (): void => { stream.destroy(signal?.reason instanceof Error ? signal.reason : new DOMException('Aborted', 'AbortError')) }
+  signal?.addEventListener('abort', onAbort, { once: true })
+  let totalBytes = 0
+  let text = ''
+  try {
+    signal?.throwIfAborted()
+    for await (const chunk of stream) {
+      signal?.throwIfAborted()
+      const buffer = chunk as Buffer
+      totalBytes += buffer.byteLength
+      if (totalBytes > maxBytes) {
+        throw new MinerUError(failure('RESULT_TOO_LARGE', label + ' exceeds its validation limit'))
+      }
+      text += decoder.decode(buffer, { stream: true })
+    }
+    text += decoder.decode()
+    return text
   } finally {
     signal?.removeEventListener('abort', onAbort)
     stream.destroy()
@@ -139,15 +284,21 @@ export class ResultTransaction implements ArtifactSink {
 
 export interface ResultRepositoryOptions {
   readonly maxJsonValidationBytes?: number
+  readonly maxManifestBytes?: number
   readonly maxArtifactBytes?: number
 }
 
 export class ResultRepository {
   private readonly maxJsonValidationBytes: number
+  private readonly maxManifestBytes: number
   private readonly maxArtifactBytes: number | undefined
 
   constructor(public readonly paths: StoragePaths, options: ResultRepositoryOptions = {}) {
     this.maxJsonValidationBytes = options.maxJsonValidationBytes ?? DEFAULT_MAX_JSON_VALIDATION_BYTES
+    this.maxManifestBytes = options.maxManifestBytes ?? DEFAULT_MAX_MANIFEST_BYTES
+    if (!Number.isSafeInteger(this.maxManifestBytes) || this.maxManifestBytes <= 0) {
+      throw new TypeError('maxManifestBytes must be a positive safe integer')
+    }
     this.maxArtifactBytes = options.maxArtifactBytes
   }
 
@@ -186,29 +337,74 @@ export class ResultRepository {
     }
   }
 
-  private async verifyArtifact(path: string, artifact: ArtifactRef, signal?: AbortSignal): Promise<void> {
+  private async verifyArtifact(rootDir: string, path: string, artifact: ArtifactRef, signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted()
-    const details = await stat(path)
-    if (!details.isFile() || details.size !== artifact.bytes) throw new TypeError(`Artifact ${artifact.relativePath} size or type mismatch`)
+    await assertRegularFileWithin(rootDir, path)
+    const details = await lstat(path)
+    if (details.size !== artifact.bytes) throw new TypeError(`Artifact ${artifact.relativePath} size mismatch`)
     if (await sha256File(path, signal) !== artifact.sha256) throw new TypeError(`Artifact ${artifact.relativePath} SHA-256 mismatch`)
     if (artifact.kind === 'markdown') await validateUtf8(path, signal)
     if (artifact.kind === 'layout' || artifact.kind === 'model-output' || artifact.kind === 'content-list') {
       if (artifact.bytes > this.maxJsonValidationBytes) {
         throw new MinerUError(failure('RESULT_TOO_LARGE', `JSON artifact ${artifact.relativePath} exceeds validation limit`))
       }
-      const json = await readFile(path, 'utf8')
+      const json = await readUtf8Bounded(path, this.maxJsonValidationBytes, 'JSON artifact', signal)
       JSON.parse(json)
     }
   }
 
   private async verifyManifestArtifacts(
     manifest: MinerUResultManifest,
+    rootDir: string,
     resolvePath: (relativePath: string) => string,
     signal?: AbortSignal,
   ): Promise<void> {
     for (const artifact of manifest.files[0].artifacts) {
-      await this.verifyArtifact(resolvePath(artifact.relativePath), artifact, signal)
+      await this.verifyArtifact(rootDir, resolvePath(artifact.relativePath), artifact, signal)
     }
+  }
+
+  private async assertPublishedTreeContents(
+    rootDir: string,
+    manifest: MinerUResultManifest,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const expectedFiles = new Set<string>(['manifest.json'])
+    const expectedDirectories = new Set<string>()
+    for (const artifact of manifest.files[0].artifacts) {
+      expectedFiles.add(artifact.relativePath)
+      const segments = artifact.relativePath.split('/')
+      for (let index = 1; index < segments.length; index++) {
+        expectedDirectories.add(segments.slice(0, index).join('/'))
+      }
+    }
+
+    const walk = async (directory: string, relativeDirectory: string): Promise<void> => {
+      signal?.throwIfAborted()
+      const details = await lstat(directory)
+      if (details.isSymbolicLink() || !details.isDirectory()) {
+        throw new TypeError('Published result contains an unsafe directory')
+      }
+      const entries = await readdir(directory, { withFileTypes: true })
+      for (const entry of entries) {
+        signal?.throwIfAborted()
+        assertSafePathSegment(entry.name, 'published result entry')
+        const relativePath = relativeDirectory === '' ? entry.name : relativeDirectory + '/' + entry.name
+        const path = join(directory, entry.name)
+        const child = await lstat(path)
+        if (child.isSymbolicLink()) throw new TypeError('Published result contains a symlink')
+        if (child.isDirectory()) {
+          if (!expectedDirectories.has(relativePath)) throw new TypeError('Published result contains an undeclared directory')
+          await walk(path, relativePath)
+        } else if (child.isFile()) {
+          if (!expectedFiles.has(relativePath)) throw new TypeError('Published result contains an undeclared file')
+        } else {
+          throw new TypeError('Published result contains an unsupported filesystem entry')
+        }
+      }
+    }
+
+    await walk(rootDir, '')
   }
 
   async commitTransaction(
@@ -222,6 +418,7 @@ export class ResultRepository {
     try {
       await this.verifyManifestArtifacts(
         validated,
+        tx.stagingDir,
         relativePath => this.paths.resolveStagingArtifactPath(tx.operationId, relativePath),
         signal,
       )
@@ -232,11 +429,24 @@ export class ResultRepository {
     }
 
     const stagingManifestPath = this.paths.stagingManifestFile(tx.operationId)
-    await writeFile(stagingManifestPath, JSON.stringify(validated, null, 2), { encoding: 'utf8', mode: 0o600 })
+    const serializedManifest = JSON.stringify(validated, null, 2)
+    if (Buffer.byteLength(serializedManifest, 'utf8') > this.maxManifestBytes) {
+      await tx.abort()
+      throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result manifest exceeds its publication limit'))
+    }
+    await writeFile(stagingManifestPath, serializedManifest, { encoding: 'utf8', mode: 0o600 })
     await rm(this.paths.stagingTempDir(tx.operationId), { recursive: true, force: true })
+    try {
+      await this.assertPublishedTreeContents(tx.stagingDir, validated, signal)
+    } catch (error) {
+      await tx.abort()
+      if (error instanceof MinerUError) throw error
+      throw new MinerUError(failure('CACHE_CORRUPT', error instanceof Error ? error.message : String(error)))
+    }
 
     const targetDir = this.paths.resultDir(validated.cacheKey)
-    await mkdir(dirname(targetDir), { recursive: true })
+    await mkdir(dirname(targetDir), { recursive: true, mode: 0o700 })
+    await chmod(dirname(targetDir), 0o700)
 
     const resolveExisting = async (): Promise<MinerUResultManifest | undefined> => {
       const existing = await this.get(validated.cacheKey, undefined, signal)
@@ -274,27 +484,35 @@ export class ResultRepository {
     throw new MinerUError(failure('CACHE_CONFLICT', `Could not atomically publish cache key ${validated.cacheKey}`))
   }
 
-  async get(
+  /**
+   * Strictly verifies one published result without moving or modifying it.
+   * This is the maintenance-safe counterpart to get(), whose cache-hit path
+   * still quarantines invalid entries before returning a miss.
+   */
+  async inspectPublished(
     cacheKey: CacheKey | string,
-    requiredArtifacts?: readonly ArtifactKind[],
     signal?: AbortSignal,
-  ): Promise<MinerUResultManifest | undefined> {
+  ): Promise<PublishedResultInspection> {
     signal?.throwIfAborted()
     const key = asCacheKey(cacheKey)
     const resultDir = this.paths.resultDir(key)
+
+    try {
+      await assertRegularDirectoryWithin(this.paths.resultsDir(), resultDir)
+    } catch (error) {
+      if (isAbort(error, signal)) throw signal?.reason ?? error
+      if (errnoCode(error) === 'ENOENT') return { status: 'missing', reason: 'absent' }
+      return inspectionFailure(error, 'unsafe-entry')
+    }
+
     let raw: string
     try {
-      raw = await readFile(this.paths.manifestFile(key), 'utf8')
+      const manifestPath = this.paths.manifestFile(key)
+      await assertRegularFileWithin(resultDir, manifestPath)
+      raw = await readUtf8Bounded(manifestPath, this.maxManifestBytes, 'Result manifest', signal)
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        try {
-          if ((await stat(resultDir)).isDirectory()) await this.quarantine(resultDir, 'missing_manifest')
-        } catch (statError) {
-          if ((statError as NodeJS.ErrnoException).code !== 'ENOENT') throw statError
-        }
-        return undefined
-      }
-      throw error
+      if (isAbort(error, signal)) throw signal?.reason ?? error
+      return inspectionFailure(error, 'unsafe-entry')
     }
 
     let manifest: MinerUResultManifest
@@ -302,14 +520,46 @@ export class ResultRepository {
       manifest = parseMinerUResultManifest(JSON.parse(raw))
       this.assertManifestConsistency(undefined, manifest)
       if (manifest.cacheKey !== key) throw new TypeError('Manifest cache key does not match its directory')
-      await this.verifyManifestArtifacts(manifest, relativePath => this.paths.resolveArtifactPath(key, relativePath), signal)
     } catch (error) {
-      if (signal?.aborted) throw signal.reason ?? error
-      if (error instanceof Error && error.name === 'AbortError') throw error
-      await this.quarantine(resultDir, 'corrupt')
+      if (isAbort(error, signal)) throw signal?.reason ?? error
+      return { status: 'corrupt', reason: 'manifest-invalid' }
+    }
+
+    try {
+      await this.verifyManifestArtifacts(
+        manifest,
+        resultDir,
+        relativePath => this.paths.resolveArtifactPath(key, relativePath),
+        signal,
+      )
+      await this.assertPublishedTreeContents(resultDir, manifest, signal)
+    } catch (error) {
+      if (isAbort(error, signal)) throw signal?.reason ?? error
+      return inspectionFailure(error, 'artifact-invalid')
+    }
+
+    return { status: 'valid', manifest }
+  }
+
+  async get(
+    cacheKey: CacheKey | string,
+    requiredArtifacts?: readonly ArtifactKind[],
+    signal?: AbortSignal,
+  ): Promise<MinerUResultManifest | undefined> {
+    signal?.throwIfAborted()
+    const key = asCacheKey(cacheKey)
+    const inspection = await this.inspectPublished(key, signal)
+    if (inspection.status !== 'valid') {
+      if (inspection.status === 'unreadable') {
+        throw new MinerUError(failure('CACHE_CORRUPT', 'Published MinerU cache data could not be read'))
+      }
+      if (inspection.reason !== 'absent') {
+        await this.quarantine(this.paths.resultDir(key), inspection.status === 'missing' ? 'missing_manifest' : 'corrupt').catch(() => undefined)
+      }
       return undefined
     }
 
+    const manifest = inspection.manifest
     if (requiredArtifacts !== undefined) {
       const present = new Set(manifest.files[0].artifacts.map(artifact => artifact.kind))
       if (requiredArtifacts.some(kind => !present.has(kind))) return undefined
@@ -326,17 +576,29 @@ export class ResultRepository {
   }
 
   async quarantine(sourcePath: string, reason = 'quarantine'): Promise<string> {
+    const safeSourcePath = assertQuarantineSourcePath(this.paths, sourcePath)
     const id = `${String(Date.now())}_${reason}_${randomUUID().slice(0, 8)}`
     const destination = this.paths.quarantineDir(id)
-    await mkdir(this.paths.quarantineDir(), { recursive: true })
-    // Published roots are read-only; restore owner traversal before moving the whole tree.
-    await chmod(sourcePath, 0o755).catch(() => undefined)
     try {
-      await rename(sourcePath, destination)
+      const source = await lstat(safeSourcePath)
+      if (source.isSymbolicLink() || !source.isDirectory()) {
+        throw new TypeError('Only regular directories can be quarantined')
+      }
+    } catch (error) {
+      if (errnoCode(error) === 'ENOENT') return destination
+      throw new MinerUError(failure('CACHE_CORRUPT', 'Failed to isolate corrupt MinerU data safely'))
+    }
+
+    await mkdir(this.paths.quarantineDir(), { recursive: true })
+    // The source was lstat-verified as a regular directory above. Published
+    // roots are read-only, so restore owner traversal before atomic rename.
+    await chmod(safeSourcePath, 0o755).catch(() => undefined)
+    try {
+      await rename(safeSourcePath, destination)
       return destination
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return destination
-      throw new MinerUError(failure('CACHE_CORRUPT', `Failed to isolate corrupt MinerU data: ${error instanceof Error ? error.message : String(error)}`))
+      throw new MinerUError(failure('CACHE_CORRUPT', 'Failed to isolate corrupt MinerU data'))
     }
   }
 
@@ -362,8 +624,8 @@ export class ResultRepository {
       if (activeOperationIds.has(operationId)) continue
       const path = this.paths.stagingDir(operationId)
       try {
-        const details = await stat(path)
-        if (details.isDirectory() && now - details.mtimeMs > ttlMs) {
+        const details = await lstat(path)
+        if (!details.isSymbolicLink() && details.isDirectory() && now - details.mtimeMs > ttlMs) {
           await rm(path, { recursive: true, force: true })
           cleaned++
         }

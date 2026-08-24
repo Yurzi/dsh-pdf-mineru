@@ -16,6 +16,7 @@ import type {
   ArtifactWriteOptions,
   ProviderCallContext,
   ProviderJobRef,
+  ProviderRetryEvent,
   TemporaryArtifact,
 } from '../src/providers/provider.js'
 import { OfficialV4Provider } from '../src/providers/official-v4.js'
@@ -116,6 +117,12 @@ describe('OfficialV4Provider', () => {
         maxZipTotalBytes: 50 * 1024 * 1024,
         maxZipCompressionRatio: 50,
       },
+      retry: {
+        initialDelayMs: 1,
+        maxDelayMs: 5,
+        jitter: false,
+        sleep: async () => {},
+      },
       ...overrides,
     }
   }
@@ -213,7 +220,7 @@ describe('OfficialV4Provider', () => {
       }
 
       const key = await provider.compatibilityKey(request, {})
-      expect(key).toMatch(/^official-v4:[a-f0-9]{16}:v4:vlm$/)
+      expect(key).toMatch(/^official-v4:[a-f0-9]{24}$/)
       expect(key).not.toContain('secret-cluster')
       expect(key).not.toContain('https://')
     })
@@ -252,6 +259,47 @@ describe('OfficialV4Provider', () => {
       expect(result.provider).toBe('official-v4')
       expect(result.protocolVersion).toBe('v4')
       expect(result.queue).toBeUndefined()
+    })
+
+    it('accepts only the documented missing-batch probe sentinel', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+        code: 'BATCH_NOT_FOUND', msg: 'Probe batch does not exist',
+      }), { status: 404, headers: { 'content-type': 'application/json' } }))
+      const result = await new OfficialV4Provider(makeConfig()).probe(makeContext())
+      expect(result.available).toBe(true)
+      expect(result.authentication).toBe('valid')
+    })
+
+    it('does not report a generic proxy 400 as a valid authenticated provider', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ msg: 'Bad request' }), {
+        status: 400, headers: { 'content-type': 'application/json' },
+      }))
+      const result = await new OfficialV4Provider(makeConfig()).probe(makeContext())
+      expect(result.available).toBe(false)
+      expect(result.authentication).toBe('unknown')
+    })
+
+    it('retries a probe business code 429 before accepting its sentinel response', async () => {
+      let fetchCount = 0
+      const events: ProviderRetryEvent[] = []
+      globalThis.fetch = vi.fn().mockImplementation(async () => {
+        fetchCount++
+        if (fetchCount === 1) {
+          return new Response(JSON.stringify({ code: 429, msg: 'Rate limited' }), {
+            status: 200, headers: { 'content-type': 'application/json', 'retry-after': '2' },
+          })
+        }
+        return new Response(JSON.stringify({ code: 'BATCH_NOT_FOUND', msg: 'Probe batch does not exist' }), {
+          status: 404, headers: { 'content-type': 'application/json' },
+        })
+      })
+      const result = await new OfficialV4Provider(makeConfig()).probe(makeContext({
+        retry: { maxRetries: 2, sleep: async () => {}, onRetry: event => events.push(event) },
+      }))
+      expect(result.available).toBe(true)
+      expect(result.authentication).toBe('valid')
+      expect(fetchCount).toBe(2)
+      expect(events[0]).toMatchObject({ operation: 'probe', status: 429, delayMs: 2000 })
     })
 
     it.each(['A0202', 'A0211', '401'])('returns invalid for HTTP 200 auth business code %s', async code => {
@@ -299,6 +347,7 @@ describe('OfficialV4Provider', () => {
 
       let postCalled = false
       let putCalled = false
+      let acceptedCalled = false
 
       globalThis.fetch = vi.fn().mockImplementation(async (url: string, init: RequestInit) => {
         if (url === 'https://mineru.net/api/v4/file-urls/batch') {
@@ -351,9 +400,16 @@ describe('OfficialV4Provider', () => {
       })
 
       const provider = new OfficialV4Provider(makeConfig())
-      const submission = await provider.submit(request, [source], makeContext())
+      const submission = await provider.submit(request, [source], makeContext({
+        onAccepted: async ref => {
+          expect(putCalled).toBe(false)
+          expect(ref).toMatchObject({ provider: 'official-v4', batchId: 'batch_uuid_123' })
+          acceptedCalled = true
+        },
+      }))
 
       expect(postCalled).toBe(true)
+      expect(acceptedCalled).toBe(true)
       expect(putCalled).toBe(true)
       expect(submission.ref.provider).toBe('official-v4')
       if (submission.ref.provider !== 'official-v4') throw new Error('unexpected provider ref')
@@ -413,7 +469,7 @@ describe('OfficialV4Provider', () => {
         .rejects.toMatchObject({ failure: { code: expectedCode, providerCode: String(providerCode), traceId: 'trace-business' } })
     })
 
-    it('rejects legacy txt parse method instead of silently treating it as auto', async () => {
+    it('rejects txt parse method instead of silently treating it as auto', async () => {
       const source = await createTestFile('txt.pdf')
       const request: CanonicalParseRequest = {
         schemaVersion: 1, files: [source],
@@ -667,6 +723,726 @@ describe('OfficialV4Provider', () => {
       const provider = new OfficialV4Provider(makeConfig())
 
       await expect(provider.collect(ref, request, sink, makeContext())).rejects.toThrowError(/not ready/i)
+    })
+  })
+
+  describe('Stage 2 Provider Reliability & Bounded Retry', () => {
+    it('retries inspect on transient 500/502 and recovers with valid result', async () => {
+      const fileId = asFileId('mf_0123456789abcdef0123456789_0')
+      const ref: ProviderJobRef = {
+        provider: 'official-v4',
+        batchId: 'batch_retry_1',
+        files: [{ fileId, dataId: 'data_1', name: 'doc1.pdf' }],
+      }
+
+      let fetchCount = 0
+      const events: ProviderRetryEvent[] = []
+      globalThis.fetch = vi.fn().mockImplementation(async (url: string | URL, init: RequestInit) => {
+        fetchCount++
+        if (fetchCount === 1) {
+          return new Response(JSON.stringify({ msg: 'Server maintenance' }), {
+            status: 502,
+            headers: { 'content-type': 'application/json' },
+          })
+        }
+        return new Response(JSON.stringify({
+          code: 0,
+          msg: 'ok',
+          data: {
+            batch_id: 'batch_retry_1',
+            extract_result: [{ data_id: 'data_1', file_name: 'doc1.pdf', state: 'done' }],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      })
+
+      const provider = new OfficialV4Provider(makeConfig())
+      const context = makeContext({
+        retry: {
+          maxRetries: 3,
+          initialDelayMs: 50,
+          jitter: false,
+          sleep: async () => {},
+          onRetry: e => events.push(e),
+        },
+      })
+
+      const snapshot = await provider.inspect(ref, context)
+      expect(snapshot.state).toBe('completed')
+      expect(fetchCount).toBe(2)
+      expect(events).toHaveLength(1)
+      expect(events[0]).toMatchObject({
+        provider: 'official-v4',
+        operation: 'inspect',
+        attempt: 1,
+        maxRetries: 3,
+        status: 502,
+      })
+    })
+
+    it('honors Retry-After header on 429 during inspect', async () => {
+      const fileId = asFileId('mf_0123456789abcdef0123456789_0')
+      const ref: ProviderJobRef = {
+        provider: 'official-v4',
+        batchId: 'batch_rate_limited',
+        files: [{ fileId, dataId: 'data_1', name: 'doc1.pdf' }],
+      }
+
+      let fetchCount = 0
+      const events: ProviderRetryEvent[] = []
+      globalThis.fetch = vi.fn().mockImplementation(async () => {
+        fetchCount++
+        if (fetchCount === 1) {
+          return new Response(JSON.stringify({ msg: 'Rate limited' }), {
+            status: 429,
+            headers: {
+              'content-type': 'application/json',
+              'retry-after': '2',
+            },
+          })
+        }
+        return new Response(JSON.stringify({
+          code: 0,
+          msg: 'ok',
+          data: {
+            batch_id: 'batch_rate_limited',
+            extract_result: [{ data_id: 'data_1', file_name: 'doc1.pdf', state: 'done' }],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      })
+
+      const provider = new OfficialV4Provider(makeConfig())
+      const snapshot = await provider.inspect(ref, makeContext({
+        retry: {
+          maxRetries: 2,
+          sleep: async () => {},
+          onRetry: e => events.push(e),
+        },
+      }))
+
+      expect(snapshot.state).toBe('completed')
+      expect(fetchCount).toBe(2)
+      expect(events).toHaveLength(1)
+      expect(events[0]).toMatchObject({
+        provider: 'official-v4',
+        operation: 'inspect',
+        status: 429,
+        retryAfterMs: 2000,
+        delayMs: 2000,
+      })
+    })
+
+    it('retries HTTP 200 business code 429 during inspect and honors Retry-After', async () => {
+      const fileId = asFileId('mf_0123456789abcdef0123456789_0')
+      const ref: ProviderJobRef = {
+        provider: 'official-v4',
+        batchId: 'batch_business_rate_limited',
+        files: [{ fileId, dataId: 'data_1', name: 'doc1.pdf' }],
+      }
+      let fetchCount = 0
+      const events: ProviderRetryEvent[] = []
+      globalThis.fetch = vi.fn().mockImplementation(async () => {
+        fetchCount++
+        if (fetchCount === 1) {
+          return new Response(JSON.stringify({ code: 429, msg: 'Business rate limit' }), {
+            status: 200,
+            headers: { 'content-type': 'application/json', 'retry-after': '3' },
+          })
+        }
+        return new Response(JSON.stringify({
+          code: 0, msg: 'ok',
+          data: {
+            batch_id: 'batch_business_rate_limited',
+            extract_result: [{ data_id: 'data_1', file_name: 'doc1.pdf', state: 'done' }],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      })
+
+      const provider = new OfficialV4Provider(makeConfig())
+      const snapshot = await provider.inspect(ref, makeContext({
+        retry: { maxRetries: 2, sleep: async () => {}, onRetry: event => events.push(event) },
+      }))
+
+      expect(snapshot.state).toBe('completed')
+      expect(fetchCount).toBe(2)
+      expect(events).toHaveLength(1)
+      expect(events[0]).toMatchObject({
+        operation: 'inspect', status: 429, retryAfterMs: 3000, delayMs: 3000, reason: 'http-status',
+      })
+    })
+
+    it('retries HTTP 200 business code 429 during collect before downloading ZIP', async () => {
+      const fileId = asFileId('mf_0123456789abcdef0123456789_0')
+      const ref: ProviderJobRef = {
+        provider: 'official-v4',
+        batchId: 'batch_collect_business_rate',
+        files: [{ fileId, dataId: 'data_1', name: 'doc1.pdf' }],
+      }
+      const request: CanonicalParseRequest = {
+        schemaVersion: 1,
+        files: [{ fileId, name: 'doc1.pdf', bytes: 100, sha256: SHA256_A }],
+        semantics: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true },
+        requiredArtifacts: ['markdown'],
+      }
+      const zipBuf = await createValidResultZipBuffer()
+      const events: ProviderRetryEvent[] = []
+      let apiCount = 0
+      let cdnCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(async (url: string | URL) => {
+        if (String(url).includes('/extract-results/batch/')) {
+          apiCount++
+          if (apiCount === 1) {
+            return new Response(JSON.stringify({ code: 429, msg: 'Business rate limit' }), {
+              status: 200, headers: { 'content-type': 'application/json', 'retry-after': '1' },
+            })
+          }
+          return new Response(JSON.stringify({
+            code: 0, msg: 'ok',
+            data: {
+              batch_id: 'batch_collect_business_rate',
+              extract_result: [{
+                data_id: 'data_1', file_name: 'doc1.pdf', state: 'done',
+                full_zip_url: 'https://cdn.example.com/business-rate-result.zip',
+              }],
+            },
+          }), { status: 200, headers: { 'content-type': 'application/json' } })
+        }
+        cdnCount++
+        const body = zipBuf.buffer.slice(zipBuf.byteOffset, zipBuf.byteOffset + zipBuf.byteLength) as ArrayBuffer
+        return new Response(body, { status: 200 })
+      })
+
+      const collection = await new OfficialV4Provider(makeConfig()).collect(
+        ref, request, new MockArtifactSink(), makeContext({
+          retry: { maxRetries: 2, sleep: async () => {}, onRetry: event => events.push(event) },
+        }),
+      )
+      expect(collection.files[0]?.artifacts).toHaveLength(1)
+      expect(apiCount).toBe(2)
+      expect(cdnCount).toBe(1)
+      expect(events).toHaveLength(1)
+      expect(events[0]).toMatchObject({
+        operation: 'collect', status: 429, retryAfterMs: 1000, delayMs: 1000,
+      })
+    })
+
+    it('exhausts retries on persistent 500 during inspect and throws PROVIDER_UNAVAILABLE', async () => {
+      const fileId = asFileId('mf_0123456789abcdef0123456789_0')
+      const ref: ProviderJobRef = {
+        provider: 'official-v4',
+        batchId: 'batch_fail_persist',
+        files: [{ fileId, dataId: 'data_1', name: 'doc1.pdf' }],
+      }
+
+      let fetchCount = 0
+      const events: ProviderRetryEvent[] = []
+      globalThis.fetch = vi.fn().mockImplementation(async () => {
+        fetchCount++
+        return new Response(JSON.stringify({ msg: 'Internal server crash' }), {
+          status: 500,
+          headers: { 'content-type': 'application/json' },
+        })
+      })
+
+      const provider = new OfficialV4Provider(makeConfig())
+      await expect(
+        provider.inspect(ref, makeContext({
+          retry: {
+            maxRetries: 2,
+            sleep: async () => {},
+            onRetry: e => events.push(e),
+          },
+        })),
+      ).rejects.toMatchObject({
+        failure: expect.objectContaining({
+          code: 'PROVIDER_UNAVAILABLE',
+          retryable: true,
+        }),
+      })
+
+      // 1 initial attempt + 2 retries = 3 attempts
+      expect(fetchCount).toBe(3)
+      expect(events).toHaveLength(2)
+    })
+
+    it('does NOT retry non-retryable 401 / 403 / 404 / 413 or business code errors', async () => {
+      const fileId = asFileId('mf_0123456789abcdef0123456789_0')
+      const ref: ProviderJobRef = {
+        provider: 'official-v4',
+        batchId: 'batch_non_retryable',
+        files: [{ fileId, dataId: 'data_1', name: 'doc1.pdf' }],
+      }
+
+      const provider = new OfficialV4Provider(makeConfig())
+
+      // 1. HTTP 401
+      let fetchCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(async () => {
+        fetchCount++
+        return new Response(JSON.stringify({ msg: 'Unauthorized' }), {
+          status: 401,
+          headers: { 'content-type': 'application/json' },
+        })
+      })
+      await expect(provider.inspect(ref, makeContext())).rejects.toMatchObject({
+        failure: expect.objectContaining({ code: 'AUTHENTICATION_FAILED', retryable: false }),
+      })
+      expect(fetchCount).toBe(1)
+
+      // 2. HTTP 404
+      fetchCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(async () => {
+        fetchCount++
+        return new Response(JSON.stringify({ msg: 'Batch not found' }), {
+          status: 404,
+          headers: { 'content-type': 'application/json' },
+        })
+      })
+      await expect(provider.inspect(ref, makeContext())).rejects.toMatchObject({
+        failure: expect.objectContaining({ code: 'JOB_NOT_FOUND', retryable: false }),
+      })
+      expect(fetchCount).toBe(1)
+
+      // 3. Business code A0202 (Authentication failed)
+      fetchCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(async () => {
+        fetchCount++
+        return new Response(JSON.stringify({ code: 'A0202', msg: 'Token expired' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      })
+      await expect(provider.inspect(ref, makeContext())).rejects.toMatchObject({
+        failure: expect.objectContaining({ code: 'AUTHENTICATION_FAILED', retryable: false }),
+      })
+      expect(fetchCount).toBe(1)
+    })
+
+    it('does NOT automatically retry POST /file-urls/batch on failure or timeout (exactly 1 attempt)', async () => {
+      const source = await createTestFile('sample.pdf', '%PDF-1.4 test')
+      const request: CanonicalParseRequest = {
+        schemaVersion: 1,
+        files: [{ fileId: source.fileId, name: source.name, bytes: source.bytes, sha256: source.sha256 }],
+        semantics: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true },
+        requiredArtifacts: ['markdown'],
+      }
+
+      let fetchCount = 0
+      const events: ProviderRetryEvent[] = []
+      globalThis.fetch = vi.fn().mockImplementation(async (url: string | URL, init: RequestInit) => {
+        fetchCount++
+        expect(init.method).toBe('POST')
+        return new Response(JSON.stringify({ msg: 'Server timeout during batch registration' }), {
+          status: 500,
+          headers: { 'content-type': 'application/json' },
+        })
+      })
+
+      const provider = new OfficialV4Provider(makeConfig())
+      await expect(
+        provider.submit(request, [source], makeContext({
+          retry: {
+            maxRetries: 3,
+            onRetry: e => events.push(e),
+          },
+        })),
+      ).rejects.toMatchObject({
+        failure: expect.objectContaining({
+          code: 'PROVIDER_UNAVAILABLE',
+        }),
+      })
+
+      // Must NOT retry POST
+      expect(fetchCount).toBe(1)
+      expect(events).toHaveLength(0)
+
+      fetchCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(async () => {
+        fetchCount++
+        return new Response(JSON.stringify({ code: 429, msg: 'Business rate limit' }), {
+          status: 200, headers: { 'content-type': 'application/json', 'retry-after': '5' },
+        })
+      })
+      await expect(provider.submit(request, [source], makeContext({
+        retry: { maxRetries: 3, sleep: async () => {}, onRetry: event => events.push(event) },
+      }))).rejects.toMatchObject({
+        failure: expect.objectContaining({ code: 'PROVIDER_RATE_LIMITED', retryable: true }),
+      })
+      expect(fetchCount).toBe(1)
+      expect(events).toHaveLength(0)
+    })
+
+    it('retries presigned PUT with fresh stream on attempt 2 and preserves empty headers object {} without auth', async () => {
+      const fileContent = '%PDF-1.4 binary content for fresh stream verification'
+      const source = await createTestFile('upload_test.pdf', fileContent)
+      const request: CanonicalParseRequest = {
+        schemaVersion: 1,
+        files: [{ fileId: source.fileId, name: source.name, bytes: source.bytes, sha256: source.sha256 }],
+        semantics: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true },
+        requiredArtifacts: ['markdown'],
+      }
+
+      let postCount = 0
+      let putCount = 0
+      const putBodies: string[] = []
+      const events: ProviderRetryEvent[] = []
+
+      globalThis.fetch = vi.fn().mockImplementation(async (url: string | URL, init: RequestInit) => {
+        const urlStr = String(url)
+        if (urlStr.endsWith('/file-urls/batch')) {
+          postCount++
+          return new Response(JSON.stringify({
+            code: 0,
+            msg: 'ok',
+            data: {
+              batch_id: 'batch_put_retry',
+              file_urls: ['https://oss-storage.example.com/presigned_upload?signature=xyz'],
+            },
+          }), { status: 200, headers: { 'content-type': 'application/json' } })
+        }
+
+        if (urlStr.startsWith('https://oss-storage.example.com/presigned_upload')) {
+          putCount++
+          expect(init.method).toBe('PUT')
+
+          // Invariant 1: headers object MUST be strictly empty
+          expect(init.headers).toEqual({})
+          // Invariant 2: NO Authorization or Content-Type header
+          expect((init.headers as Record<string, string>)?.['authorization']).toBeUndefined()
+          expect((init.headers as Record<string, string>)?.['Authorization']).toBeUndefined()
+          expect(init.redirect).toBe('error')
+
+          // Read body chunks
+          const bodyStream = init.body as import('node:stream/web').ReadableStream<Uint8Array>
+          const reader = bodyStream.getReader()
+          const chunks: Uint8Array[] = []
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            if (value) chunks.push(value)
+          }
+          const receivedText = Buffer.concat(chunks).toString('utf8')
+          putBodies.push(receivedText)
+
+          if (putCount === 1) {
+            // Transient 503 on first PUT attempt
+            return new Response('OSS internal server error', { status: 503 })
+          }
+
+          // Second attempt succeeds
+          return new Response('', { status: 200 })
+        }
+
+        throw new Error(`Unexpected fetch: ${urlStr}`)
+      })
+
+      const provider = new OfficialV4Provider(makeConfig())
+      const submission = await provider.submit(request, [source], makeContext({
+        retry: {
+          maxRetries: 3,
+          initialDelayMs: 20,
+          jitter: false,
+          sleep: async () => {},
+          onRetry: e => events.push(e),
+        },
+      }))
+
+      expect(submission.ref.batchId).toBe('batch_put_retry')
+      expect(postCount).toBe(1)
+      expect(putCount).toBe(2)
+      // Both attempts received the full stream content (fresh stream opened per attempt)
+      expect(putBodies[0]).toBe(fileContent)
+      expect(putBodies[1]).toBe(fileContent)
+      expect(events).toHaveLength(1)
+      expect(events[0]).toMatchObject({
+        provider: 'official-v4',
+        operation: 'presigned-put',
+        attempt: 1,
+        status: 503,
+      })
+    })
+
+    it('does not retry and closes the active PUT stream when the caller aborts', async () => {
+      const source = await createTestFile('upload_abort.pdf', '%PDF-1.4 ' + 'x'.repeat(2 * 1024 * 1024))
+      const request: CanonicalParseRequest = {
+        schemaVersion: 1,
+        files: [{ fileId: source.fileId, name: source.name, bytes: source.bytes, sha256: source.sha256 }],
+        semantics: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true },
+        requiredArtifacts: ['markdown'],
+      }
+      const controller = new AbortController()
+      const events: ProviderRetryEvent[] = []
+      let putCount = 0
+      let bodyClosed = false
+
+      globalThis.fetch = vi.fn().mockImplementation(async (url: string | URL, init: RequestInit) => {
+        if (String(url).endsWith('/file-urls/batch')) {
+          return new Response(JSON.stringify({
+            code: 0, msg: 'ok',
+            data: { batch_id: 'batch_put_abort', file_urls: ['https://oss.example.com/abort-upload'] },
+          }), { status: 200, headers: { 'content-type': 'application/json' } })
+        }
+        putCount++
+        const reader = (init.body as import('node:stream/web').ReadableStream<Uint8Array>).getReader()
+        const first = await reader.read()
+        expect(first.done).toBe(false)
+        controller.abort(new DOMException('Caller stopped upload', 'AbortError'))
+        try {
+          await reader.read()
+        } catch {
+          bodyClosed = true
+        }
+        throw new DOMException('Caller stopped upload', 'AbortError')
+      })
+
+      const provider = new OfficialV4Provider(makeConfig())
+      await expect(provider.submit(request, [source], makeContext({
+        signal: controller.signal,
+        retry: { maxRetries: 3, sleep: async () => {}, onRetry: event => events.push(event) },
+      }))).rejects.toMatchObject({ failure: expect.objectContaining({ code: 'CANCELLED' }) })
+      expect(putCount).toBe(1)
+      expect(bodyClosed).toBe(true)
+      expect(events).toHaveLength(0)
+    })
+
+    it('retries unauthenticated CDN ZIP download on transient 503 and unpacks cleanly', async () => {
+      const fileId = asFileId('mf_0123456789abcdef0123456789_0')
+      const ref: ProviderJobRef = {
+        provider: 'official-v4',
+        batchId: 'batch_cdn_retry',
+        files: [{ fileId, dataId: 'data_1', name: 'doc1.pdf' }],
+      }
+
+      const request: CanonicalParseRequest = {
+        schemaVersion: 1,
+        files: [{ fileId, name: 'doc1.pdf', bytes: 100, sha256: SHA256_A }],
+        semantics: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true },
+        requiredArtifacts: ['markdown'],
+      }
+
+      const zipBuf = await createValidResultZipBuffer()
+
+      let cdnCount = 0
+      const events: ProviderRetryEvent[] = []
+      globalThis.fetch = vi.fn().mockImplementation(async (url: string | URL, init: RequestInit) => {
+        const urlStr = String(url)
+        if (urlStr.includes('/extract-results/batch/')) {
+          return new Response(JSON.stringify({
+            code: 0,
+            msg: 'ok',
+            data: {
+              batch_id: 'batch_cdn_retry',
+              extract_result: [
+                { data_id: 'data_1', file_name: 'doc1.pdf', state: 'done', full_zip_url: 'https://cdn.example.com/result.zip' },
+              ],
+            },
+          }), { status: 200, headers: { 'content-type': 'application/json' } })
+        }
+
+        if (urlStr === 'https://cdn.example.com/result.zip') {
+          cdnCount++
+          expect(init.method).toBe('GET')
+          // Assert CDN has NO authorization header
+          expect((init.headers as Record<string, string>)?.['authorization']).toBeUndefined()
+          expect((init.headers as Record<string, string>)?.['Authorization']).toBeUndefined()
+
+          if (cdnCount === 1) {
+            return new Response('CDN rate limit or glitch', {
+              status: 503,
+              headers: { 'retry-after': '1' },
+            })
+          }
+
+          const body = zipBuf.buffer.slice(zipBuf.byteOffset, zipBuf.byteOffset + zipBuf.byteLength) as ArrayBuffer
+          return new Response(body, { status: 200, headers: { 'content-type': 'application/zip' } })
+        }
+
+        throw new Error(`Unexpected fetch: ${urlStr}`)
+      })
+
+      const sink = new MockArtifactSink()
+      const provider = new OfficialV4Provider(makeConfig())
+      const collection = await provider.collect(ref, request, sink, makeContext({
+        retry: {
+          maxRetries: 2,
+          sleep: async () => {},
+          onRetry: e => events.push(e),
+        },
+      }))
+
+      expect(cdnCount).toBe(2)
+      expect(collection.files).toHaveLength(1)
+      expect(collection.files[0]?.artifacts).toHaveLength(1)
+      expect(events).toHaveLength(1)
+      expect(events[0]).toMatchObject({
+        provider: 'official-v4',
+        operation: 'cdn-download',
+        status: 503,
+        retryAfterMs: 1000,
+      })
+    })
+
+    it('does not retry and cancels the CDN body when collection is aborted during staging', async () => {
+      const fileId = asFileId('mf_0123456789abcdef0123456789_0')
+      const ref: ProviderJobRef = {
+        provider: 'official-v4',
+        batchId: 'batch_cdn_abort',
+        files: [{ fileId, dataId: 'data_1', name: 'doc1.pdf' }],
+      }
+      const request: CanonicalParseRequest = {
+        schemaVersion: 1,
+        files: [{ fileId, name: 'doc1.pdf', bytes: 100, sha256: SHA256_A }],
+        semantics: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true },
+        requiredArtifacts: ['markdown'],
+      }
+      const controller = new AbortController()
+      const events: ProviderRetryEvent[] = []
+      let cdnCount = 0
+      let bodyCancelled = false
+      let stagedStream: Readable | undefined
+
+      globalThis.fetch = vi.fn().mockImplementation(async (url: string | URL) => {
+        if (String(url).includes('/extract-results/batch/')) {
+          return new Response(JSON.stringify({
+            code: 0, msg: 'ok',
+            data: {
+              batch_id: 'batch_cdn_abort',
+              extract_result: [{
+                data_id: 'data_1', file_name: 'doc1.pdf', state: 'done',
+                full_zip_url: 'https://cdn.example.com/active.zip',
+              }],
+            },
+          }), { status: 200, headers: { 'content-type': 'application/json' } })
+        }
+        cdnCount++
+        const body = new ReadableStream<Uint8Array>({
+          start(streamController) { streamController.enqueue(new Uint8Array([1, 2, 3])) },
+          cancel() { bodyCancelled = true },
+        })
+        return new Response(body, { status: 200 })
+      })
+
+      const sink = new MockArtifactSink()
+      sink.writeTemporary = async (_name, input) => {
+        expect(input).toBeInstanceOf(Readable)
+        stagedStream = input as Readable
+        controller.abort(new DOMException('Caller stopped download', 'AbortError'))
+        throw new DOMException('Caller stopped download', 'AbortError')
+      }
+      const provider = new OfficialV4Provider(makeConfig())
+      await expect(provider.collect(ref, request, sink, makeContext({
+        signal: controller.signal,
+        retry: { maxRetries: 3, sleep: async () => {}, onRetry: event => events.push(event) },
+      }))).rejects.toMatchObject({ failure: expect.objectContaining({ code: 'CANCELLED' }) })
+      await new Promise(resolve => setImmediate(resolve))
+      expect(cdnCount).toBe(1)
+      expect(stagedStream?.destroyed).toBe(true)
+      expect(bodyCancelled).toBe(true)
+      expect(events).toHaveLength(0)
+    })
+
+    it('fails immediately when CDN download returns non-retryable 404', async () => {
+      const fileId = asFileId('mf_0123456789abcdef0123456789_0')
+      const ref: ProviderJobRef = {
+        provider: 'official-v4',
+        batchId: 'batch_cdn_404',
+        files: [{ fileId, dataId: 'data_1', name: 'doc1.pdf' }],
+      }
+
+      const request: CanonicalParseRequest = {
+        schemaVersion: 1,
+        files: [{ fileId, name: 'doc1.pdf', bytes: 100, sha256: SHA256_A }],
+        semantics: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true },
+        requiredArtifacts: ['markdown'],
+      }
+
+      let cdnCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(async (url: string | URL) => {
+        const urlStr = String(url)
+        if (urlStr.includes('/extract-results/batch/')) {
+          return new Response(JSON.stringify({
+            code: 0,
+            msg: 'ok',
+            data: {
+              batch_id: 'batch_cdn_404',
+              extract_result: [
+                { data_id: 'data_1', file_name: 'doc1.pdf', state: 'done', full_zip_url: 'https://cdn.example.com/missing.zip' },
+              ],
+            },
+          }), { status: 200, headers: { 'content-type': 'application/json' } })
+        }
+
+        if (urlStr === 'https://cdn.example.com/missing.zip') {
+          cdnCount++
+          return new Response('Not found', { status: 404 })
+        }
+
+        throw new Error(`Unexpected fetch: ${urlStr}`)
+      })
+
+      const sink = new MockArtifactSink()
+      const provider = new OfficialV4Provider(makeConfig())
+
+      await expect(
+        provider.collect(ref, request, sink, makeContext({
+          retry: { maxRetries: 3, sleep: async () => {} },
+        })),
+      ).rejects.toMatchObject({
+        failure: expect.objectContaining({
+          code: 'RESULT_DOWNLOAD_FAILED',
+          retryable: false,
+        }),
+      })
+
+      expect(cdnCount).toBe(1)
+    })
+
+    it('diagnostic onRetry hook emits sanitized events without credentials, URLs, bodies, or source paths', async () => {
+      const fileId = asFileId('mf_0123456789abcdef0123456789_0')
+      const ref: ProviderJobRef = {
+        provider: 'official-v4',
+        batchId: 'batch_diag_test',
+        files: [{ fileId, dataId: 'data_1', name: 'doc1.pdf' }],
+      }
+
+      const events: ProviderRetryEvent[] = []
+      let count = 0
+      globalThis.fetch = vi.fn().mockImplementation(async () => {
+        count++
+        if (count === 1) {
+          return new Response(JSON.stringify({
+            msg: 'Error with token Bearer secret-token-12345 and url https://api.example.com/secret?token=abc',
+          }), { status: 500, headers: { 'content-type': 'application/json' } })
+        }
+        return new Response(JSON.stringify({
+          code: 0,
+          msg: 'ok',
+          data: {
+            batch_id: 'batch_diag_test',
+            extract_result: [{ data_id: 'data_1', file_name: 'doc1.pdf', state: 'done' }],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      })
+
+      const provider = new OfficialV4Provider(makeConfig())
+      await provider.inspect(ref, makeContext({
+        credential: 'super-secret-api-token',
+        retry: {
+          maxRetries: 2,
+          sleep: async () => {},
+          onRetry: e => events.push(e),
+        },
+      }))
+
+      expect(events).toHaveLength(1)
+      const event = events[0]!
+      expect(event.provider).toBe('official-v4')
+      expect(event.operation).toBe('inspect')
+      expect(event.reason).toBe('http-status')
+      const serialized = JSON.stringify(event)
+      expect(serialized).not.toContain('secret-token-12345')
+      expect(serialized).not.toContain('super-secret-api-token')
+      expect(serialized).not.toContain('token=abc')
+      expect(serialized).not.toContain('api.example.com')
     })
   })
 })

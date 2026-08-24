@@ -192,7 +192,7 @@ interface ParseRequestInput {
 
 首版可以只允许单文件以保持现有工具习惯，但领域 schema 和 Provider interface 应支持文件数组。若模型接口启用批量，必须明确批次数、单文件和总字节限制。
 
-pages 使用统一的 1 基用户语义，例如 1-10,15。RequestNormalizer 负责验证、排序、合并和生成规范字符串。工具层不继续暴露自托管的 start_page_id/end_page_id 作为新主接口；兼容层可将旧字段转换为 pages。
+pages 使用统一的 1 基用户语义，例如 1-10,15。RequestNormalizer 负责验证、排序、合并和生成规范字符串。工具层不暴露自托管的 start_page_id/end_page_id；Provider 只在适配上游 v2 multipart 协议时生成这些私有字段。
 
 ### 8.2 规范请求
 
@@ -640,6 +640,7 @@ interface MinerUConfig {
   defaults: ParseDefaults
   storage: StorageConfig
   polling: PollingConfig
+  retry: RetryConfig
   output: OutputConfig
 }
 
@@ -648,7 +649,7 @@ type ProviderConfig = SelfHostedV2Config | OfficialV4Config
 
 SelfHostedV2Config 包含 id、type、baseURL、可选 apiKeyEnv、统一 model 到 backend 的显式映射。OfficialV4Config 包含 id、type、默认 https://mineru.net/api/v4 的 baseURL、必填 apiKeyEnv 和受支持模型配置。当前官方限制按文档固定为单文件 200 MB、200 页；官方 Provider 只声明 auto/ocr parseMethods。
 
-StorageConfig 包括 storageRoot、cacheEnabled、retainSources=false 和 stagingTtlMs。首版采用第 18.1 节的引用保留策略，不执行结果时间/容量驱逐；ZIP、API、文件、轮询和输出限制在 limits/polling/output 分组显式配置并验证。storageRoot 在进程启动时固定，设置修改需重启生效。
+StorageConfig 包括 storageRoot、cacheEnabled、retainSources=false 和 stagingTtlMs。当前采用第 18.1 节的引用保留策略，不执行结果时间/容量驱逐；ZIP、API、文件、轮询、重试和输出限制在 limits/polling/retry/output 分组显式配置并验证。RetryConfig 使用 maxAttempts、baseDelayMs 和 maxDelayMs 表达总尝试次数与退避边界。storageRoot 在进程启动时固定，设置修改需重启生效。
 
 ### 16.2 配置快照
 
@@ -656,7 +657,7 @@ Job 保存 providerConfigId 和不含秘密的 provider compatibility metadata�
 
 ### 16.3 RPC
 
-配置 RPC 继续负责 get/set/probe。新增缓存统计和清理 RPC 可作为设置页能力，但必须在实现缓存管理 UI 时一起设计授权与确认。probe 应接受待测试 draft 配置，避免用户必须先保存错误配置才能测试。
+配置 RPC 负责 get/set/probe；存储运维 RPC 提供 stats、只读 integrity scan、GC preview、quarantine list 和 cleanup。所有通道保持 loopback authority，不接受任意路径。integrity isolation 和非 dry-run quarantine cleanup 必须携带显式 confirm=true；GC 当前永远只生成计划，不执行删除。probe 接受待测试 draft 配置，避免用户必须先保存错误配置才能测试。
 
 ### 16.4 设置页
 
@@ -670,7 +671,9 @@ Job 保存 providerConfigId 和不含秘密的 provider compatibility metadata�
 - 带鉴权请求设置 redirect: error，防止跨主机泄漏。
 - 官方预签名 PUT 使用独立请求构造器，禁止继承认证头和 Content-Type。
 - ZIP/CDN 下载不携带 API Token。
-- 错误日志对 URL 查询参数和认证信息脱敏。
+- 错误日志对 URL 查询参数和认证信息脱敏；结构化诊断不接受 URL、Header、响应体、Token 或本地路径字段。
+- 只对幂等 GET 和可重新打开新文件流的官方裸 PUT 执行有界重试，识别网络错误、408、429、5xx 和 Retry-After。
+- 官方 /file-urls/batch POST 与自托管 multipart POST 在结果不明确时不得自动重试，避免重复上游任务。
 - 可配置 baseURL 必须使用 URL parser 验证；是否允许 HTTP 由 Provider 类型和配置明确决定。
 
 ### 17.2 本地文件
@@ -697,18 +700,23 @@ Job 保存 providerConfigId 和不含秘密的 provider compatibility metadata�
 
 ### 18.1 缓存保留
 
-默认采用可配置保留策略。清理只删除没有活跃 staging/operation 的已发布结果。由于 Job 可能长期引用结果，策略必须二选一并在配置中明确：
+当前采用引用保留加 staging TTL：任意严格可解析 Job 的顶层或逐文件 cacheKey 都视为引用，不执行已发布结果自动删除。时间/容量优先策略仍是未来选项；若启用，历史 result 必须返回 CACHE_EVICTED 并明确是否允许重新解析。
 
-- 引用保留：存在 Job 引用时不删除。
-- 时间/容量优先：允许删除旧结果，后续 result 返回 CACHE_EVICTED 并可选择重新解析。
+### 18.2 存储运维
 
-建议首版使用引用保留加 staging TTL，避免已完成任务失效；缓存容量管理作为后续增强。
+- StorageMaintenanceService 只在持有同一 storageRoot 的 ProcessLock 时运行，不注册模型工具。
+- stats 对 results、jobs、staging、quarantine 统计字节和条目，遍历不跟随符号链接。
+- integrity scan 默认只读；显式 isolation 只原子移动已确认无效的完整 result 目录。
+- quarantine cleanup 默认 dry-run，只接受 list 返回的安全 entry ID；实际删除由 loopback RPC 二次确认。
+- GC dry-run 严格解析全部 Job 引用，只报告已验证且无引用的 immutable result。任意 malformed、unreadable、temporary、unexpected 或 symlinked Job，以及 result 扫描截断，都会令计划 eligible=false。
+- Manifest 和 persisted Job 使用流式有界读取；超限数据按 corrupt/malformed 处理，不允许运维扫描无界分配内存。
+- 候选项、诊断和 quarantine 列表都有响应上限及 truncated 元数据；当前不存在已发布结果删除 API。
 
-### 18.2 可选增强
+### 18.3 可选增强
 
 - 跨进程 claim、heartbeat 和 stale-owner 接管。
 - credential 或 tenant 级 cacheScope。
-- 缓存浏览、统计、手动清理和重新解析 UI。
+- 自动容量/时间驱逐、Job 保留期和 CACHE_EVICTED 后重新解析。
 - URL 输入 Provider 能力。
 - source object 内容寻址存储与失败重试。
 - DSH 通用 Session Artifact 服务和 session export 集成。
@@ -716,15 +724,14 @@ Job 保存 providerConfigId 和不含秘密的 provider compatibility metadata�
 
 这些增强不能改变现有 CacheKey 和 manifest 解释；需要改变时提升版本。
 
-## 19. 迁移方案
+## 19. 接口收敛
 
-允许完整重构，但升级必须避免把旧配置静默解释成官方模式。
+插件只接受 Provider-based canonical config 和当前工具参数，不对旧接口做静默转换。
 
-1. 读取旧 baseURL/apiKeyEnv/defaultBackend 等配置时，生成一个 self-hosted-v2 ProviderConfig，并将其设为 activeProvider。
-2. 旧工具名保留。旧 file_path、backend、parse_method、lang_list、start_page_id 和 end_page_id 在兼容层转换为统一字段。
-3. 有损或无法表达的旧 backend 映射必须来自迁移生成的 modelMap，不能在每次请求时猜测。
-4. 当前 /tmp/mineru-* 文件不迁移到全局缓存，因为缺少可靠 CacheKey 与 manifest。
-5. 发布新的 major 版本时，可移除旧参数兼容层；README 和工具描述应明确迁移周期。
+1. flat `baseURL/apiKeyEnv/defaultBackend` 配置会被配置解析器拒绝。
+2. 模型工具只接受 `file_paths/model/ocr/language/formula/table/pages/artifacts`，查询只接受 `job_id`。
+3. Self-hosted v2 的 `task_id/backend/parse_method/start_page_id/end_page_id` 仅存在于 Provider 私有协议适配中。
+4. 旧 `/tmp/mineru-*` 文件不迁移到全局缓存，因为缺少可靠 CacheKey 与 manifest。
 
 ## 20. 典型流程
 
@@ -770,6 +777,7 @@ Job 保存 providerConfigId 和不含秘密的 provider compatibility metadata�
 - Bearer 可选、重定向策略、HTTP/JSON 错误。
 - 状态和内联结果向统一 schema 转换。
 - 取消、请求超时和多文件结果。
+- probe/inspect/collect 的有界重试、Retry-After、耗尽和 backoff 取消；multipart POST 不重试。
 
 ### 21.3 OfficialV4Provider
 
@@ -780,6 +788,7 @@ Job 保存 providerConfigId 和不含秘密的 provider compatibility metadata�
 - full_zip_url 去重下载。
 - 单文件根目录、多文件子目录和重复内容 ZIP。
 - Token 不发送到上传或 CDN 主机。
+- inspect/collect/CDN GET 和新流裸 PUT 的安全重试；file-urls/batch POST 不重试。
 
 ### 21.4 存储与安全
 
@@ -787,7 +796,9 @@ Job 保存 providerConfigId 和不含秘密的 provider compatibility metadata�
 - ZIP Slip、绝对路径、符号链接、压缩炸弹、条目数和大小限制。
 - ArtifactRef 越界路径拒绝。
 - manifest 哈希、字节数和 requiredArtifacts 校验。
-- 残留 staging 清理不影响活跃 operation。
+- 残留 staging 清理不影响活跃 operation，也不跟随 staging 符号链接。
+- 只读统计/完整性扫描、quarantine 边界、删除 dry-run、响应截断和取消。
+- GC preview 的 Job 引用并集、orphan 候选与 malformed/unreadable/symlink fail-closed。
 
 ### 21.5 Service 与并发
 
@@ -803,7 +814,9 @@ Job 保存 providerConfigId 和不含秘密的 provider compatibility metadata�
 - 五个工具的 canonical output 和 render 文本。
 - 大 Markdown 的完整工具输出限制。
 - RPC 配置判别联合、draft probe 和热更新只影响新任务。
-- 设置页按 Provider 显示有效字段并适配桌面/移动布局。
+- loopback 运维 RPC 的输入上限、只读默认值和 destructive confirm。
+- 设置页按 Provider 显示有效字段，并提供统计、扫描、GC preview 与 quarantine 二次确认流程。
+- 桌面/移动布局验证包含 CSS module 生效、内部表格滚动和页面无横向溢出。
 - 真实插件组合测试验证工具注册、会话绑定和持久输出。
 
 ### 21.7 验证命令
@@ -814,6 +827,8 @@ Job 保存 providerConfigId 和不含秘密的 provider compatibility metadata�
 pnpm run typecheck
 pnpm test
 pnpm run build
+git diff --check
+pnpm run verify:gui
 ~~~
 
 涉及客户端设置页时，还需构建客户端 bundle，并在现有 DSH Web GUI 中刷新验证 Provider 切换、字段可见性、保存和连接测试。
@@ -836,9 +851,9 @@ pnpm run build
 
 迁移到 Provider 配置联合，更新 RPC、设置页和多语言字典，实现 draft probe 和 Provider 特定字段。
 
-### 阶段五：迁移、文档和集成验证
+### 阶段五：接口收敛、文档和集成验证
 
-加入旧配置与旧工具参数迁移，更新 README/AGENTS，生成 lib 构建产物，并执行完整类型、测试、构建和 GUI 验证。
+移除旧配置与旧工具参数入口，更新 README/AGENTS，生成 lib 构建产物，并执行完整类型、测试、构建和 GUI 验证。
 
 ## 23. 验收标准
 
@@ -856,6 +871,9 @@ pnpm run build
 10. 重启后已持久化的远端任务可继续查询和收集；不可恢复上传明确失败。
 11. 所有模型可见大内容受限，完整产物通过安全路径引用。
 12. typecheck、测试、构建和设置页验证全部通过。
+13. 安全网络操作在瞬时失败时有界重试，模糊提交 POST 不会被自动重放，重试日志不泄漏请求私有信息。
+14. 存储统计和完整性检查默认不修改数据；GC 只预览，无法证明引用扫描完整时不产生 eligible 删除计划。
+15. quarantine 实际清理只作用于显式选择的安全 entry ID，并通过 loopback RPC 二次确认。
 
 ## 24. 决策摘要
 
@@ -866,3 +884,5 @@ pnpm run build
 - 完成结果全局复用，并发相同请求在进程内合并。
 - DSH 会话日志保留工具结果和轻量引用，不承载完整解析产物。
 - 官方 v4 的预签名上传、无认证 CDN 下载和 ZIP 解包使用独立安全路径。
+- 重试仅属于 Provider 网络适配层；Service 提供热配置和不含私有字符串的结构化诊断。
+- 存储运维属于 loopback 管理面；模型工具、持久 Job/Result schema 和 CacheKey 解释保持不变。

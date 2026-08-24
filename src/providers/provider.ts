@@ -5,6 +5,13 @@ import type { MinerUFileState, MinerUJobState } from '../domain/job.js'
 import type { MinerUFileId } from '../domain/ids.js'
 import type { ArtifactRef } from '../domain/result.js'
 import type { ArtifactKind, CanonicalParseRequest, MinerUModel, ParseMethod, PreparedSourceFile } from '../domain/request.js'
+import type { ProviderRetryOptions } from './retry.js'
+
+export * from './retry.js'
+
+export interface ProviderOptions {
+  readonly retry?: ProviderRetryOptions
+}
 
 export interface ProviderCapabilities {
   readonly models: readonly MinerUModel[]
@@ -34,6 +41,9 @@ export interface ProviderCallContext {
   readonly credential?: string
   readonly timeoutMs: number
   readonly limits: ProviderCallLimits
+  readonly retry?: ProviderRetryOptions
+  /** Persist the durable provider reference immediately after upstream acceptance. */
+  readonly onAccepted?: (ref: ProviderJobRef) => Promise<void>
 }
 
 export interface ProviderCompatibilityContext {

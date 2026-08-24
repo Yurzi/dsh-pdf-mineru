@@ -16,13 +16,17 @@ interface FakeRuntime {
   readonly ctx: Context
   readonly definitions: unknown[]
   readonly effects: Array<() => void | Promise<void>>
-  readonly rpc: { authority?: string; disposeCount: number }
+  readonly rpc: {
+    authority?: string
+    disposeCount: number
+    handler?: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>
+  }
 }
 
 function fakeContext(config: ReturnType<typeof defaultMinerUConfig>, failToolRegistration = false): FakeRuntime {
   const definitions: unknown[] = []
   const effects: Array<() => void | Promise<void>> = []
-  const rpc = { authority: undefined as string | undefined, disposeCount: 0 }
+  const rpc: FakeRuntime['rpc'] = { authority: undefined, disposeCount: 0 }
   const scope = {
     get: () => config,
     watch: (_callback: (next: unknown) => void) => () => undefined,
@@ -39,8 +43,13 @@ function fakeContext(config: ReturnType<typeof defaultMinerUConfig>, failToolReg
     },
     connection: {
       rpc: {
-        handle: (_channel: string, _handler: unknown, options: { authority: string }) => {
+        handle: (
+          _channel: string,
+          handler: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>,
+          options: { authority: string },
+        ) => {
           rpc.authority = options.authority
+          rpc.handler = handler
           return () => { rpc.disposeCount++ }
         },
       },
@@ -78,6 +87,15 @@ describe('plugin composition lifecycle', () => {
     expect(runtime.rpc.authority).toBe('loopback')
     expect(await stat(join(config.storage.storageRoot, '.process.lock'))).toBeDefined()
     expect(runtime.effects.length).toBeGreaterThan(0)
+
+    const otherRoot = join(root, 'other-store')
+    const changed = { ...config, storage: { ...config.storage, storageRoot: otherRoot } }
+    const response = await runtime.rpc.handler?.(
+      'mineru/config.set', { config: changed }, new AbortController().signal,
+    ) as { ok: boolean; error?: { code: string } }
+    expect(response).toMatchObject({ ok: false })
+    await expect(stat(join(otherRoot, '.process.lock'))).rejects.toThrow()
+
     for (const eff of runtime.effects) await eff()
     await dispose()
     await expect(stat(join(config.storage.storageRoot, '.process.lock'))).rejects.toThrow()

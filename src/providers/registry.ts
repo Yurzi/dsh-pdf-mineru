@@ -5,7 +5,7 @@ import type { MinerUConfig, ProviderConfig } from '../config.js'
 import { providerById } from '../config.js'
 import { SelfHostedV2Provider } from './self-hosted-v2.js'
 import { OfficialV4Provider } from './official-v4.js'
-import type { MinerUProvider } from './provider.js'
+import type { MinerUProvider, ProviderOptions } from './provider.js'
 
 export interface ResolvedProvider {
   readonly provider: MinerUProvider
@@ -13,7 +13,10 @@ export interface ResolvedProvider {
 }
 
 export class ProviderRegistry {
-  constructor(private readonly getConfig: () => MinerUConfig) {}
+  constructor(
+    private readonly getConfig: () => MinerUConfig,
+    private readonly options?: ProviderOptions,
+  ) {}
 
   active(): ResolvedProvider {
     const config = this.getConfig()
@@ -48,9 +51,9 @@ export class ProviderRegistry {
   create(config: ProviderConfig): MinerUProvider {
     switch (config.type) {
       case 'self-hosted-v2':
-        return new SelfHostedV2Provider(config)
+        return new SelfHostedV2Provider(config, this.options)
       case 'official-v4':
-        return new OfficialV4Provider(config)
+        return new OfficialV4Provider(config, this.options)
     }
   }
 }

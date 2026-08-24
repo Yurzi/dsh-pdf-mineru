@@ -47,12 +47,19 @@ export class MinerUError extends Error {
   }
 }
 
-export function sanitizeDiagnostic(input: string): string {
-  return input
+export function sanitizeDiagnostic(input: string, secrets: readonly string[] = []): string {
+  let sanitized = input
+  for (const secret of secrets) {
+    if (secret !== '') sanitized = sanitized.split(secret).join('[REDACTED]')
+  }
+  return sanitized
     .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, 'Bearer [REDACTED]')
     .replace(/https?:\/\/[^\s<>"']+/gi, raw => {
       try {
         const url = new URL(raw)
+        url.username = ''
+        url.password = ''
+        url.pathname = url.pathname === '/' ? '/' : '/[REDACTED]'
         url.search = ''
         url.hash = ''
         return url.toString()

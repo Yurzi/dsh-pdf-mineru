@@ -17,17 +17,12 @@ import {
   asProviderConfigId,
   asResultId,
   asSessionId,
-  type CacheKey,
-  type MinerUFileId,
-  type MinerUJobId,
-  type MinerUResultId,
-  type OperationId,
-  type ProviderConfigId,
-  type SessionId,
 } from './ids.js'
 import {
   ARTIFACT_KINDS,
   CANONICAL_PARSE_REQUEST_SCHEMA_VERSION,
+  normalizeArtifactKinds,
+  normalizePageRanges,
   type ArtifactKind,
   type CanonicalParseRequest,
   type CanonicalSourceFile,
@@ -224,6 +219,10 @@ export function parseParseSemantics(input: unknown): ParseSemantics {
     throw new TypeError(`invalid ParseSemantics.parseMethod: "${String(parseMethod)}"`)
   }
 
+  if (ocr !== (parseMethod === 'ocr')) {
+    throw new TypeError('ParseSemantics.ocr must agree with ParseSemantics.parseMethod')
+  }
+
   const language = assertNonEmptyString(obj['language'], 'ParseSemantics.language')
   assertNoUrlOrSecret(language, 'ParseSemantics.language')
 
@@ -240,8 +239,8 @@ export function parseParseSemantics(input: unknown): ParseSemantics {
   let pages: string | undefined
   if (obj['pages'] !== undefined) {
     const rawPages = assertNonEmptyString(obj['pages'], 'ParseSemantics.pages')
-    if (!PAGE_RANGES.test(rawPages)) {
-      throw new TypeError(`invalid ParseSemantics.pages format: "${rawPages}"`)
+    if (!PAGE_RANGES.test(rawPages) || normalizePageRanges(rawPages) !== rawPages) {
+      throw new TypeError(`ParseSemantics.pages is not canonical: "${rawPages}"`)
     }
     pages = rawPages
   }
@@ -296,6 +295,11 @@ export function parseCanonicalParseRequest(input: unknown): CanonicalParseReques
   const requiredArtifacts = obj['requiredArtifacts'].map(k => parseArtifactKind(k))
   if (new Set(requiredArtifacts).size !== requiredArtifacts.length) {
     throw new TypeError('CanonicalParseRequest.requiredArtifacts cannot contain duplicates')
+  }
+  const normalizedArtifacts = normalizeArtifactKinds(requiredArtifacts)
+  if (normalizedArtifacts.length !== requiredArtifacts.length
+    || normalizedArtifacts.some((kind, index) => kind !== requiredArtifacts[index])) {
+    throw new TypeError('CanonicalParseRequest.requiredArtifacts must be canonical and include markdown')
   }
 
   return {
@@ -559,6 +563,36 @@ export function parseMinerUJobRecord(input: unknown): MinerUJobRecord {
   }
   const files = obj['files'].map(f => parseMinerUFileStatus(f))
 
+  if (sourceFiles.length !== request.files.length || files.length !== request.files.length) {
+    throw new TypeError('MinerUJobRecord source, request, and status file counts must match')
+  }
+  for (let index = 0; index < request.files.length; index++) {
+    const source = sourceFiles[index]!
+    const requested = request.files[index]!
+    const statusFile = files[index]!
+    if (source.fileId !== requested.fileId || source.name !== requested.name
+      || source.bytes !== requested.bytes || source.sha256 !== requested.sha256) {
+      throw new TypeError('MinerUJobRecord sourceFiles must exactly match request.files')
+    }
+    if (statusFile.fileId !== requested.fileId || statusFile.name !== requested.name) {
+      throw new TypeError('MinerUJobRecord file statuses must match request.files')
+    }
+  }
+  const ref = resolution.kind === 'cache-hit' ? undefined : resolution.ref
+  if (ref !== undefined) {
+    if (ref.provider !== providerId || ref.files.length !== request.files.length) {
+      throw new TypeError('MinerUJobRecord provider reference does not match its provider or request')
+    }
+    const dataIds = new Set<string>()
+    for (let index = 0; index < ref.files.length; index++) {
+      const mapped = ref.files[index]!
+      const requested = request.files[index]!
+      if (mapped.fileId !== requested.fileId || mapped.name !== requested.name || dataIds.has(mapped.dataId)) {
+        throw new TypeError('MinerUJobRecord provider file mappings must uniquely match request.files')
+      }
+      dataIds.add(mapped.dataId)
+    }
+  }
   const resultId = obj['resultId'] === undefined
     ? undefined
     : asResultId(assertNonEmptyString(obj['resultId'], 'MinerUJobRecord.resultId'))

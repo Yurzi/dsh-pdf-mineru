@@ -24,7 +24,7 @@ function transformCssModules(filename: string, source: Buffer): { classMap: Reco
   while ((match = classPattern.exec(cssText)) !== null) {
     const local = match[1]
     if (local !== undefined && classMap[local] === undefined) {
-      classMap[local] = `${hash}_${local}`
+      classMap[local] = `dshm_${hash}_${local}`
     }
   }
   const transformedCss = cssText.replace(/\.([a-zA-Z_][a-zA-Z0-9_-]*)/g, (full, name: string) => {

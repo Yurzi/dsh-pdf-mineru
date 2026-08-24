@@ -19,7 +19,7 @@ export type ParseMethod = 'auto' | 'txt' | 'ocr'
 export interface ParseSemantics {
   readonly model: MinerUModel
   readonly ocr: boolean
-  /** Preserves the self-hosted legacy txt/auto distinction in the cache key. */
+  /** Parse method remains explicit because txt and auto have different cache semantics. */
   readonly parseMethod: ParseMethod
   readonly language: string
   readonly formula: boolean
@@ -59,8 +59,6 @@ export interface PreparedParseRequest {
 
 export interface ParseRequestInput {
   readonly file_paths?: readonly string[]
-  /** Compatibility alias through the next major release. */
-  readonly file_path?: string
   readonly model?: MinerUModel
   readonly ocr?: boolean
   readonly language?: string
@@ -68,17 +66,6 @@ export interface ParseRequestInput {
   readonly table?: boolean
   readonly pages?: string
   readonly artifacts?: readonly ArtifactKind[]
-  readonly backend?: string
-  readonly parse_method?: ParseMethod
-  readonly lang_list?: readonly string[]
-  readonly formula_enable?: boolean
-  readonly table_enable?: boolean
-  readonly return_middle_json?: boolean
-  readonly return_model_output?: boolean
-  readonly return_content_list?: boolean
-  readonly return_images?: boolean
-  readonly start_page_id?: number
-  readonly end_page_id?: number
 }
 
 export interface ParseDefaults {
@@ -89,6 +76,32 @@ export interface ParseDefaults {
   readonly formula: boolean
   readonly table: boolean
   readonly artifacts: readonly ArtifactKind[]
+}
+
+interface PageInterval { start: number; end: number }
+
+export function normalizePageRanges(input: string): string {
+  const intervals: PageInterval[] = []
+  for (const token of input.split(',')) {
+    const trimmed = token.trim()
+    const match = /^(\d+)(?:-(\d+))?$/.exec(trimmed)
+    if (match === null) throw new TypeError(`Invalid page range token: ${trimmed}`)
+    const start = Number(match[1])
+    const end = match[2] === undefined ? start : Number(match[2])
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start || end > 99999) {
+      throw new TypeError(`Invalid page range token: ${trimmed}`)
+    }
+    intervals.push({ start, end })
+  }
+  if (intervals.length === 0) throw new TypeError('Page range cannot be empty')
+  intervals.sort((left, right) => left.start - right.start || left.end - right.end)
+  const merged: PageInterval[] = []
+  for (const current of intervals) {
+    const previous = merged.at(-1)
+    if (previous !== undefined && current.start <= previous.end + 1) previous.end = Math.max(previous.end, current.end)
+    else merged.push({ ...current })
+  }
+  return merged.map(({ start, end }) => start === end ? String(start) : `${String(start)}-${String(end)}`).join(',')
 }
 
 export function normalizeArtifactKinds(kinds: readonly ArtifactKind[]): readonly ArtifactKind[] {

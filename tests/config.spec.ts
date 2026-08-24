@@ -2,36 +2,23 @@ import { describe, expect, it } from 'vitest'
 import { defaultMinerUConfig, migrateConfig, providerById } from '../src/config.js'
 import { asProviderConfigId } from '../src/domain/ids.js'
 
-describe('MinerU config migration and validation', () => {
+describe('MinerU config parsing and validation', () => {
   it('creates a complete self-hosted default', () => {
     const config = defaultMinerUConfig()
     expect(config.schemaVersion).toBe(1)
     expect(config.activeProvider).toBe('mp_self_hosted')
     expect(config.providers[0]).toMatchObject({ type: 'self-hosted-v2', allowInsecureHttp: true })
     expect(config.defaults).toMatchObject({ model: 'pipeline', parseMethod: 'auto', ocr: false })
+    expect(config.retry).toEqual({ maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 10000 })
     expect(config.storage.storageRoot).toMatch(/[\\/]dsh-pdf-mineru[\\/]v1$/)
   })
 
-  it('migrates legacy self-hosted config and preserves txt semantics', () => {
-    const config = migrateConfig({
+  it('rejects removed flat configuration fields', () => {
+    expect(() => migrateConfig({
       baseURL: 'http://mineru.local:18000/',
       apiKeyEnv: 'CUSTOM_MINERU_KEY',
       defaultBackend: 'hybrid-engine',
-      defaultParseMethod: 'txt',
-      defaultLang: 'en',
-      pollIntervalMs: 750,
-      maxMdOutputChars: 4096,
-    })
-    expect(config.activeProvider).toBe('mp_self_hosted')
-    expect(config.defaults).toMatchObject({ model: 'vlm', parseMethod: 'txt', ocr: false, language: 'en' })
-    expect(config.polling.pollIntervalMs).toBe(750)
-    expect(config.output.maxInlineChars).toBe(4096)
-    expect(config.providers[0]).toMatchObject({
-      type: 'self-hosted-v2',
-      baseURL: 'http://mineru.local:18000',
-      apiKeyEnv: 'CUSTOM_MINERU_KEY',
-      modelMap: { pipeline: 'pipeline', vlm: 'hybrid-engine' },
-    })
+    })).toThrow(/unsupported property/)
   })
 
   it('accepts an official-v4 discriminated provider config', () => {
@@ -79,6 +66,21 @@ describe('MinerU config migration and validation', () => {
       providers: [{ id, type: 'official-v4', apiKeyEnv: 'TOKEN' }],
       defaults: { model: 'pipeline', parseMethod: 'txt', ocr: false },
     })).toThrow(/cannot use txt/)
+  })
+
+  it('fills retry defaults for 0.0.1 configs and validates bounded delays', () => {
+    const base = defaultMinerUConfig()
+    const olderCanonical = { ...base, retry: undefined }
+    expect(migrateConfig(olderCanonical).retry).toEqual(base.retry)
+
+    expect(() => migrateConfig({
+      ...base,
+      retry: { maxAttempts: 11, baseDelayMs: 500, maxDelayMs: 10000 },
+    })).toThrow(/retry.maxAttempts/)
+    expect(() => migrateConfig({
+      ...base,
+      retry: { maxAttempts: 3, baseDelayMs: 2000, maxDelayMs: 1000 },
+    })).toThrow(/cannot exceed/)
   })
 
   it('rejects conflicting default OCR and parse method settings', () => {

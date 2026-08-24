@@ -98,7 +98,6 @@ describe('MinerU Tool Layer', () => {
       'mineru_get_parse_result',
       'mineru_parse_document',
     ])
-
     expect(typeof dispose).toBe('function')
     dispose()
   })
@@ -199,38 +198,6 @@ describe('MinerU Tool Layer', () => {
       expect(rendered[0]?.text).toContain('doc.pdf')
     })
 
-    it('passes legacy alias parameters directly to service', async () => {
-      const mockService = {
-        submit: vi.fn(async () => ({
-          job_id: 'mj_legacy_1',
-          state: 'queued' as const,
-          source: 'provider' as const,
-          provider: 'self-hosted-v2' as const,
-          files: [],
-          result_available: false,
-        })),
-      } as unknown as MinerUService
-
-      const { ctx, registeredTools } = createMockContext()
-      registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
-
-      const exec = createMockExec(true)
-      const legacyArgs = {
-        file_path: '/data/legacy.pdf',
-        backend: 'pipeline',
-        parse_method: 'ocr' as const,
-        lang_list: ['ch'],
-        formula_enable: true,
-        table_enable: true,
-        return_middle_json: true,
-        start_page_id: 0,
-        end_page_id: 9,
-      }
-
-      await submitTool.execute(legacyArgs, exec)
-      expect(mockService.submit).toHaveBeenCalledWith(exec.agent?.session, legacyArgs, exec.signal)
-    })
   })
 
   describe('mineru_get_parse_status', () => {
@@ -264,35 +231,15 @@ describe('MinerU Tool Layer', () => {
       expect(rendered[0]?.text).toContain('progress: 3/10')
     })
 
-    it('accepts legacy task_id alias and treats it as job_id', async () => {
-      const mockService = {
-        status: vi.fn(async () => ({
-          job_id: 'mj_task_alias',
-          state: 'completed' as const,
-          source: 'cache' as const,
-          provider: 'official-v4' as const,
-          files: [],
-          result_available: true,
-          created_at: 1700000000000,
-          updated_at: 1700000001000,
-        })),
-      } as unknown as MinerUService
-
+    it('rejects a missing job_id', async () => {
+      const mockService = { status: vi.fn() } as unknown as MinerUService
       const { ctx, registeredTools } = createMockContext()
       registerTools(ctx, () => mockService)
       const statusTool = registeredTools.find(t => t.name === 'mineru_get_parse_status')!
-
       const exec = createMockExec(true)
-      await statusTool.execute({ task_id: 'mj_task_alias' }, exec)
-      expect(mockService.status).toHaveBeenCalledWith(exec.agent?.session, 'mj_task_alias', exec.signal)
-    })
-
-    it('throws when neither job_id nor task_id is provided', async () => {
-      const { ctx, registeredTools } = createMockContext()
-      registerTools(ctx, () => ({} as MinerUService))
-      const statusTool = registeredTools.find(t => t.name === 'mineru_get_parse_status')!
-
-      await expect(statusTool.execute({}, createMockExec(true))).rejects.toThrow(/job_id is required/)
+      await expect(statusTool.execute({}, exec)).rejects.toThrow(/job_id is required/)
+      await expect(statusTool.execute({ task_id: 'mj_removed' }, exec)).rejects.toThrow(/Unsupported tool argument/)
+      expect(mockService.status).not.toHaveBeenCalled()
     })
   })
 
@@ -354,6 +301,16 @@ describe('MinerU Tool Layer', () => {
     })
   })
 
+
+    it('makes structured artifact truncation explicit in rendered prose', () => {
+      const rendered = renderResult({
+        job_id: 'mj_artifacts', state: 'completed', cache_hit: false, result_id: 'mr_artifacts',
+        files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [], artifacts_truncated: true }],
+        preview_truncated: false, manifest_path: '/cache/manifest.json', output_limit_chars: 2000,
+      })
+      expect(rendered[0]?.text).toContain('Artifact list truncated')
+    })
+
   describe('mineru_parse_document', () => {
     it('executes folded parseDocument and returns result on completion', async () => {
       const completedResult: ResultView = {
@@ -379,11 +336,27 @@ describe('MinerU Tool Layer', () => {
       const args = { file_paths: ['/sync.pdf'], poll_timeout_ms: 30000 }
       const result = await parseTool.execute(args, exec)
 
-      expect(mockService.parseDocument).toHaveBeenCalledWith(exec.agent?.session, args, exec.signal, 30000)
+      expect(mockService.parseDocument).toHaveBeenCalledWith(
+        exec.agent?.session, { file_paths: ['/sync.pdf'] }, exec.signal, 30000,
+      )
       expect(result).toEqual(completedResult)
 
       const rendered = parseTool.output.render(args, result)
       expect(rendered[0]?.text).toContain('Synchronous Content')
+    })
+
+
+    it('rejects invalid poll timeouts before invoking the service', async () => {
+      const mockService = { parseDocument: vi.fn() } as unknown as MinerUService
+      const { ctx, registeredTools } = createMockContext()
+      registerTools(ctx, () => mockService)
+      const parseTool = registeredTools.find(t => t.name === 'mineru_parse_document')!
+      const exec = createMockExec(true)
+      for (const poll_timeout_ms of [-1, 0, 86_400_001, Number.MAX_SAFE_INTEGER]) {
+        await expect(parseTool.execute({ file_paths: ['/doc.pdf'], poll_timeout_ms }, exec))
+          .rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
+      }
+      expect(mockService.parseDocument).not.toHaveBeenCalled()
     })
 
     it('renders status view when parseDocument returns in-progress timed out status', () => {

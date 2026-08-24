@@ -13,7 +13,10 @@
  *   - Staging TTL cleanup respecting active operations
  */
 
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -199,56 +202,56 @@ describe('ProcessLock', () => {
     await expect(readFile(paths.processLockFile(), 'utf8')).rejects.toThrow()
   })
 
-  it('throws STORAGE_LOCKED when lock is held by another active process', async () => {
+  it('throws STORAGE_LOCKED while another socket owner is active', async () => {
     const root = await createTempRoot()
     const paths = new StoragePaths(root)
-
-    // Simulate lock held by current process under another ownerToken
-    const fakeLock = {
-      pid: process.pid,
-      ownerToken: 'owner_foreign_999',
-      createdAt: Date.now(),
-      hostname: 'testhost',
-    }
-    await writeFile(paths.processLockFile(), JSON.stringify(fakeLock))
-
-    const lock = new ProcessLock(paths)
-    await expect(lock.acquire()).rejects.toMatchObject({
-      failure: { code: 'STORAGE_LOCKED' },
-    })
+    const owner = new ProcessLock(paths)
+    const contender = new ProcessLock(paths)
+    await owner.acquire()
+    await expect(contender.acquire()).rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
+    await owner.release()
+    await contender.acquire()
+    await contender.release()
   })
 
-  it('refuses to delete a malformed lock whose owner cannot be proven stale', async () => {
+
+  it('reacquires after a socket-owning process is killed without cleanup', async () => {
     const root = await createTempRoot()
     const paths = new StoragePaths(root)
-    await writeFile(paths.processLockFile(), '{not-json')
-    await expect(new ProcessLock(paths).acquire()).rejects.toMatchObject({
-      failure: { code: 'STORAGE_LOCKED' },
-    })
-    expect(await readFile(paths.processLockFile(), 'utf8')).toBe('{not-json')
-  })
-
-  it('reclaims stale lock when previous owner process is dead', async () => {
-    const root = await createTempRoot()
-    const paths = new StoragePaths(root)
-
-    // PID 99999999 is dead
-    const deadLock = {
-      pid: 99999999,
-      ownerToken: 'owner_dead_123',
-      createdAt: Date.now() - 100000,
-      hostname: 'testhost',
-    }
-    await writeFile(paths.processLockFile(), JSON.stringify(deadLock))
+    const rootHash = createHash('sha256').update(paths.root).digest('hex').slice(0, 32)
+    const childCode = [
+      "const { createServer } = require('node:net')",
+      "const name = String.fromCharCode(0) + 'dsh-pdf-mineru-' + process.argv[1]",
+      "const server = createServer()",
+      "server.listen(name, () => process.stdout.write('ready'))",
+      "setInterval(() => {}, 1000)",
+    ].join(';')
+    const child = spawn(process.execPath, ['-e', childCode, rootHash], { stdio: ['ignore', 'pipe', 'inherit'] })
+    await once(child.stdout!, 'data')
+    child.kill('SIGKILL')
+    await once(child, 'exit')
 
     const lock = new ProcessLock(paths)
     await lock.acquire()
     expect(lock.isHeld()).toBe(true)
-
-    const newLock = JSON.parse(await readFile(paths.processLockFile(), 'utf8')) as { pid: number }
-    expect(newLock.pid).toBe(process.pid)
-
     await lock.release()
+  })
+
+  it('replaces stale metadata only after acquiring OS lock authority', async () => {
+    const root = await createTempRoot()
+    const paths = new StoragePaths(root)
+    const staleValues = [
+      '{not-json',
+      JSON.stringify({ pid: 99999999, ownerToken: 'dead', createdAt: 0, hostname: 'old' }),
+    ]
+    for (const stale of staleValues) {
+      await writeFile(paths.processLockFile(), stale)
+      const lock = new ProcessLock(paths)
+      await lock.acquire()
+      const current = JSON.parse(await readFile(paths.processLockFile(), 'utf8')) as { pid: number }
+      expect(current.pid).toBe(process.pid)
+      await lock.release()
+    }
   })
 })
 
@@ -630,6 +633,41 @@ describe('ResultRepository (Transactions, Publishing, Cache Hits & Quarantine)',
     await chmod(physical, 0o644)
     await writeFile(physical, 'same-size-B')
     expect(await repo.get(manifest.cacheKey)).toBeUndefined()
+    await expect(stat(paths.resultDir(manifest.cacheKey))).rejects.toThrow()
+  })
+
+  it('rejects unmanaged quarantine sources and never follows staging symlinks', async () => {
+    const root = await createTempRoot()
+    const paths = new StoragePaths(root)
+    const repo = new ResultRepository(paths)
+    const outside = join(root, 'outside-managed-storage')
+    await mkdir(outside, { recursive: true })
+    await writeFile(join(outside, 'preserve.txt'), 'preserve')
+
+    await expect(repo.quarantine(outside)).rejects.toThrow(/complete staging operation or published result/)
+
+    const linkedOperation = createOperationId()
+    await mkdir(paths.stagingDir(), { recursive: true })
+    await symlink(outside, paths.stagingDir(linkedOperation))
+    await new Promise(resolve => setTimeout(resolve, 5))
+    expect(await repo.cleanupStaging(1)).toBe(0)
+    expect(await readFile(join(outside, 'preserve.txt'), 'utf8')).toBe('preserve')
+    expect((await stat(paths.stagingDir(linkedOperation))).isDirectory()).toBe(true)
+  })
+
+  it('rejects oversized manifests without loading them unboundedly', async () => {
+    const root = await createTempRoot()
+    const paths = new StoragePaths(root)
+    const repo = new ResultRepository(paths, { maxManifestBytes: 128 })
+    const request = sampleRequest()
+    const tx = repo.beginTransaction(createOperationId(), request, sampleProducer())
+    const file = request.files[0]!
+    const artifact = await tx.writeArtifact(file.fileId, 'markdown', '# bounded manifest', { mediaType: 'text/markdown' })
+    const manifest = tx.buildManifest(file, [artifact])
+    await expect(repo.commitTransaction(tx, manifest)).rejects.toMatchObject({
+      failure: { code: 'RESULT_TOO_LARGE' },
+    })
+    await expect(stat(paths.stagingDir(tx.operationId))).rejects.toThrow()
     await expect(stat(paths.resultDir(manifest.cacheKey))).rejects.toThrow()
   })
 

@@ -24,3 +24,7 @@
           table: true
           artifacts:
             - markdown
+        retry:
+          maxAttempts: 3
+          baseDelayMs: 500
+          maxDelayMs: 10000

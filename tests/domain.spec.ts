@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { asCacheKey, asSessionId, createFileId } from '../src/domain/ids.js'
 import { MinerUError, sanitizeDiagnostic } from '../src/domain/errors.js'
-import { CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, type CanonicalParseRequest, type ParseDefaults } from '../src/domain/request.js'
+import { CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, type CanonicalParseRequest, type ParseDefaults, type ParseRequestInput } from '../src/domain/request.js'
 import { computeCacheKey } from '../src/service/cache-key.js'
 import { RequestNormalizer, assertSourcesUnchanged, normalizePages } from '../src/service/request-normalizer.js'
 
@@ -41,7 +41,7 @@ describe('request normalization', () => {
   it('applies defaults and strips local paths from the canonical request', async () => {
     const { root, path } = await fixture()
     const normalizer = new RequestNormalizer({ defaults, cwd: root })
-    const prepared = await normalizer.normalize({ file_path: path }, new AbortController().signal)
+    const prepared = await normalizer.normalize({ file_paths: [path] }, new AbortController().signal)
     expect(prepared.request.semantics).toEqual({
       model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true,
     })
@@ -50,40 +50,40 @@ describe('request normalization', () => {
     expect(JSON.stringify(prepared.request)).not.toContain(root)
   })
 
-  it('normalizes legacy aliases without losing txt semantics', async () => {
+  it('normalizes modern request fields and artifact selection', async () => {
     const { path } = await fixture()
-    const normalizer = new RequestNormalizer({
-      defaults,
-      legacyBackendModels: { pipeline: 'pipeline', 'vlm-engine': 'vlm' },
-    })
+    const normalizer = new RequestNormalizer({ defaults })
     const prepared = await normalizer.normalize({
-      file_path: path,
-      backend: 'vlm-engine',
-      parse_method: 'txt',
-      lang_list: ['en'],
-      start_page_id: 0,
-      end_page_id: 4,
-      return_content_list: true,
-      return_images: true,
+      file_paths: [path], model: 'vlm', ocr: true, language: 'en', pages: '1-5',
+      artifacts: ['markdown', 'content-list', 'images'],
     }, new AbortController().signal)
     expect(prepared.request.semantics).toMatchObject({
-      model: 'vlm', ocr: false, parseMethod: 'txt', language: 'en', pages: '1-5',
+      model: 'vlm', ocr: true, parseMethod: 'ocr', language: 'en', pages: '1-5',
     })
     expect(prepared.request.requiredArtifacts).toEqual(['markdown', 'content-list', 'images'])
   })
 
-  it('rejects conflicting modern and legacy aliases', async () => {
+
+  it('rejects every removed request alias at the service boundary', async () => {
     const { path } = await fixture()
     const normalizer = new RequestNormalizer({ defaults })
-    await expect(normalizer.normalize({
-      file_path: path, ocr: true, parse_method: 'auto',
-    }, new AbortController().signal)).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
+    const aliases: Record<string, unknown> = {
+      file_path: path, backend: 'pipeline', parse_method: 'ocr', lang_list: ['en'],
+      formula_enable: true, table_enable: true, return_middle_json: true,
+      return_model_output: true, return_content_list: true, return_images: true,
+      start_page_id: 0, end_page_id: 1,
+    }
+    for (const [key, value] of Object.entries(aliases)) {
+      const input = { file_paths: [path], [key]: value } as unknown as ParseRequestInput
+      await expect(normalizer.normalize(input, new AbortController().signal))
+        .rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
+    }
   })
 
   it('detects a file changed after hashing and before upload', async () => {
     const { path } = await fixture()
     const normalizer = new RequestNormalizer({ defaults })
-    const prepared = await normalizer.normalize({ file_path: path }, new AbortController().signal)
+    const prepared = await normalizer.normalize({ file_paths: [path] }, new AbortController().signal)
     await writeFile(path, '%PDF-1.4 changed')
     const now = new Date(Date.now() + 2000)
     await utimes(path, now, now)
@@ -127,10 +127,13 @@ describe('identifier and diagnostic safety', () => {
     expect(() => asCacheKey('not-a-digest')).toThrow()
   })
 
-  it('redacts bearer credentials and signed URL queries', () => {
-    const clean = sanitizeDiagnostic('Authorization: Bearer secret.token https://cdn.example/result.zip?X-Amz-Signature=secret')
-    expect(clean).not.toContain('secret.token')
-    expect(clean).not.toContain('X-Amz')
-    expect(clean).toContain('https://cdn.example/result.zip')
+  it('redacts bearer credentials and all secret-bearing URL components', () => {
+    const clean = sanitizeDiagnostic(
+      'Authorization: Bearer secret.token https://user:p%40ss@cdn.example/token/secret?X-Amz-Signature=query-secret#fragment-secret',
+    )
+    for (const secret of ['secret.token', 'user', 'p%40ss', '/token/secret', 'query-secret', 'fragment-secret', 'X-Amz']) {
+      expect(clean).not.toContain(secret)
+    }
+    expect(clean).toContain('https://cdn.example/[REDACTED]')
   })
 })

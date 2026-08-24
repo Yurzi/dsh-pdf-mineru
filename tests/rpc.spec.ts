@@ -21,10 +21,12 @@ import { asProviderConfigId } from '../src/domain/ids.js'
 import { registerRpc, RPC_CHANNEL, type MineruRpcDeps, type RpcResult } from '../src/rpc.js'
 import type { ProbeView } from '../src/service/mineru-service.js'
 import {
+  normalizeProviderDefaults,
   patchActiveProvider,
   switchProviderType,
   updateConfigSection,
 } from '../src/client/SettingsPage.js'
+import { formatBytes } from '../src/client/StorageOperations.js'
 
 type RpcHandler = (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<RpcResult<unknown>>
 
@@ -67,11 +69,24 @@ function createMockContext(): { ctx: Context; getHandler: () => RpcHandler; getO
   }
 }
 
+function maintenanceDeps(): Pick<MineruRpcDeps, 'maintenance'> {
+  return {
+    maintenance: {
+      getStatistics: vi.fn(),
+      scanIntegrity: vi.fn(),
+      listQuarantine: vi.fn(),
+      cleanupQuarantine: vi.fn(),
+      gcDryRun: vi.fn(),
+    } as unknown as MineruRpcDeps['maintenance'],
+  }
+}
+
 describe('MinerU RPC (registerRpc)', () => {
   it('registers on /dsh-pdf-mineru-api channel with loopback authority', () => {
     expect(RPC_CHANNEL).toBe('/dsh-pdf-mineru-api')
     const { ctx, getOptions } = createMockContext()
     const deps: MineruRpcDeps = {
+      ...maintenanceDeps(),
       getConfig: vi.fn(() => defaultMinerUConfig()),
       setConfig: vi.fn(async c => c as MinerUConfig),
       probe: vi.fn(async () => ({
@@ -90,6 +105,7 @@ describe('MinerU RPC (registerRpc)', () => {
     const { ctx, getHandler } = createMockContext()
     const config = defaultMinerUConfig()
     const deps: MineruRpcDeps = {
+      ...maintenanceDeps(),
       getConfig: vi.fn(() => config),
       setConfig: vi.fn(async c => c as MinerUConfig),
       probe: vi.fn(async () => ({} as ProbeView)),
@@ -110,6 +126,7 @@ describe('MinerU RPC (registerRpc)', () => {
     const { ctx, getHandler } = createMockContext()
     let storedConfig = defaultMinerUConfig()
     const deps: MineruRpcDeps = {
+      ...maintenanceDeps(),
       getConfig: vi.fn(() => storedConfig),
       setConfig: vi.fn(async (c: unknown) => {
         storedConfig = c as MinerUConfig
@@ -135,26 +152,21 @@ describe('MinerU RPC (registerRpc)', () => {
     }
     expect(deps.setConfig).toHaveBeenCalledTimes(1)
 
-    // 2. Legacy config migration (baseURL + defaultBackend)
-    const legacyPayload = {
-      config: {
-        baseURL: 'http://custom-host:18000',
-        defaultBackend: 'vlm-engine',
-        apiKeyEnv: 'MY_KEY',
-      },
-    }
-    const res2 = await handler('mineru/config.set', legacyPayload, new AbortController().signal)
-    expect(res2.ok).toBe(true)
-    if (res2.ok) {
-      const cfg = (res2.value as { config: MinerUConfig }).config
-      expect(cfg.providers[0]?.baseURL).toBe('http://custom-host:18000')
-      expect(cfg.providers[0]?.apiKeyEnv).toBe('MY_KEY')
-      expect(cfg.defaults.model).toBe('vlm')
-    }
+    // 2. Removed flat config and malformed payloads fail without persistence
+    const flat = await handler('mineru/config.set', { config: {
+      baseURL: 'http://custom-host:18000', defaultBackend: 'vlm-engine',
+    } }, new AbortController().signal)
+    expect(flat).toMatchObject({ ok: false, error: { code: 'invalid-argument' } })
 
-    // 3. Invalid payload returns failure without crashing
+    // 3. Invalid or missing config returns failure without persisting defaults
     const invalidRes = await handler('mineru/config.set', { config: { activeProvider: 'invalid-id' } }, new AbortController().signal)
     expect(invalidRes.ok).toBe(false)
+    const callsBeforeMissingConfig = vi.mocked(deps.setConfig).mock.calls.length
+    for (const payload of [{}, [], { config: undefined }, { config: null }]) {
+      const missingRes = await handler('mineru/config.set', payload, new AbortController().signal)
+      expect(missingRes).toMatchObject({ ok: false, error: { code: 'invalid-argument' } })
+    }
+    expect(deps.setConfig).toHaveBeenCalledTimes(callsBeforeMissingConfig)
   })
 
   it('handles mineru/probe with unsaved draft provider without calling setConfig', async () => {
@@ -174,6 +186,7 @@ describe('MinerU RPC (registerRpc)', () => {
 
     const setConfigMock = vi.fn()
     const deps: MineruRpcDeps = {
+      ...maintenanceDeps(),
       getConfig: vi.fn(() => defaultMinerUConfig()),
       setConfig: setConfigMock,
       probe: probeMock,
@@ -203,17 +216,90 @@ describe('MinerU RPC (registerRpc)', () => {
       expect(view.queue?.queued).toBe(2)
     }
 
-    // Probing a draft MUST NOT persist/call setConfig
+    // Probing a draft MUST NOT persist/call setConfig. Malformed payloads fail before probing.
     expect(setConfigMock).not.toHaveBeenCalled()
+    const malformed = await handler('mineru/probe', 'not-an-object', controller.signal)
+    expect(malformed).toMatchObject({ ok: false, error: { code: 'invalid-argument' } })
+    expect(probeMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('exposes bounded read-only storage statistics and GC preview endpoints', async () => {
+    const { ctx, getHandler } = createMockContext()
+    const stats = { generatedAt: 1, publishedResults: { byteUsage: 10, logicalEntryCount: 1 } }
+    const preview = { generatedAt: 2, dryRun: true, eligible: true, candidateCount: 1, candidateBytes: 10 }
+    const maintenance = {
+      getStatistics: vi.fn(async () => stats),
+      scanIntegrity: vi.fn(),
+      listQuarantine: vi.fn(),
+      cleanupQuarantine: vi.fn(),
+      gcDryRun: vi.fn(async () => preview),
+    }
+    const deps: MineruRpcDeps = {
+      getConfig: vi.fn(() => defaultMinerUConfig()), setConfig: vi.fn(), probe: vi.fn(),
+      maintenance: maintenance as unknown as MineruRpcDeps['maintenance'],
+    }
+    registerRpc(ctx, deps)
+    const handler = getHandler()
+    const signal = new AbortController().signal
+
+    expect(await handler('mineru/storage.stats', {}, signal)).toEqual({ ok: true, value: stats })
+    expect(await handler('mineru/storage.gc.preview', { result_limit: 20, candidate_limit: 5 }, signal))
+      .toEqual({ ok: true, value: preview })
+    expect(maintenance.getStatistics).toHaveBeenCalledWith(signal)
+    expect(maintenance.gcDryRun).toHaveBeenCalledWith(expect.objectContaining({
+      resultLimit: 20, candidateLimit: 5, signal,
+    }))
+  })
+
+  it('requires explicit confirmation for destructive maintenance operations', async () => {
+    const { ctx, getHandler } = createMockContext()
+    const cleanup = { generatedAt: 1, dryRun: false, requestedCount: 1, deletedCount: 1, deletedBytes: 10 }
+    const scan = { generatedAt: 1, readOnly: false, isolateInvalid: true, quarantinedCount: 1, scan: { scanned: 1 } }
+    const maintenance = {
+      getStatistics: vi.fn(),
+      scanIntegrity: vi.fn(async () => scan),
+      listQuarantine: vi.fn(),
+      cleanupQuarantine: vi.fn(async () => cleanup),
+      gcDryRun: vi.fn(),
+    }
+    const deps: MineruRpcDeps = {
+      getConfig: vi.fn(() => defaultMinerUConfig()), setConfig: vi.fn(), probe: vi.fn(),
+      maintenance: maintenance as unknown as MineruRpcDeps['maintenance'],
+    }
+    registerRpc(ctx, deps)
+    const handler = getHandler()
+    const signal = new AbortController().signal
+
+    const refusedCleanup = await handler(
+      'mineru/storage.quarantine.cleanup', { entry_ids: ['entry_1'], dry_run: false }, signal,
+    )
+    expect(refusedCleanup).toMatchObject({ ok: false, error: { code: 'invalid-argument' } })
+    expect(maintenance.cleanupQuarantine).not.toHaveBeenCalled()
+
+    const acceptedCleanup = await handler(
+      'mineru/storage.quarantine.cleanup', { entry_ids: ['entry_1'], dry_run: false, confirm: true }, signal,
+    )
+    expect(acceptedCleanup).toEqual({ ok: true, value: cleanup })
+    expect(maintenance.cleanupQuarantine).toHaveBeenCalledWith({ entryIds: ['entry_1'], dryRun: false, signal })
+
+    const refusedIsolation = await handler(
+      'mineru/storage.integrity.scan', { isolate_invalid: true }, signal,
+    )
+    expect(refusedIsolation).toMatchObject({ ok: false, error: { code: 'invalid-argument' } })
+    const acceptedIsolation = await handler(
+      'mineru/storage.integrity.scan', { isolate_invalid: true, confirm: true }, signal,
+    )
+    expect(acceptedIsolation).toEqual({ ok: true, value: scan })
   })
 
   it('sanitizes error diagnostics in probe failure and does not leak credentials', async () => {
     const { ctx, getHandler } = createMockContext()
     const deps: MineruRpcDeps = {
+      ...maintenanceDeps(),
       getConfig: vi.fn(() => defaultMinerUConfig()),
       setConfig: vi.fn(),
       probe: vi.fn(async () => {
-        throw new Error('Connection failed: Bearer secret_token_12345 to https://secret.host/api?token=abc')
+        throw new Error('Connection failed: Bearer secret_token_12345 to https://user:p%40ss@secret.host/token/path?token=abc#fragment')
       }),
     }
 
@@ -224,14 +310,16 @@ describe('MinerU RPC (registerRpc)', () => {
     expect(res.ok).toBe(false)
     if (!res.ok) {
       expect(res.error.message).toContain('Bearer [REDACTED]')
-      expect(res.error.message).not.toContain('secret_token_12345')
-      expect(res.error.message).not.toContain('token=abc')
+      for (const secret of ['secret_token_12345', 'user', 'p%40ss', '/token/path', 'token=abc', 'fragment']) {
+        expect(res.error.message).not.toContain(secret)
+      }
     }
   })
 
   it('returns not-found for unknown RPC endpoints', async () => {
     const { ctx, getHandler } = createMockContext()
     const deps: MineruRpcDeps = {
+      ...maintenanceDeps(),
       getConfig: vi.fn(() => defaultMinerUConfig()),
       setConfig: vi.fn(),
       probe: vi.fn(),
@@ -249,6 +337,14 @@ describe('MinerU RPC (registerRpc)', () => {
 })
 
 describe('Client UI Pure Helpers (SettingsPage)', () => {
+  it('formats storage byte counters without unsafe or shifting values', () => {
+    expect(formatBytes(0)).toBe('0 B')
+    expect(formatBytes(1024)).toBe('1.00 KiB')
+    expect(formatBytes(10 * 1024 * 1024)).toBe('10.0 MiB')
+    expect(formatBytes(Number.MAX_SAFE_INTEGER, true)).toMatch(/^>= /)
+    expect(formatBytes(-1)).toBe('N/A')
+  })
+
   it('switchProviderType converts between self-hosted-v2 and official-v4 preserving IDs and cleaning invalid fields', () => {
     const selfHosted: SelfHostedV2Config = {
       id: asProviderConfigId('mp_primary'),
@@ -286,6 +382,22 @@ describe('Client UI Pure Helpers (SettingsPage)', () => {
     expect(switchProviderType(selfHosted, 'self-hosted-v2')).toBe(selfHosted)
   })
 
+  it('normalizes defaults to the active official provider capabilities', () => {
+    const base = defaultMinerUConfig()
+    const provider: OfficialV4Config = {
+      id: asProviderConfigId('mp_official'), type: 'official-v4',
+      baseURL: 'https://mineru.net/api/v4', apiKeyEnv: 'TOKEN',
+      models: ['vlm'], configuredVersion: 'v4',
+    }
+    const invalidDraft = {
+      ...base, activeProvider: provider.id, providers: [provider],
+      defaults: { ...base.defaults, model: 'pipeline' as const, parseMethod: 'txt' as const },
+    }
+    expect(normalizeProviderDefaults(invalidDraft, provider).defaults).toMatchObject({
+      model: 'vlm', parseMethod: 'auto', ocr: false,
+    })
+  })
+
   it('patchActiveProvider updates the active provider in config.providers', () => {
     const config = defaultMinerUConfig()
     const updated = patchActiveProvider(config, {
@@ -312,5 +424,9 @@ describe('Client UI Pure Helpers (SettingsPage)', () => {
     })
     expect(withPolling.polling.pollIntervalMs).toBe(5000)
     expect(withPolling.polling.pollTimeoutMs).toBe(config.polling.pollTimeoutMs)
+
+    const withRetry = updateConfigSection(config, 'retry', { maxAttempts: 4 })
+    expect(withRetry.retry.maxAttempts).toBe(4)
+    expect(withRetry.retry.maxDelayMs).toBe(config.retry.maxDelayMs)
   })
 })

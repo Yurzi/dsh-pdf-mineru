@@ -1,12 +1,15 @@
 /**
- * process-lock.ts — Single-process storageRoot lock with stale PID cleanup.
+ * process-lock.ts — Fail-closed single-process storageRoot lock.
  *
  * Prevents multiple concurrent DSH processes from mutating the same storageRoot.
- * Dead process locks (ESRCH) are safely reclaimed; active locks throw STORAGE_LOCKED.
+ * Lock authority is a Linux abstract Unix socket, which the OS releases on
+ * process death. The pathname file is ownership metadata only and can safely be
+ * replaced after socket acquisition.
  */
 
-import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { createServer, type Server } from 'node:net'
+import { chmod, mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { throwMinerU } from '../domain/errors.js'
 import type { StoragePaths } from './paths.js'
@@ -36,26 +39,18 @@ function parseLockPayload(raw: string): ProcessLockPayload {
   }
 }
 
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (err: unknown) {
-    const nodeErr = err as NodeJS.ErrnoException
-    if (nodeErr.code === 'ESRCH') return false
-    if (nodeErr.code === 'EPERM') return true
-    return false
-  }
-}
 
 export class ProcessLock {
   private readonly lockFilePath: string
+  private readonly socketName: string
   private readonly ownerToken: string
+  private server: Server | undefined
   private acquired = false
 
   constructor(public readonly paths: StoragePaths) {
     this.lockFilePath = paths.processLockFile()
+    const rootHash = createHash('sha256').update(paths.root).digest('hex').slice(0, 32)
+    this.socketName = `\0dsh-pdf-mineru-${rootHash}`
     this.ownerToken = `owner_${randomUUID().replace(/-/g, '')}`
   }
 
@@ -67,76 +62,63 @@ export class ProcessLock {
     if (this.acquired) return
     signal?.throwIfAborted()
 
-    await mkdir(this.paths.root, { recursive: true })
-
+    await mkdir(this.paths.root, { recursive: true, mode: 0o700 })
+    await chmod(this.paths.root, 0o700)
     const payload: ProcessLockPayload = {
       pid: process.pid,
       ownerToken: this.ownerToken,
       createdAt: Date.now(),
       hostname: hostname(),
     }
-    const data = JSON.stringify(payload, null, 2)
 
-    for (let attempt = 0; attempt < 3; attempt++) {
-      signal?.throwIfAborted()
+    if (process.platform !== 'linux') {
       try {
-        await writeFile(this.lockFilePath, data, { flag: 'wx', mode: 0o600 })
+        await writeFile(this.lockFilePath, JSON.stringify(payload, null, 2), { flag: 'wx', mode: 0o600 })
         this.acquired = true
         return
-      } catch (err: unknown) {
-        const nodeErr = err as NodeJS.ErrnoException
-        if (nodeErr.code !== 'EEXIST') {
-          throw err
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+          throwMinerU('STORAGE_LOCKED', 'MinerU storage is already locked by another process')
         }
-
-        // Lock file exists — check if existing lock is active or stale
-        let existing: ProcessLockPayload
-        try {
-          existing = parseLockPayload(await readFile(this.lockFilePath, 'utf8'))
-        } catch {
-          throwMinerU(
-            'STORAGE_LOCKED',
-            `MinerU storage root "${this.paths.root}" has an invalid lock file; refusing unsafe recovery`,
-          )
-        }
-
-        if (isProcessAlive(existing.pid)) {
-          if (existing.pid === process.pid && existing.ownerToken === this.ownerToken) {
-            this.acquired = true
-            return
-          }
-          throwMinerU(
-            'STORAGE_LOCKED',
-            `MinerU storage root "${this.paths.root}" is locked by active process PID ${String(existing.pid)} (host: ${existing.hostname})`,
-          )
-        }
-
-        // A well-formed lock whose owner is definitely dead may be reclaimed.
-        try {
-          await unlink(this.lockFilePath)
-        } catch (unlinkErr: unknown) {
-          const uErr = unlinkErr as NodeJS.ErrnoException
-          if (uErr.code !== 'ENOENT') throw unlinkErr
-        }
+        throw error
       }
     }
-
-    // Final attempt if loop exhausted
+    const server = createServer()
     try {
-      await writeFile(this.lockFilePath, data, { flag: 'wx' })
-      this.acquired = true
-    } catch (finalErr: unknown) {
-      const nodeErr = finalErr as NodeJS.ErrnoException
-      if (nodeErr.code === 'EEXIST') {
-        throwMinerU('STORAGE_LOCKED', `Failed to acquire lock on "${this.paths.root}"`)
+      await new Promise<void>((resolve, reject) => {
+        const onError = (error: Error): void => { server.removeListener('listening', onListening); reject(error) }
+        const onListening = (): void => { server.removeListener('error', onError); resolve() }
+        server.once('error', onError)
+        server.once('listening', onListening)
+        server.listen(this.socketName)
+      })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') {
+        throwMinerU('STORAGE_LOCKED', 'MinerU storage is already locked by another process')
       }
-      throw finalErr
+      throw error
+    }
+    server.unref()
+    this.server = server
+    try {
+      await writeFile(this.lockFilePath, JSON.stringify(payload, null, 2), { flag: 'w', mode: 0o600 })
+      await chmod(this.lockFilePath, 0o600)
+      this.acquired = true
+    } catch (error) {
+      this.server = undefined
+      await new Promise<void>(resolve => server.close(() => resolve()))
+      throw error
     }
   }
 
   async release(): Promise<void> {
     if (!this.acquired) return
     this.acquired = false
+    const server = this.server
+    this.server = undefined
+    if (server !== undefined) {
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    }
 
     try {
       const raw = await readFile(this.lockFilePath, 'utf8')

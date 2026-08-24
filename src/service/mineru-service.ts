@@ -19,20 +19,23 @@ import {
   type MinerUJobRecord,
   type MinerUJobState,
 } from '../domain/job.js'
-import type { ArtifactKind, ParseRequestInput, PreparedParseRequest } from '../domain/request.js'
+import type { ParseRequestInput, PreparedParseRequest } from '../domain/request.js'
 import type { ArtifactRef, MinerUResultManifest } from '../domain/result.js'
-import type { MinerUProvider, ProviderCallContext, ProviderJobRef, ProviderJobSnapshot } from '../providers/provider.js'
+import type { ProviderCallContext, ProviderJobRef, ProviderJobSnapshot, ProviderRetryEvent } from '../providers/provider.js'
 import { validateProviderCapabilities } from '../providers/provider.js'
 import { ProviderRegistry, type ResolvedProvider } from '../providers/registry.js'
 import { computeCacheKey } from './cache-key.js'
 import { RequestNormalizer, assertSourcesUnchanged } from './request-normalizer.js'
 import { SharedOperationRegistry, type SharedOperation, type SharedOutcome, type SharedSubmission } from './shared-operations.js'
 import type { JobRepository, SessionIdentifier } from '../storage/job-repository.js'
-import type { ResultRepository } from '../storage/result-repository.js'
+import type { ResultRepository, ResultTransaction } from '../storage/result-repository.js'
+import { emitDiagnostic, type MinerUDiagnosticEvent, type MinerUDiagnosticSink } from '../observability.js'
 
 export interface ServiceSession extends SessionIdentifier {
   readonly header: { readonly id: SessionId | string; readonly cwd?: string }
 }
+
+const MAX_POLL_TIMEOUT_MS = 24 * 60 * 60 * 1000
 
 export type CredentialResolver = (reference: string, signal: AbortSignal) => Promise<string | undefined>
 export type SubmissionSource = 'cache' | 'shared-operation' | 'provider'
@@ -110,6 +113,7 @@ export interface MinerUServiceOptions {
   readonly results: ResultRepository
   readonly operations: SharedOperationRegistry
   readonly resolveCredential: CredentialResolver
+  readonly diagnostics?: MinerUDiagnosticSink
 }
 
 function delay(ms: number, signal: AbortSignal): Promise<void> {
@@ -189,12 +193,22 @@ export class MinerUService {
     return this.options.getConfig()
   }
 
-  private async callContext(config: ProviderConfig, signal: AbortSignal): Promise<ProviderCallContext> {
+  private diagnostic(event: MinerUDiagnosticEvent): void {
+    emitDiagnostic(this.options.diagnostics, event)
+  }
+
+  private async callContext(
+    config: ProviderConfig,
+    signal: AbortSignal,
+    operationId?: string,
+    onAccepted?: (ref: ProviderJobRef) => Promise<void>,
+    allowMissingCredential = false,
+  ): Promise<ProviderCallContext> {
     signal.throwIfAborted()
     const reference = config.apiKeyEnv
     const credential = reference === undefined ? undefined : await this.options.resolveCredential(reference, signal)
     signal.throwIfAborted()
-    if (config.type === 'official-v4' && credential === undefined) {
+    if (config.type === 'official-v4' && credential === undefined && !allowMissingCredential) {
       throw new MinerUError(failure('CREDENTIAL_MISSING', `Credential ${config.apiKeyEnv} is not configured`))
     }
     const current = this.config()
@@ -202,6 +216,20 @@ export class MinerUService {
       signal,
       ...(credential === undefined ? {} : { credential }),
       timeoutMs: current.polling.requestTimeoutMs,
+      ...(onAccepted === undefined ? {} : { onAccepted }),
+      retry: {
+        maxRetries: current.retry.maxAttempts - 1,
+        initialDelayMs: current.retry.baseDelayMs,
+        maxDelayMs: current.retry.maxDelayMs,
+        onRetry: (event: ProviderRetryEvent) => {
+          this.diagnostic({
+            level: 'warn', phase: 'provider-retry', provider: event.provider,
+            ...(operationId === undefined ? {} : { operationId }),
+            providerOperation: event.operation, attempt: event.attempt, maxAttempts: event.maxRetries + 1,
+            delayMs: event.delayMs, reason: event.reason, ...(event.status === undefined ? {} : { status: event.status }),
+          })
+        },
+      },
       limits: {
         maxApiResponseBytes: current.limits.maxApiResponseBytes,
         maxZipDownloadBytes: current.limits.maxZipDownloadBytes,
@@ -213,16 +241,9 @@ export class MinerUService {
     }
   }
 
-  private legacyBackendModels(config: ProviderConfig): Readonly<Record<string, 'pipeline' | 'vlm'>> {
-    if (config.type === 'self-hosted-v2') {
-      return Object.fromEntries(Object.entries(config.modelMap).map(([model, backend]) => [backend, model])) as Readonly<Record<string, 'pipeline' | 'vlm'>>
-    }
-    return { pipeline: 'pipeline', 'vlm-engine': 'vlm', 'hybrid-engine': 'vlm', 'vlm-http-client': 'vlm', 'hybrid-http-client': 'vlm' }
-  }
-
   async probe(signal: AbortSignal, draft?: ProviderConfig): Promise<ProbeView> {
     const resolved = draft === undefined ? this.options.providers.active() : { config: draft, provider: this.options.providers.create(draft) }
-    const result = await resolved.provider.probe(await this.callContext(resolved.config, signal))
+    const result = await resolved.provider.probe(await this.callContext(resolved.config, signal, undefined, undefined, true))
     return {
       available: result.available,
       provider: result.provider,
@@ -249,9 +270,8 @@ export class MinerUService {
     const normalizer = new RequestNormalizer({
       defaults: current.defaults,
       cwd: session.header.cwd,
-      maxFiles: Math.min(current.limits.maxFilesPerRequest, active.provider.capabilities.maxFilesPerSubmission),
+      maxFiles: 1,
       maxFileBytes: Math.min(current.limits.maxFileBytes, active.provider.capabilities.maxFileBytes ?? current.limits.maxFileBytes),
-      legacyBackendModels: this.legacyBackendModels(active.config),
     })
     const prepared = await normalizer.normalize(input, signal)
     if (prepared.request.files.length !== 1) {
@@ -269,14 +289,22 @@ export class MinerUService {
       if (hit !== undefined) {
         const job = this.newJob(sessionId, prepared, active, compatibility, cacheKey, { kind: 'cache-hit' }, hit.id, 'completed')
         await this.options.jobs.create(session, job)
+        this.diagnostic({
+          level: 'info', phase: 'cache-hit', provider: active.provider.id, jobId: job.id,
+          bytes: prepared.request.files.reduce((total, source) => total + source.bytes, 0), cacheHit: true,
+        })
         return submitView(job)
       }
     }
 
     let job = this.newJob(sessionId, prepared, active, compatibility, cacheKey, { kind: 'provider' }, undefined, 'queued')
     await this.options.jobs.create(session, job)
+    this.diagnostic({
+      level: 'info', phase: 'job-created', provider: active.provider.id, jobId: job.id,
+      bytes: prepared.request.files.reduce((total, source) => total + source.bytes, 0), cacheHit: false,
+    })
     const acquired = this.options.operations.acquire(
-      cacheKey, current.polling.operationTimeoutMs,
+      cacheKey, active.config.id, current.polling.operationTimeoutMs,
       operation => this.runOperation(operation, prepared, active, compatibility),
     )
     if (!acquired.created) {
@@ -285,7 +313,12 @@ export class MinerUService {
         resolution: { kind: 'shared-operation', operationId: acquired.operation.id },
       }))
     }
-    acquired.operation.attach({ jobId: job.id, sessionId, session })
+    acquired.operation.attach({ jobId: job.id, session })
+    job = await this.replayOperation(session, job.id, acquired.operation)
+    this.diagnostic({
+      level: 'debug', phase: 'shared-operation', provider: active.provider.id, jobId: job.id,
+      operationId: acquired.operation.id, waiterCount: acquired.operation.waiters.size,
+    })
 
     try {
       const submitted = await acquired.operation.waitForSubmission(signal)
@@ -327,21 +360,67 @@ export class MinerUService {
     }
   }
 
-  private async syncSubmission(session: ServiceSession, jobId: MinerUJobId, submitted: SharedSubmission): Promise<MinerUJobRecord> {
+  private async syncAcceptedRef(
+    session: ServiceSession, jobId: MinerUJobId, ref: ProviderJobRef,
+  ): Promise<MinerUJobRecord> {
     return this.options.jobs.update(session, jobId, current => {
       if (isTerminalJobState(current.state)) return current
-      const ref = submitted.ref
-      const mayAdvance = current.state === 'queued' || current.state === 'uploading' || current.state === 'processing'
       return {
         ...current,
-        state: submitted.state === 'failed' ? 'failed' : mayAdvance ? 'processing' : current.state,
-        resolution: ref === undefined ? current.resolution : withProviderRef(current.resolution, ref),
+        state: current.state === 'queued' ? 'uploading' : current.state,
+        resolution: withProviderRef(current.resolution, ref),
         files: current.files.map(file => ({
-          ...file,
-          state: submitted.state === 'failed' ? 'failed' : file.state === 'queued' || file.state === 'uploading' ? 'processing' : file.state,
+          ...file, state: file.state === 'queued' ? 'uploading' : file.state,
         })),
       }
     })
+  }
+
+  private async syncSubmission(session: ServiceSession, jobId: MinerUJobId, submitted: SharedSubmission): Promise<MinerUJobRecord> {
+    return this.options.jobs.update(session, jobId, current => {
+      if (isTerminalJobState(current.state)) return current
+      const resolution = submitted.ref === undefined ? current.resolution : withProviderRef(current.resolution, submitted.ref)
+      if (submitted.resultId !== undefined) {
+        return {
+          ...current, state: 'completed', resolution, resultId: submitted.resultId,
+          files: current.files.map(file => ({ ...file, state: 'completed', resultId: submitted.resultId })),
+        }
+      }
+      if (submitted.state === 'failed') {
+        const cause = submitted.failure ?? failure('REMOTE_PARSE_FAILED', 'Remote parse failed')
+        return {
+          ...current, state: 'failed', resolution, failure: cause,
+          files: current.files.map(file => ({ ...file, state: 'failed', failure: cause })),
+        }
+      }
+      return {
+        ...current,
+        state: current.state === 'queued' || current.state === 'uploading' ? 'processing' : current.state,
+        resolution,
+        files: current.files.map(file => ({
+          ...file,
+          state: file.state === 'queued' || file.state === 'uploading' ? 'processing' : file.state,
+        })),
+      }
+    })
+  }
+
+  private async replayOperation(
+    session: ServiceSession, jobId: MinerUJobId, operation: SharedOperation,
+  ): Promise<MinerUJobRecord> {
+    if (operation.acceptedRef !== undefined) {
+      await this.syncAcceptedRef(session, jobId, operation.acceptedRef)
+    }
+    if (operation.submittedValue !== undefined) {
+      await this.syncSubmission(session, jobId, operation.submittedValue)
+    }
+    const outcome = operation.settledValue
+    if (outcome?.resultId !== undefined) {
+      await this.syncSubmission(session, jobId, {
+        state: outcome.state, resultId: outcome.resultId,
+      })
+    }
+    return this.options.jobs.require(session, jobId)
   }
 
   private async updateWaiters(
@@ -379,16 +458,25 @@ export class MinerUService {
     recoveryRef?: ProviderJobRef,
   ): Promise<SharedOutcome> {
     let ref = recoveryRef
+    let transaction: ResultTransaction | undefined
+    const startedAt = Date.now()
+    const requestBytes = prepared.request.files.reduce((total, source) => total + source.bytes, 0)
     try {
-      const cached = this.config().storage.cacheEnabled
+      const cached = recoveryRef !== undefined || this.config().storage.cacheEnabled
         ? await this.options.results.get(operation.cacheKey, prepared.request.requiredArtifacts, operation.controller.signal)
         : undefined
       if (cached !== undefined) {
         await this.updateWaiters(operation, current => ({
-          ...current, state: 'completed', resolution: { kind: 'cache-hit' }, resultId: cached.id,
+          ...current, state: 'completed',
+          resolution: ref === undefined ? { kind: 'cache-hit' } : withProviderRef(current.resolution, ref),
+          resultId: cached.id,
           files: current.files.map(file => ({ ...file, state: 'completed', resultId: cached.id })),
         }))
-        operation.markSubmitted({ state: 'completed' })
+        operation.markSubmitted({ state: 'completed', resultId: cached.id })
+        this.diagnostic({
+          level: 'info', phase: 'cache-hit', provider: resolved.provider.id, operationId: operation.id,
+          durationMs: Date.now() - startedAt, bytes: requestBytes, cacheHit: true, waiterCount: operation.waiters.size,
+        })
         return { state: 'completed', resultId: cached.id }
       }
 
@@ -398,59 +486,121 @@ export class MinerUService {
           ...current, state: 'uploading', files: current.files.map(file => ({ ...file, state: 'uploading' })),
         }))
         await assertSourcesUnchanged(prepared.sources, operation.controller.signal)
+        this.diagnostic({
+          level: 'info', phase: 'uploading', provider: resolved.provider.id, operationId: operation.id,
+          bytes: requestBytes, waiterCount: operation.waiters.size,
+        })
         const submission = await resolved.provider.submit(
-          prepared.request, prepared.sources, await this.callContext(resolved.config, operation.controller.signal),
+          prepared.request, prepared.sources,
+          await this.callContext(
+            resolved.config, operation.controller.signal, operation.id,
+            async accepted => {
+              ref = accepted
+              operation.markAccepted(accepted)
+              await this.updateWaiters(operation, current => isTerminalJobState(current.state) ? current : ({
+                ...current,
+                state: current.state === 'queued' ? 'uploading' : current.state,
+                resolution: withProviderRef(current.resolution, accepted),
+                files: current.files.map(file => ({
+                  ...file, state: file.state === 'queued' ? 'uploading' : file.state,
+                })),
+              }))
+            },
+          ),
         )
         ref = submission.ref
         snapshot = { state: submission.state, files: submission.files }
       } else {
-        snapshot = await resolved.provider.inspect(ref, await this.callContext(resolved.config, operation.controller.signal))
+        snapshot = await resolved.provider.inspect(ref, await this.callContext(resolved.config, operation.controller.signal, operation.id))
       }
 
+      if (ref === undefined) throw new TypeError('Provider submission did not produce a durable reference')
+      const durableRef = ref
+      const submissionFailure = snapshot.files.find(file => file.failure)?.failure
+        ?? failure('REMOTE_PARSE_FAILED', 'Remote parse failed')
       await this.updateWaiters(operation, current => isTerminalJobState(current.state) ? current : ({
         ...current,
-        state: snapshot.state === 'failed' ? 'failed' : 'processing',
-        resolution: withProviderRef(current.resolution, ref!),
+        state: snapshot.state === 'failed' ? 'failed' : current.state === 'collecting' ? 'collecting' : 'processing',
+        resolution: withProviderRef(current.resolution, durableRef),
         files: this.snapshotFiles(current, snapshot),
-        ...(snapshot.state === 'failed' ? { failure: snapshot.files.find(file => file.failure)?.failure ?? failure('REMOTE_PARSE_FAILED', 'Remote parse failed') } : {}),
+        ...(snapshot.state === 'failed' ? { failure: submissionFailure } : {}),
       }))
-      operation.markSubmitted({ ref, state: snapshot.state === 'failed' ? 'failed' : 'processing' })
-      if (snapshot.state === 'failed') return { state: 'failed' }
+      operation.markSubmitted({
+        ref: durableRef, state: snapshot.state === 'failed' ? 'failed' : 'processing',
+        ...(snapshot.state === 'failed' ? { failure: submissionFailure } : {}),
+      })
+      this.diagnostic({
+        level: snapshot.state === 'failed' ? 'warn' : 'info', phase: 'provider-accepted',
+        provider: resolved.provider.id, operationId: operation.id, bytes: requestBytes, waiterCount: operation.waiters.size,
+      })
+      if (snapshot.state === 'failed') {
+        this.diagnostic({
+          level: submissionFailure.retryable ? 'warn' : 'error', phase: 'failed', provider: resolved.provider.id,
+          operationId: operation.id, durationMs: Date.now() - startedAt, bytes: requestBytes,
+          waiterCount: operation.waiters.size, errorCode: submissionFailure.code, retryable: submissionFailure.retryable,
+        })
+        return { state: 'failed' }
+      }
+      this.diagnostic({
+        level: 'info', phase: 'processing', provider: resolved.provider.id, operationId: operation.id,
+        durationMs: Date.now() - startedAt, bytes: requestBytes, waiterCount: operation.waiters.size,
+      })
 
       while (snapshot.state !== 'completed' && snapshot.state !== 'partially-completed') {
         await delay(this.config().polling.pollIntervalMs, operation.controller.signal)
-        snapshot = await resolved.provider.inspect(ref, await this.callContext(resolved.config, operation.controller.signal))
+        snapshot = await resolved.provider.inspect(durableRef, await this.callContext(resolved.config, operation.controller.signal, operation.id))
+        const pollingFailure = snapshot.files.find(file => file.failure)?.failure
+          ?? failure('REMOTE_PARSE_FAILED', 'Remote parse failed')
         await this.updateWaiters(operation, current => isTerminalJobState(current.state) ? current : ({
           ...current,
-          state: snapshot.state === 'failed' ? 'failed' : 'processing',
+          state: snapshot.state === 'failed' ? 'failed' : current.state === 'collecting' ? 'collecting' : 'processing',
+          resolution: withProviderRef(current.resolution, durableRef),
           files: this.snapshotFiles(current, snapshot),
-          ...(snapshot.state === 'failed' ? { failure: snapshot.files.find(file => file.failure)?.failure ?? failure('REMOTE_PARSE_FAILED', 'Remote parse failed') } : {}),
+          ...(snapshot.state === 'failed' ? { failure: pollingFailure } : {}),
         }))
-        if (snapshot.state === 'failed') return { state: 'failed' }
+        if (snapshot.state === 'failed') {
+          this.diagnostic({
+            level: pollingFailure.retryable ? 'warn' : 'error', phase: 'failed', provider: resolved.provider.id,
+            operationId: operation.id, durationMs: Date.now() - startedAt, bytes: requestBytes,
+            waiterCount: operation.waiters.size, errorCode: pollingFailure.code, retryable: pollingFailure.retryable,
+          })
+          return { state: 'failed' }
+        }
       }
 
       await this.updateWaiters(operation, current => isTerminalJobState(current.state) ? current : ({ ...current, state: 'collecting' }))
-      const transaction = this.options.results.beginTransaction(
+      this.diagnostic({
+        level: 'info', phase: 'collecting', provider: resolved.provider.id, operationId: operation.id,
+        durationMs: Date.now() - startedAt, bytes: requestBytes, waiterCount: operation.waiters.size,
+      })
+      transaction = this.options.results.beginTransaction(
         operation.id, prepared.request,
         { providerId: resolved.provider.id, providerConfigId: resolved.config.id, compatibilityKey: compatibility },
         operation.controller.signal,
       )
       const collection = await resolved.provider.collect(
-        ref, prepared.request, transaction, await this.callContext(resolved.config, operation.controller.signal),
+        durableRef, prepared.request, transaction, await this.callContext(resolved.config, operation.controller.signal, operation.id),
       )
       const file = prepared.request.files[0]
       const collected = collection.files.find(candidate => candidate.fileId === file.fileId)
       if (collected === undefined || collected.failure !== undefined) {
         await transaction.abort()
+        transaction = undefined
         const cause = collected?.failure ?? failure('REMOTE_PARSE_FAILED', 'Provider did not collect the requested file')
         await this.updateWaiters(operation, current => isTerminalJobState(current.state) ? current : ({
           ...current, state: 'failed', failure: cause,
           files: current.files.map(status => ({ ...status, state: 'failed', failure: cause })),
         }))
+        this.diagnostic({
+          level: cause.retryable ? 'warn' : 'error', phase: 'failed', provider: resolved.provider.id,
+          operationId: operation.id, durationMs: Date.now() - startedAt, bytes: requestBytes,
+          waiterCount: operation.waiters.size, errorCode: cause.code, retryable: cause.retryable,
+        })
         return { state: 'failed' }
       }
       const manifest = transaction.buildManifest(file, collected.artifacts)
       const published = await this.options.results.commitTransaction(transaction, manifest, operation.controller.signal)
+      transaction = undefined
       await this.updateWaiters(operation, current => {
         if (isTerminalJobState(current.state)) return current
         const { failure: _oldFailure, ...stable } = current
@@ -462,15 +612,25 @@ export class MinerUService {
           }),
         }
       })
+      this.diagnostic({
+        level: 'info', phase: 'published', provider: resolved.provider.id, operationId: operation.id,
+        durationMs: Date.now() - startedAt, bytes: requestBytes, cacheHit: false, waiterCount: operation.waiters.size,
+      })
       return { state: 'completed', resultId: published.resultId }
     } catch (error) {
+      await transaction?.abort().catch(() => undefined)
       const normalized = ref === undefined && operation.controller.signal.aborted
         ? failure('INTERRUPTED_UPLOAD', 'Upload was interrupted before a recoverable provider reference was stored', true)
         : toMinerUFailure(error)
+      this.diagnostic({
+        level: normalized.retryable ? 'warn' : 'error', phase: 'failed', provider: resolved.provider.id,
+        operationId: operation.id, durationMs: Date.now() - startedAt, bytes: requestBytes,
+        waiterCount: operation.waiters.size, errorCode: normalized.code, retryable: normalized.retryable,
+      })
       await this.updateWaiters(operation, current => {
         if (isTerminalJobState(current.state)) return current
         if (ref !== undefined && normalized.retryable) {
-          return { ...current, state: 'processing', resolution: withProviderRef(current.resolution, ref), failure: normalized }
+          return { ...current, resolution: withProviderRef(current.resolution, ref), failure: normalized }
         }
         return {
           ...current, state: 'failed', failure: normalized,
@@ -484,9 +644,10 @@ export class MinerUService {
   async status(session: ServiceSession, jobId: string, signal: AbortSignal): Promise<StatusView> {
     let job = await this.options.jobs.require(session, jobId)
     if (isTerminalJobState(job.state)) return statusView(job)
-    const active = this.options.operations.get(job.cacheKey)
+    const active = this.options.operations.get(job.cacheKey, job.providerConfigId)
     if (active !== undefined) {
-      active.attach({ jobId: job.id, sessionId: job.sessionId, session })
+      active.attach({ jobId: job.id, session })
+      job = await this.replayOperation(session, job.id, active)
       return statusView(job)
     }
 
@@ -503,10 +664,15 @@ export class MinerUService {
     const resolved = await this.options.providers.resolveForJob(job)
     const prepared: PreparedParseRequest = { request: job.request, sources: [] }
     const acquired = this.options.operations.acquire(
-      job.cacheKey, this.config().polling.operationTimeoutMs,
+      job.cacheKey, job.providerConfigId, this.config().polling.operationTimeoutMs,
       operation => this.runOperation(operation, prepared, resolved, job.providerCompatibilityKey, ref),
     )
-    acquired.operation.attach({ jobId: job.id, sessionId: job.sessionId, session })
+    acquired.operation.attach({ jobId: job.id, session })
+    job = await this.replayOperation(session, job.id, acquired.operation)
+    this.diagnostic({
+      level: 'debug', phase: 'shared-operation', provider: resolved.provider.id, jobId: job.id,
+      operationId: acquired.operation.id, waiterCount: acquired.operation.waiters.size,
+    })
     try { await acquired.operation.waitForSubmission(signal) } catch (error) { if (signal.aborted) throw error }
     job = await this.options.jobs.require(session, job.id)
     return statusView(job)
@@ -618,14 +784,17 @@ export class MinerUService {
     if (submitted.state === 'completed' || submitted.state === 'partially-completed') return this.result(session, submitted.job_id, signal)
     if (submitted.state === 'failed') return this.status(session, submitted.job_id, signal)
     const job = await this.options.jobs.require(session, submitted.job_id)
-    let operation = this.options.operations.get(job.cacheKey)
+    let operation = this.options.operations.get(job.cacheKey, job.providerConfigId)
     if (operation === undefined) {
       await this.status(session, job.id, signal)
-      operation = this.options.operations.get(job.cacheKey)
+      operation = this.options.operations.get(job.cacheKey, job.providerConfigId)
     }
     if (operation === undefined) return this.status(session, job.id, signal)
 
     const timeout = pollTimeoutMs ?? this.config().polling.pollTimeoutMs
+    if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > MAX_POLL_TIMEOUT_MS) {
+      throw new MinerUError(failure('INVALID_REQUEST', 'poll timeout is outside the supported range'))
+    }
     const waitController = new AbortController()
     const onAbort = (): void => waitController.abort(signal.reason)
     signal.addEventListener('abort', onAbort, { once: true })

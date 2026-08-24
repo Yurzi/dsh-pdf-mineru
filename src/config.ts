@@ -1,7 +1,7 @@
 import { homedir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
 import { asProviderConfigId, type ProviderConfigId } from './domain/ids.js'
-import type { ArtifactKind, MinerUModel, ParseDefaults, ParseMethod } from './domain/request.js'
+import type { ArtifactKind, MinerUModel, ParseDefaults } from './domain/request.js'
 
 export interface SelfHostedV2Config {
   readonly id: ProviderConfigId
@@ -38,6 +38,12 @@ export interface PollingConfig {
   readonly operationTimeoutMs: number
 }
 
+export interface RetryConfig {
+  readonly maxAttempts: number
+  readonly baseDelayMs: number
+  readonly maxDelayMs: number
+}
+
 export interface OutputConfig {
   readonly maxInlineChars: number
 }
@@ -60,20 +66,9 @@ export interface MinerUConfig {
   readonly defaults: ParseDefaults
   readonly storage: StorageConfig
   readonly polling: PollingConfig
+  readonly retry: RetryConfig
   readonly output: OutputConfig
   readonly limits: SecurityLimits
-}
-
-export interface LegacyMinerUConfig {
-  readonly baseURL?: string
-  readonly apiKeyEnv?: string
-  readonly defaultBackend?: string
-  readonly defaultParseMethod?: ParseMethod
-  readonly defaultLang?: string
-  readonly pollIntervalMs?: number
-  readonly pollTimeoutMs?: number
-  readonly requestTimeoutMs?: number
-  readonly maxMdOutputChars?: number
 }
 
 function dshHome(): string {
@@ -97,6 +92,7 @@ export function defaultMinerUConfig(): MinerUConfig {
     defaults: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true, artifacts: ['markdown'] },
     storage: { storageRoot: join(dshHome(), 'dsh-pdf-mineru', 'v1'), cacheEnabled: true, retainSources: false, stagingTtlMs: 24 * 60 * 60 * 1000 },
     polling: { pollIntervalMs: 2000, pollTimeoutMs: 600000, requestTimeoutMs: 60000, operationTimeoutMs: 60 * 60 * 1000 },
+    retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 10000 },
     output: { maxInlineChars: 200000 },
     limits: {
       maxFilesPerRequest: 1,
@@ -210,6 +206,7 @@ function parseCanonical(input: Record<string, unknown>, fallback: MinerUConfig):
   const defaults = record(input.defaults ?? {}, 'defaults')
   const storage = record(input.storage ?? {}, 'storage')
   const polling = record(input.polling ?? {}, 'polling')
+  const retry = record(input.retry ?? {}, 'retry')
   const output = record(input.output ?? {}, 'output')
   const limits = record(input.limits ?? {}, 'limits')
   const model = defaults.model === undefined ? fallback.defaults.model : defaults.model
@@ -250,6 +247,11 @@ function parseCanonical(input: Record<string, unknown>, fallback: MinerUConfig):
       requestTimeoutMs: positive(polling.requestTimeoutMs, fallback.polling.requestTimeoutMs, 'polling.requestTimeoutMs'),
       operationTimeoutMs: positive(polling.operationTimeoutMs, fallback.polling.operationTimeoutMs, 'polling.operationTimeoutMs'),
     },
+    retry: {
+      maxAttempts: boundedPositive(retry.maxAttempts, fallback.retry.maxAttempts, 'retry.maxAttempts', 1, 10),
+      baseDelayMs: boundedPositive(retry.baseDelayMs, fallback.retry.baseDelayMs, 'retry.baseDelayMs', 1, 60_000),
+      maxDelayMs: boundedPositive(retry.maxDelayMs, fallback.retry.maxDelayMs, 'retry.maxDelayMs', 1, 300_000),
+    },
     output: {
       maxInlineChars: boundedPositive(output.maxInlineChars, fallback.output.maxInlineChars, 'output.maxInlineChars', 1024, 1_000_000),
     },
@@ -269,6 +271,9 @@ function parseCanonical(input: Record<string, unknown>, fallback: MinerUConfig):
     if (!active.models.includes(result.defaults.model)) throw new TypeError('active official provider does not support defaults.model')
     if (result.defaults.parseMethod === 'txt') throw new TypeError('official-v4 cannot use txt as defaults.parseMethod')
   }
+  if (result.retry.baseDelayMs > result.retry.maxDelayMs) {
+    throw new TypeError('retry.baseDelayMs cannot exceed retry.maxDelayMs')
+  }
   if (result.limits.maxZipEntryBytes > result.limits.maxZipTotalBytes) {
     throw new TypeError('maxZipEntryBytes cannot exceed maxZipTotalBytes')
   }
@@ -279,30 +284,14 @@ export function migrateConfig(value: unknown): MinerUConfig {
   const fallback = defaultMinerUConfig()
   if (value === undefined || value === null) return fallback
   const input = record(value, 'config')
-  if (input.providers !== undefined || input.activeProvider !== undefined) return parseCanonical(input, fallback)
-
-  const baseURL = baseUrl(input.baseURL, fallback.providers[0]!.baseURL, true, 'baseURL')
-  const defaultBackend = text(input.defaultBackend, 'pipeline', 'defaultBackend')
-  const defaultParseMethod = input.defaultParseMethod ?? 'auto'
-  if (defaultParseMethod !== 'auto' && defaultParseMethod !== 'txt' && defaultParseMethod !== 'ocr') throw new TypeError('defaultParseMethod is invalid')
-  const id = asProviderConfigId('mp_self_hosted')
-  const vlmBackend = defaultBackend === 'pipeline' ? 'vlm-engine' : defaultBackend
-  return parseCanonical({
-    activeProvider: id,
-    providers: [{
-      id, type: 'self-hosted-v2', baseURL, apiKeyEnv: input.apiKeyEnv,
-      modelMap: { pipeline: defaultBackend === 'pipeline' ? defaultBackend : 'pipeline', vlm: vlmBackend },
-      allowInsecureHttp: new URL(baseURL).protocol === 'http:',
-    }],
-    defaults: {
-      model: defaultBackend === 'pipeline' ? 'pipeline' : 'vlm',
-      ocr: defaultParseMethod === 'ocr',
-      parseMethod: defaultParseMethod,
-      language: input.defaultLang, formula: true, table: true, artifacts: ['markdown'],
-    },
-    polling: { pollIntervalMs: input.pollIntervalMs, pollTimeoutMs: input.pollTimeoutMs, requestTimeoutMs: input.requestTimeoutMs },
-    output: { maxInlineChars: input.maxMdOutputChars },
-  }, fallback)
+  const allowed = new Set([
+    'schemaVersion', 'activeProvider', 'providers', 'defaults', 'storage',
+    'polling', 'retry', 'output', 'limits',
+  ])
+  for (const key of Object.keys(input)) {
+    if (!allowed.has(key)) throw new TypeError(`config contains unsupported property ${key}`)
+  }
+  return parseCanonical(input, fallback)
 }
 
 export function providerById(config: MinerUConfig, id: ProviderConfigId): ProviderConfig | undefined {

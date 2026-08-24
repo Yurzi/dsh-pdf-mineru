@@ -1,4 +1,4 @@
-import z from '@deepseek-ai/schemastery'
+import z from 'schemastery'
 import type { Context } from 'cordis'
 import { migrateConfig, type MinerUConfig, type ProviderConfig } from './config.js'
 import { ProviderRegistry } from './providers/registry.js'
@@ -8,8 +8,10 @@ import { StoragePaths } from './storage/paths.js'
 import { ProcessLock } from './storage/process-lock.js'
 import { JobRepository } from './storage/job-repository.js'
 import { ResultRepository } from './storage/result-repository.js'
+import { StorageMaintenanceService } from './storage/maintenance-service.js'
 import { registerTools } from './tools.js'
 import { registerRpc } from './rpc.js'
+import { createStructuredDiagnosticSink } from './observability.js'
 import type {} from '@deepseek-ai/dsh-client-connection'
 
 export const name = 'dsh-pdf-mineru'
@@ -35,7 +37,6 @@ const ProviderSchema = z.union([
   }),
 ])
 
-/** Entry schema accepts both the provider config and the legacy flat config. */
 export const Config = z.object({
   schemaVersion: z.number(),
   activeProvider: z.string(),
@@ -61,6 +62,11 @@ export const Config = z.object({
     requestTimeoutMs: z.number(),
     operationTimeoutMs: z.number(),
   }),
+  retry: z.object({
+    maxAttempts: z.number(),
+    baseDelayMs: z.number(),
+    maxDelayMs: z.number(),
+  }),
   output: z.object({ maxInlineChars: z.number() }),
   limits: z.object({
     maxFilesPerRequest: z.number(),
@@ -72,15 +78,6 @@ export const Config = z.object({
     maxZipTotalBytes: z.number(),
     maxZipCompressionRatio: z.number(),
   }),
-  baseURL: z.string(),
-  apiKeyEnv: z.string().role('credential-ref'),
-  defaultBackend: z.string(),
-  defaultParseMethod: z.string(),
-  defaultLang: z.string(),
-  pollIntervalMs: z.number(),
-  pollTimeoutMs: z.number(),
-  requestTimeoutMs: z.number(),
-  maxMdOutputChars: z.number(),
 }) as unknown as z<unknown>
 
 interface SettingsScope {
@@ -116,10 +113,14 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
   let settingsScope: SettingsScope | undefined
 
   const fixedStorageRoot = persistedConfig.storage.storageRoot
-  const runtimeConfig = (): MinerUConfig => ({
-    ...persistedConfig,
-    storage: { ...persistedConfig.storage, storageRoot: fixedStorageRoot },
-  })
+  const validateRuntimeConfig = (value: unknown): MinerUConfig => {
+    const next = migrateConfig(value)
+    if (next.storage.storageRoot !== fixedStorageRoot) {
+      throw new TypeError('storage.storageRoot cannot change while the MinerU plugin is running')
+    }
+    return next
+  }
+  const runtimeConfig = (): MinerUConfig => persistedConfig
 
   const paths = new StoragePaths(fixedStorageRoot)
   const lock = new ProcessLock(paths)
@@ -133,10 +134,12 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
       maxJsonValidationBytes: Math.min(persistedConfig.limits.maxZipEntryBytes, 64 * 1024 * 1024),
     })
     await results.cleanupStaging(persistedConfig.storage.stagingTtlMs, operations.activeOperationIds())
+    const maintenance = new StorageMaintenanceService(paths, results, lock)
 
     const providers = new ProviderRegistry(runtimeConfig)
+    const diagnostics = createStructuredDiagnosticSink(ctx.logger)
     const service = new MinerUService({
-      getConfig: runtimeConfig, providers, jobs, results, operations,
+      getConfig: runtimeConfig, providers, jobs, results, operations, diagnostics,
       resolveCredential: async (reference, signal) => {
         signal.throwIfAborted()
         const credentials = ctx.get('credentials') as CredentialService | undefined
@@ -148,7 +151,7 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
       },
     })
 
-    const toolDisposer = registerTools(ctx, () => service, runtimeConfig)
+    const toolDisposer = registerTools(ctx, () => service)
 
     ctx.inject(['settings'], (settingsCtx: Context) => {
       const settings = (settingsCtx.get('settings') ?? ctx.get('settings')) as SettingsService | undefined
@@ -156,10 +159,10 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
         settingsScope = settings.register('dsh-pdf-mineru', Config, {
           base: asObject(persistedConfig),
           applies: 'live',
-          validate: value => { migrateConfig(value) },
+          validate: value => { validateRuntimeConfig(value) },
         })
-        persistedConfig = migrateConfig(settingsScope.get())
-        return settingsScope.watch(next => { persistedConfig = migrateConfig(next) })
+        persistedConfig = validateRuntimeConfig(settingsScope.get())
+        return settingsScope.watch(next => { persistedConfig = validateRuntimeConfig(next) })
       }
       return undefined
     })
@@ -168,7 +171,7 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
       return registerRpc(connectionCtx, {
         getConfig: () => persistedConfig,
         setConfig: async value => {
-          const next = migrateConfig(value)
+          const next = validateRuntimeConfig(value)
           if (settingsScope !== undefined) await settingsScope.replace(asObject(next))
           persistedConfig = next
           return next
@@ -176,6 +179,7 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
         probe: async (provider, signal) => service.probe(
           signal, provider === undefined ? undefined : parseDraftProvider(provider, persistedConfig),
         ),
+        maintenance,
       })
     })
 
@@ -202,3 +206,5 @@ export * from './providers/provider.js'
 export * from './providers/self-hosted-v2.js'
 export * from './providers/official-v4.js'
 export * from './service/mineru-service.js'
+export * from './observability.js'
+export * from './storage/maintenance-service.js'

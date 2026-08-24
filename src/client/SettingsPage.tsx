@@ -5,6 +5,7 @@ import type { MinerUConfig, OfficialV4Config, ProviderConfig, SelfHostedV2Config
 import type { ArtifactKind, MinerUModel, ParseMethod } from '../domain/request.js'
 import type { ProbeView } from '../service/mineru-service.js'
 import type { MineruKey } from './locales.js'
+import { StorageOperations } from './StorageOperations.js'
 import css from './SettingsPage.module.css'
 
 export interface MineruSettingsInjected {
@@ -58,6 +59,20 @@ export function patchActiveProvider(
   return { ...config, providers }
 }
 
+export function normalizeProviderDefaults(config: MinerUConfig, provider: ProviderConfig): MinerUConfig {
+  if (provider.type !== 'official-v4') return config
+  const model = provider.models.includes(config.defaults.model)
+    ? config.defaults.model
+    : provider.models[0]
+  if (model === undefined) return config
+  const parseMethod = config.defaults.parseMethod === 'txt' ? 'auto' : config.defaults.parseMethod
+  if (model === config.defaults.model && parseMethod === config.defaults.parseMethod) return config
+  return {
+    ...config,
+    defaults: { ...config.defaults, model, parseMethod, ocr: parseMethod === 'ocr' },
+  }
+}
+
 export function updateConfigSection<K extends keyof MinerUConfig>(
   config: MinerUConfig,
   section: K,
@@ -84,7 +99,6 @@ async function callRpc<T>(rpc: ClientConnectionRpc, endpoint: string, payload: u
 }
 
 export function SettingsPage({ rpc, t }: SettingsPageProps) {
-  const [config, setConfig] = useState<MinerUConfig | null>(null)
   const [draft, setDraft] = useState<MinerUConfig | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -102,7 +116,6 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
     try {
       const result = await callRpc<ConfigGetResult>(rpc, 'mineru/config.get', {})
       if (result.ok) {
-        setConfig(result.value.config)
         setDraft(result.value.config)
       } else {
         setError(result.error.message)
@@ -124,7 +137,6 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
     try {
       const result = await callRpc<ConfigSetResult>(rpc, 'mineru/config.set', { config: draft })
       if (result.ok) {
-        setConfig(result.value.config)
         setDraft(result.value.config)
         setSaved(true)
         setTimeout(() => setSaved(false), 2000)
@@ -176,16 +188,11 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
 
   const activeProvider = draft.providers.find(p => p.id === draft.activeProvider) ?? draft.providers[0]!
 
-  const normalizeOfficialDefaults = (config: MinerUConfig, provider: ProviderConfig): MinerUConfig => {
-    if (provider.type !== 'official-v4' || config.defaults.parseMethod !== 'txt') return config
-    return updateConfigSection(config, 'defaults', { parseMethod: 'auto', ocr: false })
-  }
-
   const handleActiveTypeChange = (newType: 'self-hosted-v2' | 'official-v4'): void => {
     const updated = switchProviderType(activeProvider, newType)
     setDraft(prev => {
       if (prev === null) return prev
-      return normalizeOfficialDefaults(patchActiveProvider(prev, updated), updated)
+      return normalizeProviderDefaults(patchActiveProvider(prev, updated), updated)
     })
   }
 
@@ -206,7 +213,7 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
     const current = activeProvider.models
     let next: MinerUModel[]
     if (current.includes(model)) {
-      if (current.length <= 1) return // Keep at least one
+      if (current.length <= 1 || draft.defaults.model === model) return
       next = current.filter(m => m !== model)
     } else {
       next = [...current, model]
@@ -293,7 +300,7 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
                 if (prev === null) return prev
                 const provider = prev.providers.find(candidate => candidate.id === event.target.value)
                 if (provider === undefined) return prev
-                return normalizeOfficialDefaults({ ...prev, activeProvider: provider.id }, provider)
+                return normalizeProviderDefaults({ ...prev, activeProvider: provider.id }, provider)
               })}
             >
               {draft.providers.map(provider => (
@@ -387,6 +394,7 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
                   <input
                     type="checkbox"
                     checked={(activeProvider as OfficialV4Config).models.includes(m)}
+                    disabled={draft.defaults.model === m}
                     onChange={() => toggleOfficialModel(m)}
                   />
                   <span>{t(m === 'pipeline' ? 'model.pipeline' : 'model.vlm')}</span>
@@ -409,8 +417,9 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
               value={draft.defaults.model}
               onChange={e => setDraft(prev => prev === null ? prev : updateConfigSection(prev, 'defaults', { model: e.target.value as MinerUModel }))}
             >
-              <option value="pipeline">{t('model.pipeline')}</option>
-              <option value="vlm">{t('model.vlm')}</option>
+              {(activeProvider.type === 'official-v4' ? activeProvider.models : (['pipeline', 'vlm'] as const)).map(model => (
+                <option key={model} value={model}>{t(model === 'pipeline' ? 'model.pipeline' : 'model.vlm')}</option>
+              ))}
             </select>
           </label>
 
@@ -485,7 +494,9 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
             <input
               className={css.input}
               value={draft.storage.storageRoot}
-              onChange={e => setDraft(prev => prev === null ? prev : updateConfigSection(prev, 'storage', { storageRoot: e.target.value }))}
+              readOnly
+              disabled
+              title="Storage root changes require editing plugin configuration and restarting the plugin."
             />
           </label>
 
@@ -512,7 +523,9 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
         </div>
       </div>
 
-      {/* 4. Polling & Timeouts */}
+      <StorageOperations rpc={rpc} t={t} />
+
+      {/* 5. Polling & Timeouts */}
       <div className={css.editorGroup}>
         <h3 className={css.groupTitle}>{t('section.polling')}</h3>
 
@@ -561,7 +574,50 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
         </div>
       </div>
 
-      {/* 5. Output Limits */}
+      {/* 6. Retry Policy */}
+      <div className={css.editorGroup}>
+        <h3 className={css.groupTitle}>{t('section.retry')}</h3>
+
+        <div className={css.row}>
+          <label className={css.field}>
+            <span className={css.fieldLabel}>{t('field.retryMaxAttempts')}</span>
+            <input
+              className={css.input}
+              type="number"
+              min={1}
+              max={10}
+              value={draft.retry.maxAttempts}
+              onChange={e => setDraft(prev => prev === null ? prev : updateConfigSection(prev, 'retry', { maxAttempts: Number(e.target.value) }))}
+            />
+          </label>
+
+          <label className={css.field}>
+            <span className={css.fieldLabel}>{t('field.retryBaseDelayMs')}</span>
+            <input
+              className={css.input}
+              type="number"
+              min={1}
+              max={60000}
+              value={draft.retry.baseDelayMs}
+              onChange={e => setDraft(prev => prev === null ? prev : updateConfigSection(prev, 'retry', { baseDelayMs: Number(e.target.value) }))}
+            />
+          </label>
+
+          <label className={css.field}>
+            <span className={css.fieldLabel}>{t('field.retryMaxDelayMs')}</span>
+            <input
+              className={css.input}
+              type="number"
+              min={1}
+              max={300000}
+              value={draft.retry.maxDelayMs}
+              onChange={e => setDraft(prev => prev === null ? prev : updateConfigSection(prev, 'retry', { maxDelayMs: Number(e.target.value) }))}
+            />
+          </label>
+        </div>
+      </div>
+
+      {/* 7. Output Limits */}
       <div className={css.editorGroup}>
         <h3 className={css.groupTitle}>{t('section.output')}</h3>
 
@@ -578,7 +634,7 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
         </div>
       </div>
 
-      {/* 6. Security Limits */}
+      {/* 8. Security Limits */}
       <div className={css.editorGroup}>
         <h3 className={css.groupTitle}>{t('section.limits')}</h3>
 

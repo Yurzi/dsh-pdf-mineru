@@ -5,7 +5,9 @@ export type MineruKey =
   | 'section.provider'
   | 'section.defaults'
   | 'section.storage'
+  | 'section.operations'
   | 'section.polling'
+  | 'section.retry'
   | 'section.output'
   | 'section.limits'
   | 'field.activeProvider'
@@ -32,6 +34,9 @@ export type MineruKey =
   | 'field.pollTimeoutMs'
   | 'field.requestTimeoutMs'
   | 'field.operationTimeoutMs'
+  | 'field.retryMaxAttempts'
+  | 'field.retryBaseDelayMs'
+  | 'field.retryMaxDelayMs'
   | 'field.maxInlineChars'
   | 'field.maxFilesPerRequest'
   | 'field.maxFileBytes'
@@ -45,6 +50,32 @@ export type MineruKey =
   | 'action.saved'
   | 'action.test'
   | 'action.testing'
+  | 'action.storageStats'
+  | 'action.integrityScan'
+  | 'action.gcPreview'
+  | 'action.quarantineList'
+  | 'action.cleanupPreview'
+  | 'action.cleanupDelete'
+  | 'action.cleanupConfirm'
+  | 'action.running'
+  | 'ops.bytes'
+  | 'ops.entries'
+  | 'ops.results'
+  | 'ops.jobs'
+  | 'ops.staging'
+  | 'ops.quarantine'
+  | 'ops.readOnly'
+  | 'ops.valid'
+  | 'ops.corrupt'
+  | 'ops.missing'
+  | 'ops.unreadable'
+  | 'ops.gcEligible'
+  | 'ops.gcBlocked'
+  | 'ops.gcCandidates'
+  | 'ops.selectAll'
+  | 'ops.modified'
+  | 'ops.cleanupPlanned'
+  | 'ops.cleanupDeleted'
   | 'test.healthy'
   | 'test.unhealthy'
   | 'test.error'
@@ -70,7 +101,9 @@ export const en: Record<MineruKey, string> = {
   'section.provider': 'Provider Settings',
   'section.defaults': 'Parsing Defaults',
   'section.storage': 'Storage & Cache',
+  'section.operations': 'Storage Operations',
   'section.polling': 'Polling & Timeouts',
+  'section.retry': 'Retry Policy',
   'section.output': 'Output Limits',
   'section.limits': 'Security & Payload Limits',
 
@@ -102,6 +135,10 @@ export const en: Record<MineruKey, string> = {
   'field.requestTimeoutMs': 'Request Timeout (ms)',
   'field.operationTimeoutMs': 'Shared Operation Timeout (ms)',
 
+  'field.retryMaxAttempts': 'Maximum Attempts',
+  'field.retryBaseDelayMs': 'Base Retry Delay (ms)',
+  'field.retryMaxDelayMs': 'Maximum Retry Delay (ms)',
+
   'field.maxInlineChars': 'Max Inline Markdown Chars',
 
   'field.maxFilesPerRequest': 'Max Files Per Request',
@@ -117,6 +154,32 @@ export const en: Record<MineruKey, string> = {
   'action.saved': 'Saved',
   'action.test': 'Test Active Provider',
   'action.testing': 'Testing…',
+  'action.storageStats': 'Refresh Statistics',
+  'action.integrityScan': 'Verify Cache',
+  'action.gcPreview': 'Preview GC',
+  'action.quarantineList': 'List Quarantine',
+  'action.cleanupPreview': 'Preview Cleanup',
+  'action.cleanupDelete': 'Delete Selected',
+  'action.cleanupConfirm': 'Confirm Delete',
+  'action.running': 'Running…',
+  'ops.bytes': 'Bytes',
+  'ops.entries': 'Entries',
+  'ops.results': 'Published Results',
+  'ops.jobs': 'Persisted Jobs',
+  'ops.staging': 'Staging',
+  'ops.quarantine': 'Quarantine',
+  'ops.readOnly': 'Read-only',
+  'ops.valid': 'Valid',
+  'ops.corrupt': 'Corrupt',
+  'ops.missing': 'Missing',
+  'ops.unreadable': 'Unreadable',
+  'ops.gcEligible': 'Complete Preview',
+  'ops.gcBlocked': 'Blocked Preview',
+  'ops.gcCandidates': 'Candidates',
+  'ops.selectAll': 'Select all quarantine entries',
+  'ops.modified': 'Modified',
+  'ops.cleanupPlanned': 'Planned',
+  'ops.cleanupDeleted': 'Deleted',
   'test.healthy': 'Connection Healthy',
   'test.unhealthy': 'Service Unhealthy',
   'test.error': 'Test Failed',
@@ -142,7 +205,9 @@ export const zh: Record<MineruKey, string> = {
   'section.provider': 'Provider 适配与鉴权',
   'section.defaults': '统一解析默认值',
   'section.storage': '存储与全局缓存',
+  'section.operations': '存储运维',
   'section.polling': '轮询与超时控制',
+  'section.retry': '网络重试策略',
   'section.output': '模型输出限制',
   'section.limits': '安全与资源上限',
 
@@ -174,6 +239,10 @@ export const zh: Record<MineruKey, string> = {
   'field.requestTimeoutMs': '单次网络请求超时 (ms)',
   'field.operationTimeoutMs': '单进程共享操作超时 (ms)',
 
+  'field.retryMaxAttempts': '最大尝试次数',
+  'field.retryBaseDelayMs': '基础重试延迟 (ms)',
+  'field.retryMaxDelayMs': '最大重试延迟 (ms)',
+
   'field.maxInlineChars': 'Markdown 预览字符上限',
 
   'field.maxFilesPerRequest': '单次请求最大文件数',
@@ -189,6 +258,32 @@ export const zh: Record<MineruKey, string> = {
   'action.saved': '已保存',
   'action.test': '测试当前 Provider 连接',
   'action.testing': '测试中…',
+  'action.storageStats': '刷新统计',
+  'action.integrityScan': '校验缓存',
+  'action.gcPreview': '预览 GC',
+  'action.quarantineList': '查看隔离区',
+  'action.cleanupPreview': '预览清理',
+  'action.cleanupDelete': '删除已选项',
+  'action.cleanupConfirm': '确认删除',
+  'action.running': '执行中…',
+  'ops.bytes': '字节数',
+  'ops.entries': '条目数',
+  'ops.results': '已发布结果',
+  'ops.jobs': '持久化 Job',
+  'ops.staging': '暂存区',
+  'ops.quarantine': '隔离区',
+  'ops.readOnly': '只读',
+  'ops.valid': '有效',
+  'ops.corrupt': '损坏',
+  'ops.missing': '缺失',
+  'ops.unreadable': '不可读',
+  'ops.gcEligible': '预览完整',
+  'ops.gcBlocked': '预览受阻',
+  'ops.gcCandidates': '候选项',
+  'ops.selectAll': '选择全部隔离条目',
+  'ops.modified': '修改时间',
+  'ops.cleanupPlanned': '计划清理',
+  'ops.cleanupDeleted': '已删除',
   'test.healthy': '连接正常',
   'test.unhealthy': '服务状态异常',
   'test.error': '连接测试失败',

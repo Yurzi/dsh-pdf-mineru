@@ -158,6 +158,24 @@ describe('safe-zip', () => {
       expect(kinds).toContain('images')
     })
 
+
+    it('rejects normalized output collisions before writing artifacts', async () => {
+      const zipPath = await createTempZip(zip => {
+        zip.addBuffer(Buffer.from('{}'), 'layout.json')
+        zip.addBuffer(Buffer.from('{}'), 'middle.json')
+        zip.addBuffer(Buffer.from('a'), 'images/a/b.png')
+        zip.addBuffer(Buffer.from('b'), 'images/a_b.png')
+      })
+      const fileId = asFileId('mf_0123456789abcdef0123456789_0')
+      const sink = new MockArtifactSink()
+      await expect(extractSafeZip({
+        zipPath, sink, files: [{ fileId, dataId: 'data_doc1', name: 'doc1.pdf' }],
+        requiredArtifacts: ['layout', 'images'], limits: defaultLimits(),
+        signal: new AbortController().signal,
+      })).rejects.toMatchObject({ failure: { code: 'RESULT_ARCHIVE_INVALID' } })
+      expect(sink.written).toHaveLength(0)
+    })
+
     it('writes fallback images/index.json when images are required but absent in zip', async () => {
       const zipPath = await createTempZip(zip => {
         zip.addBuffer(Buffer.from('# Full Markdown\nNo images', 'utf8'), 'full.md')
@@ -323,12 +341,23 @@ describe('safe-zip', () => {
   })
 
   describe('Security defenses', () => {
-    it('checks the actual staged JSON size before reading it into memory', async () => {
+    it('checks the actual staged JSON size before streaming validation', async () => {
       const dir = await mkdtemp(join(tmpdir(), 'mineru-json-size-'))
       tempDirs.push(dir)
       const path = join(dir, 'layout.json')
       await writeFile(path, '{"ok":true}          ')
       await expect(validateJsonFile(path, 8)).rejects.toMatchObject({ failure: { code: 'RESULT_TOO_LARGE' } })
+    })
+
+
+    it('rejects excessive JSON nesting with a fixed frame budget', async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'mineru-json-depth-'))
+      tempDirs.push(dir)
+      const path = join(dir, 'deep.json')
+      await writeFile(path, '['.repeat(257) + '0' + ']'.repeat(257))
+      await expect(validateJsonFile(path)).rejects.toMatchObject({
+        failure: { code: 'RESULT_ARCHIVE_INVALID' },
+      })
     })
 
     it('rejects zip containing path traversal ("../evil.txt")', async () => {

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { defaultMinerUConfig, type MinerUConfig, type ProviderConfig } from '../src/config.js'
-import { asSessionId, type SessionId } from '../src/domain/ids.js'
+import { asCacheKey, asProviderConfigId, asSessionId, type SessionId } from '../src/domain/ids.js'
 import type { CanonicalParseRequest, PreparedSourceFile } from '../src/domain/request.js'
 import type {
   ArtifactSink,
@@ -15,6 +15,7 @@ import type {
   ProviderJobRef,
   ProviderJobSnapshot,
   ProviderProbeResult,
+  ProviderRetryOptions,
   ProviderSubmission,
 } from '../src/providers/provider.js'
 import { ProviderRegistry } from '../src/providers/registry.js'
@@ -23,6 +24,7 @@ import { SharedOperationRegistry } from '../src/service/shared-operations.js'
 import { JobRepository } from '../src/storage/job-repository.js'
 import { ResultRepository } from '../src/storage/result-repository.js'
 import { StoragePaths } from '../src/storage/paths.js'
+import type { MinerUDiagnosticEvent } from '../src/observability.js'
 
 function waitSignal(promise: Promise<void>, signal: AbortSignal): Promise<void> {
   signal.throwIfAborted()
@@ -53,6 +55,7 @@ class MockProvider implements MinerUProvider {
   complete = false
   markdown = '# parsed\n'
   submitGate: Promise<void> = Promise.resolve()
+  retryOptions?: ProviderRetryOptions
 
   probe(_context: ProviderCallContext): Promise<ProviderProbeResult> {
     return Promise.resolve({ available: true, provider: this.id, authentication: 'not-configured', protocolVersion: 'v2' })
@@ -66,13 +69,16 @@ class MockProvider implements MinerUProvider {
     request: CanonicalParseRequest, _sources: readonly PreparedSourceFile[], context: ProviderCallContext,
   ): Promise<ProviderSubmission> {
     this.submitCount++
+    this.retryOptions = context.retry
+    const ref: ProviderJobRef = {
+      provider: this.id,
+      taskId: 'upstream-task-1',
+      files: request.files.map(file => ({ dataId: `data_${file.fileId}`, fileId: file.fileId, name: file.name })),
+    }
+    await context.onAccepted?.(ref)
     await waitSignal(this.submitGate, context.signal)
     return {
-      ref: {
-        provider: this.id,
-        taskId: 'upstream-task-1',
-        files: request.files.map(file => ({ dataId: `data_${file.fileId}`, fileId: file.fileId, name: file.name })),
-      },
+      ref,
       state: 'processing',
       files: request.files.map(file => ({ fileId: file.fileId, state: 'processing' })),
     }
@@ -110,6 +116,7 @@ interface Harness {
   readonly jobs: JobRepository
   readonly results: ResultRepository
   readonly operations: SharedOperationRegistry
+  readonly diagnostics: MinerUDiagnosticEvent[]
   readonly service: MinerUService
 }
 
@@ -136,11 +143,12 @@ async function harness(): Promise<Harness> {
   const operations = new SharedOperationRegistry()
   const provider = new MockProvider()
   const providers = new MockProviderRegistry(() => config, provider)
+  const diagnostics: MinerUDiagnosticEvent[] = []
   const service = new MinerUService({
-    getConfig: () => config, providers, jobs, results, operations,
+    getConfig: () => config, providers, jobs, results, operations, diagnostics: event => diagnostics.push(event),
     resolveCredential: () => Promise.resolve(undefined),
   })
-  const result = { root, file, provider, config, jobs, results, operations, service }
+  const result = { root, file, provider, config, jobs, results, operations, diagnostics, service }
   harnesses.push(result)
   return result
 }
@@ -181,30 +189,73 @@ describe('MinerUService cache, sessions, concurrency, and recovery', () => {
     const h = await harness()
     const owner = session('session-cache')
     h.provider.complete = true
-    const first = await h.service.parseDocument(owner, { file_path: h.file }, new AbortController().signal, 1000)
+    const first = await h.service.parseDocument(owner, { file_paths: [h.file] }, new AbortController().signal, 1000)
     expect(first.state).toBe('completed')
     expect(h.provider.submitCount).toBe(1)
 
-    const second = await h.service.submit(owner, { file_path: h.file }, new AbortController().signal)
+    const second = await h.service.submit(owner, { file_paths: [h.file] }, new AbortController().signal)
     expect(second.source).toBe('cache')
     expect(second.state).toBe('completed')
     expect(h.provider.submitCount).toBe(1)
     expect(second.job_id).not.toBe(first.job_id)
+    expect(h.provider.retryOptions).toMatchObject({ maxRetries: 2, initialDelayMs: 500, maxDelayMs: 10000 })
+    h.provider.retryOptions?.onRetry?.({
+      provider: 'self-hosted-v2', operation: 'inspect', attempt: 1, maxRetries: 2,
+      delayMs: 500, reason: 'transport',
+    })
+    expect(h.diagnostics.some(event => event.phase === 'provider-retry'
+      && event.providerOperation === 'inspect' && event.maxAttempts === 3)).toBe(true)
+    const published = h.diagnostics.find(event => event.phase === 'published')
+    expect(published).toMatchObject({ provider: 'self-hosted-v2', cacheHit: false, waiterCount: 1 })
+    expect(published?.bytes).toBeGreaterThan(0)
+    expect(published?.durationMs).toBeGreaterThanOrEqual(0)
+    expect(h.diagnostics.some(event => event.phase === 'cache-hit' && event.jobId === second.job_id)).toBe(true)
+    expect(JSON.stringify(h.diagnostics)).not.toContain(h.file)
+    expect(JSON.stringify(h.diagnostics)).not.toContain(h.root)
+  })
+
+
+  it('does not coalesce live operations across provider credential authorities', async () => {
+    const registry = new SharedOperationRegistry()
+    const cacheKey = asCacheKey('a'.repeat(64))
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const runner = async () => { await gate; return { state: 'failed' as const } }
+    const first = registry.acquire(cacheKey, asProviderConfigId('mp_account_a'), 5000, runner)
+    const second = registry.acquire(cacheKey, asProviderConfigId('mp_account_b'), 5000, runner)
+    const duplicate = registry.acquire(cacheKey, asProviderConfigId('mp_account_a'), 5000, runner)
+    expect(first.created).toBe(true)
+    expect(second.created).toBe(true)
+    expect(duplicate.created).toBe(false)
+    expect(duplicate.operation).toBe(first.operation)
+    expect(second.operation).not.toBe(first.operation)
+    release()
+    await Promise.all([
+      first.operation.waitForOutcome(new AbortController().signal),
+      second.operation.waitForOutcome(new AbortController().signal),
+    ])
+    registry.dispose()
   })
 
   it('coalesces concurrent sessions to one upstream submit but creates independent jobs', async () => {
     const h = await harness()
     let release!: () => void
     h.provider.submitGate = new Promise(resolve => { release = resolve })
-    const one = h.service.submit(session('session-one'), { file_path: h.file }, new AbortController().signal)
-    const two = h.service.submit(session('session-two'), { file_path: h.file }, new AbortController().signal)
+    const one = h.service.submit(session('session-one'), { file_paths: [h.file] }, new AbortController().signal)
+    const two = h.service.submit(session('session-two'), { file_paths: [h.file] }, new AbortController().signal)
     await new Promise(resolve => setTimeout(resolve, 10))
     expect(h.provider.submitCount).toBe(1)
+    const [persistedOne, persistedTwo] = await Promise.all([
+      h.jobs.list(session('session-one')), h.jobs.list(session('session-two')),
+    ])
+    expect(persistedOne[0]?.resolution).toMatchObject({ ref: { provider: 'self-hosted-v2', taskId: 'upstream-task-1' } })
+    expect(persistedTwo[0]?.resolution).toMatchObject({ ref: { provider: 'self-hosted-v2', taskId: 'upstream-task-1' } })
     release()
     const [first, second] = await Promise.all([one, two])
     expect(first.job_id).not.toBe(second.job_id)
     expect(new Set([first.source, second.source])).toEqual(new Set(['provider', 'shared-operation']))
     expect(h.provider.submitCount).toBe(1)
+    expect(h.diagnostics.some(event => event.phase === 'shared-operation' && event.waiterCount === 2)).toBe(true)
     h.provider.complete = true
     await Promise.all([
       waitCompleted(h.service, session('session-one'), first.job_id),
@@ -218,9 +269,9 @@ describe('MinerUService cache, sessions, concurrency, and recovery', () => {
     h.provider.submitGate = new Promise(resolve => { release = resolve })
     const firstOwner = session('session-keep')
     const cancelledOwner = session('session-cancelled')
-    const first = h.service.submit(firstOwner, { file_path: h.file }, new AbortController().signal)
+    const first = h.service.submit(firstOwner, { file_paths: [h.file] }, new AbortController().signal)
     const controller = new AbortController()
-    const cancelled = h.service.submit(cancelledOwner, { file_path: h.file }, controller.signal)
+    const cancelled = h.service.submit(cancelledOwner, { file_paths: [h.file] }, controller.signal)
     await new Promise(resolve => setTimeout(resolve, 10))
     controller.abort()
     await expect(cancelled).rejects.toBeDefined()
@@ -238,7 +289,7 @@ describe('MinerUService cache, sessions, concurrency, and recovery', () => {
     const h = await harness()
     const a = session('session-a')
     h.provider.complete = true
-    const submitted = await h.service.submit(a, { file_path: h.file }, new AbortController().signal)
+    const submitted = await h.service.submit(a, { file_paths: [h.file] }, new AbortController().signal)
     await expect(h.service.status(session('session-b'), submitted.job_id, new AbortController().signal))
       .rejects.toMatchObject({ failure: { code: 'JOB_NOT_FOUND' } })
   })
@@ -246,7 +297,7 @@ describe('MinerUService cache, sessions, concurrency, and recovery', () => {
   it('recovers a persisted remote ref after restart without the source path', async () => {
     const h = await harness()
     const owner = session('session-restart')
-    const submitted = await h.service.submit(owner, { file_path: h.file }, new AbortController().signal)
+    const submitted = await h.service.submit(owner, { file_paths: [h.file] }, new AbortController().signal)
     expect(submitted.state).toBe('processing')
     h.operations.dispose()
     await new Promise(resolve => setTimeout(resolve, 10))
@@ -271,8 +322,8 @@ describe('MinerUService cache, sessions, concurrency, and recovery', () => {
     const ownerA = session('session-recovery-a')
     const ownerB = session('session-recovery-b')
     const [jobA, jobB] = await Promise.all([
-      h.service.submit(ownerA, { file_path: h.file }, new AbortController().signal),
-      h.service.submit(ownerB, { file_path: h.file }, new AbortController().signal),
+      h.service.submit(ownerA, { file_paths: [h.file] }, new AbortController().signal),
+      h.service.submit(ownerB, { file_paths: [h.file] }, new AbortController().signal),
     ])
     expect(h.provider.submitCount).toBe(1)
     h.operations.dispose()
@@ -300,7 +351,7 @@ describe('MinerUService cache, sessions, concurrency, and recovery', () => {
   it('keeps a job queryable after synchronous parse timeout', async () => {
     const h = await harness()
     const owner = session('session-timeout')
-    const timedOut = await h.service.parseDocument(owner, { file_path: h.file }, new AbortController().signal, 10)
+    const timedOut = await h.service.parseDocument(owner, { file_paths: [h.file] }, new AbortController().signal, 10)
     expect('poll_timed_out' in timedOut && timedOut.poll_timed_out).toBe(true)
     expect(timedOut.state).toBe('processing')
     h.provider.complete = true
@@ -313,7 +364,7 @@ describe('MinerUService cache, sessions, concurrency, and recovery', () => {
     h.provider.markdown = 'x'.repeat(20000)
     h.provider.complete = true
     const owner = session('session-limit')
-    const parsed = await h.service.parseDocument(owner, { file_path: h.file }, new AbortController().signal, 1000)
+    const parsed = await h.service.parseDocument(owner, { file_paths: [h.file] }, new AbortController().signal, 1000)
     expect(parsed.state).toBe('completed')
     expect(JSON.stringify(parsed).length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
     expect('preview_truncated' in parsed && parsed.preview_truncated).toBe(true)

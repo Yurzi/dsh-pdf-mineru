@@ -2,15 +2,11 @@ import { createHash } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { Readable } from 'node:stream'
-import {
-  type MinerUFileId,
-  asProviderConfigId,
-} from '../domain/ids.js'
+import { asProviderConfigId } from '../domain/ids.js'
 import {
   MinerUError,
   failure,
   sanitizeDiagnostic,
-  throwMinerU,
   toMinerUFailure,
 } from '../domain/errors.js'
 import type {
@@ -32,10 +28,18 @@ import {
   type ProviderFileSnapshot,
   type ProviderJobRef,
   type ProviderJobSnapshot,
+  type ProviderOptions,
   type ProviderProbeResult,
+  type ProviderRetryOperation,
+  type ProviderRetryOptions,
   type ProviderSubmission,
   type ProviderSubmittedFile,
   type TemporaryArtifact,
+  executeWithRetry,
+  mergeRetryOptions,
+  readBoundedResponseText,
+  isRetryableHttpStatus,
+  parseRetryAfter,
   validateProviderCapabilities,
 } from './provider.js'
 import type { OfficialV4Config } from '../config.js'
@@ -125,12 +129,15 @@ function parseProgress(extractProgress: unknown): { completed: number; total: nu
     const obj = extractProgress as Record<string, unknown>
     const extracted = typeof obj['extracted_pages'] === 'number' ? obj['extracted_pages'] : undefined
     const total = typeof obj['total_pages'] === 'number' ? obj['total_pages'] : undefined
-    if (extracted !== undefined && total !== undefined && total > 0) {
+    if (extracted !== undefined && total !== undefined
+      && Number.isSafeInteger(extracted) && Number.isSafeInteger(total)
+      && extracted >= 0 && total > 0 && extracted <= total) {
       return { completed: extracted, total }
     }
   }
-  if (typeof extractProgress === 'number' && !Number.isNaN(extractProgress)) {
-    return { completed: Math.round(extractProgress), total: 100 }
+  if (Number.isSafeInteger(extractProgress)
+    && (extractProgress as number) >= 0 && (extractProgress as number) <= 100) {
+    return { completed: extractProgress as number, total: 100 }
   }
   return undefined
 }
@@ -140,10 +147,12 @@ export class OfficialV4Provider implements MinerUProvider {
   readonly config: OfficialV4Config
   readonly capabilities: ProviderCapabilities
   private readonly parsedBaseUrl: URL
+  private readonly retryOptions: ProviderRetryOptions
 
-  constructor(config: OfficialV4Config) {
+  constructor(config: OfficialV4Config, options?: ProviderOptions) {
     asProviderConfigId(config.id)
     this.config = config
+    this.retryOptions = options?.retry ?? {}
     this.parsedBaseUrl = validateAndNormalizeOfficialBaseURL(config.baseURL)
 
     const supportedModels = config.models.length > 0 ? config.models : (['pipeline', 'vlm'] as const)
@@ -168,10 +177,12 @@ export class OfficialV4Provider implements MinerUProvider {
     context: ProviderCompatibilityContext,
   ): Promise<string> {
     const originAndPath = `${this.parsedBaseUrl.origin}${this.parsedBaseUrl.pathname.replace(/\/+$/, '')}`
-    const urlHash = createHash('sha256').update(originAndPath, 'utf8').digest('hex').slice(0, 16)
-    const rawVersion = context.configuredVersion ?? this.config.configuredVersion ?? 'v4'
-    const safeVersion = rawVersion.replace(/[^A-Za-z0-9._-]/g, '_')
-    return `official-v4:${urlHash}:${safeVersion}:${request.semantics.model}`
+    const behaviorHash = createHash('sha256').update(JSON.stringify({
+      originAndPath,
+      configuredVersion: context.configuredVersion ?? this.config.configuredVersion ?? 'v4',
+      model: request.semantics.model,
+    }), 'utf8').digest('hex').slice(0, 24)
+    return `official-v4:${behaviorHash}`
   }
 
   async probe(context: ProviderCallContext): Promise<ProviderProbeResult> {
@@ -187,25 +198,15 @@ export class OfficialV4Provider implements MinerUProvider {
 
     try {
       // Send a lightweight probe query to check connectivity and auth without creating parsing jobs
-      const response = await this.requestJson<OfficialV4ApiResponse<OfficialV4ExtractResultsData>>(
+      await this.requestJson<OfficialV4ApiResponse<OfficialV4ExtractResultsData>>(
         'GET',
         '/extract-results/batch/__dsh_probe__',
         undefined,
         {},
         context,
-        [200, 400, 404],
+        [200, 404],
+        { operation: 'probe', retry: true, businessValidation: 'probe' },
       )
-
-      const probeCode = String(response.code).toUpperCase()
-      if (probeCode === '401' || probeCode === 'A0202' || probeCode === 'A0211') {
-        return {
-          available: false,
-          provider: 'official-v4',
-          authentication: 'invalid',
-          protocolVersion: 'v4',
-          diagnostics: sanitizeDiagnostic(response.msg || 'Authentication failed'),
-        }
-      }
 
       return {
         available: true,
@@ -290,18 +291,11 @@ export class OfficialV4Provider implements MinerUProvider {
       { 'content-type': 'application/json' },
       context,
       [200],
+      { operation: 'submit', retry: false },
     )
 
     if (!submitResponse || typeof submitResponse !== 'object') {
       throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'MinerU server returned empty or invalid response', false, { provider: 'official-v4' }))
-    }
-
-    if (submitResponse.code !== 0) {
-      throw officialBusinessFailure(
-        submitResponse.code,
-        submitResponse.msg || `Submission failed with code ${String(submitResponse.code)}`,
-        submitResponse.trace_id,
-      )
     }
 
     const batchId = submitResponse.data?.batch_id
@@ -322,29 +316,19 @@ export class OfficialV4Provider implements MinerUProvider {
       )
     }
 
+    const ref: ProviderJobRef = {
+      provider: 'official-v4',
+      batchId,
+      files: submittedFiles,
+    }
+    await context.onAccepted?.(ref)
+
     // Bare PUT upload for each file in order
     for (let i = 0; i < sources.length; i++) {
       context.signal.throwIfAborted()
       const source = sources[i]!
       const uploadUrl = externalHttpsUrl(fileUrls[i]!, 'Official presigned upload URL')
-
-      // Re-verify file stat right before streaming
-      let currentStat
-      try {
-        currentStat = await stat(source.path)
-      } catch (err) {
-        throw new MinerUError(failure('FILE_NOT_FOUND', `Source file missing during upload: ${source.name}`), { cause: err })
-      }
-      if (
-        currentStat.size !== source.fingerprint.size ||
-        currentStat.mtimeMs !== source.fingerprint.mtimeMs ||
-        currentStat.dev !== source.fingerprint.device ||
-        currentStat.ino !== source.fingerprint.inode
-      ) {
-        throw new MinerUError(failure('INVALID_REQUEST', `Source file ${source.name} modified during upload`, true))
-      }
-
-      await this.barePutStream(uploadUrl, source.path, context)
+      await this.barePutStream(uploadUrl, source, context)
     }
 
     const fileSnapshots: ProviderFileSnapshot[] = request.files.map(f => ({
@@ -354,11 +338,7 @@ export class OfficialV4Provider implements MinerUProvider {
     }))
 
     return {
-      ref: {
-        provider: 'official-v4',
-        batchId,
-        files: submittedFiles,
-      },
+      ref,
       state: 'processing',
       files: fileSnapshots,
     }
@@ -377,18 +357,11 @@ export class OfficialV4Provider implements MinerUProvider {
       {},
       context,
       [200],
+      { operation: 'inspect', retry: true },
     )
 
     if (!data || typeof data !== 'object') {
       throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'MinerU server returned empty status response', false, { provider: 'official-v4' }))
-    }
-
-    if (data.code !== 0) {
-      throw officialBusinessFailure(
-        data.code,
-        data.msg || `Query failed with code ${String(data.code)}`,
-        data.trace_id,
-      )
     }
 
     const extractResults = Array.isArray(data.data?.extract_result) ? data.data.extract_result : []
@@ -422,7 +395,7 @@ export class OfficialV4Provider implements MinerUProvider {
       const fileState = mapOfficialFileState(item.state)
       const progress = parseProgress(item.extract_progress)
       const fileFailure = fileState === 'failed'
-        ? failure('REMOTE_PARSE_FAILED', item.err_msg || 'Remote document extraction failed', false, {
+        ? failure('REMOTE_PARSE_FAILED', sanitizeDiagnostic(item.err_msg || 'Remote document extraction failed', [context.credential ?? '']), false, {
             provider: 'official-v4',
             fileId: file.fileId,
             traceId: data.trace_id,
@@ -483,18 +456,11 @@ export class OfficialV4Provider implements MinerUProvider {
       {},
       context,
       [200],
+      { operation: 'collect', retry: true },
     )
 
     if (!data || typeof data !== 'object') {
       throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'MinerU server returned empty result response', false, { provider: 'official-v4' }))
-    }
-
-    if (data.code !== 0) {
-      throw officialBusinessFailure(
-        data.code,
-        data.msg || `Result query failed with code ${String(data.code)}`,
-        data.trace_id,
-      )
     }
 
     const extractResults = Array.isArray(data.data?.extract_result) ? data.data.extract_result : []
@@ -526,7 +492,7 @@ export class OfficialV4Provider implements MinerUProvider {
           fileId: file.fileId,
           name: file.name,
           artifacts: [],
-          failure: failure('REMOTE_PARSE_FAILED', item.err_msg || 'Remote extraction failed', false, {
+          failure: failure('REMOTE_PARSE_FAILED', sanitizeDiagnostic(item.err_msg || 'Remote extraction failed', [context.credential ?? '']), false, {
             provider: 'official-v4',
             fileId: file.fileId,
             traceId: data.trace_id,
@@ -591,192 +557,294 @@ export class OfficialV4Provider implements MinerUProvider {
     headers: Record<string, string>,
     context: ProviderCallContext,
     acceptedStatuses: readonly number[] = [200],
+    options?: {
+      operation?: ProviderRetryOperation
+      retry?: boolean
+      businessValidation?: 'strict' | 'probe'
+    },
   ): Promise<T> {
-    context.signal.throwIfAborted()
+    const allowRetry = options?.retry ?? (method.toUpperCase() === 'GET')
+    const operation = options?.operation ?? (path.startsWith('/extract-results/batch/__dsh_probe__') ? 'probe' : 'api-json')
+    const businessValidation = options?.businessValidation ?? 'strict'
 
-    const url = `${this.parsedBaseUrl.origin}${this.parsedBaseUrl.pathname.replace(/\/+$/, '')}${path}`
-    const controller = new AbortController()
-    let timedOut = false
-    const timer = setTimeout(() => {
-      timedOut = true
-      controller.abort(new DOMException(`Request timed out after ${String(context.timeoutMs)}ms`, 'TimeoutError'))
-    }, context.timeoutMs)
+    const executeOnce = async (): Promise<T> => {
+      context.signal.throwIfAborted()
 
-    const onParentAbort = () => {
-      controller.abort(context.signal.reason)
-    }
-    context.signal.addEventListener('abort', onParentAbort, { once: true })
+      const url = `${this.parsedBaseUrl.origin}${this.parsedBaseUrl.pathname.replace(/\/+$/, '')}${path}`
+      const controller = new AbortController()
+      let timedOut = false
+      const timer = setTimeout(() => {
+        timedOut = true
+        controller.abort(new DOMException(`Request timed out after ${String(context.timeoutMs)}ms`, 'TimeoutError'))
+      }, context.timeoutMs)
 
-    try {
-      const requestHeaders: Record<string, string> = { ...headers }
-      if (context.credential && context.credential.trim() !== '') {
-        requestHeaders['authorization'] = `Bearer ${context.credential}`
+      const onParentAbort = () => {
+        controller.abort(context.signal.reason)
       }
+      context.signal.addEventListener('abort', onParentAbort, { once: true })
 
-      let response: Response
       try {
-        const requestInit: RequestInit = {
-          method,
-          headers: requestHeaders,
-          body: bodyText,
-          signal: controller.signal,
-          redirect: 'error',
-        }
-        response = await fetch(url, requestInit)
-      } catch (err: unknown) {
-        if (context.signal.aborted) {
-          throw new MinerUError(failure('CANCELLED', 'Operation was cancelled', true))
-        }
-        if (timedOut) {
-          throw new MinerUError(failure('PROVIDER_UNAVAILABLE', `Request to MinerU official API timed out after ${String(context.timeoutMs)}ms`, true))
-        }
-        const message = err instanceof Error ? err.message : String(err)
-        throw new MinerUError(
-          failure('PROVIDER_UNAVAILABLE', `Failed to connect to MinerU official API: ${sanitizeDiagnostic(message)}`, true),
-          { cause: err },
-        )
-      }
-
-      const status = response.status
-      if (!acceptedStatuses.includes(status)) {
-        let errorBody = ''
-        try {
-          errorBody = await this.readBoundedResponseBody(response, context.limits.maxApiResponseBytes, controller.signal)
-        } catch {
-          // ignore
+        const requestHeaders: Record<string, string> = { ...headers }
+        if (context.credential && context.credential.trim() !== '') {
+          requestHeaders['authorization'] = `Bearer ${context.credential}`
         }
 
-        let parsedError: string | undefined
+        let response: Response
         try {
-          const parsed: unknown = JSON.parse(errorBody)
-          if (typeof parsed === 'object' && parsed !== null) {
-            const json = parsed as Record<string, unknown>
-            if (typeof json.msg === 'string') parsedError = json.msg
-            else if (typeof json.message === 'string') parsedError = json.message
-            else if (typeof json.detail === 'string') parsedError = json.detail
+          const requestInit: RequestInit = {
+            method,
+            headers: requestHeaders,
+            body: bodyText,
+            signal: controller.signal,
+            redirect: 'error',
           }
-        } catch {
-          parsedError = errorBody.slice(0, 500)
+          response = await fetch(url, requestInit)
+        } catch (err: unknown) {
+          if (context.signal.aborted) {
+            throw new MinerUError(failure('CANCELLED', 'Operation was cancelled', true))
+          }
+          if (timedOut) {
+            const timeoutErr = new MinerUError(
+              failure('PROVIDER_UNAVAILABLE', `Request to MinerU official API timed out after ${String(context.timeoutMs)}ms`, true),
+            )
+            Object.assign(timeoutErr, { httpStatus: 408 })
+            throw timeoutErr
+          }
+          const message = err instanceof Error ? err.message : String(err)
+          throw new MinerUError(
+            failure('PROVIDER_UNAVAILABLE', `Failed to connect to MinerU official API: ${sanitizeDiagnostic(message)}`, true),
+            { cause: err },
+          )
         }
 
-        const diagnostic = parsedError ? `: ${parsedError}` : ''
-        if (status === 401 || status === 403) {
-          throw new MinerUError(failure('AUTHENTICATION_FAILED', `Official MinerU authentication failed (${String(status)})${diagnostic}`, false, { provider: 'official-v4' }))
-        }
-        if (status === 404) {
-          throw new MinerUError(failure('JOB_NOT_FOUND', `Official MinerU resource not found (${String(status)})${diagnostic}`, false, { provider: 'official-v4' }))
-        }
-        if (status === 413) {
-          throw new MinerUError(failure('FILE_TOO_LARGE', `File exceeds size limit (${String(status)})${diagnostic}`, false, { provider: 'official-v4' }))
-        }
-        if (status === 429) {
-          throw new MinerUError(failure('PROVIDER_RATE_LIMITED', `Official MinerU rate limit exceeded (${String(status)})${diagnostic}`, true, { provider: 'official-v4' }))
-        }
-        if (status >= 500) {
-          throw new MinerUError(failure('PROVIDER_UNAVAILABLE', `Official MinerU server error (${String(status)})${diagnostic}`, true, { provider: 'official-v4' }))
-        }
-        throw new MinerUError(failure('REMOTE_PARSE_FAILED', `Official MinerU returned status ${String(status)}${diagnostic}`, false, { provider: 'official-v4' }))
-      }
+        const status = response.status
+        if (!acceptedStatuses.includes(status)) {
+          let errorBody = ''
+          try {
+            errorBody = await readBoundedResponseText(response, context.limits.maxApiResponseBytes, controller.signal)
+          } catch {
+            if (response.body) {
+              try { await response.body.cancel() } catch {}
+            }
+          }
 
-      const contentType = response.headers.get('content-type') ?? ''
-      if (!contentType.toLowerCase().includes('application/json')) {
-        throw new MinerUError(failure('REMOTE_PARSE_FAILED', `Expected application/json response, got "${contentType}"`, false, { provider: 'official-v4' }))
-      }
+          let parsedError: string | undefined
+          try {
+            const parsed: unknown = JSON.parse(errorBody)
+            if (typeof parsed === 'object' && parsed !== null) {
+              const json = parsed as Record<string, unknown>
+              if (typeof json.msg === 'string') parsedError = json.msg
+              else if (typeof json.message === 'string') parsedError = json.message
+              else if (typeof json.detail === 'string') parsedError = json.detail
+            }
+          } catch {
+            parsedError = errorBody.slice(0, 500)
+          }
 
-      const rawText = await this.readBoundedResponseBody(response, context.limits.maxApiResponseBytes, controller.signal)
-      try {
-        return JSON.parse(rawText) as T
-      } catch (err) {
-        throw new MinerUError(
-          failure('REMOTE_PARSE_FAILED', `Failed to parse JSON response: ${sanitizeDiagnostic(err instanceof Error ? err.message : String(err))}`, false, { provider: 'official-v4' }),
-          { cause: err },
-        )
+          const diagnostic = parsedError
+            ? `: ${sanitizeDiagnostic(parsedError, [context.credential ?? ''])}`
+            : ''
+          const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'))
+          let err: MinerUError
+
+          if (status === 401 || status === 403) {
+            err = new MinerUError(failure('AUTHENTICATION_FAILED', `Official MinerU authentication failed (${String(status)})${diagnostic}`, false, { provider: 'official-v4' }))
+          } else if (status === 404) {
+            err = new MinerUError(failure('JOB_NOT_FOUND', `Official MinerU resource not found (${String(status)})${diagnostic}`, false, { provider: 'official-v4' }))
+          } else if (status === 413) {
+            err = new MinerUError(failure('FILE_TOO_LARGE', `File exceeds size limit (${String(status)})${diagnostic}`, false, { provider: 'official-v4' }))
+          } else if (status === 429) {
+            err = new MinerUError(failure('PROVIDER_RATE_LIMITED', `Official MinerU rate limit exceeded (${String(status)})${diagnostic}`, true, { provider: 'official-v4' }))
+          } else if (status === 408) {
+            err = new MinerUError(failure('PROVIDER_UNAVAILABLE', `Official MinerU request timeout (${String(status)})${diagnostic}`, true, { provider: 'official-v4' }))
+          } else if (status >= 500) {
+            err = new MinerUError(failure('PROVIDER_UNAVAILABLE', `Official MinerU server error (${String(status)})${diagnostic}`, true, { provider: 'official-v4' }))
+          } else {
+            err = new MinerUError(failure('REMOTE_PARSE_FAILED', `Official MinerU returned status ${String(status)}${diagnostic}`, false, { provider: 'official-v4' }))
+          }
+
+          Object.assign(err, { httpStatus: status, retryAfterMs })
+          throw err
+        }
+
+        const contentType = response.headers.get('content-type') ?? ''
+        if (!contentType.toLowerCase().includes('application/json')) {
+          if (response.body) {
+            try { await response.body.cancel() } catch {}
+          }
+          throw new MinerUError(failure('REMOTE_PARSE_FAILED', `Expected application/json response, got "${contentType}"`, false, { provider: 'official-v4' }))
+        }
+
+        const rawText = await readBoundedResponseText(response, context.limits.maxApiResponseBytes, controller.signal)
+        let parsed: T
+        try {
+          parsed = JSON.parse(rawText) as T
+        } catch (err) {
+          throw new MinerUError(
+            failure('REMOTE_PARSE_FAILED', `Failed to parse JSON response: ${sanitizeDiagnostic(err instanceof Error ? err.message : String(err))}`, false, { provider: 'official-v4' }),
+            { cause: err },
+          )
+        }
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Official MinerU response must be an object', false, { provider: 'official-v4' }))
+        }
+        if (!('code' in parsed)) {
+          throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Official MinerU response is missing its business code', false, { provider: 'official-v4' }))
+        }
+        const envelope = parsed as unknown as OfficialV4ApiResponse<unknown>
+        if (envelope.code !== 0) {
+          const normalizedCode = String(envelope.code).toUpperCase()
+          const probeSentinel = businessValidation === 'probe' && normalizedCode === 'BATCH_NOT_FOUND'
+          if (probeSentinel) return parsed
+          const businessError = officialBusinessFailure(
+            envelope.code,
+            sanitizeDiagnostic(envelope.msg || `Official API failed with code ${String(envelope.code)}`, [context.credential ?? '']),
+            envelope.trace_id,
+          )
+          if (normalizedCode === '429') {
+            Object.assign(businessError, {
+              httpStatus: 429,
+              retryAfterMs: parseRetryAfter(response.headers.get('retry-after')),
+            })
+          }
+          throw businessError
+        }
+        return parsed
+      } finally {
+        clearTimeout(timer)
+        context.signal.removeEventListener('abort', onParentAbort)
       }
-    } finally {
-      clearTimeout(timer)
-      context.signal.removeEventListener('abort', onParentAbort)
     }
+
+    if (!allowRetry) {
+      return await executeOnce()
+    }
+
+    return await executeWithRetry({
+      provider: 'official-v4',
+      operation,
+      signal: context.signal,
+      retryOptions: mergeRetryOptions(this.retryOptions, context.retry),
+      fn: executeOnce,
+    })
   }
 
-  // 2. Bare PUT Request builder (Strictly empty headers, stream upload to presigned OSS URL)
+  // 2. Bare PUT Request builder (Strictly empty headers, fresh stream upload to presigned OSS URL per attempt)
   private async barePutStream(
     uploadUrl: string,
-    filePath: string,
+    source: PreparedSourceFile,
     context: ProviderCallContext,
   ): Promise<void> {
     context.signal.throwIfAborted()
     const safeUploadUrl = externalHttpsUrl(uploadUrl, 'Official presigned upload URL')
 
-    const controller = new AbortController()
-    let timedOut = false
-    const timer = setTimeout(() => {
-      timedOut = true
-      controller.abort(new DOMException(`Upload timed out after ${String(context.timeoutMs)}ms`, 'TimeoutError'))
-    }, context.timeoutMs)
+    await executeWithRetry({
+      provider: 'official-v4',
+      operation: 'presigned-put',
+      signal: context.signal,
+      retryOptions: mergeRetryOptions(this.retryOptions, context.retry),
+      fn: async () => {
+        context.signal.throwIfAborted()
 
-    const onParentAbort = () => {
-      controller.abort(context.signal.reason)
-    }
-    context.signal.addEventListener('abort', onParentAbort, { once: true })
-
-    const stream = createReadStream(filePath)
-    const onStreamAbort = () => {
-      stream.destroy(new DOMException('Aborted', 'AbortError'))
-    }
-    context.signal.addEventListener('abort', onStreamAbort, { once: true })
-
-    try {
-      const webStream = Readable.toWeb(stream) as unknown as BodyInit
-      // Request headers MUST be strictly empty. NO Authorization, NO Content-Type, NO custom headers.
-      const requestInit: RequestInit & { duplex?: 'half' } = {
-        method: 'PUT',
-        headers: {},
-        body: webStream,
-        signal: controller.signal,
-        redirect: 'error',
-        duplex: 'half',
-      }
-
-      let response: Response
-      try {
-        response = await fetch(safeUploadUrl, requestInit)
-      } catch (err: unknown) {
-        if (context.signal.aborted) {
-          throw new MinerUError(failure('CANCELLED', 'Upload was cancelled', true))
-        }
-        if (timedOut) {
-          throw new MinerUError(failure('UPLOAD_FAILED', `Upload timed out after ${String(context.timeoutMs)}ms`, true))
-        }
-        const message = err instanceof Error ? err.message : String(err)
-        throw new MinerUError(
-          failure('UPLOAD_FAILED', `Failed to upload file to storage: ${sanitizeDiagnostic(message)}`, true),
-          { cause: err },
-        )
-      }
-
-      if (response.status !== 200 && response.status !== 204) {
-        let errText = ''
+        // Re-verify file stat right before streaming
+        let currentStat
         try {
-          errText = await this.readBoundedResponseBody(response, 2048, controller.signal)
-        } catch {
-          // ignore
+          currentStat = await stat(source.path)
+        } catch (err) {
+          throw new MinerUError(failure('FILE_NOT_FOUND', `Source file missing during upload: ${source.name}`), { cause: err })
         }
-        throw new MinerUError(
-          failure(
-            'UPLOAD_FAILED',
-            `Storage upload failed with HTTP status ${String(response.status)}${errText ? `: ${sanitizeDiagnostic(errText)}` : ''}`,
-            true,
-          ),
-        )
-      }
-    } finally {
-      clearTimeout(timer)
-      context.signal.removeEventListener('abort', onParentAbort)
-      context.signal.removeEventListener('abort', onStreamAbort)
-      if (!stream.destroyed) {
-        stream.destroy()
-      }
-    }
+        if (
+          currentStat.size !== source.fingerprint.size ||
+          currentStat.mtimeMs !== source.fingerprint.mtimeMs ||
+          currentStat.dev !== source.fingerprint.device ||
+          currentStat.ino !== source.fingerprint.inode
+        ) {
+          throw new MinerUError(failure('INVALID_REQUEST', `Source file ${source.name} modified during upload`, true))
+        }
+
+        const controller = new AbortController()
+        let timedOut = false
+        const timer = setTimeout(() => {
+          timedOut = true
+          controller.abort(new DOMException(`Upload timed out after ${String(context.timeoutMs)}ms`, 'TimeoutError'))
+        }, context.timeoutMs)
+
+        const onParentAbort = () => {
+          controller.abort(context.signal.reason)
+        }
+        context.signal.addEventListener('abort', onParentAbort, { once: true })
+
+        const stream = createReadStream(source.path)
+        const onStreamAbort = () => {
+          stream.destroy(new DOMException('Aborted', 'AbortError'))
+        }
+        context.signal.addEventListener('abort', onStreamAbort, { once: true })
+
+        try {
+          const webStream = Readable.toWeb(stream) as unknown as BodyInit
+          // Request headers MUST be strictly empty. NO Authorization, NO Content-Type, NO custom headers.
+          const requestInit: RequestInit & { duplex?: 'half' } = {
+            method: 'PUT',
+            headers: {},
+            body: webStream,
+            signal: controller.signal,
+            redirect: 'error',
+            duplex: 'half',
+          }
+
+          let response: Response
+          try {
+            response = await fetch(safeUploadUrl, requestInit)
+          } catch (err: unknown) {
+            if (context.signal.aborted) {
+              throw new MinerUError(failure('CANCELLED', 'Upload was cancelled', true))
+            }
+            if (timedOut) {
+              const err = new MinerUError(failure('UPLOAD_FAILED', `Upload timed out after ${String(context.timeoutMs)}ms`, true))
+              Object.assign(err, { httpStatus: 408 })
+              throw err
+            }
+            const message = err instanceof Error ? err.message : String(err)
+            throw new MinerUError(
+              failure('UPLOAD_FAILED', `Failed to upload file to storage: ${sanitizeDiagnostic(message)}`, true),
+              { cause: err },
+            )
+          }
+
+          if (response.status !== 200 && response.status !== 204) {
+            let errText = ''
+            try {
+              errText = await readBoundedResponseText(response, 2048, controller.signal)
+            } catch {
+              if (response.body) {
+                try { await response.body.cancel() } catch {}
+              }
+            }
+            const retryAfter = parseRetryAfter(response.headers.get('retry-after'))
+            const retryable = isRetryableHttpStatus(response.status)
+            const err = new MinerUError(
+              failure(
+                'UPLOAD_FAILED',
+                `Storage upload failed with HTTP status ${String(response.status)}${errText ? `: ${sanitizeDiagnostic(errText)}` : ''}`,
+                retryable,
+              ),
+            )
+            Object.assign(err, { httpStatus: response.status, retryAfterMs: retryAfter })
+            throw err
+          }
+          if (response.body) {
+            try { await response.body.cancel() } catch {}
+          }
+        } finally {
+          clearTimeout(timer)
+          context.signal.removeEventListener('abort', onParentAbort)
+          context.signal.removeEventListener('abort', onStreamAbort)
+          if (!stream.destroyed) {
+            stream.destroy()
+          }
+        }
+      },
+    })
   }
 
   // 3. CDN Download Request builder (NO Authorization header, stream download of ZIP)
@@ -788,92 +856,87 @@ export class OfficialV4Provider implements MinerUProvider {
     context.signal.throwIfAborted()
     const safeCdnUrl = externalHttpsUrl(cdnUrl, 'Official result ZIP URL')
 
-    const controller = new AbortController()
-    let timedOut = false
-    const timer = setTimeout(() => {
-      timedOut = true
-      controller.abort(new DOMException(`Download timed out after ${String(context.timeoutMs)}ms`, 'TimeoutError'))
-    }, context.timeoutMs)
+    return await executeWithRetry({
+      provider: 'official-v4',
+      operation: 'cdn-download',
+      signal: context.signal,
+      retryOptions: mergeRetryOptions(this.retryOptions, context.retry),
+      fn: async () => {
+        context.signal.throwIfAborted()
 
-    const onParentAbort = () => {
-      controller.abort(context.signal.reason)
-    }
-    context.signal.addEventListener('abort', onParentAbort, { once: true })
+        const controller = new AbortController()
+        let timedOut = false
+        const timer = setTimeout(() => {
+          timedOut = true
+          controller.abort(new DOMException(`Download timed out after ${String(context.timeoutMs)}ms`, 'TimeoutError'))
+        }, context.timeoutMs)
 
-    try {
-      // Must NOT include Authorization header
-      const requestInit: RequestInit = {
-        method: 'GET',
-        headers: {},
-        signal: controller.signal,
-        redirect: 'error',
-      }
-
-      let response: Response
-      try {
-        response = await fetch(safeCdnUrl, requestInit)
-      } catch (err: unknown) {
-        if (context.signal.aborted) {
-          throw new MinerUError(failure('CANCELLED', 'Download was cancelled', true))
+        const onParentAbort = () => {
+          controller.abort(context.signal.reason)
         }
-        if (timedOut) {
-          throw new MinerUError(failure('RESULT_DOWNLOAD_FAILED', `Download timed out after ${String(context.timeoutMs)}ms`, true))
-        }
-        const message = err instanceof Error ? err.message : String(err)
-        throw new MinerUError(
-          failure('RESULT_DOWNLOAD_FAILED', `Failed to download result archive: ${sanitizeDiagnostic(message)}`, true),
-          { cause: err },
-        )
-      }
+        context.signal.addEventListener('abort', onParentAbort, { once: true })
 
-      if (response.status !== 200) {
-        throw new MinerUError(
-          failure('RESULT_DOWNLOAD_FAILED', `Failed to download result archive, HTTP status ${String(response.status)}`, true),
-        )
-      }
-
-      const body = response.body
-      if (!body) {
-        throw new MinerUError(failure('RESULT_DOWNLOAD_FAILED', 'Result archive response body is empty', false))
-      }
-
-      const nodeStream = Readable.fromWeb(body as import('node:stream/web').ReadableStream<Uint8Array>)
-      const tempName = `mineru_v4_${createHash('sha256').update(safeCdnUrl).digest('hex').slice(0, 16)}.zip`
-
-      return await sink.writeTemporary(tempName, nodeStream, context.limits.maxZipDownloadBytes)
-    } finally {
-      clearTimeout(timer)
-      context.signal.removeEventListener('abort', onParentAbort)
-    }
-  }
-
-  private async readBoundedResponseBody(
-    response: Response,
-    maxBytes: number,
-    signal: AbortSignal,
-  ): Promise<string> {
-    const body = response.body
-    if (!body) return ''
-    const reader = body.getReader()
-    const chunks: Uint8Array[] = []
-    let totalBytes = 0
-
-    try {
-      while (true) {
-        signal.throwIfAborted()
-        const { done, value } = await reader.read()
-        if (done) break
-        if (value) {
-          totalBytes += value.length
-          if (totalBytes > maxBytes) {
-            throw new MinerUError(failure('RESULT_TOO_LARGE', `Response body exceeded limit of ${String(maxBytes)} bytes`))
+        try {
+          // Must NOT include Authorization header
+          const requestInit: RequestInit = {
+            method: 'GET',
+            headers: {},
+            signal: controller.signal,
+            redirect: 'error',
           }
-          chunks.push(value)
+
+          let response: Response
+          try {
+            response = await fetch(safeCdnUrl, requestInit)
+          } catch (err: unknown) {
+            if (context.signal.aborted) {
+              throw new MinerUError(failure('CANCELLED', 'Download was cancelled', true))
+            }
+            if (timedOut) {
+              const err = new MinerUError(failure('RESULT_DOWNLOAD_FAILED', `Download timed out after ${String(context.timeoutMs)}ms`, true))
+              Object.assign(err, { httpStatus: 408 })
+              throw err
+            }
+            const message = err instanceof Error ? err.message : String(err)
+            throw new MinerUError(
+              failure('RESULT_DOWNLOAD_FAILED', `Failed to download result archive: ${sanitizeDiagnostic(message)}`, true),
+              { cause: err },
+            )
+          }
+
+          if (response.status !== 200) {
+            if (response.body) {
+              try { await response.body.cancel() } catch {}
+            }
+            const retryAfter = parseRetryAfter(response.headers.get('retry-after'))
+            const retryable = isRetryableHttpStatus(response.status)
+            const err = new MinerUError(
+              failure('RESULT_DOWNLOAD_FAILED', `Failed to download result archive, HTTP status ${String(response.status)}`, retryable),
+            )
+            Object.assign(err, { httpStatus: response.status, retryAfterMs: retryAfter })
+            throw err
+          }
+
+          const body = response.body
+          if (!body) {
+            throw new MinerUError(failure('RESULT_DOWNLOAD_FAILED', 'Result archive response body is empty', false))
+          }
+
+          const nodeStream = Readable.fromWeb(body as import('node:stream/web').ReadableStream<Uint8Array>)
+          const tempName = `mineru_v4_${createHash('sha256').update(safeCdnUrl).digest('hex').slice(0, 16)}.zip`
+
+          try {
+            return await sink.writeTemporary(tempName, nodeStream, context.limits.maxZipDownloadBytes)
+          } catch (error) {
+            nodeStream.destroy()
+            throw error
+          }
+        } finally {
+          clearTimeout(timer)
+          context.signal.removeEventListener('abort', onParentAbort)
         }
-      }
-      return Buffer.concat(chunks).toString('utf8')
-    } finally {
-      reader.releaseLock()
-    }
+      },
+    })
   }
+
 }
