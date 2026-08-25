@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="./docs/assets/deepseek-mineru-banner.png" width="100%" alt="DeepSeek 娘与 MinerU 文档解析插件横幅">
+
 # dsh-pdf-mineru
 
 **让 DeepSeek Harness 以统一方式使用 MinerU 解析文档**
@@ -17,11 +19,6 @@
 [快速开始](#快速开始) · [核心能力](#核心能力) · [模型工具](#模型工具) · [Provider](#provider-对照) · [配置](#配置) · [安全与存储](#安全与存储) · [开发](#开发与验证)
 
 </div>
-
-<p align="center">
-  <img src="./docs/assets/mineru-settings-preview.png" width="800" alt="dsh-pdf-mineru 在 DSH Settings 中的 Provider 与解析默认值界面">
-</p>
-<p align="center"><sub>Provider 与解析默认值的可视化配置；同一页面还提供缓存、重试、安全限制和存储运维。</sub></p>
 
 ---
 
@@ -170,6 +167,11 @@ Provider 不注册工具、不访问 DSH Session、不决定存储路径，也�
 ## 配置
 
 推荐通过 **Settings → MinerU** 编辑配置。Provider、解析默认值、轮询、重试和输出限制对新任务实时生效；`storageRoot` 变更需要重启插件进程。
+
+<p align="center">
+  <img src="./docs/assets/mineru-settings-preview.png" width="800" alt="dsh-pdf-mineru 在 DSH Settings 中的 Provider 与解析默认值界面">
+</p>
+<p align="center"><sub>Provider 与解析默认值的可视化配置；同一页面还提供缓存、重试、安全限制和存储运维。</sub></p>
 
 <details>
 <summary><strong>Self-hosted v2 最小配置</strong></summary>
