@@ -27,6 +27,7 @@ import type {
 } from '@deepseek-ai/dsh-tools'
 import { MinerUError, failure } from './domain/errors.js'
 import type { ParseRequestInput } from './domain/request.js'
+import type { StorageAccessGate } from './storage/access-gate.js'
 import type {
   BatchParseDocumentView,
   BatchSubmitView,
@@ -141,28 +142,28 @@ const parseParameters: ParameterSchemaSpec = {
   file_paths: {
     type: 'array',
     items: { type: 'string' },
-    description: 'Local filesystem paths of the documents to parse. Each source receives an independent job and immutable single-file result.',
+    description: 'Paths of local documents (PDF, Word, Excel, PPT) to parse.',
   },
   model: {
     type: 'string',
     enum: ['pipeline', 'vlm'],
-    description: 'Parsing model. pipeline: rule-based layout/table/formula pipeline. vlm: vision-language model.',
+    description: 'Parsing model: "pipeline" (rule-based layout/table) or "vlm" (vision model for complex visual layouts).',
   },
   ocr: {
     type: 'boolean',
-    description: 'Force OCR parsing for all pages.',
+    description: 'Force OCR on all pages (for scanned documents or image PDFs).',
   },
   language: {
     type: 'string',
-    description: 'Language hint code (e.g. "ch", "en", "latin", "japan", "korean").',
+    description: 'Language hint code (e.g. "ch", "en", "japan", "korean").',
   },
   formula: {
     type: 'boolean',
-    description: 'Enable mathematical formula recognition.',
+    description: 'Enable LaTeX mathematical formula recognition.',
   },
   table: {
     type: 'boolean',
-    description: 'Enable table structure recognition.',
+    description: 'Enable table structure recognition into Markdown/HTML.',
   },
   pages: {
     type: 'string',
@@ -174,9 +175,8 @@ const parseParameters: ParameterSchemaSpec = {
       type: 'string',
       enum: ['markdown', 'layout', 'model-output', 'content-list', 'images'],
     },
-    description: 'Artifact kinds to retain and publish in the global result (default: ["markdown"]).',
+    description: 'Artifacts to extract and retain (e.g. ["markdown", "images"]). Default: ["markdown"].',
   },
-
 }
 
 // ============================================================================
@@ -358,15 +358,19 @@ function requireJobId(args: unknown): string {
 export function registerTools(
   ctx: Context,
   getService: () => MinerUService,
+  accessGate?: StorageAccessGate,
 ): () => void {
   const disposers: Array<() => void> = []
+  const withStorageAccess = async <T,>(operation: () => Promise<T>): Promise<T> => {
+    return accessGate === undefined ? await operation() : await accessGate.runShared(operation)
+  }
 
   // 1. mineru_health
   disposers.push(
     ctx.tools.register(
       defineTool({
         name: 'mineru_health',
-        description: 'Check MinerU server and provider health, connection status, and queue depth.',
+        description: 'Check MinerU backend connectivity, authentication status, and queue capacity.',
         parameters: {},
         output: {
           schema: {
@@ -412,7 +416,7 @@ export function registerTools(
     ctx.tools.register(
       defineTool({
         name: 'mineru_submit_parse_job',
-        description: 'Submit a document to MinerU for asynchronous parsing and return immediately with a job ID.',
+        description: 'Submit documents (PDF, Word, Excel, PPT) for async parsing into Markdown. Returns a job ID immediately for non-blocking or large batch tasks.',
         parameters: parseParameters,
         output: {
           schema: {
@@ -446,7 +450,7 @@ export function registerTools(
         },
         execute: async (args: unknown, exec: ToolRunContext) => {
           const { session, signal } = requireAgentSession(exec)
-          return await getService().submit(session, args as ParseRequestInput, signal)
+          return await withStorageAccess(() => getService().submit(session, args as ParseRequestInput, signal))
         },
       }),
     ) as () => void,
@@ -457,11 +461,11 @@ export function registerTools(
     ctx.tools.register(
       defineTool({
         name: 'mineru_get_parse_status',
-        description: 'Check the status and progress of an asynchronous MinerU parsing job.',
+        description: 'Check status and progress of an async parsing job. Call mineru_get_parse_result when completed.',
         parameters: {
           job_id: {
             type: 'string',
-            description: 'MinerU job ID (mj_...) returned by submit or parse_document.',
+            description: 'MinerU job ID (mj_...) to query.',
           },
         },
         output: {
@@ -496,7 +500,7 @@ export function registerTools(
         },
         execute: async (args: unknown, exec: ToolRunContext) => {
           const { session, signal } = requireAgentSession(exec)
-          return await getService().status(session, requireJobId(args), signal)
+          return await withStorageAccess(() => getService().status(session, requireJobId(args), signal))
         },
       }),
     ) as () => void,
@@ -507,7 +511,7 @@ export function registerTools(
     ctx.tools.register(
       defineTool({
         name: 'mineru_get_parse_result',
-        description: 'Fetch parsed markdown content and published artifact paths for a completed MinerU task.',
+        description: 'Retrieve parsed Markdown preview and local artifact paths (images, layout) for a completed job.',
         parameters: {
           job_id: {
             type: 'string',
@@ -542,7 +546,7 @@ export function registerTools(
         },
         execute: async (args: unknown, exec: ToolRunContext) => {
           const { session, signal } = requireAgentSession(exec)
-          return await getService().result(session, requireJobId(args), signal)
+          return await withStorageAccess(() => getService().result(session, requireJobId(args), signal))
         },
       }),
     ) as () => void,
@@ -553,12 +557,12 @@ export function registerTools(
     ctx.tools.register(
       defineTool({
         name: 'mineru_parse_document',
-        description: 'Parse a local document via MinerU and return extracted markdown content and artifact paths.',
+        description: 'Parse documents (PDF, Word, Excel, PPT) into Markdown with formulas, tables, and images. Synchronously waits and returns markdown preview and artifact paths.',
         parameters: {
           ...parseParameters,
           poll_timeout_ms: {
             type: 'integer',
-            description: 'Maximum time (ms) to wait for parsing before returning in-progress job status.',
+            description: 'Maximum time (ms) to wait before returning in-progress status.',
           },
         },
         output: {
@@ -632,7 +636,7 @@ export function registerTools(
             throw new MinerUError(failure('INVALID_REQUEST', 'Tool arguments must be an object'))
           }
           const { poll_timeout_ms: rawPollTimeout, ...input } = args as ParseRequestInput & { poll_timeout_ms?: unknown }
-          return await getService().parseDocument(session, input, signal, parsePollTimeout(rawPollTimeout))
+          return await withStorageAccess(() => getService().parseDocument(session, input, signal, parsePollTimeout(rawPollTimeout)))
         },
       }),
     ) as () => void,
