@@ -147,6 +147,28 @@
   margin-top: 2px;
 }
 
+.credentialInputRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.credentialInputRow > .input {
+  min-width: 0;
+  width: 100%;
+}
+
+@media (max-width: 520px) {
+  .credentialInputRow {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .credentialInputRow > .secondaryButton {
+    justify-self: start;
+  }
+}
+
 .chipGroup {
   display: flex;
   flex-wrap: wrap;

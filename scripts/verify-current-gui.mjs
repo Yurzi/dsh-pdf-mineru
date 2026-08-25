@@ -171,6 +171,13 @@ if (await page.getByText('Provider Settings', { exact: true }).count() === 0) {
   console.error(JSON.stringify({ bundleIntercepts, rpcCalls, errors, body: (await page.locator('body').innerText()).slice(0, 8000) }, null, 2))
 }
 await page.getByText('Provider Settings', { exact: true }).waitFor({ timeout: 10_000 })
+const credentialInput = page.getByLabel('API Key', { exact: true })
+await credentialInput.waitFor({ timeout: 5000 })
+if (await credentialInput.getAttribute('type') !== 'password') throw new Error('API key control is not a password input')
+if (await credentialInput.inputValue() !== '') throw new Error('credential value was restored into the browser')
+if (await page.getByRole('button', { name: 'Clear API Key', exact: true }).count() !== 1) throw new Error('credential clear control is missing')
+await page.getByText('Provider Settings', { exact: true }).scrollIntoViewIfNeeded()
+await page.screenshot({ path: '/tmp/mineru-current-settings-credential-desktop.png', fullPage: true })
 const providerType = page.getByLabel('Provider Type')
 if (await providerType.inputValue() !== 'self-hosted-v2') throw new Error('initial provider type mismatch')
 if (await page.getByText('Pipeline Backend Map', { exact: true }).count() !== 1) throw new Error('self-hosted fields are missing')
@@ -220,6 +227,11 @@ await page.getByRole('button', { name: 'Settings', exact: true }).click()
 await page.waitForTimeout(300)
 await page.getByRole('button', { name: 'MinerU', exact: true }).click()
 await page.getByText('Provider Settings', { exact: true }).waitFor({ timeout: 5000 })
+const mobileCredentialInput = page.getByLabel('API Key', { exact: true })
+await mobileCredentialInput.waitFor({ timeout: 5000 })
+if (await mobileCredentialInput.inputValue() !== '') throw new Error('credential value was restored into the mobile browser')
+await page.getByText('Provider Settings', { exact: true }).scrollIntoViewIfNeeded()
+await page.screenshot({ path: '/tmp/mineru-current-settings-credential-mobile.png', fullPage: true })
 await page.getByRole('button', { name: 'List Quarantine', exact: true }).click()
 await page.getByText('entry_corrupt_1', { exact: true }).waitFor({ timeout: 5000 })
 await page.getByText('Storage & Cache', { exact: true }).scrollIntoViewIfNeeded()
@@ -299,8 +311,13 @@ if (cleanupPreviewCall?.payload?.entry_ids?.[0] !== 'entry_corrupt_1') throw new
 const cleanupDeleteCall = rpcCalls.find(call => call.endpoint === 'mineru/storage.quarantine.cleanup' && call.payload?.dry_run === false)
 if (cleanupDeleteCall?.payload?.confirm !== true) throw new Error('cleanup deletion did not carry explicit confirmation')
 console.log(JSON.stringify({
-  providerSwitch: true, draftProbe: true, save: true, maintenance: true, errors, desktopMetrics, mobileMetrics, sectionBox, providerHeadingBox, layoutDiagnostics, visibleControlBoxes,
+  providerSwitch: true, draftProbe: true, save: true, credentialUi: true, maintenance: true, errors, desktopMetrics, mobileMetrics, sectionBox, providerHeadingBox, layoutDiagnostics, visibleControlBoxes,
   rpcEndpoints: rpcCalls.map(call => call.endpoint),
-  screenshots: ['/tmp/mineru-current-settings-desktop.png', '/tmp/mineru-current-settings-mobile.png'],
+  screenshots: [
+    '/tmp/mineru-current-settings-credential-desktop.png',
+    '/tmp/mineru-current-settings-desktop.png',
+    '/tmp/mineru-current-settings-credential-mobile.png',
+    '/tmp/mineru-current-settings-mobile.png',
+  ],
 }, null, 2))
 await browser.close()

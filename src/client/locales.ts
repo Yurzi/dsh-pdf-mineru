@@ -16,6 +16,8 @@ export type MineruKey =
   | 'field.baseURL.placeholder'
   | 'field.apiKeyEnv'
   | 'field.apiKeyEnv.placeholder'
+  | 'field.apiKeyEnv.hint'
+  | 'field.apiKey'
   | 'field.allowInsecureHttp'
   | 'field.configuredVersion'
   | 'field.modelMap.pipeline'
@@ -60,6 +62,8 @@ export type MineruKey =
   | 'action.saved'
   | 'action.test'
   | 'action.testing'
+  | 'action.clearApiKey'
+  | 'action.clearingApiKey'
   | 'action.storageStats'
   | 'action.integrityScan'
   | 'action.gcPreview'
@@ -93,6 +97,13 @@ export type MineruKey =
   | 'test.healthy'
   | 'test.unhealthy'
   | 'test.error'
+  | 'credential.placeholderStored'
+  | 'credential.placeholderEmpty'
+  | 'credential.loading'
+  | 'credential.configured'
+  | 'credential.notConfigured'
+  | 'credential.readOnly'
+  | 'credential.referenceRequired'
   | 'provider.type.selfHosted'
   | 'provider.type.official'
   | 'model.pipeline'
@@ -125,8 +136,10 @@ export const en: Record<MineruKey, string> = {
   'field.providerType': 'Provider Type',
   'field.baseURL': 'API Base URL',
   'field.baseURL.placeholder': 'https://mineru.net/api/v4 or http://localhost:18000',
-  'field.apiKeyEnv': 'API Key Env Var',
+  'field.apiKeyEnv': 'Credential Reference',
   'field.apiKeyEnv.placeholder': 'MINERU_API_KEY',
+  'field.apiKeyEnv.hint': 'Reference name stored in MinerU configuration. The API key value is kept separately by DeepSeek Harness.',
+  'field.apiKey': 'API Key',
   'field.allowInsecureHttp': 'Allow Insecure HTTP (Local Only)',
   'field.configuredVersion': 'Server Protocol / Version',
   'field.modelMap.pipeline': 'Pipeline Backend Map',
@@ -178,6 +191,8 @@ export const en: Record<MineruKey, string> = {
   'action.saved': 'Saved',
   'action.test': 'Test Active Provider',
   'action.testing': 'Testing…',
+  'action.clearApiKey': 'Clear API Key',
+  'action.clearingApiKey': 'Clearing…',
   'action.storageStats': 'Refresh Statistics',
   'action.integrityScan': 'Verify Cache',
   'action.gcPreview': 'Preview GC',
@@ -211,6 +226,13 @@ export const en: Record<MineruKey, string> = {
   'test.healthy': 'Connection Healthy',
   'test.unhealthy': 'Service Unhealthy',
   'test.error': 'Test Failed',
+  'credential.placeholderStored': 'Stored; leave blank to keep the current key',
+  'credential.placeholderEmpty': 'Enter an API key to store on save',
+  'credential.loading': 'Checking credential status…',
+  'credential.configured': 'A credential is configured. Saving with this field blank keeps it unchanged.',
+  'credential.notConfigured': 'No credential is configured. Enter a key and save the configuration to store it.',
+  'credential.readOnly': 'This credential comes from a read-only source, such as the process environment, and cannot be changed here.',
+  'credential.referenceRequired': 'Set a credential reference before entering an API key.',
 
   'provider.type.selfHosted': 'Self-Hosted MinerU (v2 API)',
   'provider.type.official': 'Official MinerU Cloud (v4 API)',
@@ -243,8 +265,10 @@ export const zh: Record<MineruKey, string> = {
   'field.providerType': 'Provider 类型',
   'field.baseURL': 'API 服务地址',
   'field.baseURL.placeholder': 'https://mineru.net/api/v4 或 http://localhost:18000',
-  'field.apiKeyEnv': 'API Key 环境变量名',
+  'field.apiKeyEnv': '凭据引用名',
   'field.apiKeyEnv.placeholder': 'MINERU_API_KEY',
+  'field.apiKeyEnv.hint': 'MinerU 配置中仅保存此引用名；API Key 值由 DeepSeek Harness 凭据服务单独保管。',
+  'field.apiKey': 'API Key',
   'field.allowInsecureHttp': '允许非加密 HTTP 连接',
   'field.configuredVersion': '服务端协议版本标识',
   'field.modelMap.pipeline': 'Pipeline 模型后端映射',
@@ -296,6 +320,8 @@ export const zh: Record<MineruKey, string> = {
   'action.saved': '已保存',
   'action.test': '测试当前 Provider 连接',
   'action.testing': '测试中…',
+  'action.clearApiKey': '清除 API Key',
+  'action.clearingApiKey': '清除中…',
   'action.storageStats': '刷新统计',
   'action.integrityScan': '校验缓存',
   'action.gcPreview': '预览 GC',
@@ -329,6 +355,13 @@ export const zh: Record<MineruKey, string> = {
   'test.healthy': '连接正常',
   'test.unhealthy': '服务状态异常',
   'test.error': '连接测试失败',
+  'credential.placeholderStored': '已保存；留空将保留当前 Key',
+  'credential.placeholderEmpty': '输入 API Key，保存配置时写入凭据服务',
+  'credential.loading': '正在检查凭据状态…',
+  'credential.configured': '凭据已配置；API Key 留空保存不会覆盖现有值。',
+  'credential.notConfigured': '尚未配置凭据；输入 API Key 并保存配置即可写入。',
+  'credential.readOnly': '该凭据来自进程环境变量等只读来源，无法在此修改或清除。',
+  'credential.referenceRequired': '请先填写凭据引用名，再输入 API Key。',
 
   'provider.type.selfHosted': '自托管 MinerU (v2 API)',
   'provider.type.official': '官方云服务 MinerU (v4 API)',

@@ -3,7 +3,7 @@ import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client
 import type {} from '@deepseek-ai/dsh-client-connection/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
-import { SettingsPage, type MineruSettingsInjected } from './SettingsPage.js'
+import { SettingsPage, type CredentialClient, type MineruSettingsInjected } from './SettingsPage.js'
 import { en, NS, zh, type MineruKey } from './locales.js'
 import { dicts } from './dictionaries.js'
 
@@ -38,11 +38,14 @@ export function apply(ctx: ClientContext): void {
     }
   }, 'dsh-pdf-mineru: better-locale override dicts')
 
-  const connection = ctx.connection as unknown as ConnectionHandle
+  const connection = ctx.connection as unknown as ConnectionHandle & {
+    readonly api: { readonly credentials: CredentialClient }
+  }
   const t = ctx.locale.bind(NS) as (key: string) => string
 
   const settingsInjected = (): MineruSettingsInjected => ({
     rpc: connection.rpc,
+    credentials: connection.api.credentials,
     t,
   })
 

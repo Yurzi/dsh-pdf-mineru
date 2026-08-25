@@ -21,10 +21,15 @@ import { asProviderConfigId } from '../src/domain/ids.js'
 import { registerRpc, RPC_CHANNEL, type MineruRpcDeps, type RpcResult } from '../src/rpc.js'
 import type { ProbeView } from '../src/service/mineru-service.js'
 import {
+  clearCredential,
+  credentialReference,
+  describeCredential,
   normalizeProviderDefaults,
   patchActiveProvider,
+  storeCredential,
   switchProviderType,
   updateConfigSection,
+  type CredentialClient,
 } from '../src/client/SettingsPage.js'
 import { formatBytes } from '../src/client/StorageOperations.js'
 
@@ -365,6 +370,51 @@ describe('MinerU RPC (registerRpc)', () => {
 })
 
 describe('Client UI Pure Helpers (SettingsPage)', () => {
+  it('uses the Harness credential API without exposing stored values', async () => {
+    const describe = vi.fn(async () => ({
+      result: {
+        ok: true as const,
+        value: { credentials: { MINERU_API_KEY: { configured: true, source: 'file', writable: true } } },
+      },
+    }))
+    const set = vi.fn(async () => ({ result: { ok: true as const, value: {} } }))
+    const unset = vi.fn(async () => ({ result: { ok: true as const, value: {} } }))
+    const credentials = { describe, set, unset } as CredentialClient
+
+    const view = await describeCredential(credentials, 'MINERU_API_KEY')
+    expect(view).toEqual({ configured: true, source: 'file', writable: true })
+    expect(view).not.toHaveProperty('value')
+    expect(describe).toHaveBeenCalledWith({ refs: ['MINERU_API_KEY'] })
+
+    await storeCredential(credentials, 'MINERU_API_KEY', '  secret-mineru-key  ')
+    expect(set).toHaveBeenCalledWith({ ref: 'MINERU_API_KEY', value: 'secret-mineru-key' })
+
+    await clearCredential(credentials, 'MINERU_API_KEY')
+    expect(unset).toHaveBeenCalledWith({ ref: 'MINERU_API_KEY' })
+  })
+
+  it('rejects blank or Host-rejected credential writes and keeps references separate', async () => {
+    const base = defaultMinerUConfig()
+    expect(credentialReference(base.providers[0])).toBe('MINERU_API_KEY')
+    expect(credentialReference({ ...base.providers[0]!, apiKeyEnv: undefined })).toBeUndefined()
+
+    const set = vi.fn(async () => ({
+      result: {
+        ok: false as const,
+        error: { code: 'credential-rejected', message: 'credential is shadowed by a read-only source' },
+      },
+    }))
+    const credentials = {
+      describe: vi.fn(),
+      set,
+      unset: vi.fn(),
+    } as unknown as CredentialClient
+
+    await expect(storeCredential(credentials, 'MINERU_API_KEY', '   ')).rejects.toThrow(/must not be empty/)
+    expect(set).not.toHaveBeenCalled()
+    await expect(storeCredential(credentials, 'MINERU_API_KEY', 'new-secret')).rejects.toThrow(/read-only source/)
+  })
+
   it('formats storage byte counters without unsafe or shifting values', () => {
     expect(formatBytes(0)).toBe('0 B')
     expect(formatBytes(1024)).toBe('1.00 KiB')

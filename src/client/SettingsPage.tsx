@@ -10,7 +10,26 @@ import css from './SettingsPage.module.css'
 
 export interface MineruSettingsInjected {
   readonly rpc: ClientConnectionRpc
+  readonly credentials: CredentialClient
   readonly t: (key: MineruKey) => string
+}
+
+export interface CredentialView {
+  readonly configured: boolean
+  readonly source?: string
+  readonly writable: boolean
+}
+
+interface CredentialResponse<T> {
+  readonly result: RpcResult<T>
+}
+
+export interface CredentialClient {
+  describe(payload: { readonly refs: string[] }): Promise<CredentialResponse<{
+    readonly credentials: Readonly<Record<string, CredentialView>>
+  }>>
+  set(payload: { readonly ref: string; readonly value: string }): Promise<CredentialResponse<Record<string, never>>>
+  unset(payload: { readonly ref: string }): Promise<CredentialResponse<Record<string, never>>>
 }
 
 type SettingsPageProps = PropsRuntime<'settings.section'> & PropsLocale<'dsh-pdf-mineru'> & MineruSettingsInjected
@@ -18,6 +37,13 @@ type SettingsPageProps = PropsRuntime<'settings.section'> & PropsLocale<'dsh-pdf
 type ConfigGetResult = RpcResult<{ readonly config: MinerUConfig }>
 type ConfigSetResult = RpcResult<{ readonly config: MinerUConfig }>
 type ProbeRpcResult = RpcResult<ProbeView>
+
+interface CredentialState {
+  readonly status: 'unavailable' | 'loading' | 'ready' | 'error'
+  readonly ref?: string
+  readonly view?: CredentialView
+  readonly error?: string
+}
 
 const ALL_ARTIFACT_KINDS: readonly ArtifactKind[] = ['markdown', 'layout', 'model-output', 'content-list', 'images']
 
@@ -98,12 +124,43 @@ async function callRpc<T>(rpc: ClientConnectionRpc, endpoint: string, payload: u
   return rpc.call('/dsh-pdf-mineru-api', endpoint, payload) as Promise<T>
 }
 
-export function SettingsPage({ rpc, t }: SettingsPageProps) {
+export function credentialReference(provider: ProviderConfig | undefined): string | undefined {
+  const reference = provider?.apiKeyEnv?.trim()
+  return reference === undefined || reference.length === 0 ? undefined : reference
+}
+
+export async function describeCredential(credentials: CredentialClient, reference: string): Promise<CredentialView> {
+  const response = await credentials.describe({ refs: [reference] })
+  if (!response.result.ok) throw new Error(response.result.error.message)
+  return response.result.value.credentials[reference] ?? { configured: false, writable: true }
+}
+
+export async function storeCredential(
+  credentials: CredentialClient,
+  reference: string,
+  value: string,
+): Promise<void> {
+  const secret = value.trim()
+  if (secret.length === 0) throw new TypeError('API key must not be empty')
+  const response = await credentials.set({ ref: reference, value: secret })
+  if (!response.result.ok) throw new Error(response.result.error.message)
+}
+
+export async function clearCredential(credentials: CredentialClient, reference: string): Promise<void> {
+  const response = await credentials.unset({ ref: reference })
+  if (!response.result.ok) throw new Error(response.result.error.message)
+}
+
+export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
   const [draft, setDraft] = useState<MinerUConfig | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState<string | undefined>(undefined)
+  const [apiKeyDraft, setApiKeyDraft] = useState('')
+  const [credentialBusy, setCredentialBusy] = useState(false)
+  const [credentialRevision, setCredentialRevision] = useState(0)
+  const [credentialState, setCredentialState] = useState<CredentialState>({ status: 'unavailable' })
   const [testState, setTestState] = useState<{
     status: 'idle' | 'testing' | 'healthy' | 'unhealthy' | 'error'
     view?: ProbeView
@@ -129,8 +186,39 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
 
   useEffect(() => { void refresh() }, [refresh])
 
+  const activeProviderDraft = draft?.providers.find(p => p.id === draft.activeProvider) ?? draft?.providers[0]
+  const activeCredentialRef = credentialReference(activeProviderDraft)
+
+  useEffect(() => {
+    setApiKeyDraft('')
+    if (activeCredentialRef === undefined) {
+      setCredentialState({ status: 'unavailable' })
+      return undefined
+    }
+
+    let stale = false
+    setCredentialState({ status: 'loading', ref: activeCredentialRef })
+    void describeCredential(credentials, activeCredentialRef).then(
+      view => {
+        if (!stale) setCredentialState({ status: 'ready', ref: activeCredentialRef, view })
+      },
+      err => {
+        if (!stale) {
+          setCredentialState({
+            status: 'error',
+            ref: activeCredentialRef,
+            error: err instanceof Error ? err.message : String(err),
+          })
+        }
+      },
+    )
+    return () => { stale = true }
+  }, [activeCredentialRef, credentialRevision, credentials])
+
   const save = useCallback(async () => {
     if (draft === null) return
+    const reference = credentialReference(draft.providers.find(p => p.id === draft.activeProvider))
+    const secret = apiKeyDraft.trim()
     setSaving(true)
     setError(undefined)
     setSaved(false)
@@ -138,6 +226,12 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
       const result = await callRpc<ConfigSetResult>(rpc, 'mineru/config.set', { config: draft })
       if (result.ok) {
         setDraft(result.value.config)
+        if (secret.length > 0) {
+          if (reference === undefined) throw new TypeError(t('credential.referenceRequired'))
+          await storeCredential(credentials, reference, secret)
+          setApiKeyDraft('')
+          setCredentialRevision(value => value + 1)
+        }
         setSaved(true)
         setTimeout(() => setSaved(false), 2000)
       } else {
@@ -148,7 +242,24 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
     } finally {
       setSaving(false)
     }
-  }, [draft, rpc])
+  }, [apiKeyDraft, credentials, draft, rpc, t])
+
+  const clearStoredCredential = useCallback(async () => {
+    if (activeCredentialRef === undefined) return
+    setCredentialBusy(true)
+    setError(undefined)
+    setSaved(false)
+    try {
+      await clearCredential(credentials, activeCredentialRef)
+      setApiKeyDraft('')
+      setCredentialRevision(value => value + 1)
+      setTestState({ status: 'idle' })
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setCredentialBusy(false)
+    }
+  }, [activeCredentialRef, credentials])
 
   const testActiveProvider = useCallback(async () => {
     if (draft === null) return
@@ -186,7 +297,14 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
     )
   }
 
-  const activeProvider = draft.providers.find(p => p.id === draft.activeProvider) ?? draft.providers[0]!
+  const activeProvider = activeProviderDraft!
+  const credentialStateReady = credentialState.status === 'ready' && credentialState.ref === activeCredentialRef
+  const credentialView = credentialStateReady ? credentialState.view : undefined
+  const credentialLocked = credentialView?.writable === false
+  const credentialInputDisabled = saving || credentialBusy || activeCredentialRef === undefined || !credentialStateReady || credentialLocked
+  const credentialPlaceholder = credentialView?.configured === true
+    ? t('credential.placeholderStored')
+    : t('credential.placeholderEmpty')
 
   const handleActiveTypeChange = (newType: 'self-hosted-v2' | 'official-v4'): void => {
     const updated = switchProviderType(activeProvider, newType)
@@ -236,7 +354,7 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
         <button
           type="button"
           className={css.primaryButton}
-          disabled={saving}
+          disabled={saving || credentialBusy}
           onClick={() => void save()}
         >
           {saving ? '…' : saved ? t('action.saved') : t('action.save')}
@@ -341,7 +459,45 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
               placeholder={t('field.apiKeyEnv.placeholder')}
               onChange={e => setDraft(prev => prev === null ? prev : patchActiveProvider(prev, { apiKeyEnv: e.target.value || undefined }))}
             />
+            <span className={css.fieldHint}>{t('field.apiKeyEnv.hint')}</span>
           </label>
+        </div>
+
+        <div className={css.field}>
+          <span className={css.fieldLabel}>{t('field.apiKey')}</span>
+          <div className={css.credentialInputRow}>
+            <input
+              className={css.input}
+              type="password"
+              autoComplete="off"
+              aria-label={t('field.apiKey')}
+              value={apiKeyDraft}
+              placeholder={credentialPlaceholder}
+              disabled={credentialInputDisabled}
+              onChange={event => setApiKeyDraft(event.target.value)}
+            />
+            <button
+              type="button"
+              className={css.secondaryButton}
+              disabled={credentialInputDisabled || credentialView?.configured !== true}
+              onClick={() => void clearStoredCredential()}
+            >
+              {credentialBusy ? t('action.clearingApiKey') : t('action.clearApiKey')}
+            </button>
+          </div>
+          <span className={css.fieldHint}>
+            {credentialState.status === 'loading'
+              ? t('credential.loading')
+              : credentialState.status === 'error'
+                ? credentialState.error
+                : activeCredentialRef === undefined
+                  ? t('credential.referenceRequired')
+                  : credentialLocked
+                    ? t('credential.readOnly')
+                    : credentialView?.configured === true
+                      ? [t('credential.configured'), credentialView.source ? ` (${credentialView.source})` : ''].join('')
+                      : t('credential.notConfigured')}
+          </span>
         </div>
 
         {activeProvider.type === 'self-hosted-v2' && (
