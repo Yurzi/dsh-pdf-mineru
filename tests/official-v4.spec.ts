@@ -270,18 +270,18 @@ describe('OfficialV4Provider', () => {
       expect(result.authentication).toBe('valid')
     })
 
-    it('accepts the current official missing-task probe sentinel', async () => {
+    it.each([-500, -60012])('accepts official missing-task probe sentinel %s', async code => {
       globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
-        code: -500, msg: 'task not found or expire',
+        code, msg: 'task not found or expire',
       }), { status: 200, headers: { 'content-type': 'application/json' } }))
       const result = await new OfficialV4Provider(makeConfig()).probe(makeContext())
       expect(result.available).toBe(true)
       expect(result.authentication).toBe('valid')
     })
 
-    it('does not accept an unrelated -500 response as a probe sentinel', async () => {
+    it.each([-500, -60012])('does not accept unrelated message for probe sentinel %s', async code => {
       globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
-        code: -500, msg: 'Internal service error',
+        code, msg: 'Internal service error',
       }), { status: 200, headers: { 'content-type': 'application/json' } }))
       const result = await new OfficialV4Provider(makeConfig()).probe(makeContext())
       expect(result.available).toBe(false)

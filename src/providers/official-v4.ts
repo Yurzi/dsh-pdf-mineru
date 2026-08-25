@@ -103,7 +103,8 @@ function mapOfficialFileState(rawState: string | undefined): MinerUFileState {
 function isMissingBatchProbeSentinel(code: number | string, message: string): boolean {
   const normalizedCode = String(code).toUpperCase()
   if (normalizedCode === 'BATCH_NOT_FOUND') return true
-  return normalizedCode === '-500' && /^task not found or expire(?:d)?[.!]?$/i.test(message.trim())
+  return (normalizedCode === '-500' || normalizedCode === '-60012')
+    && /^task not found or expire(?:d)?[.!]?$/i.test(message.trim())
 }
 
 function officialBusinessFailure(code: number | string, message: string, traceId?: string): MinerUError {
