@@ -140,6 +140,58 @@
   cursor: default;
 }
 
+.fieldHint {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-tertiary);
+  margin-top: 2px;
+}
+
+.chipGroup {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  box-sizing: border-box;
+  height: 24px;
+  padding: 0 8px;
+  font-size: 11px;
+  line-height: 16px;
+  font-family: var(--ds-font-family-code, monospace);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 4px;
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.chip:hover {
+  background: var(--dsw-alias-interactive-bg-hover-solid);
+  color: var(--dsw-alias-label-primary);
+  border-color: var(--dsw-alias-border-l3);
+}
+
+.chipActive {
+  background: var(--dsw-alias-bg-layer-2);
+  border-color: var(--dsw-alias-brand-primary);
+  color: var(--dsw-alias-brand-primary);
+  font-weight: 500;
+}
+
+.chipBadge {
+  font-size: 10px;
+  font-family: system-ui, -apple-system, sans-serif;
+  opacity: 0.85;
+}
+
 .checkboxGroup {
   display: flex;
   flex-wrap: wrap;

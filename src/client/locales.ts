@@ -19,7 +19,17 @@ export type MineruKey =
   | 'field.allowInsecureHttp'
   | 'field.configuredVersion'
   | 'field.modelMap.pipeline'
+  | 'field.modelMap.pipeline.hint'
+  | 'field.modelMap.pipeline.placeholder'
   | 'field.modelMap.vlm'
+  | 'field.modelMap.vlm.hint'
+  | 'field.modelMap.vlm.placeholder'
+  | 'field.modelMap.chip.default'
+  | 'field.modelMap.chip.recommended'
+  | 'field.modelMap.chip.vlmEngine'
+  | 'field.modelMap.opt.pipeline'
+  | 'field.modelMap.opt.hybridEngine'
+  | 'field.modelMap.opt.vlmEngine'
   | 'field.officialModels'
   | 'field.defaultModel'
   | 'field.defaultParseMethod'
@@ -53,6 +63,8 @@ export type MineruKey =
   | 'action.storageStats'
   | 'action.integrityScan'
   | 'action.gcPreview'
+  | 'action.cacheClear'
+  | 'action.cacheClearConfirm'
   | 'action.quarantineList'
   | 'action.cleanupPreview'
   | 'action.cleanupDelete'
@@ -72,6 +84,9 @@ export type MineruKey =
   | 'ops.gcEligible'
   | 'ops.gcBlocked'
   | 'ops.gcCandidates'
+  | 'ops.clearReady'
+  | 'ops.clearBlocked'
+  | 'ops.activeJobs'
   | 'ops.selectAll'
   | 'ops.modified'
   | 'ops.cleanupPlanned'
@@ -116,7 +131,17 @@ export const en: Record<MineruKey, string> = {
   'field.allowInsecureHttp': 'Allow Insecure HTTP (Local Only)',
   'field.configuredVersion': 'Server Protocol / Version',
   'field.modelMap.pipeline': 'Pipeline Backend Map',
+  'field.modelMap.pipeline.hint': 'Backend engine identifier sent to the self-hosted MinerU server for pipeline requests. Default and standard value is pipeline.',
+  'field.modelMap.pipeline.placeholder': 'pipeline',
   'field.modelMap.vlm': 'VLM Backend Map',
+  'field.modelMap.vlm.hint': 'Backend engine identifier sent to the self-hosted MinerU server for VLM requests. Common choices include hybrid-engine (hybrid layout + VLM, recommended) and vlm-engine (pure local VLM).',
+  'field.modelMap.vlm.placeholder': 'hybrid-engine or vlm-engine',
+  'field.modelMap.chip.default': 'default',
+  'field.modelMap.chip.recommended': 'recommended',
+  'field.modelMap.chip.vlmEngine': 'pure VLM',
+  'field.modelMap.opt.pipeline': 'pipeline (Rule & OCR pipeline, fast and deterministic)',
+  'field.modelMap.opt.hybridEngine': 'hybrid-engine (Layout analysis + VLM hybrid, high accuracy & low hallucination - recommended)',
+  'field.modelMap.opt.vlmEngine': 'vlm-engine (Pure local VLM inference)',
   'field.officialModels': 'Supported Cloud Models',
 
   'field.defaultModel': 'Default Model',
@@ -157,6 +182,8 @@ export const en: Record<MineruKey, string> = {
   'action.storageStats': 'Refresh Statistics',
   'action.integrityScan': 'Verify Cache',
   'action.gcPreview': 'Preview GC',
+  'action.cacheClear': 'Clear Cache',
+  'action.cacheClearConfirm': 'Confirm Clear',
   'action.quarantineList': 'List Quarantine',
   'action.cleanupPreview': 'Preview Cleanup',
   'action.cleanupDelete': 'Delete Selected',
@@ -176,6 +203,9 @@ export const en: Record<MineruKey, string> = {
   'ops.gcEligible': 'Complete Preview',
   'ops.gcBlocked': 'Blocked Preview',
   'ops.gcCandidates': 'Candidates',
+  'ops.clearReady': 'Ready to Clear',
+  'ops.clearBlocked': 'Clear Blocked',
+  'ops.activeJobs': 'Active Jobs',
   'ops.selectAll': 'Select all quarantine entries',
   'ops.modified': 'Modified',
   'ops.cleanupPlanned': 'Planned',
@@ -220,7 +250,17 @@ export const zh: Record<MineruKey, string> = {
   'field.allowInsecureHttp': '允许非加密 HTTP 连接',
   'field.configuredVersion': '服务端协议版本标识',
   'field.modelMap.pipeline': 'Pipeline 模型后端映射',
+  'field.modelMap.pipeline.hint': '自托管 MinerU 服务端在处理 pipeline（规则与 OCR 流水线）解析请求时调用的底层后端标识，默认且通常填写 pipeline。',
+  'field.modelMap.pipeline.placeholder': 'pipeline',
   'field.modelMap.vlm': 'VLM 模型后端映射',
+  'field.modelMap.vlm.hint': '自托管 MinerU 服务端在处理 vlm（视觉大模型）解析请求时调用的底层后端标识。常用项包括 hybrid-engine（混合引擎，高精度低幻觉，推荐）和 vlm-engine（纯本地视觉大模型）。',
+  'field.modelMap.vlm.placeholder': 'hybrid-engine 或 vlm-engine',
+  'field.modelMap.chip.default': '默认',
+  'field.modelMap.chip.recommended': '推荐',
+  'field.modelMap.chip.vlmEngine': '纯 VLM',
+  'field.modelMap.opt.pipeline': 'pipeline（规则与 OCR 流水线，速度快且无幻觉）',
+  'field.modelMap.opt.hybridEngine': 'hybrid-engine（版面分析 + VLM 混合引擎，高精度低幻觉，推荐）',
+  'field.modelMap.opt.vlmEngine': 'vlm-engine（纯本地视觉大模型端到端推理）',
   'field.officialModels': '云服务支持模型',
 
   'field.defaultModel': '默认解析模型',
@@ -261,6 +301,8 @@ export const zh: Record<MineruKey, string> = {
   'action.storageStats': '刷新统计',
   'action.integrityScan': '校验缓存',
   'action.gcPreview': '预览 GC',
+  'action.cacheClear': '清除缓存',
+  'action.cacheClearConfirm': '确认清除',
   'action.quarantineList': '查看隔离区',
   'action.cleanupPreview': '预览清理',
   'action.cleanupDelete': '删除已选项',
@@ -280,6 +322,9 @@ export const zh: Record<MineruKey, string> = {
   'ops.gcEligible': '预览完整',
   'ops.gcBlocked': '预览受阻',
   'ops.gcCandidates': '候选项',
+  'ops.clearReady': '可以清除',
+  'ops.clearBlocked': '清除受阻',
+  'ops.activeJobs': '活动 Job',
   'ops.selectAll': '选择全部隔离条目',
   'ops.modified': '修改时间',
   'ops.cleanupPlanned': '计划清理',

@@ -358,29 +358,74 @@ export function SettingsPage({ rpc, t }: SettingsPageProps) {
             </div>
 
             <div className={css.row}>
-              <label className={css.field}>
+              <div className={css.field}>
                 <span className={css.fieldLabel}>{t('field.modelMap.pipeline')}</span>
                 <input
                   className={css.input}
+                  list="mineru-modelmap-pipeline-options"
+                  placeholder={t('field.modelMap.pipeline.placeholder')}
                   value={(activeProvider as SelfHostedV2Config).modelMap.pipeline}
                   onChange={e => {
                     const currentMap = (activeProvider as SelfHostedV2Config).modelMap
                     setDraft(prev => prev === null ? prev : patchActiveProvider(prev, { modelMap: { ...currentMap, pipeline: e.target.value } }))
                   }}
                 />
-              </label>
+                <datalist id="mineru-modelmap-pipeline-options">
+                  <option value="pipeline">{t('field.modelMap.opt.pipeline')}</option>
+                </datalist>
+                <div className={css.chipGroup}>
+                  <button
+                    type="button"
+                    className={`${css.chip} ${(activeProvider as SelfHostedV2Config).modelMap.pipeline === 'pipeline' ? css.chipActive : ''}`}
+                    onClick={() => {
+                      const currentMap = (activeProvider as SelfHostedV2Config).modelMap
+                      setDraft(prev => prev === null ? prev : patchActiveProvider(prev, { modelMap: { ...currentMap, pipeline: 'pipeline' } }))
+                    }}
+                  >
+                    <span>pipeline</span>
+                    <span className={css.chipBadge}>({t('field.modelMap.chip.default')})</span>
+                  </button>
+                </div>
+                <span className={css.fieldHint}>{t('field.modelMap.pipeline.hint')}</span>
+              </div>
 
-              <label className={css.field}>
+              <div className={css.field}>
                 <span className={css.fieldLabel}>{t('field.modelMap.vlm')}</span>
                 <input
                   className={css.input}
+                  list="mineru-modelmap-vlm-options"
+                  placeholder={t('field.modelMap.vlm.placeholder')}
                   value={(activeProvider as SelfHostedV2Config).modelMap.vlm}
                   onChange={e => {
                     const currentMap = (activeProvider as SelfHostedV2Config).modelMap
                     setDraft(prev => prev === null ? prev : patchActiveProvider(prev, { modelMap: { ...currentMap, vlm: e.target.value } }))
                   }}
                 />
-              </label>
+                <datalist id="mineru-modelmap-vlm-options">
+                  <option value="hybrid-engine">{t('field.modelMap.opt.hybridEngine')}</option>
+                  <option value="vlm-engine">{t('field.modelMap.opt.vlmEngine')}</option>
+                </datalist>
+                <div className={css.chipGroup}>
+                  {([
+                    { value: 'hybrid-engine', badge: t('field.modelMap.chip.recommended') },
+                    { value: 'vlm-engine', badge: t('field.modelMap.chip.vlmEngine') },
+                  ] as const).map(opt => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      className={`${css.chip} ${(activeProvider as SelfHostedV2Config).modelMap.vlm === opt.value ? css.chipActive : ''}`}
+                      onClick={() => {
+                        const currentMap = (activeProvider as SelfHostedV2Config).modelMap
+                        setDraft(prev => prev === null ? prev : patchActiveProvider(prev, { modelMap: { ...currentMap, vlm: opt.value } }))
+                      }}
+                    >
+                      <span>{opt.value}</span>
+                      <span className={css.chipBadge}>({opt.badge})</span>
+                    </button>
+                  ))}
+                </div>
+                <span className={css.fieldHint}>{t('field.modelMap.vlm.hint')}</span>
+              </div>
             </div>
           </>
         )}

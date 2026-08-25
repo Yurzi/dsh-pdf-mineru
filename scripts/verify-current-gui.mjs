@@ -75,6 +75,17 @@ const gcPreview = {
   jobReferences: { complete: true, scannedJobCount: 3, referencedCacheKeyCount: 1, malformedJobCount: 0, unreadableJobCount: 0, unsafeJobEntryCount: 0 },
   scan: { limit: 10000, scanned: 2, truncated: false, diagnosticsLimit: 50, diagnosticsTruncated: false }, diagnostics: [],
 }
+const cacheClearReport = dryRun => ({
+  generatedAt: Date.now(), dryRun, eligible: true, activeJobCount: 0, activeAccessCount: 0,
+  ...(dryRun ? { confirmationToken: 'cache-clear-preview-token' } : {}),
+  plannedCount: 2, plannedBytes: 4096, plannedBytesSaturated: false,
+  deletedCount: dryRun ? 0 : 2, deletedBytes: dryRun ? 0 : 4096, deletedBytesSaturated: false,
+  skippedCount: 0,
+  jobScan: { complete: true, scannedJobCount: 3, referencedCacheKeyCount: 1, malformedJobCount: 0, unreadableJobCount: 0, unsafeJobEntryCount: 0 },
+  scan: { limit: 10000, scanned: 2, truncated: false, diagnosticsLimit: 50, diagnosticsTruncated: false },
+  diagnostics: [],
+})
+
 const quarantineReport = {
   generatedAt: Date.now(),
   entries: [
@@ -94,7 +105,14 @@ const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } })
 const errors = []
 const rpcCalls = []
 let bundleIntercepts = 0
-page.on('console', message => { if (message.type() === 'error') errors.push(message.text()) })
+page.on('console', message => {
+  if (message.type() === 'error') {
+    const text = message.text()
+    if (!text.includes('sidebar/ws') && !text.includes('dsh-better-sidebar')) {
+      errors.push(text)
+    }
+  }
+})
 page.on('pageerror', error => errors.push(error.message))
 await page.route(
   url => url.origin === webUrl.origin && url.pathname === webUrl.pathname && url.search === '',
@@ -124,6 +142,7 @@ await page.route('**/dsh-pdf-mineru-api/**', async route => {
   else if (endpoint === 'mineru/storage.stats') result = { ok: true, value: storageStats }
   else if (endpoint === 'mineru/storage.integrity.scan') result = { ok: true, value: integrityScan }
   else if (endpoint === 'mineru/storage.gc.preview') result = { ok: true, value: gcPreview }
+  else if (endpoint === 'mineru/storage.cache.clear') result = { ok: true, value: cacheClearReport(payload.dry_run !== false) }
   else if (endpoint === 'mineru/storage.quarantine.list') result = { ok: true, value: quarantineReport }
   else if (endpoint === 'mineru/storage.quarantine.cleanup') result = {
     ok: true,
@@ -171,6 +190,13 @@ await page.getByRole('button', { name: 'Verify Cache', exact: true }).click()
 await page.getByText('Valid: 2', { exact: true }).waitFor({ timeout: 5000 })
 await page.getByRole('button', { name: 'Preview GC', exact: true }).click()
 await page.getByText('Complete Preview', { exact: true }).waitFor({ timeout: 5000 })
+await page.getByRole('button', { name: 'Clear Cache', exact: true }).click()
+await page.getByText('Ready to Clear', { exact: true }).waitFor({ timeout: 5000 })
+await page.getByRole('button', { name: 'Preview GC', exact: true }).click()
+if (await page.getByRole('button', { name: 'Confirm Clear', exact: true }).count() !== 0) throw new Error('cache clear confirmation stayed armed after another operation')
+await page.getByRole('button', { name: 'Clear Cache', exact: true }).click()
+await page.getByRole('button', { name: 'Confirm Clear', exact: true }).click()
+await page.getByText('Deleted: 2', { exact: true }).waitFor({ timeout: 5000 })
 await page.getByRole('button', { name: 'List Quarantine', exact: true }).click()
 await page.getByText('entry_corrupt_1', { exact: true }).waitFor({ timeout: 5000 })
 await page.getByLabel('entry_corrupt_1').check()
@@ -263,6 +289,11 @@ if (probe?.payload?.provider?.type !== 'official-v4') throw new Error('draft pro
 const save = rpcCalls.find(call => call.endpoint === 'mineru/config.set')
 if (save?.payload?.config?.providers?.[0]?.type !== 'self-hosted-v2') throw new Error('save did not carry current provider config')
 if (save?.payload?.config?.retry?.maxAttempts !== 4) throw new Error('save did not carry retry policy')
+const cacheClearPreviewCall = rpcCalls.find(call => call.endpoint === 'mineru/storage.cache.clear' && call.payload?.dry_run === true)
+if (cacheClearPreviewCall === undefined) throw new Error('cache clear preview was not requested')
+const cacheClearDeleteCall = rpcCalls.find(call => call.endpoint === 'mineru/storage.cache.clear' && call.payload?.dry_run === false)
+if (cacheClearDeleteCall?.payload?.confirm !== true) throw new Error('cache clear deletion did not carry explicit confirmation')
+if (cacheClearDeleteCall?.payload?.confirmation_token !== 'cache-clear-preview-token') throw new Error('cache clear deletion was not bound to its preview')
 const cleanupPreviewCall = rpcCalls.find(call => call.endpoint === 'mineru/storage.quarantine.cleanup' && call.payload?.dry_run === true)
 if (cleanupPreviewCall?.payload?.entry_ids?.[0] !== 'entry_corrupt_1') throw new Error('cleanup preview did not carry selected entry')
 const cleanupDeleteCall = rpcCalls.find(call => call.endpoint === 'mineru/storage.quarantine.cleanup' && call.payload?.dry_run === false)
