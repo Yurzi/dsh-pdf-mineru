@@ -96,15 +96,13 @@ function createContext(definitions) {
 function summarize(result) {
   return {
     state: result.state,
-    provider: result.provider ?? 'official-v4',
-    job_id: result.job_id,
+    source: result.source,
     result_id: result.result_id,
     cache_hit: result.cache_hit,
     preview_chars: typeof result.markdown_preview === 'string' ? result.markdown_preview.length : 0,
     preview_truncated: result.preview_truncated,
     files: Array.isArray(result.files) ? result.files.map(file => ({
       name: file.name,
-      state: file.state,
       artifacts: Array.isArray(file.artifacts)
         ? file.artifacts.map(artifact => ({ kind: artifact.kind, bytes: artifact.bytes }))
         : [],

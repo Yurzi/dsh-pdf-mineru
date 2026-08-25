@@ -4,19 +4,14 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   asProviderConfigId,
-  asSessionId,
   createFileId,
-  createJobId,
   createOperationId,
   type CacheKey,
-  type SessionId,
 } from '../src/domain/ids.js'
-import { MINERU_JOB_SCHEMA_VERSION, type MinerUJobRecord } from '../src/domain/job.js'
 import { CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, type CanonicalParseRequest } from '../src/domain/request.js'
 import type { ResultProducer } from '../src/domain/result.js'
-import { computeCacheKey } from '../src/service/cache-key.js'
+import { SharedOperationRegistry } from '../src/service/shared-operations.js'
 import {
-  JobRepository,
   ProcessLock,
   ResultRepository,
   StorageMaintenanceService,
@@ -62,35 +57,10 @@ function sampleProducer(): ResultProducer {
   }
 }
 
-function sessionObject(id: SessionId): { readonly header: { readonly id: SessionId } } {
-  return { header: { id } }
-}
-
-function sampleJob(sessionId: SessionId, request: CanonicalParseRequest, producer: ResultProducer): MinerUJobRecord {
-  const file = request.files[0]!
-  const cacheKey = computeCacheKey(request, file, producer.compatibilityKey)
-  return {
-    schemaVersion: MINERU_JOB_SCHEMA_VERSION,
-    id: createJobId(),
-    sessionId,
-    providerId: producer.providerId,
-    providerConfigId: producer.providerConfigId,
-    providerCompatibilityKey: producer.compatibilityKey,
-    sourceFiles: [{ fileId: file.fileId, name: file.name, bytes: file.bytes, sha256: file.sha256 }],
-    request,
-    cacheKey,
-    state: 'completed',
-    resolution: { kind: 'cache-hit' },
-    files: [{ fileId: file.fileId, name: file.name, cacheKey, state: 'completed' }],
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-  }
-}
-
 interface MaintenanceFixture {
   readonly paths: StoragePaths
   readonly results: ResultRepository
-  readonly jobs: JobRepository
+  readonly operations: SharedOperationRegistry
   readonly maintenance: StorageMaintenanceService
   readonly lock: ProcessLock
 }
@@ -99,11 +69,11 @@ async function createMaintenanceFixture(): Promise<MaintenanceFixture> {
   const root = await createTempRoot()
   const paths = new StoragePaths(root)
   const results = new ResultRepository(paths)
-  const jobs = new JobRepository(paths)
+  const operations = new SharedOperationRegistry()
   const lock = new ProcessLock(paths)
   await lock.acquire()
   heldLocks.push(lock)
-  return { paths, results, jobs, maintenance: new StorageMaintenanceService(paths, results, lock), lock }
+  return { paths, results, operations, maintenance: new StorageMaintenanceService(paths, results, operations, lock), lock }
 }
 
 async function publish(
@@ -127,11 +97,9 @@ async function makePublishedWritable(paths: StoragePaths, cacheKey: CacheKey, fi
 }
 
 describe('StorageMaintenanceService statistics and integrity', () => {
-  it('reports normal-store usage without following symlinks', async () => {
-    const { paths, results, jobs, maintenance } = await createMaintenanceFixture()
+  it('reports normal cache usage without following symlinks', async () => {
+    const { paths, results, maintenance } = await createMaintenanceFixture()
     const published = await publish(results, 'a'.repeat(64), '# published')
-    const request = sampleRequest('a'.repeat(64))
-    await jobs.create(sessionObject(asSessionId('stats-session')), sampleJob(asSessionId('stats-session'), request, sampleProducer()))
 
     const staging = results.beginTransaction(createOperationId(), sampleRequest('b'.repeat(64)), sampleProducer())
     await staging.writeArtifact(sampleRequest('b'.repeat(64)).files[0]!.fileId, 'markdown', '# staging', { mediaType: 'text/markdown' })
@@ -145,11 +113,9 @@ describe('StorageMaintenanceService statistics and integrity', () => {
 
     const stats = await maintenance.getStatistics()
     expect(stats.publishedResults.logicalEntryCount).toBe(1)
-    expect(stats.persistedJobs.logicalEntryCount).toBe(1)
     expect(stats.staging.logicalEntryCount).toBe(1)
     expect(stats.quarantine.logicalEntryCount).toBe(1)
     expect(stats.publishedResults.byteUsage).toBeGreaterThan(0)
-    expect(stats.persistedJobs.byteUsage).toBeGreaterThan(0)
     expect(stats.staging.byteUsage).toBeGreaterThan(0)
     expect(stats.quarantine.byteUsage).toBe('quarantine bytes'.length)
     expect(stats.quarantine.skippedSymlinkCount).toBe(1)
@@ -233,19 +199,15 @@ describe('StorageMaintenanceService statistics and integrity', () => {
     const paths = new StoragePaths(root)
     const results = new ResultRepository(paths)
     const lock = new ProcessLock(paths)
-    const maintenance = new StorageMaintenanceService(paths, results, lock)
+    const maintenance = new StorageMaintenanceService(paths, results, new SharedOperationRegistry(), lock)
     await expect(maintenance.getStatistics()).rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
   })
 })
 
 describe('StorageMaintenanceService quarantine operations', () => {
   it('lists bounded quarantine entries and cleans only requested safe entries', async () => {
-    const { paths, results, jobs, maintenance } = await createMaintenanceFixture()
+    const { paths, results, maintenance } = await createMaintenanceFixture()
     const published = await publish(results, 'a'.repeat(64), '# preserve result')
-    const request = sampleRequest('a'.repeat(64))
-    const session = asSessionId('cleanup-session')
-    const persistedJob = sampleJob(session, request, sampleProducer())
-    await jobs.create(sessionObject(session), persistedJob)
     const staging = results.beginTransaction(createOperationId(), sampleRequest('b'.repeat(64)), sampleProducer())
     await staging.writeArtifact(sampleRequest('b'.repeat(64)).files[0]!.fileId, 'markdown', '# preserve staging', { mediaType: 'text/markdown' })
 
@@ -275,7 +237,6 @@ describe('StorageMaintenanceService quarantine operations', () => {
     expect(cleaned.deletedCount).toBe(1)
     await expect(stat(paths.quarantineDir('entry_0'))).rejects.toThrow()
     await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
-    await expect(stat(paths.jobFile(session, persistedJob.id))).resolves.toBeDefined()
     await expect(stat(staging.stagingDir)).resolves.toBeDefined()
     expect(await readFile(outside, 'utf8')).toBe('outside')
   })
@@ -323,17 +284,10 @@ describe('StorageMaintenanceService quarantine operations', () => {
 })
 
 describe('StorageMaintenanceService cache clear', () => {
-  it('previews then deletes published results while retaining persisted jobs', async () => {
-    const { paths, results, jobs, maintenance } = await createMaintenanceFixture()
-    const referenced = await publish(results, 'a'.repeat(64), '# referenced')
-    const orphan = await publish(results, 'b'.repeat(64), '# orphan')
-    const session = asSessionId('cache-clear-session')
-    const job = sampleJob(session, sampleRequest('a'.repeat(64)), sampleProducer())
-    await jobs.create(sessionObject(session), {
-      ...job,
-      cacheKey: referenced.cacheKey,
-      files: job.files.map(file => ({ ...file, cacheKey: referenced.cacheKey })),
-    })
+  it('previews then deletes all published results while no parse operation is active', async () => {
+    const { paths, results, maintenance } = await createMaintenanceFixture()
+    const first = await publish(results, 'a'.repeat(64), '# first')
+    const second = await publish(results, 'b'.repeat(64), '# second')
 
     const preview = await maintenance.clearCache()
     expect(preview.dryRun).toBe(true)
@@ -341,42 +295,32 @@ describe('StorageMaintenanceService cache clear', () => {
     expect(preview.activeJobCount).toBe(0)
     expect(preview.plannedCount).toBe(2)
     expect(preview.deletedCount).toBe(0)
-    await expect(stat(paths.resultDir(referenced.cacheKey))).resolves.toBeDefined()
-    await expect(stat(paths.resultDir(orphan.cacheKey))).resolves.toBeDefined()
+    await expect(stat(paths.resultDir(first.cacheKey))).resolves.toBeDefined()
+    await expect(stat(paths.resultDir(second.cacheKey))).resolves.toBeDefined()
 
-    expect(preview.confirmationToken).toBeDefined()
-    const cleared = await maintenance.clearCache({
-      dryRun: false,
-      confirmationToken: preview.confirmationToken,
-    })
+    const cleared = await maintenance.clearCache({ dryRun: false, confirmationToken: preview.confirmationToken })
     expect(cleared.eligible).toBe(true)
     expect(cleared.deletedCount).toBe(2)
     expect(cleared.deletedBytes).toBeGreaterThan(0)
     expect(cleared.skippedCount).toBe(0)
-    await expect(stat(paths.resultDir(referenced.cacheKey))).rejects.toThrow()
-    await expect(stat(paths.resultDir(orphan.cacheKey))).rejects.toThrow()
-    await expect(jobs.get(sessionObject(session), job.id)).resolves.toBeDefined()
+    await expect(stat(paths.resultDir(first.cacheKey))).rejects.toThrow()
+    await expect(stat(paths.resultDir(second.cacheKey))).rejects.toThrow()
   })
 
-  it('fails closed while a persisted job is active', async () => {
-    const { paths, results, jobs, maintenance } = await createMaintenanceFixture()
-    const published = await publish(results, 'c'.repeat(64), '# active')
-    const session = asSessionId('cache-clear-active-session')
-    const job = sampleJob(session, sampleRequest('c'.repeat(64)), sampleProducer())
-    await jobs.create(sessionObject(session), {
-      ...job,
-      state: 'processing',
-      resolution: { kind: 'provider' },
-      files: job.files.map(file => ({ ...file, cacheKey: published.cacheKey, state: 'processing' })),
-    })
+  it('blocks deletion while a background shared operation is still active', async () => {
+    const { paths, results, operations, maintenance } = await createMaintenanceFixture()
+    const published = await publish(results, 'e'.repeat(64), '# producer')
+    const reserved = operations.reserve(published.cacheKey, asProviderConfigId('mp_maintenance'), 1000)
+    expect(reserved.created).toBe(true)
 
     const report = await maintenance.clearCache({ dryRun: false })
     expect(report.eligible).toBe(false)
-    expect(report.activeJobCount).toBe(1)
+    expect(report.activeJobCount).toBe(0)
+    expect(report.activeOperationCount).toBe(1)
     expect(report.deletedCount).toBe(0)
     await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
+    operations.dispose()
   })
-
   it('blocks deletion while a model tool holds shared storage access', async () => {
     const { paths, results, maintenance } = await createMaintenanceFixture()
     const published = await publish(results, 'e'.repeat(64), '# leased')
@@ -441,81 +385,23 @@ describe('StorageMaintenanceService cache clear', () => {
 })
 
 describe('StorageMaintenanceService GC dry run', () => {
-  it('retains every parsed job cache-key reference and returns bounded orphan candidates without deletion', async () => {
-    const { paths, results, jobs, maintenance } = await createMaintenanceFixture()
-    const firstReferenced = await publish(results, 'a'.repeat(64), '# first reference')
-    const secondReferenced = await publish(results, 'b'.repeat(64), '# second reference')
-    const orphanOne = await publish(results, 'c'.repeat(64), '# orphan one')
-    const orphanTwo = await publish(results, 'd'.repeat(64), '# orphan two')
-
-    const session = asSessionId('gc-session')
-    const firstJob = sampleJob(session, sampleRequest('a'.repeat(64)), sampleProducer())
-    const secondJob = sampleJob(session, sampleRequest('b'.repeat(64)), sampleProducer())
-    await jobs.create(sessionObject(session), {
-      ...firstJob, cacheKey: firstReferenced.cacheKey,
-      files: firstJob.files.map(file => ({ ...file, cacheKey: firstReferenced.cacheKey })),
-    })
-    await jobs.create(sessionObject(session), {
-      ...secondJob, cacheKey: secondReferenced.cacheKey,
-      files: secondJob.files.map(file => ({ ...file, cacheKey: secondReferenced.cacheKey })),
-    })
+  it('returns bounded candidates without retaining obsolete plugin Job references', async () => {
+    const { paths, results, maintenance } = await createMaintenanceFixture()
+    const first = await publish(results, 'a'.repeat(64), '# first')
+    const second = await publish(results, 'b'.repeat(64), '# second')
 
     const report = await maintenance.gcDryRun({ candidateLimit: 1 })
     expect(report.dryRun).toBe(true)
-    expect(report.referencePolicy).toBe('job-reference-retention')
     expect(report.eligible).toBe(true)
-    expect(report.jobReferences.complete).toBe(true)
-    expect(report.referencedResultCount).toBe(2)
+    expect(report.jobReferences).toMatchObject({ complete: true, sessionJobCount: 0, activeJobCount: 0 })
+    expect(report.referencedResultCount).toBe(0)
     expect(report.candidateCount).toBe(2)
     expect(report.candidates).toHaveLength(1)
     expect(report.candidatesTruncated).toBe(true)
-    expect(report.candidates[0]!.cacheKey === orphanOne.cacheKey || report.candidates[0]!.cacheKey === orphanTwo.cacheKey).toBe(true)
-    await expect(stat(paths.resultDir(firstReferenced.cacheKey))).resolves.toBeDefined()
-    await expect(stat(paths.resultDir(secondReferenced.cacheKey))).resolves.toBeDefined()
-    await expect(stat(paths.resultDir(orphanOne.cacheKey))).resolves.toBeDefined()
-    await expect(stat(paths.resultDir(orphanTwo.cacheKey))).resolves.toBeDefined()
+    expect([first.cacheKey, second.cacheKey]).toContain(report.candidates[0]!.cacheKey)
+    await expect(stat(paths.resultDir(first.cacheKey))).resolves.toBeDefined()
+    await expect(stat(paths.resultDir(second.cacheKey))).resolves.toBeDefined()
   })
-
-  it('fails closed for malformed, oversized, temporary, or symlinked job records', async () => {
-    const { paths, results, maintenance } = await createMaintenanceFixture()
-    const orphan = await publish(results, 'a'.repeat(64), '# orphan')
-    const session = asSessionId('gc-blocked-session')
-    const jobId = createJobId()
-    await mkdir(paths.jobDir(session), { recursive: true })
-    await writeFile(paths.jobFile(session, jobId), '{not-json')
-
-    const malformed = await maintenance.gcDryRun()
-    expect(malformed.eligible).toBe(false)
-    expect(malformed.jobReferences.complete).toBe(false)
-    expect(malformed.jobReferences.malformedJobCount).toBe(1)
-    expect(malformed.candidateCount).toBe(0)
-
-    await rm(paths.jobFile(session, jobId))
-    await writeFile(paths.jobFile(session, jobId), 'x'.repeat(1024 * 1024 + 1))
-    const oversized = await maintenance.gcDryRun()
-    expect(oversized.eligible).toBe(false)
-    expect(oversized.jobReferences.malformedJobCount).toBe(1)
-    expect(oversized.candidateCount).toBe(0)
-
-    await rm(paths.jobFile(session, jobId))
-    await writeFile(paths.jobTempFile(session, jobId, 'token'), 'partial')
-    const temporary = await maintenance.gcDryRun()
-    expect(temporary.eligible).toBe(false)
-    expect(temporary.jobReferences.unsafeJobEntryCount).toBe(1)
-    expect(temporary.candidateCount).toBe(0)
-
-    await rm(paths.jobTempFile(session, jobId, 'token'))
-    const outside = join(paths.root, 'outside-job.json')
-    await writeFile(outside, '{not-json')
-    await symlink(outside, paths.jobFile(session, jobId))
-    const linked = await maintenance.gcDryRun()
-    expect(linked.eligible).toBe(false)
-    expect(linked.jobReferences.unsafeJobEntryCount).toBe(1)
-    expect(linked.candidateCount).toBe(0)
-    expect(await readFile(outside, 'utf8')).toBe('{not-json')
-    await expect(stat(paths.resultDir(orphan.cacheKey))).resolves.toBeDefined()
-  })
-
   it('never makes corrupt or scan-truncated results GC candidates', async () => {
     const { paths, results, maintenance } = await createMaintenanceFixture()
     const corrupt = await publish(results, 'a'.repeat(64), 'same-size-A')

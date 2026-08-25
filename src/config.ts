@@ -73,7 +73,10 @@ export interface MinerUConfig {
 
 function dshHome(): string {
   const env = process.env.DSH_HOME?.trim()
-  return env ? resolve(env) : join(homedir(), '.dsh')
+  if (!env) return join(homedir(), '.dsh')
+  if (env === '~') return homedir()
+  if (env.startsWith('~/') || env.startsWith('~\\')) return resolve(join(homedir(), env.slice(2)))
+  return resolve(env)
 }
 
 export function defaultMinerUConfig(): MinerUConfig {
@@ -90,7 +93,7 @@ export function defaultMinerUConfig(): MinerUConfig {
       allowInsecureHttp: true,
     }],
     defaults: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true, artifacts: ['markdown'] },
-    storage: { storageRoot: join(dshHome(), 'dsh-pdf-mineru', 'v1'), cacheEnabled: true, retainSources: false, stagingTtlMs: 24 * 60 * 60 * 1000 },
+    storage: { storageRoot: join(dshHome(), 'cache', 'pdf-mineru'), cacheEnabled: true, retainSources: false, stagingTtlMs: 24 * 60 * 60 * 1000 },
     polling: { pollIntervalMs: 2000, pollTimeoutMs: 600000, requestTimeoutMs: 60000, operationTimeoutMs: 60 * 60 * 1000 },
     retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 10000 },
     output: { maxInlineChars: 200000 },

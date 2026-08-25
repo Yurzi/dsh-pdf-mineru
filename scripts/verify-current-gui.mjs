@@ -57,7 +57,7 @@ const storageArea = (byteUsage, logicalEntryCount) => ({
 })
 const storageStats = {
   generatedAt: Date.now(),
-  publishedResults: storageArea(4096, 2), persistedJobs: storageArea(2048, 3),
+  publishedResults: storageArea(4096, 2),
   staging: storageArea(1024, 1), quarantine: storageArea(512, 2),
 }
 const integrityScan = {
@@ -67,21 +67,21 @@ const integrityScan = {
   diagnostics: [],
 }
 const gcPreview = {
-  generatedAt: Date.now(), dryRun: true, referencePolicy: 'job-reference-retention', eligible: true,
-  candidateCount: 1, candidateBytes: 2048, candidateBytesSaturated: false,
+  generatedAt: Date.now(), dryRun: true, referencePolicy: 'no-plugin-job-retention', eligible: true,
+  candidateCount: 2, candidateBytes: 4096, candidateBytesSaturated: false,
   candidates: [{ cacheKey: 'a'.repeat(64), resultId: 'mr_' + 'a'.repeat(32), byteUsage: 2048, byteUsageSaturated: false }],
-  candidatesTruncated: false, candidateTotalsComplete: true, referencedResultCount: 1,
+  candidatesTruncated: true, candidateTotalsComplete: true, referencedResultCount: 0,
   invalidResultCount: 0, unsafeResultCount: 0,
-  jobReferences: { complete: true, scannedJobCount: 3, referencedCacheKeyCount: 1, malformedJobCount: 0, unreadableJobCount: 0, unsafeJobEntryCount: 0 },
+  jobReferences: { complete: true, sessionJobCount: 0, activeJobCount: 0, referencedCacheKeyCount: 0 },
   scan: { limit: 10000, scanned: 2, truncated: false, diagnosticsLimit: 50, diagnosticsTruncated: false }, diagnostics: [],
 }
 const cacheClearReport = dryRun => ({
-  generatedAt: Date.now(), dryRun, eligible: true, activeJobCount: 0, activeAccessCount: 0,
+  generatedAt: Date.now(), dryRun, eligible: true, activeJobCount: 0, activeOperationCount: 0, activeAccessCount: 0,
   ...(dryRun ? { confirmationToken: 'cache-clear-preview-token' } : {}),
   plannedCount: 2, plannedBytes: 4096, plannedBytesSaturated: false,
   deletedCount: dryRun ? 0 : 2, deletedBytes: dryRun ? 0 : 4096, deletedBytesSaturated: false,
   skippedCount: 0,
-  jobScan: { complete: true, scannedJobCount: 3, referencedCacheKeyCount: 1, malformedJobCount: 0, unreadableJobCount: 0, unsafeJobEntryCount: 0 },
+  jobScan: { complete: true, sessionJobCount: 3, activeJobCount: 0, referencedCacheKeyCount: 1 },
   scan: { limit: 10000, scanned: 2, truncated: false, diagnosticsLimit: 50, diagnosticsTruncated: false },
   diagnostics: [],
 })

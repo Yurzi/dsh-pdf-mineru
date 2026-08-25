@@ -116,23 +116,9 @@ declare module '@deepseek-ai/dsh-tools' {
 
   export type InferValue<S> = InferValueAt<S>
 
-  export interface AgentSessionHeader {
-    readonly id: string
-    readonly cwd?: string
-    readonly [key: string]: unknown
-  }
+  import type { Agent as RuntimeAgent } from '@deepseek-ai/dsh-agent'
 
-  export interface AgentSession {
-    readonly id: string
-    readonly header: AgentSessionHeader
-    readonly [key: string]: unknown
-  }
-
-  export interface Agent {
-    readonly id: string
-    readonly session: AgentSession
-    readonly [key: string]: unknown
-  }
+  export type Agent = RuntimeAgent
 
   export interface ToolRunContext {
     readonly signal: AbortSignal

@@ -4,21 +4,60 @@ vi.mock('@deepseek-ai/dsh-tools', () => ({
   defineTool: <T>(options: T): T => options,
 }))
 
-import { registerTools, renderHealth, renderSubmit, renderStatus, renderResult, renderParseDocument } from '../src/tools.js'
+import {
+  registerTools,
+  renderHealth,
+  renderResult,
+  renderParseDocument,
+} from '../src/tools.js'
 import type { Context } from 'cordis'
-import type { DefineToolOptions, ObjectValueSchemaSpec, ToolRunContext, ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
+import type {
+  DefineToolOptions,
+  ObjectValueSchemaSpec,
+  ToolRunContext,
+  ValueSchemaSpec,
+} from '@deepseek-ai/dsh-tools'
 import type {
   BatchParseDocumentView,
-  BatchSubmitView,
+  FailedParseView,
   MinerUService,
   ParseDocumentView,
   ProbeView,
   ResultView,
-  StatusView,
-  SubmitView,
 } from '../src/service/mineru-service.js'
+import { failure, MinerUError } from '../src/domain/errors.js'
+import { StorageAccessGate } from '../src/storage/access-gate.js'
 
-function createMockContext() {
+interface NativeJobOutcome {
+  readonly status: 'completed' | 'killed' | 'failed'
+  readonly detail?: string
+  readonly output?: string
+}
+
+interface NativeJobStartSpec {
+  readonly kind: string
+  readonly label: string
+  readonly owner: NonNullable<ToolRunContext['agent']>
+  readonly run: () => {
+    readonly cancel: (reason?: string) => void
+    readonly done: Promise<NativeJobOutcome>
+  }
+}
+
+function createMockJobRegistry() {
+  let counter = 0
+  const specs: NativeJobStartSpec[] = []
+  const registry = {
+    start: vi.fn((spec: NativeJobStartSpec) => {
+      counter++
+      specs.push(spec)
+      return 'mineru-' + counter
+    }),
+  }
+  return { registry, specs }
+}
+
+function createMockContext(jobsRegistry?: unknown) {
   const registeredTools: DefineToolOptions[] = []
   const ctx = {
     tools: {
@@ -28,7 +67,10 @@ function createMockContext() {
       }),
       schemas: vi.fn(() => []),
     },
-    get: vi.fn(),
+    get: vi.fn((name: string) => {
+      if (name === 'jobs') return jobsRegistry
+      return undefined
+    }),
     effect: vi.fn(),
     on: vi.fn(),
     inject: vi.fn(),
@@ -53,7 +95,7 @@ function createMockExec(hasAgent = true, signal = new AbortController().signal):
   return {
     ...base,
     agent: {
-      id: 'session_001',
+      id: 'agent_001',
       session: {
         id: 'session_001',
         header: { id: 'session_001', cwd: '/workspace' },
@@ -85,23 +127,21 @@ function assertAllObjectSchemasClosed(schema: ValueSchemaSpec, path = 'root'): v
   }
 }
 
-describe('MinerU Tool Layer', () => {
-  it('registers all 5 model-facing tools with disposer', () => {
+describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () => {
+  it('registers exactly 3 model-facing tools with disposer', async () => {
     const { ctx, registeredTools } = createMockContext()
     const mockService = {} as MinerUService
     const dispose = registerTools(ctx, () => mockService)
 
-    expect(registeredTools).toHaveLength(5)
+    expect(registeredTools).toHaveLength(3)
     const names = registeredTools.map(t => t.name)
     expect(names).toEqual([
       'mineru_health',
       'mineru_submit_parse_job',
-      'mineru_get_parse_status',
-      'mineru_get_parse_result',
       'mineru_parse_document',
     ])
     expect(typeof dispose).toBe('function')
-    dispose()
+    await dispose()
   })
 
   it('strictly enforces additionalProperties: false recursively on all output schemas', () => {
@@ -113,14 +153,14 @@ describe('MinerU Tool Layer', () => {
     }
   })
 
-  it('rejects execute on all 5 tools when agent session is missing', async () => {
+  it('rejects execute on all 3 tools when agent session is missing', async () => {
     const { ctx, registeredTools } = createMockContext()
     registerTools(ctx, () => ({} as MinerUService))
     const unauthenticatedExec = createMockExec(false)
 
     for (const tool of registeredTools) {
       await expect(
-        tool.execute({ job_id: 'mj_123', file_paths: ['/doc.pdf'] }, unauthenticatedExec),
+        tool.execute({ file_paths: ['/doc.pdf'] }, unauthenticatedExec),
       ).rejects.toThrow(/UNAUTHENTICATED_SESSION/)
     }
   })
@@ -156,203 +196,327 @@ describe('MinerU Tool Layer', () => {
       expect(rendered[0]?.text).toContain('Available')
       expect(rendered[0]?.text).toContain('official-v4')
       expect(rendered[0]?.text).toContain('queued=2')
+      expect(rendered[0]?.text).toContain('All systems operational')
+    })
+
+    it('renders minimal health view cleanly when optional fields are omitted', () => {
+      const minimalProbe: ProbeView = {
+        available: false,
+        provider: 'self-hosted-v2',
+        authentication: 'not-configured',
+        protocol_version: 'v2',
+      }
+      const rendered = renderHealth(minimalProbe)
+      expect(rendered[0]?.text).toContain('Unavailable')
+      expect(rendered[0]?.text).toContain('self-hosted-v2')
+      expect(rendered[0]?.text).toContain('not-configured')
+      expect(rendered[0]?.text).not.toContain('Server Version')
+      expect(rendered[0]?.text).not.toContain('Queue:')
     })
   })
 
-  describe('mineru_submit_parse_job', () => {
-    it('submits parse request and passes input and session to service', async () => {
-      const submitResult: SubmitView = {
-        job_id: 'mj_submit_123',
-        state: 'queued',
-        source: 'provider',
-        provider: 'self-hosted-v2',
-        files: [{ file_id: 'mf_1', name: 'doc.pdf', state: 'queued' }],
-        result_available: false,
-      }
-      const mockService = {
-        submit: vi.fn(async () => submitResult),
-      } as unknown as MinerUService
+  describe('mineru_submit_parse_job (Native DSH Background Job)', () => {
+    it('rejects when native DSH background jobs are unavailable', async () => {
+      const { ctx, registeredTools } = createMockContext(undefined)
+      registerTools(ctx, () => ({} as MinerUService))
+      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+      const exec = createMockExec(true)
 
-      const { ctx, registeredTools } = createMockContext()
-      registerTools(ctx, () => mockService)
+      await expect(submitTool.execute({ file_paths: ['/doc.pdf'] }, exec)).rejects.toMatchObject({
+        failure: { code: 'PROVIDER_UNAVAILABLE' },
+      })
+    })
+
+    it('rejects immediately when exec signal is already aborted', async () => {
+      const { registry } = createMockJobRegistry()
+      const { ctx, registeredTools } = createMockContext(registry)
+      registerTools(ctx, () => ({} as MinerUService))
       const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
 
       const controller = new AbortController()
+      controller.abort()
       const exec = createMockExec(true, controller.signal)
+
+      await expect(submitTool.execute({ file_paths: ['/doc.pdf'] }, exec)).rejects.toThrow()
+      expect(registry.start).not.toHaveBeenCalled()
+    })
+
+    it('submits native background job, captures start spec, and returns immediate mineru-N ID', async () => {
+      const { registry, specs } = createMockJobRegistry()
+      const { ctx, registeredTools } = createMockContext(registry)
+      const mockService = {
+        parseDocument: vi.fn(),
+      } as unknown as MinerUService
+      registerTools(ctx, () => mockService)
+      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+
+      const exec = createMockExec(true)
       const inputArgs = {
-        file_paths: ['/data/doc.pdf'],
-        model: 'pipeline' as const,
+        file_paths: ['/data/one.pdf', '/data/two.pdf'],
+        model: 'vlm' as const,
         ocr: true,
-        language: 'ch',
+        language: 'en',
         formula: true,
         table: true,
-        pages: '1-5',
-        artifacts: ['markdown' as const, 'layout' as const],
+        pages: '1-10',
+        artifacts: ['markdown' as const, 'images' as const],
       }
 
       const result = await submitTool.execute(inputArgs, exec)
-      expect(mockService.submit).toHaveBeenCalledWith(exec.agent?.session, inputArgs, controller.signal)
-      expect(result).toEqual(submitResult)
+      expect(result).toEqual({ job_id: 'mineru-1', state: 'running' })
+      expect(registry.start).toHaveBeenCalledTimes(1)
+      expect(specs).toHaveLength(1)
+
+      const captured = specs[0]!
+      expect(captured.kind).toBe('mineru')
+      expect(captured.label).toBe('Parse 2 documents with MinerU')
+      expect(captured.owner).toBe(exec.agent)
+      expect(typeof captured.run).toBe('function')
 
       const rendered = submitTool.output.render(inputArgs, result)
-      expect(rendered[0]?.text).toContain('mj_submit_123')
-      expect(rendered[0]?.text).toContain('queued')
-      expect(rendered[0]?.text).toContain('doc.pdf')
+      expect(rendered[0]?.text).toBe('Started native MinerU background job mineru-1.')
     })
 
-  })
+    it('resolves done hook with completed outcome and formatted markdown preview on success', async () => {
+      const { registry, specs } = createMockJobRegistry()
+      const { ctx, registeredTools } = createMockContext(registry)
 
-  it('renders explicit batch submit envelopes with real child job IDs only', () => {
-    const child: SubmitView = {
-      job_id: 'mj_child_1', state: 'processing', source: 'provider', provider: 'official-v4',
-      files: [{ file_id: 'mf_1', name: 'one.pdf', state: 'processing' }], result_available: false,
-    }
-    const batch: BatchSubmitView = { kind: 'batch', state: 'processing', jobs: [child, { ...child, job_id: 'mj_child_2' }] }
-    expect(batch).not.toHaveProperty('job_id')
-    expect(batch).not.toHaveProperty('result_id')
-    expect(batch).not.toHaveProperty('manifest_path')
-    expect(batch).not.toHaveProperty('cache_hit')
-    const rendered = renderSubmit(batch)[0]?.text ?? ''
-    expect(rendered).toContain('mj_child_1')
-    expect(rendered).toContain('mj_child_2')
-  })
-
-  it('renders batch parse envelopes without folded result identifiers', () => {
-    const child: StatusView = {
-      job_id: 'mj_waiting', state: 'processing', source: 'provider', provider: 'official-v4',
-      files: [{ file_id: 'mf_1', name: 'one.pdf', state: 'processing' }], result_available: false,
-      created_at: 1, updated_at: 2,
-    }
-    const batch: BatchParseDocumentView = { kind: 'batch', state: 'processing', jobs: [child], poll_timed_out: true }
-    expect(batch).not.toHaveProperty('job_id')
-    expect(batch).not.toHaveProperty('result_id')
-    const rendered = renderParseDocument(batch)[0]?.text ?? ''
-    expect(rendered).toContain('mj_waiting')
-    expect(rendered).toContain('Poll Timed Out: Yes')
-  })
-
-  describe('mineru_get_parse_status', () => {
-    it('accepts job_id and routes to service.status', async () => {
-      const statusResult: StatusView = {
-        job_id: 'mj_status_123',
-        state: 'processing',
-        source: 'provider',
-        provider: 'official-v4',
-        files: [{ file_id: 'mf_1', name: 'paper.pdf', state: 'processing', progress: { completed: 3, total: 10 } }],
-        result_available: false,
-        created_at: 1700000000000,
-        updated_at: 1700000005000,
-      }
-      const mockService = {
-        status: vi.fn(async () => statusResult),
-      } as unknown as MinerUService
-
-      const { ctx, registeredTools } = createMockContext()
-      registerTools(ctx, () => mockService)
-      const statusTool = registeredTools.find(t => t.name === 'mineru_get_parse_status')!
-
-      const exec = createMockExec(true)
-      const result = await statusTool.execute({ job_id: 'mj_status_123' }, exec)
-
-      expect(mockService.status).toHaveBeenCalledWith(exec.agent?.session, 'mj_status_123', exec.signal)
-      expect(result).toEqual(statusResult)
-
-      const rendered = statusTool.output.render({ job_id: 'mj_status_123' }, result)
-      expect(rendered[0]?.text).toContain('mj_status_123')
-      expect(rendered[0]?.text).toContain('progress: 3/10')
-    })
-
-    it('rejects a missing job_id', async () => {
-      const mockService = { status: vi.fn() } as unknown as MinerUService
-      const { ctx, registeredTools } = createMockContext()
-      registerTools(ctx, () => mockService)
-      const statusTool = registeredTools.find(t => t.name === 'mineru_get_parse_status')!
-      const exec = createMockExec(true)
-      await expect(statusTool.execute({}, exec)).rejects.toThrow(/job_id is required/)
-      await expect(statusTool.execute({ task_id: 'mj_removed' }, exec)).rejects.toThrow(/Unsupported tool argument/)
-      expect(mockService.status).not.toHaveBeenCalled()
-    })
-  })
-
-  describe('mineru_get_parse_result', () => {
-    it('fetches result and renders preview, artifacts, and clamps to output_limit_chars', async () => {
-      const resultData: ResultView = {
-        job_id: 'mj_res_123',
+      const completedResult: ResultView = {
         state: 'completed',
-        cache_hit: true,
-        result_id: 'mr_res_123',
+        source: 'provider',
+        cache_hit: false,
+        result_id: 'mr_test_123',
         files: [
           {
             file_id: 'mf_1',
-            name: 'doc.pdf',
-            artifacts: [
-              { kind: 'markdown', path: '/cache/doc/full.md', bytes: 1024 },
-              { kind: 'images', path: '/cache/doc/images/0.png', bytes: 2048 },
-            ],
+            name: 'sample.pdf',
+            artifacts: [{ kind: 'markdown', path: '/cache/sample/full.md', bytes: 512 }],
           },
         ],
-        markdown_preview: '# Document Heading\n\nExtracted document text content.',
+        markdown_preview: '# Background Parsed Content',
         preview_truncated: false,
-        manifest_path: '/cache/doc/manifest.json',
+        manifest_path: '/cache/sample/manifest.json',
+        output_limit_chars: 2000,
+      }
+
+      const mockService = {
+        parseDocument: vi.fn(async () => completedResult),
+      } as unknown as MinerUService
+      registerTools(ctx, () => mockService)
+      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+
+      const exec = createMockExec(true)
+      const inputArgs = { file_paths: ['/sample.pdf'] }
+      await submitTool.execute(inputArgs, exec)
+
+      const hooks = specs[0]!.run()
+      const outcome = await hooks.done
+
+      expect(mockService.parseDocument).toHaveBeenCalledWith(
+        exec.agent?.session,
+        { file_paths: ['/sample.pdf'] },
+        expect.any(AbortSignal),
+        null,
+      )
+      expect(outcome.status).toBe('completed')
+      expect(outcome.detail).toBe('completed')
+      expect(outcome.output).toContain('Background Parsed Content')
+      expect(outcome.output).toContain('/cache/sample/full.md')
+    })
+
+    it('resolves done hook with batch detail when batch parse settles', async () => {
+      const { registry, specs } = createMockJobRegistry()
+      const { ctx, registeredTools } = createMockContext(registry)
+
+      const batchResult: BatchParseDocumentView = {
+        kind: 'batch',
+        state: 'partially-completed',
+        results: [
+          {
+            state: 'completed',
+            source: 'provider',
+            cache_hit: true,
+            result_id: 'mr_1',
+            files: [{ file_id: 'mf_1', name: 'good.pdf', artifacts: [] }],
+            markdown_preview: '# Good',
+            preview_truncated: false,
+            manifest_path: '/cache/good/manifest.json',
+            output_limit_chars: 2000,
+          },
+          {
+            state: 'failed',
+            source: 'provider',
+            file_id: 'mf_2',
+            name: 'bad.pdf',
+            failure: failure('REMOTE_PARSE_FAILED', 'Document corrupted'),
+          },
+        ],
+      }
+
+      const mockService = {
+        parseDocument: vi.fn(async () => batchResult),
+      } as unknown as MinerUService
+      registerTools(ctx, () => mockService)
+      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+
+      const exec = createMockExec(true)
+      await submitTool.execute({ file_paths: ['/good.pdf', '/bad.pdf'] }, exec)
+
+      const hooks = specs[0]!.run()
+      const outcome = await hooks.done
+
+      expect(outcome.status).toBe('completed')
+      expect(outcome.detail).toBe('partially-completed')
+      expect(outcome.output).toContain('**MinerU Batch Result**')
+      expect(outcome.output).toContain('bad.pdf')
+      expect(outcome.output).toContain('REMOTE_PARSE_FAILED')
+    })
+
+    it('marks an all-failed batch as a failed native job outcome', async () => {
+      const { registry, specs } = createMockJobRegistry()
+      const { ctx, registeredTools } = createMockContext(registry)
+      const failedBatch: BatchParseDocumentView = {
+        kind: 'batch',
+        state: 'failed',
+        results: [{
+          state: 'failed', source: 'provider', file_id: 'mf_1', name: 'bad.pdf',
+          failure: failure('REMOTE_PARSE_FAILED', 'Document corrupted'),
+        }],
+      }
+      const mockService = { parseDocument: vi.fn(async () => failedBatch) } as unknown as MinerUService
+      registerTools(ctx, () => mockService)
+      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+
+      await submitTool.execute({ file_paths: ['/bad.pdf'] }, createMockExec(true))
+      const outcome = await specs[0]!.run().done
+
+      expect(outcome.status).toBe('failed')
+      expect(outcome.detail).toBe('batch-failed')
+      expect(outcome.output).toContain('REMOTE_PARSE_FAILED')
+    })
+
+    it('handles cancelation and resolves done with killed status', async () => {
+      const { registry, specs } = createMockJobRegistry()
+      const { ctx, registeredTools } = createMockContext(registry)
+
+      const mockService = {
+        parseDocument: vi.fn(async (_session, _input, signal: AbortSignal) => {
+          return new Promise<ResultView>((_resolve, reject) => {
+            signal.addEventListener('abort', () => {
+              reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
+            })
+          })
+        }),
+      } as unknown as MinerUService
+      registerTools(ctx, () => mockService)
+      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+
+      const exec = createMockExec(true)
+      await submitTool.execute({ file_paths: ['/hang.pdf'] }, exec)
+
+      const hooks = specs[0]!.run()
+      hooks.cancel('User requested cancellation')
+      const outcome = await hooks.done
+
+      expect(outcome.status).toBe('killed')
+      expect(outcome.detail).toBe('cancelled')
+    })
+
+    it('cancels and awaits active native wrappers when tools are disposed', async () => {
+      const { registry, specs } = createMockJobRegistry()
+      const { ctx, registeredTools } = createMockContext(registry)
+      const mockService = {
+        parseDocument: vi.fn(async (_session, _input, signal: AbortSignal) => {
+          return await new Promise<ResultView>((_resolve, reject) => {
+            if (signal.aborted) { reject(signal.reason); return }
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+          })
+        }),
+      } as unknown as MinerUService
+      const dispose = registerTools(ctx, () => mockService)
+      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+
+      await submitTool.execute({ file_paths: ['/hang.pdf'] }, createMockExec(true))
+      const hooks = specs[0]!.run()
+      await dispose()
+
+      await expect(hooks.done).resolves.toMatchObject({ status: 'killed', detail: 'cancelled' })
+    })
+
+    it('handles parse failure and maps to failed outcome with error detail', async () => {
+      const { registry, specs } = createMockJobRegistry()
+      const { ctx, registeredTools } = createMockContext(registry)
+
+      const mockService = {
+        parseDocument: vi.fn(async () => {
+          throw new MinerUError(failure('FILE_TOO_LARGE', 'Input exceeds limit'))
+        }),
+      } as unknown as MinerUService
+      registerTools(ctx, () => mockService)
+      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+
+      const exec = createMockExec(true)
+      await submitTool.execute({ file_paths: ['/giant.pdf'] }, exec)
+
+      const hooks = specs[0]!.run()
+      const outcome = await hooks.done
+
+      expect(outcome.status).toBe('failed')
+      expect(outcome.detail).toBe('FILE_TOO_LARGE')
+      expect(outcome.output).toBe('[FILE_TOO_LARGE] Input exceeds limit')
+    })
+
+    it('wraps background execution with storage access gate when provided', async () => {
+      const { registry, specs } = createMockJobRegistry()
+      const { ctx, registeredTools } = createMockContext(registry)
+      const accessGate = new StorageAccessGate()
+      const runSharedSpy = vi.spyOn(accessGate, 'runShared')
+
+      const completedResult: ResultView = {
+        state: 'completed',
+        source: 'cache',
+        cache_hit: true,
+        result_id: 'mr_gate_1',
+        files: [],
+        preview_truncated: false,
+        manifest_path: '/cache/manifest.json',
         output_limit_chars: 1000,
       }
       const mockService = {
-        result: vi.fn(async () => resultData),
+        parseDocument: vi.fn(async () => completedResult),
       } as unknown as MinerUService
 
-      const { ctx, registeredTools } = createMockContext()
-      registerTools(ctx, () => mockService)
-      const resultTool = registeredTools.find(t => t.name === 'mineru_get_parse_result')!
+      registerTools(ctx, () => mockService, accessGate)
+      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
 
       const exec = createMockExec(true)
-      const result = await resultTool.execute({ job_id: 'mj_res_123' }, exec)
-      expect(mockService.result).toHaveBeenCalledWith(exec.agent?.session, 'mj_res_123', exec.signal)
+      await submitTool.execute({ file_paths: ['/doc.pdf'] }, exec)
 
-      const rendered = resultTool.output.render({ job_id: 'mj_res_123' }, result)
-      expect(rendered[0]?.text).toContain('mj_res_123')
-      expect(rendered[0]?.text).toContain('Document Heading')
-      expect(rendered[0]?.text).toContain('/cache/doc/full.md')
-    })
+      const hooks = specs[0]!.run()
+      const outcome = await hooks.done
 
-    it('truncates render projection when text exceeds output_limit_chars', () => {
-      const resultData: ResultView = {
-        job_id: 'mj_long',
-        state: 'completed',
-        cache_hit: false,
-        result_id: 'mr_long',
-        files: [{ file_id: 'mf_1', name: 'big.pdf', artifacts: [] }],
-        markdown_preview: 'A'.repeat(5000),
-        preview_truncated: false,
-        manifest_path: '/cache/manifest.json',
-        output_limit_chars: 120,
-      }
-      const rendered = renderResult(resultData)
-      expect(rendered[0]?.text.length).toBeLessThanOrEqual(120)
-      expect(rendered[0]?.text).toContain('[Output truncated to limit]')
+      expect(outcome.status).toBe('completed')
+      expect(runSharedSpy).toHaveBeenCalled()
     })
   })
 
-
-    it('makes structured artifact truncation explicit in rendered prose', () => {
-      const rendered = renderResult({
-        job_id: 'mj_artifacts', state: 'completed', cache_hit: false, result_id: 'mr_artifacts',
-        files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [], artifacts_truncated: true }],
-        preview_truncated: false, manifest_path: '/cache/manifest.json', output_limit_chars: 2000,
-      })
-      expect(rendered[0]?.text).toContain('Artifact list truncated')
-    })
-
-  describe('mineru_parse_document', () => {
-    it('executes folded parseDocument and returns result on completion', async () => {
+  describe('mineru_parse_document (Direct Result, No Plugin Job)', () => {
+    it('executes synchronous direct parseDocument and returns direct result', async () => {
       const completedResult: ResultView = {
-        job_id: 'mj_sync_1',
         state: 'completed',
+        source: 'provider',
         cache_hit: false,
         result_id: 'mr_sync_1',
-        files: [{ file_id: 'mf_1', name: 'sync.pdf', artifacts: [] }],
-        markdown_preview: '# Synchronous Content',
+        files: [
+          {
+            file_id: 'mf_1',
+            name: 'sync.pdf',
+            artifacts: [{ kind: 'markdown', path: '/cache/sync/full.md', bytes: 100 }],
+          },
+        ],
+        markdown_preview: '# Synchronous Direct Result',
         preview_truncated: false,
-        manifest_path: '/cache/manifest.json',
+        manifest_path: '/cache/sync/manifest.json',
         output_limit_chars: 2000,
       }
       const mockService = {
@@ -368,14 +532,18 @@ describe('MinerU Tool Layer', () => {
       const result = await parseTool.execute(args, exec)
 
       expect(mockService.parseDocument).toHaveBeenCalledWith(
-        exec.agent?.session, { file_paths: ['/sync.pdf'] }, exec.signal, 30000,
+        exec.agent?.session,
+        { file_paths: ['/sync.pdf'] },
+        exec.signal,
+        30000,
       )
       expect(result).toEqual(completedResult)
 
       const rendered = parseTool.output.render(args, result)
-      expect(rendered[0]?.text).toContain('Synchronous Content')
+      expect(rendered[0]?.text).toContain('Synchronous Direct Result')
+      expect(rendered[0]?.text).toContain('/cache/sync/full.md')
+      expect(rendered[0]?.text).toContain('Cache Hit: No')
     })
-
 
     it('rejects invalid poll timeouts before invoking the service', async () => {
       const mockService = { parseDocument: vi.fn() } as unknown as MinerUService
@@ -383,30 +551,91 @@ describe('MinerU Tool Layer', () => {
       registerTools(ctx, () => mockService)
       const parseTool = registeredTools.find(t => t.name === 'mineru_parse_document')!
       const exec = createMockExec(true)
-      for (const poll_timeout_ms of [-1, 0, 86_400_001, Number.MAX_SAFE_INTEGER]) {
+
+      for (const poll_timeout_ms of [-1, 0, 86_400_001, Number.MAX_SAFE_INTEGER, 1.5, NaN]) {
         await expect(parseTool.execute({ file_paths: ['/doc.pdf'], poll_timeout_ms }, exec))
           .rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
       }
       expect(mockService.parseDocument).not.toHaveBeenCalled()
     })
 
-    it('renders status view when parseDocument returns in-progress timed out status', () => {
-      const timedOutStatus: ParseDocumentView = {
-        job_id: 'mj_sync_timeout',
-        state: 'processing',
-        source: 'provider',
-        provider: 'official-v4',
-        files: [{ file_id: 'mf_1', name: 'large.pdf', state: 'processing' }],
-        result_available: false,
-        poll_timed_out: true,
-        created_at: 1700000000000,
-        updated_at: 1700000010000,
-        failure: { code: 'POLL_TIMEOUT', message: 'Synchronous wait timed out', retryable: true },
+    it('rejects invalid non-object arguments', async () => {
+      const mockService = { parseDocument: vi.fn() } as unknown as MinerUService
+      const { ctx, registeredTools } = createMockContext()
+      registerTools(ctx, () => mockService)
+      const parseTool = registeredTools.find(t => t.name === 'mineru_parse_document')!
+      const exec = createMockExec(true)
+
+      for (const invalid of [null, undefined, 'bad', 123, []]) {
+        await expect(parseTool.execute(invalid, exec))
+          .rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
       }
-      const rendered = renderParseDocument(timedOutStatus)
-      expect(rendered[0]?.text).toContain('mj_sync_timeout')
-      expect(rendered[0]?.text).toContain('processing')
-      expect(rendered[0]?.text).toContain('POLL_TIMEOUT')
+    })
+
+    it('renders single completed result with preview truncation and limit clamping', () => {
+      const resultData: ResultView = {
+        state: 'completed',
+        source: 'cache',
+        cache_hit: true,
+        result_id: 'mr_long_preview',
+        files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
+        markdown_preview: 'A'.repeat(5000),
+        preview_truncated: true,
+        manifest_path: '/cache/doc/manifest.json',
+        output_limit_chars: 150,
+      }
+      const rendered = renderResult(resultData)
+      expect(rendered[0]?.text.length).toBeLessThanOrEqual(150)
+      expect(rendered[0]?.text).toContain('[Output truncated to limit]')
+    })
+
+    it('makes structured artifact truncation explicit in rendered prose', () => {
+      const rendered = renderResult({
+        state: 'completed',
+        source: 'provider',
+        cache_hit: false,
+        result_id: 'mr_truncated_artifacts',
+        files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [], artifacts_truncated: true }],
+        preview_truncated: false,
+        manifest_path: '/cache/manifest.json',
+        output_limit_chars: 2000,
+      })
+      expect(rendered[0]?.text).toContain('Artifact list truncated to output limit')
+    })
+
+    it('renders batch document results with mixed success and failure entries', () => {
+      const batchResult: BatchParseDocumentView = {
+        kind: 'batch',
+        state: 'partially-completed',
+        results: [
+          {
+            state: 'completed',
+            source: 'provider',
+            cache_hit: false,
+            result_id: 'mr_b1',
+            files: [{ file_id: 'mf_1', name: 'file1.pdf', artifacts: [{ kind: 'markdown', path: '/p1.md', bytes: 10 }] }],
+            markdown_preview: '# P1',
+            preview_truncated: false,
+            manifest_path: '/m1.json',
+            output_limit_chars: 1000,
+          },
+          {
+            state: 'failed',
+            source: 'provider',
+            file_id: 'mf_2',
+            name: 'file2.pdf',
+            failure: failure('REMOTE_PARSE_FAILED', 'Extraction failed'),
+          },
+        ],
+      }
+      const rendered = renderParseDocument(batchResult)
+      expect(rendered[0]?.text).toContain('**MinerU Batch Result**')
+      expect(rendered[0]?.text).toContain('- State: partially-completed')
+      expect(rendered[0]?.text).toContain('- Results: 2')
+      expect(rendered[0]?.text).toContain('file1.pdf')
+      expect(rendered[0]?.text).toContain('/p1.md')
+      expect(rendered[0]?.text).toContain('file2.pdf')
+      expect(rendered[0]?.text).toContain('REMOTE_PARSE_FAILED')
     })
   })
 })

@@ -1,24 +1,11 @@
 import { MinerUError, failure, type MinerUFailure } from '../domain/errors.js'
-import type { CacheKey, MinerUJobId, MinerUResultId, OperationId, ProviderConfigId, SessionId } from '../domain/ids.js'
+import type { CacheKey, MinerUResultId, OperationId, ProviderConfigId } from '../domain/ids.js'
 import { createOperationId } from '../domain/ids.js'
-import type { MinerUJobState } from '../domain/job.js'
-import type { ProviderJobRef } from '../providers/provider.js'
-
-export interface SharedWaiter {
-  readonly jobId: MinerUJobId
-  readonly session: { readonly header: { readonly id: SessionId | string } }
-}
-
-export interface SharedSubmission {
-  readonly ref?: ProviderJobRef
-  readonly state: MinerUJobState
-  readonly resultId?: MinerUResultId
-  readonly failure?: MinerUFailure
-}
 
 export interface SharedOutcome {
-  readonly state: Extract<MinerUJobState, 'completed' | 'partially-completed' | 'failed'>
+  readonly state: 'completed' | 'failed'
   readonly resultId?: MinerUResultId
+  readonly failure?: MinerUFailure
 }
 
 interface Deferred<T> {
@@ -43,65 +30,42 @@ function waitWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T>
   })
 }
 
+/** One process-local producer shared by foreground calls and native DSH jobs. */
 export class SharedOperation {
   readonly id: OperationId = createOperationId()
-  readonly waiters = new Map<MinerUJobId, SharedWaiter>()
   readonly controller = new AbortController()
-  private readonly submission = deferred<SharedSubmission>()
   private readonly outcome = deferred<SharedOutcome>()
-  private submitted = false
   private settled = false
-  private accepted: ProviderJobRef | undefined
-  private submissionValue: SharedSubmission | undefined
   private outcomeValue: SharedOutcome | undefined
+  private waiters = 0
 
   constructor(readonly cacheKey: CacheKey) {
-    // Mark rejections handled even when an asynchronous submit caller goes away.
-    void this.submission.promise.catch(() => undefined)
     void this.outcome.promise.catch(() => undefined)
   }
 
-  attach(waiter: SharedWaiter): void {
-    this.waiters.set(waiter.jobId, waiter)
-  }
-
-  get acceptedRef(): ProviderJobRef | undefined { return this.accepted }
-  get submittedValue(): SharedSubmission | undefined { return this.submissionValue }
   get settledValue(): SharedOutcome | undefined { return this.outcomeValue }
-
-  markAccepted(ref: ProviderJobRef): void {
-    if (this.accepted === undefined) this.accepted = ref
-  }
-
-  markSubmitted(value: SharedSubmission): void {
-    if (this.submitted) return
-    this.submitted = true
-    this.submissionValue = value
-    if (value.ref !== undefined) this.markAccepted(value.ref)
-    this.submission.resolve(value)
-  }
+  get waiterCount(): number { return this.waiters }
 
   resolve(value: SharedOutcome): void {
     if (this.settled) return
     this.settled = true
     this.outcomeValue = value
-    if (!this.submitted) this.markSubmitted({ state: value.state, ...(value.resultId === undefined ? {} : { resultId: value.resultId }) })
     this.outcome.resolve(value)
   }
 
   reject(error: unknown): void {
     if (this.settled) return
     this.settled = true
-    if (!this.submitted) this.submission.reject(error)
     this.outcome.reject(error)
   }
 
-  waitForSubmission(signal: AbortSignal): Promise<SharedSubmission> {
-    return waitWithSignal(this.submission.promise, signal)
-  }
-
-  waitForOutcome(signal: AbortSignal): Promise<SharedOutcome> {
-    return waitWithSignal(this.outcome.promise, signal)
+  async waitForOutcome(signal: AbortSignal): Promise<SharedOutcome> {
+    this.waiters++
+    try {
+      return await waitWithSignal(this.outcome.promise, signal)
+    } finally {
+      this.waiters--
+    }
   }
 
   abort(reason: unknown): void {
@@ -112,11 +76,11 @@ export class SharedOperation {
 export class SharedOperationRegistry {
   private readonly operations = new Map<string, SharedOperation>()
   private disposed = false
-
   private readonly coordinatorDisposers = new Set<() => void>()
   private readonly operationKeys = new WeakMap<SharedOperation, string>()
   private readonly operationTimeouts = new WeakMap<SharedOperation, number>()
   private readonly started = new WeakSet<SharedOperation>()
+  private readonly runners = new Set<Promise<void>>()
 
   reserve(
     cacheKey: CacheKey, authority: ProviderConfigId, timeoutMs: number,
@@ -143,13 +107,25 @@ export class SharedOperationRegistry {
       operation.abort(new MinerUError(failure('POLL_TIMEOUT', 'Shared MinerU operation timed out', true)))
     }, this.operationTimeouts.get(operation) ?? 1)
     timeout.unref?.()
-    void Promise.resolve()
+    const running = Promise.resolve()
       .then(() => runner(operation))
       .then(outcome => operation.resolve(outcome), error => operation.reject(error))
       .finally(() => {
         clearTimeout(timeout)
+        this.runners.delete(running)
         if (this.operations.get(operationKey) === operation) this.operations.delete(operationKey)
       })
+    this.runners.add(running)
+  }
+
+  release(operation: SharedOperation, error: unknown): boolean {
+    const operationKey = this.operationKeys.get(operation)
+    if (operationKey === undefined || this.operations.get(operationKey) !== operation || this.started.has(operation)) {
+      return false
+    }
+    this.operations.delete(operationKey)
+    operation.reject(error)
+    return true
   }
 
   acquire(
@@ -175,11 +151,22 @@ export class SharedOperationRegistry {
     return new Set([...this.operations.values()].map(operation => operation.id))
   }
 
+  activeOperationCount(): number {
+    return this.operations.size
+  }
+
   dispose(): void {
     this.disposed = true
     const error = new MinerUError(failure('CANCELLED', 'MinerU plugin disposed', true))
     for (const dispose of this.coordinatorDisposers) dispose()
     this.coordinatorDisposers.clear()
-    for (const operation of this.operations.values()) operation.abort(error)
+    for (const operation of [...this.operations.values()]) {
+      if (!this.release(operation, error)) operation.abort(error)
+    }
+  }
+
+  async shutdown(): Promise<void> {
+    this.dispose()
+    await Promise.allSettled([...this.runners])
   }
 }

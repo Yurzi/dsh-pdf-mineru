@@ -78,11 +78,11 @@ Model
   |
   v
 DSH Tool Layer
+  |-- JobRegistry               native async ownership and cancellation
   |  require exec.agent.session
   v
 MinerUService
   |-- RequestNormalizer
-  |-- JobRepository             session-scoped jobs
   |-- ResultRepository          global immutable results
   |-- SharedOperationRegistry   in-process request coalescing
   |-- ProviderRegistry
@@ -96,15 +96,15 @@ MinerUService
 
 ### 5.2 MinerUService
 
-负责完整用例编排：规范化请求、读取 Provider 能力、计算源文件哈希与缓存键、创建会话任务、查询缓存、合并并发操作、调用 Provider、发布结果、更新任务和返回统一输出。
+负责完整用例编排：规范化请求、读取 Provider 能力、计算源文件哈希与缓存键、查询缓存、合并并发操作、调用 Provider、发布 immutable result 并返回统一输出。同步和异步入口共享此直接结果管线。
 
 ### 5.3 ProviderRegistry
 
-根据持久任务记录中的 providerId 和 providerConfigId 解析 Provider。当前配置切换不能改变已提交任务的路由。Provider 配置删除时，仍应保留完成任务的缓存读取能力；需要访问远端的未完成任务应返回明确的 PROVIDER_CONFIG_MISSING 错误。
+解析当前活动 Provider，并在一次 PreparedParseRequest/SharedOperation 生命周期内固定该配置。已发布缓存读取不依赖当前 Provider。
 
-### 5.4 JobRepository
+### 5.4 DSH JobRegistry
 
-持久化会话任务，执行 sessionId 访问校验和原子状态更新。任务是可变记录，但状态只能按定义的状态机前进。
+异步入口通过 ctx.jobs.start 注册 kind=mineru、精确 owner Agent、同步 cancel hook 和非拒绝 done Promise。DSH 负责 session 隔离、job_list/job_output/job_kill、完成通知和 owner 清理；插件不维护第二套 JobRepository。
 
 ### 5.5 ResultRepository
 
@@ -164,7 +164,7 @@ src/
 
 跨持久化边界的 ID 应使用不透明、带前缀的字符串，并在 TypeScript 中使用 branded type：
 
-- MinerUJobId：mj_<random>
+- Native DSH JobId：mineru-N（由宿主签发）
 - MinerUResultId：mr_<cache-key-prefix-or-random>
 - MinerUFileId：mf_<stable-data-id>
 - ProviderConfigId：mp_<configured-id>
@@ -296,7 +296,7 @@ type ProviderJobRef =
     }
 ~~~
 
-ProviderSubmittedFile 保存插件生成的 dataId、fileId 与规范文件名映射，不保存本地绝对路径、上传 URL 或 Token。自托管分支同样保存文件映射，以便 JSON 结果收集和重启恢复；官方分支只按 dataId 关联。
+ProviderSubmittedFile 保存插件生成的 dataId、fileId 与规范文件名映射，不保存本地绝对路径、上传 URL 或 Token。自托管分支同样保存文件映射，以便同进程 live operation 的 JSON 结果收集；官方分支只按 dataId 关联。
 
 ### 9.1 probe 语义
 
@@ -404,11 +404,11 @@ queued -> uploading -> processing -> collecting -> completed
    |-> failed
 ~~~
 
-终态不可回退。状态更新先持久化，再对调用者发布。Provider 原始状态可以保存在诊断字段，但不能代替统一状态。
+Provider 状态用于一次 SharedOperation 内的轮询和逐文件结算，不持久化为插件 Job。DSH 后台任务只投影 running/stopping/completed/killed/failed。
 
 ### 11.3 会话授权
 
-所有 job 操作都接收当前 Session，而不是裸 sessionId 字符串。JobRepository.get(session, jobId) 必须验证 job.sessionId 与 session.header.id 一致。不提供直接以 resultId 读取完整结果的模型工具。
+工具必须取得 exec.agent.session。原生后台任务把精确 exec.agent 交给 JobRegistry，DSH 按 owner session 隔离可见性和控制权限；同步解析直接返回本次调用结果。
 
 ## 12. 全局缓存设计
 
@@ -480,10 +480,7 @@ ArtifactRef.relativePath 必须为规范相对路径。一个已发布 manifest 
 默认根目录从 DSH Home 派生，也允许通过经过验证的 storageRoot 配置覆盖：
 
 ~~~text
-$DSH_HOME/mineru/v1/
-  jobs/
-    <session-id>/
-      <job-id>.json
+$DSH_HOME/cache/pdf-mineru/
   results/
     sha256/
       <key[0:2]>/
@@ -502,7 +499,7 @@ $DSH_HOME/mineru/v1/
   sources/                 optional
 ~~~
 
-sessionId 和所有 ID 必须经过格式校验后才能参与路径拼接。
+Session 身份只交给 DSH JobRegistry 做 owner 隔离，不参与缓存目录路径拼接；所有持久化路径 ID 必须经过格式校验。
 
 ### 12.5 原子发布
 
@@ -510,22 +507,22 @@ ResultTransaction 在 staging 写入并计算哈希，完成后生成 manifest�
 
 staging 中断残留可在插件启动或定时维护时按 TTL 清理。清理不得删除活跃 SharedOperation 使用的目录。
 
-## 13. 并发、取消与恢复
+## 13. 并发、取消与生命周期
 
 ### 13.1 单进程请求合并
 
-SharedOperationRegistry 以 CacheKey 为键。缓存未命中时，第一个调用创建 producer，后续调用创建各自会话 Job 并成为 waiter。每个 waiter 有独立 AbortSignal：
+DSH 原生 Job 只在宿主进程和 owner Agent 生命周期内存在；全局 immutable Result 缓存不随原生任务一起删除。
 
-- waiter 取消后停止等待并更新其调用结果，但不破坏其他会话任务。
-- 只要仍有 waiter 或 Provider 已提交不可撤销远端任务，共享操作继续。
-- producer 完成后，每个未取消 Job 分别提交 resultId 和终态。
-- producer 失败后，每个关联 Job 记录规范化失败。
+SharedOperationRegistry 以 CacheKey 和 Provider authority 为键。缓存未命中时，第一个调用创建 producer，后续同步调用或原生后台任务成为独立 waiter：
 
-工具调用取消和任务取消是不同语义。首版没有 mineru_cancel 工具；取消一个同步等待仅停止当前工具调用，异步任务仍可由 status/result 查询。
+- waiter 取消只停止该调用等待，不破坏其他调用依赖的 producer。
+- producer 继续到成功发布、领域失败、operation timeout 或插件关闭。
+- producer 完成后，每个 waiter从同一 resultId 投影自己的结果。
+- 原生 job_kill 取消 wrapper wait；job_output 对 final-output task 幂等返回最终文本。
 
 ### 13.2 进程重启
 
-Job 是持久记录。重启后 status/result 可根据 ProviderJobRef 恢复远端查询和收集。处于 uploading 且没有完整 ProviderJobRef 的任务无法可靠恢复，应标记为 failed，错误码为 INTERRUPTED_UPLOAD。
+原生 DSH Job 和 SharedOperation 都是进程内记录，不跨进程恢复。已发布 Result 仍可由相同规范请求重新命中。ProviderJobRef 只存在于一次 provider operation 内。
 
 首版不允许多个 DSH 进程同时共享同一 storageRoot。插件注册工具前以 .process.lock 原子获取 PID/owner 锁；活进程冲突明确返回 STORAGE_LOCKED，只回收格式有效且 PID 已确认死亡的 stale lock。
 
@@ -536,7 +533,7 @@ Job 是持久记录。重启后 status/result 可根据 ProviderJobRef 恢复远
 - pollTimeoutMs：mineru_parse_document 的总等待时间，不改变异步任务本身。
 - operationTimeoutMs：可选共享 producer 总时限。
 
-超时必须保留可恢复 ProviderJobRef。同步工具超时不应将仍在远端执行的任务标为 failed。
+同步 waiter 超时不应将 SharedOperation 或仍在远端执行的任务标为 failed；重试相同请求可重新加入。
 
 ## 14. 错误模型
 
@@ -584,7 +581,7 @@ Provider 应保留官方 code/msg/trace_id 或自托管 HTTP 状态作为诊断�
 
 ## 15. 工具接口
 
-为减少模型行为迁移，保留现有五个工具名，但重新定义为统一领域接口。旧参数可以在一个明确的迁移周期内作为兼容别名，内部立即规范化。
+模型面保留三个工具；异步控制统一复用 DSH 通用 job 工具，不再维护插件专用 status/result 工具。
 
 ### 15.1 mineru_health
 
@@ -592,38 +589,13 @@ Provider 应保留官方 code/msg/trace_id 或自托管 HTTP 状态作为诊断�
 
 ### 15.2 mineru_submit_parse_job
 
-输入 file_paths 和统一解析参数，立即返回：
+输入 file_paths 和统一解析参数，通过 ctx.jobs.start 立即返回原生 job_id 和 running。任务完成文本由 job_output 读取；取消由 job_kill 处理。工具不返回上游 status_url、result_url、batch_id 或预签名地址。
 
-- job_id
-- state
-- source：cache、shared-operation 或 provider
-- provider
-- files
-- result_available
+### 15.3 mineru_parse_document
 
-缓存命中时任务可以直接 completed。工具不返回上游 status_url、result_url、batch_id 或预签名地址。
+同步执行直接结果管线，成功返回 result_id、cache_hit、artifact paths、Markdown preview 和 manifest_path，不创建插件 Job。pollTimeout 仅停止当前 waiter；再次提交相同请求可重新加入仍在运行的 SharedOperation。
 
-### 15.3 mineru_get_parse_status
-
-输入 job_id。校验当前会话所有权，必要时查询 Provider 并持久化最新统一状态。返回任务状态、逐文件状态、进度、缓存来源和统一错误。
-
-### 15.4 mineru_get_parse_result
-
-输入 job_id 和可选结果投影。仅终态成功文件可读取。返回：
-
-- job_id、state、cache_hit、result_id
-- 文件清单及 artifact paths
-- 第一个或指定文件的 Markdown preview
-- preview_truncated
-- manifest_path
-
-完整结果路径来自 ResultRepository 解析，不从 manifest 读取绝对路径。
-
-### 15.5 mineru_parse_document
-
-高层组合工具，执行 submit -> wait -> result。pollTimeout 仅停止当前等待；若远端任务已提交，返回 job_id 和当前状态，允许模型稍后继续查询。
-
-### 15.6 模型输出限制
+### 15.4 模型输出限制
 
 Markdown preview 的完整包装和正文必须共同受 maxInlineMarkdownChars 或字节限制约束。JSON、图片和完整 Markdown只以路径和小型元数据返回。工具 execute 返回规范 JSON，render 继续作为纯投影。
 
@@ -653,7 +625,7 @@ StorageConfig 包括 storageRoot、cacheEnabled、retainSources=false 和 stagin
 
 ### 16.2 配置快照
 
-Job 保存 providerConfigId 和不含秘密的 provider compatibility metadata。配置热更新只影响新任务。旧任务恢复时通过 providerConfigId 解析原配置；不得使用当前 activeProvider 替代。
+Prepared request 和 SharedOperation 在创建时固定 providerConfigId 与 compatibility metadata；配置热更新只影响新 operation。
 
 ### 16.3 RPC
 
@@ -694,29 +666,29 @@ Job 保存 providerConfigId 和不含秘密的 provider compatibility metadata�
 
 ### 17.4 缓存访问
 
-模型只能通过当前会话 Job 获取结果。RPC 不暴露任意路径读取。ArtifactRef 的相对路径必须在 ResultRepository 内解析并验证仍位于结果根目录。
+模型只能通过同步工具返回值或 owner 隔离的 DSH job_output 获取结果。RPC 不暴露任意路径读取。ArtifactRef 的相对路径必须在 ResultRepository 内解析并验证仍位于结果根目录。
 
 ## 18. 生命周期与维护
 
 ### 18.1 缓存保留
 
-当前采用引用保留加 staging TTL：任意严格可解析 Job 的顶层或逐文件 cacheKey 都视为引用，不执行已发布结果自动删除。时间/容量优先策略仍是未来选项；若启用，历史 result 必须返回 CACHE_EVICTED 并明确是否允许重新解析。
+当前采用 immutable cache 加 staging TTL，不执行自动删除。GC 仅预览所有通过验证的已发布结果；显式缓存清除需要确认，并在 SharedOperation 或存储读租约活动时 fail closed。
 
 ### 18.2 存储运维
 
 - StorageMaintenanceService 只在持有同一 storageRoot 的 ProcessLock 时运行，不注册模型工具。
-- stats 对 results、jobs、staging、quarantine 统计字节和条目，遍历不跟随符号链接。
+- stats 对 results、staging、quarantine 统计字节和条目，遍历不跟随符号链接。
 - integrity scan 默认只读；显式 isolation 只原子移动已确认无效的完整 result 目录。
 - quarantine cleanup 默认 dry-run，只接受 list 返回的安全 entry ID；实际删除由 loopback RPC 二次确认。
-- GC dry-run 严格解析全部 Job 引用，只报告已验证且无引用的 immutable result。任意 malformed、unreadable、temporary、unexpected 或 symlinked Job，以及 result 扫描截断，都会令计划 eligible=false。
-- Manifest 和 persisted Job 使用流式有界读取；超限数据按 corrupt/malformed 处理，不允许运维扫描无界分配内存。
+- GC dry-run 报告所有已验证 immutable result；result 扫描截断或不安全目录会令计划 eligible=false。
+- Manifest 使用流式有界读取；原生 DSH Job 与 SharedOperation 都不进入 storageRoot。
 - 候选项、诊断和 quarantine 列表都有响应上限及 truncated 元数据；当前不存在已发布结果删除 API。
 
 ### 18.3 可选增强
 
 - 跨进程 claim、heartbeat 和 stale-owner 接管。
 - credential 或 tenant 级 cacheScope。
-- 自动容量/时间驱逐、Job 保留期和 CACHE_EVICTED 后重新解析。
+- 自动容量/时间驱逐和 CACHE_EVICTED 后重新解析。
 - URL 输入 Provider 能力。
 - source object 内容寻址存储与失败重试。
 - DSH 通用 Session Artifact 服务和 session export 集成。
@@ -729,7 +701,7 @@ Job 保存 providerConfigId 和不含秘密的 provider compatibility metadata�
 插件只接受 Provider-based canonical config 和当前工具参数，不对旧接口做静默转换。
 
 1. flat `baseURL/apiKeyEnv/defaultBackend` 配置会被配置解析器拒绝。
-2. 模型工具只接受 `file_paths/model/ocr/language/formula/table/pages/artifacts`，查询只接受 `job_id`。
+2. MinerU 工具只接受 `file_paths/model/ocr/language/formula/table/pages/artifacts`，后台控制使用 DSH 通用 job 工具。
 3. Self-hosted v2 的 `task_id/backend/parse_method/start_page_id/end_page_id` 仅存在于 Provider 私有协议适配中。
 4. 旧 `/tmp/mineru-*` 文件不迁移到全局缓存，因为缺少可靠 CacheKey 与 manifest。
 
@@ -740,28 +712,27 @@ Job 保存 providerConfigId 和不含秘密的 provider compatibility metadata�
 1. Tool 从 exec.agent 取得 Session。
 2. Service 规范化请求并流式计算 sourceSha256。
 3. Provider 生成 compatibilityKey，Service 计算 CacheKey。
-4. Service 创建 session Job。
-5. ResultRepository 验证缓存命中。
-6. Job 原子更新为 completed、resolution=cache-hit、resultId=<id>。
-7. Tool 返回有限 preview 和产物路径。
+4. ResultRepository 验证缓存命中。
+5. Service 直接投影 immutable result。
+6. 同步 Tool 返回有限 preview 和产物路径；后台任务通过 job_output 返回同一投影。
 
 ### 20.2 官方 v4 缓存未命中
 
-1. Service 创建 Job 并取得 SharedOperation producer。
+1. Service 取得 SharedOperation producer。
 2. OfficialV4Provider 申请上传地址并执行裸 PUT。
-3. Job 保存 batchId 与 dataId 映射，进入 processing。
+3. ProviderJobRef 在 operation 内临时保存 batchId 与 dataId 映射。
 4. inspect 轮询逐文件状态。
 5. 进入 collecting 后下载去重 ZIP 并安全解包到 staging。
 6. ResultRepository 校验并原子发布。
-7. Job 提交 completed 或 partially-completed 与 resultId。
-8. 所有等待该 CacheKey 的会话任务分别引用同一结果。
+7. SharedOperation 按文件结算 completed 或 failed 与 resultId。
+8. 所有等待该 CacheKey 的调用分别投影同一结果。
 
 ### 20.3 同步等待超时
 
-1. mineru_parse_document 已完成远端提交并持久化 ProviderJobRef。
-2. pollTimeout 到期，当前工具返回 job_id、processing 和 POLL_TIMEOUT 诊断。
+1. mineru_parse_document 已取得 SharedOperation waiter。
+2. pollTimeout 到期，当前工具抛出可重试 POLL_TIMEOUT。
 3. 远端任务和共享 producer 不因单个等待超时而失效。
-4. 模型稍后使用 status/result 继续。
+4. 模型可重新提交相同请求加入现有 operation，或改用原生后台任务。
 
 ## 21. 测试策略
 
@@ -798,26 +769,26 @@ Job 保存 providerConfigId 和不含秘密的 provider compatibility metadata�
 - manifest 哈希、字节数和 requiredArtifacts 校验。
 - 残留 staging 清理不影响活跃 operation，也不跟随 staging 符号链接。
 - 只读统计/完整性扫描、quarantine 边界、删除 dry-run、响应截断和取消。
-- GC preview 的 Job 引用并集、orphan 候选与 malformed/unreadable/symlink fail-closed。
+- GC preview 的无插件 Job 保留策略、候选边界与 malformed/unreadable/symlink fail-closed。
 
 ### 21.5 Service 与并发
 
 - 缓存命中不调用 Provider。
-- 相同 CacheKey 的并发请求只提交一次，各自创建会话 Job。
-- 不同解析参数、Provider compatibilityKey 或 artifact 集不共享。
-- 一个 waiter 取消不取消其他 waiter。
-- 重启后用 ProviderJobRef 恢复 processing/collecting。
-- 会话 A 不能读取会话 B 的 job_id。
+- 相同 CacheKey 的并发请求只提交一次，各自持有独立 waiter。
+- 不同解析参数、Provider authority/compatibilityKey 或 artifact 集不共享。
+- 一个 waiter 取消不取消其他 waiter或 producer。
+- 新服务实例不恢复 SharedOperation；相同规范请求仍可命中 immutable cache。
+- DSH JobRegistry 隔离不同 owner session 的原生 job_id。
 
 ### 21.6 工具、RPC 和 UI
 
-- 五个工具的 canonical output 和 render 文本。
+- 三个 MinerU 工具以及通用 job_output/job_list/job_kill 协作的 canonical output 和 render 文本。
 - 大 Markdown 的完整工具输出限制。
 - RPC 配置判别联合、draft probe 和热更新只影响新任务。
 - loopback 运维 RPC 的输入上限、只读默认值和 destructive confirm。
 - 设置页按 Provider 显示有效字段，并提供统计、扫描、GC preview 与 quarantine 二次确认流程。
 - 桌面/移动布局验证包含 CSS module 生效、内部表格滚动和页面无横向溢出。
-- 真实插件组合测试验证工具注册、会话绑定和持久输出。
+- 真实插件组合测试验证工具注册、原生 Job owner/cancel/done hooks 和持久 Result 输出。
 
 ### 21.7 验证命令
 
@@ -837,11 +808,11 @@ pnpm run verify:gui
 
 ### 阶段一：领域与自托管迁移
 
-建立统一 schema、Provider interface、MinerUService、JobRepository 和 ResultRepository；将现有自托管实现迁入 SelfHostedV2Provider，确保本地能力和工具行为可用。
+建立统一 schema、Provider interface、MinerUService 和 ResultRepository；将现有自托管实现迁入 SelfHostedV2Provider，确保本地能力和工具行为可用。
 
 ### 阶段二：全局缓存
 
-实现文件流式哈希、CacheKey、staging transaction、原子 manifest、会话任务授权和单进程共享 operation。补齐缓存与并发测试。
+实现文件流式哈希、CacheKey、staging transaction、原子 manifest、DSH owner 授权和单进程共享 operation。补齐缓存与并发测试。
 
 ### 阶段三：官方 v4
 
@@ -862,13 +833,13 @@ pnpm run verify:gui
 1. 同一组工具可在不改变模型工作流的情况下使用自托管 v2 或官方 v4。
 2. 工具输出不泄漏 Provider 私有 URL、Token、batch_id 或自托管 status_url。
 3. 相同文件与规范解析请求第二次提交命中全局缓存，不调用上游。
-4. 两个会话并发提交相同请求只产生一个上游操作，但各自拥有独立 job_id。
-5. 任意会话不能读取另一个会话的 job。
+4. 两个调用并发提交相同请求只产生一个上游操作，但拥有独立 waiter；异步调用各自由 DSH 签发 job_id。
+5. DSH owner session 不能读取或取消另一个 owner 的原生 job。
 6. Provider 或解析参数的实质变化不会错误命中缓存。
 7. 官方上传请求不携带任何签名之外的自定义头，API Token 不离开 mineru.net API 请求。
 8. 官方状态、部分失败和 ZIP 结果完整转换为统一 schema。
 9. 损坏、超限或恶意 ZIP 不会写出 staging、消耗无界资源或发布结果。
-10. 重启后已持久化的远端任务可继续查询和收集；不可恢复上传明确失败。
+10. owner/session 结束时 DSH 取消并清理原生 job；插件关闭会等待 SharedOperation 释放资源。
 11. 所有模型可见大内容受限，完整产物通过安全路径引用。
 12. typecheck、测试、构建和设置页验证全部通过。
 13. 安全网络操作在瞬时失败时有界重试，模糊提交 POST 不会被自动重放，重试日志不泄漏请求私有信息。
@@ -879,10 +850,10 @@ pnpm run verify:gui
 
 - 对模型统一工具，对内部统一领域 schema，对上游统一 Provider interface。
 - Provider 差异保留在 ProviderJobRef、能力声明和适配实现中，不污染工具协议。
-- 会话拥有 Job 和访问权限；插件全局拥有不可变 Result。
+- DSH Agent owner 拥有原生 Job 和访问权限；插件全局拥有不可变 Result。
 - 缓存键由源内容、规范解析语义、必要产物、Provider 兼容标识和 schema 版本共同决定。
 - 完成结果全局复用，并发相同请求在进程内合并。
 - DSH 会话日志保留工具结果和轻量引用，不承载完整解析产物。
 - 官方 v4 的预签名上传、无认证 CDN 下载和 ZIP 解包使用独立安全路径。
 - 重试仅属于 Provider 网络适配层；Service 提供热配置和不含私有字符串的结构化诊断。
-- 存储运维属于 loopback 管理面；模型工具、持久 Job/Result schema 和 CacheKey 解释保持不变。
+- 存储运维属于 loopback 管理面；模型工具、原生 Job adapter、持久 Result schema 和 CacheKey 解释保持明确版本边界。

@@ -12,23 +12,24 @@ import { join, resolve, sep } from 'node:path'
 import {
   asCacheKey,
   asFileId,
-  asJobId,
   asOperationId,
-  asSessionId,
   assertSafePathSegment,
   type CacheKey,
   type MinerUFileId,
-  type MinerUJobId,
   type OperationId,
-  type SessionId,
 } from '../domain/ids.js'
 import { assertSafeArtifactRelativePath } from '../domain/schemas.js'
 
 export function defaultStorageRoot(): string {
-  const dshHome = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== ''
-    ? process.env.DSH_HOME.trim()
-    : join(homedir(), '.dsh')
-  return join(dshHome, 'dsh-pdf-mineru', 'v1')
+  const configured = process.env.DSH_HOME?.trim()
+  const dshHome = !configured
+    ? join(homedir(), '.dsh')
+    : configured === '~'
+      ? homedir()
+      : configured.startsWith('~/') || configured.startsWith('~\\')
+        ? resolve(join(homedir(), configured.slice(2)))
+        : resolve(configured)
+  return join(dshHome, 'cache', 'pdf-mineru')
 }
 
 export class StoragePaths {
@@ -39,26 +40,6 @@ export class StoragePaths {
       throw new TypeError('Storage root path must be a non-empty string')
     }
     this.root = resolve(root)
-  }
-
-  jobsDir(): string {
-    return join(this.root, 'jobs')
-  }
-
-  jobDir(sessionId: SessionId | string): string {
-    const session = asSessionId(sessionId)
-    return join(this.jobsDir(), session)
-  }
-
-  jobFile(sessionId: SessionId | string, jobId: MinerUJobId | string): string {
-    const job = asJobId(jobId)
-    return join(this.jobDir(sessionId), `${job}.json`)
-  }
-
-  jobTempFile(sessionId: SessionId | string, jobId: MinerUJobId | string, token: string): string {
-    const job = asJobId(jobId)
-    const safeToken = assertSafePathSegment(token, 'job temp token')
-    return join(this.jobDir(sessionId), `${job}.tmp.${safeToken}`)
   }
 
   resultsDir(): string {

@@ -73,7 +73,6 @@ export type MineruKey =
   | 'ops.bytes'
   | 'ops.entries'
   | 'ops.results'
-  | 'ops.jobs'
   | 'ops.staging'
   | 'ops.quarantine'
   | 'ops.readOnly'
@@ -86,7 +85,7 @@ export type MineruKey =
   | 'ops.gcCandidates'
   | 'ops.clearReady'
   | 'ops.clearBlocked'
-  | 'ops.activeJobs'
+  | 'ops.activeOperations'
   | 'ops.selectAll'
   | 'ops.modified'
   | 'ops.cleanupPlanned'
@@ -192,7 +191,6 @@ export const en: Record<MineruKey, string> = {
   'ops.bytes': 'Bytes',
   'ops.entries': 'Entries',
   'ops.results': 'Published Results',
-  'ops.jobs': 'Persisted Jobs',
   'ops.staging': 'Staging',
   'ops.quarantine': 'Quarantine',
   'ops.readOnly': 'Read-only',
@@ -205,7 +203,7 @@ export const en: Record<MineruKey, string> = {
   'ops.gcCandidates': 'Candidates',
   'ops.clearReady': 'Ready to Clear',
   'ops.clearBlocked': 'Clear Blocked',
-  'ops.activeJobs': 'Active Jobs',
+  'ops.activeOperations': 'Active Operations',
   'ops.selectAll': 'Select all quarantine entries',
   'ops.modified': 'Modified',
   'ops.cleanupPlanned': 'Planned',
@@ -311,7 +309,6 @@ export const zh: Record<MineruKey, string> = {
   'ops.bytes': '字节数',
   'ops.entries': '条目数',
   'ops.results': '已发布结果',
-  'ops.jobs': '持久化 Job',
   'ops.staging': '暂存区',
   'ops.quarantine': '隔离区',
   'ops.readOnly': '只读',
@@ -324,7 +321,7 @@ export const zh: Record<MineruKey, string> = {
   'ops.gcCandidates': '候选项',
   'ops.clearReady': '可以清除',
   'ops.clearBlocked': '清除受阻',
-  'ops.activeJobs': '活动 Job',
+  'ops.activeOperations': '活动共享操作',
   'ops.selectAll': '选择全部隔离条目',
   'ops.modified': '修改时间',
   'ops.cleanupPlanned': '计划清理',

@@ -8,21 +8,18 @@
 
 import { chmod, lstat, readdir, realpath, rm } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
-import { createReadStream, type Dirent } from 'node:fs'
+import { type Dirent } from 'node:fs'
 import { join, parse, resolve, sep } from 'node:path'
 import {
   asCacheKey,
-  asJobId,
   asOperationId,
-  asSessionId,
   assertSafePathSegment,
   type CacheKey,
   type MinerUResultId,
 } from '../domain/ids.js'
 import { throwMinerU } from '../domain/errors.js'
-import { isTerminalJobState, type MinerUJobRecord } from '../domain/job.js'
-import { parseMinerUJobRecord } from '../domain/schemas.js'
 import type { ResultRepository } from './result-repository.js'
+import type { SharedOperationRegistry } from '../service/shared-operations.js'
 import type { ProcessLock } from './process-lock.js'
 import { StorageAccessGate } from './access-gate.js'
 import type { StoragePaths } from './paths.js'
@@ -36,10 +33,9 @@ const MAX_DIAGNOSTIC_LIMIT = 1_000
 const MAX_QUARANTINE_LIST_LIMIT = 1_000
 const MAX_GC_CANDIDATE_LIMIT = 1_000
 const MAX_QUARANTINE_CLEANUP_ENTRIES = 100
-const MAX_PERSISTED_JOB_BYTES = 1024 * 1024
 const MAX_WALK_DEPTH = 64
 
-export type StorageMaintenanceArea = 'published-results' | 'persisted-jobs' | 'staging' | 'quarantine'
+export type StorageMaintenanceArea = 'published-results' | 'staging' | 'quarantine'
 
 export type StorageMaintenanceDiagnosticCode =
   | 'unexpected-entry'
@@ -79,7 +75,6 @@ export interface StorageAreaStatistics {
 export interface StorageStatistics {
   readonly generatedAt: number
   readonly publishedResults: StorageAreaStatistics
-  readonly persistedJobs: StorageAreaStatistics
   readonly staging: StorageAreaStatistics
   readonly quarantine: StorageAreaStatistics
 }
@@ -184,12 +179,10 @@ export interface GcCandidate {
 }
 
 export interface JobReferenceScan {
-  readonly complete: boolean
-  readonly scannedJobCount: number
+  readonly complete: true
+  readonly sessionJobCount: number
+  readonly activeJobCount: number
   readonly referencedCacheKeyCount: number
-  readonly malformedJobCount: number
-  readonly unreadableJobCount: number
-  readonly unsafeJobEntryCount: number
 }
 
 /**
@@ -199,7 +192,7 @@ export interface JobReferenceScan {
 export interface GcDryRunReport {
   readonly generatedAt: number
   readonly dryRun: true
-  readonly referencePolicy: 'job-reference-retention'
+  readonly referencePolicy: 'no-plugin-job-retention'
   readonly eligible: boolean
   readonly candidateCount: number
   readonly candidateBytes: number
@@ -231,6 +224,7 @@ export interface CacheClearReport {
   readonly dryRun: boolean
   readonly eligible: boolean
   readonly activeJobCount: number
+  readonly activeOperationCount: number
   readonly activeAccessCount: number
   readonly confirmationToken?: string
   readonly plannedCount: number
@@ -338,30 +332,6 @@ function errnoCode(error: unknown): string | undefined {
 
 function isMissing(error: unknown): boolean {
   return errnoCode(error) === 'ENOENT'
-}
-
-async function readPersistedJobBounded(path: string, signal?: AbortSignal): Promise<string> {
-  const stream = createReadStream(path)
-  const onAbort = (): void => {
-    stream.destroy(signal?.reason instanceof Error ? signal.reason : new DOMException('Aborted', 'AbortError'))
-  }
-  signal?.addEventListener('abort', onAbort, { once: true })
-  const chunks: Buffer[] = []
-  let bytes = 0
-  try {
-    signal?.throwIfAborted()
-    for await (const chunk of stream) {
-      signal?.throwIfAborted()
-      const buffer = chunk as Buffer
-      bytes += buffer.byteLength
-      if (bytes > MAX_PERSISTED_JOB_BYTES) throw new TypeError('Persisted Job exceeds maintenance scan limit')
-      chunks.push(buffer)
-    }
-    return Buffer.concat(chunks, bytes).toString('utf8')
-  } finally {
-    signal?.removeEventListener('abort', onAbort)
-    stream.destroy()
-  }
 }
 
 function diagnosticMessage(code: StorageMaintenanceDiagnosticCode): string {
@@ -574,15 +544,12 @@ function toAreaStatistics(usage: UsageCounter, logicalEntryCount: number): Stora
   }
 }
 
-/**
- * Storage maintenance is deliberately separate from JobRepository's session-scoped
- * public API. It reads persisted jobs with the same strict parser, but it neither
- * exposes them nor bypasses session access for model-facing operations.
- */
+/** Storage maintenance is loopback-only and blocks destructive work while parse operations are active. */
 export class StorageMaintenanceService {
   constructor(
     public readonly paths: StoragePaths,
     public readonly results: ResultRepository,
+    public readonly operations: SharedOperationRegistry,
     public readonly lock: ProcessLock,
     public readonly accessGate: StorageAccessGate = new StorageAccessGate(),
   ) {
@@ -595,20 +562,16 @@ export class StorageMaintenanceService {
     this.assertLockHeld()
     const [
       publishedUsage,
-      jobsUsage,
       stagingUsage,
       quarantineUsage,
       publishedCount,
-      jobsCount,
       stagingCount,
       quarantineCount,
     ] = await Promise.all([
       collectUsage(this.paths.resultsDir(), signal),
-      collectUsage(this.paths.jobsDir(), signal),
       collectUsage(this.paths.stagingDir(), signal),
       collectUsage(this.paths.quarantineDir(), signal),
       this.countPublishedResultDirectories(signal),
-      this.countPersistedJobFiles(signal),
       this.countDirectDirectories(this.paths.stagingDir(), value => asOperationId(value), signal),
       this.countDirectDirectories(this.paths.quarantineDir(), value => assertSafePathSegment(value, 'quarantine entry'), signal),
     ])
@@ -616,7 +579,6 @@ export class StorageMaintenanceService {
     return {
       generatedAt: Date.now(),
       publishedResults: toAreaStatistics(publishedUsage, publishedCount),
-      persistedJobs: toAreaStatistics(jobsUsage, jobsCount),
       staging: toAreaStatistics(stagingUsage, stagingCount),
       quarantine: toAreaStatistics(quarantineUsage, quarantineCount),
     }
@@ -912,6 +874,7 @@ export class StorageMaintenanceService {
     const deletedTotals = { value: 0, saturated: false }
     let unsafeResultCount = 0
     let deletedCount = 0
+    const deletedCacheKeys = new Set<CacheKey>()
     let skippedCount = 0
     let traversal: TraversalSummary = { scanned: 0, truncated: false, complete: true }
 
@@ -942,8 +905,10 @@ export class StorageMaintenanceService {
     }
 
     const token = cacheClearConfirmationToken(planned.map(entry => entry.cacheKey))
+    const activeOperationCount = this.operations.activeOperationCount()
     const preflightEligible = references.report.complete
       && references.activeJobCount === 0
+      && activeOperationCount === 0
       && activeAccessCount === 0
       && traversal.complete
       && !traversal.truncated
@@ -973,6 +938,7 @@ export class StorageMaintenanceService {
           }
           await rm(entry.resultDir, { recursive: true, force: false, maxRetries: 1 })
           deletedCount++
+          deletedCacheKeys.add(entry.cacheKey)
           addTotal(deletedTotals, entry.byteUsage, entry.byteUsageSaturated)
         } catch (error) {
           if (!isMissing(error)) {
@@ -988,6 +954,7 @@ export class StorageMaintenanceService {
       dryRun,
       eligible,
       activeJobCount: references.activeJobCount,
+      activeOperationCount,
       activeAccessCount,
       ...(dryRun && preflightEligible && planned.length > 0 ? { confirmationToken: token } : {}),
       plannedCount: planned.length,
@@ -1067,7 +1034,7 @@ export class StorageMaintenanceService {
     return {
       generatedAt: Date.now(),
       dryRun: true,
-      referencePolicy: 'job-reference-retention',
+      referencePolicy: 'no-plugin-job-retention',
       eligible: references.report.complete && traversal.complete && !traversal.truncated,
       candidateCount,
       candidateBytes: candidateTotals.value,
@@ -1099,35 +1066,6 @@ export class StorageMaintenanceService {
   private async countPublishedResultDirectories(signal?: AbortSignal): Promise<number> {
     const traversal = await this.visitPublishedResults(Number.MAX_SAFE_INTEGER, signal, undefined, async () => undefined)
     return traversal.scanned
-  }
-
-  private async countPersistedJobFiles(signal?: AbortSignal): Promise<number> {
-    let count = 0
-    const jobs = await readSafeDirectory(this.paths.jobsDir())
-    if (jobs.kind !== 'entries') return 0
-    for (const sessionEntry of jobs.entries) {
-      signal?.throwIfAborted()
-      if (!isSafeSegment(sessionEntry.name) || sessionEntry.isSymbolicLink()) continue
-      try {
-        asSessionId(sessionEntry.name)
-      } catch {
-        continue
-      }
-      const sessionDirectory = await readSafeDirectory(this.paths.jobDir(sessionEntry.name))
-      if (sessionDirectory.kind !== 'entries') continue
-      for (const jobEntry of sessionDirectory.entries) {
-        signal?.throwIfAborted()
-        if (!jobEntry.name.endsWith('.json') || jobEntry.isSymbolicLink()) continue
-        const jobId = jobEntry.name.slice(0, -'.json'.length)
-        try {
-          asJobId(jobId)
-        } catch {
-          continue
-        }
-        if (await classifyNode(this.paths.jobFile(sessionEntry.name, jobId)) === 'file') count++
-      }
-    }
-    return count
   }
 
   private async countDirectDirectories<T>(
@@ -1238,136 +1176,17 @@ export class StorageMaintenanceService {
     else addDiagnostic(diagnostics, area, entry, 'unexpected-entry')
   }
 
-  private async collectJobReferences(signal: AbortSignal | undefined, diagnostics: DiagnosticCollector): Promise<ReferenceCollection> {
-    const cacheKeys = new Set<CacheKey>()
-    let scannedJobCount = 0
-    let malformedJobCount = 0
-    let unreadableJobCount = 0
-    let unsafeJobEntryCount = 0
-    let activeJobCount = 0
-    let complete = true
-
-    const jobs = await readSafeDirectory(this.paths.jobsDir())
-    if (jobs.kind !== 'entries') {
-      if (jobs.kind !== 'missing') {
-        complete = false
-        this.recordDirectoryIssue(diagnostics, 'persisted-jobs', 'jobs', jobs.kind)
-      }
-      return {
-        cacheKeys,
-        activeJobCount,
-        report: { complete, scannedJobCount, referencedCacheKeyCount: cacheKeys.size, malformedJobCount, unreadableJobCount, unsafeJobEntryCount },
-      }
-    }
-
-    for (const sessionEntry of jobs.entries) {
-      signal?.throwIfAborted()
-      if (!isSafeSegment(sessionEntry.name)) {
-        unsafeJobEntryCount++
-        complete = false
-        addDiagnostic(diagnostics, 'persisted-jobs', sessionEntry.name, 'unexpected-entry')
-        continue
-      }
-      if (sessionEntry.isSymbolicLink()) {
-        unsafeJobEntryCount++
-        complete = false
-        addDiagnostic(diagnostics, 'persisted-jobs', sessionEntry.name, 'symlink-skipped')
-        continue
-      }
-      let sessionId: string
-      try {
-        sessionId = asSessionId(sessionEntry.name)
-      } catch {
-        unsafeJobEntryCount++
-        complete = false
-        addDiagnostic(diagnostics, 'persisted-jobs', sessionEntry.name, 'unexpected-entry')
-        continue
-      }
-      const sessionDirectory = await readSafeDirectory(this.paths.jobDir(sessionId))
-      if (sessionDirectory.kind !== 'entries') {
-        if (sessionDirectory.kind !== 'missing') {
-          unsafeJobEntryCount++
-          complete = false
-          this.recordDirectoryIssue(diagnostics, 'persisted-jobs', sessionEntry.name, sessionDirectory.kind)
-        }
-        continue
-      }
-
-      for (const jobEntry of sessionDirectory.entries) {
-        signal?.throwIfAborted()
-        if (!isSafeSegment(jobEntry.name) || jobEntry.isSymbolicLink()) {
-          unsafeJobEntryCount++
-          complete = false
-          addDiagnostic(diagnostics, 'persisted-jobs', jobEntry.name, jobEntry.isSymbolicLink() ? 'symlink-skipped' : 'unexpected-entry')
-          continue
-        }
-        const looksLikeFinalJob = jobEntry.name.startsWith('mj_')
-          && jobEntry.name.endsWith('.json')
-          && !jobEntry.name.includes('.tmp.')
-        if (!looksLikeFinalJob) {
-          // Temporary writes and unknown entries can conceal an unscanned reference.
-          unsafeJobEntryCount++
-          complete = false
-          addDiagnostic(diagnostics, 'persisted-jobs', jobEntry.name, 'unexpected-entry')
-          continue
-        }
-        const idText = jobEntry.name.slice(0, -'.json'.length)
-        let jobId: string
-        try {
-          jobId = asJobId(idText)
-        } catch {
-          malformedJobCount++
-          complete = false
-          addDiagnostic(diagnostics, 'persisted-jobs', idText, 'malformed-job')
-          continue
-        }
-        const filePath = this.paths.jobFile(sessionId, jobId)
-        if (await classifyNode(filePath) !== 'file') {
-          unsafeJobEntryCount++
-          complete = false
-          addDiagnostic(diagnostics, 'persisted-jobs', jobId, 'unreadable-entry')
-          continue
-        }
-
-        let record: MinerUJobRecord
-        try {
-          const raw = await readPersistedJobBounded(filePath, signal)
-          record = parseMinerUJobRecord(JSON.parse(raw))
-        } catch (error) {
-          complete = false
-          if (isMissing(error) || errnoCode(error) === 'EACCES' || errnoCode(error) === 'EPERM') {
-            unreadableJobCount++
-            addDiagnostic(diagnostics, 'persisted-jobs', jobId, 'unreadable-entry')
-          } else {
-            malformedJobCount++
-            addDiagnostic(diagnostics, 'persisted-jobs', jobId, 'malformed-job')
-          }
-          continue
-        }
-
-        scannedJobCount++
-        if (record.id !== jobId || record.sessionId !== sessionId) {
-          complete = false
-          malformedJobCount++
-          addDiagnostic(diagnostics, 'persisted-jobs', jobId, 'malformed-job')
-          continue
-        }
-        if (!isTerminalJobState(record.state)) activeJobCount++
-        this.addJobReferences(record, cacheKeys)
-      }
-    }
-
+  private async collectJobReferences(signal: AbortSignal | undefined, _diagnostics: DiagnosticCollector): Promise<ReferenceCollection> {
+    signal?.throwIfAborted()
     return {
-      cacheKeys,
-      activeJobCount,
-      report: { complete, scannedJobCount, referencedCacheKeyCount: cacheKeys.size, malformedJobCount, unreadableJobCount, unsafeJobEntryCount },
+      cacheKeys: new Set<CacheKey>(),
+      activeJobCount: 0,
+      report: {
+        complete: true,
+        sessionJobCount: 0,
+        activeJobCount: 0,
+        referencedCacheKeyCount: 0,
+      },
     }
-  }
-
-  private addJobReferences(record: MinerUJobRecord, cacheKeys: Set<CacheKey>): void {
-    // Persisted jobs may carry multiple file cache keys. Retain their full union
-    // across every state; resultId is intentionally not used because it is lossy.
-    cacheKeys.add(record.cacheKey)
-    for (const file of record.files) cacheKeys.add(file.cacheKey)
   }
 }

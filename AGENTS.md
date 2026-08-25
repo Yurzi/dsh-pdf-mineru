@@ -2,12 +2,12 @@
 
 ## Architecture
 
-The plugin exposes five stable model tools over one versioned MinerU domain. Keep this dependency direction:
+The plugin exposes three model tools over one versioned MinerU domain. Keep this dependency direction:
 
 ```text
-tools -> MinerUService
-  -> RequestNormalizer
-  -> JobRepository
+tools -> DSH JobRegistry (async ownership, cancellation, completion)
+  -> MinerUService
+    -> RequestNormalizer
   -> ResultRepository
   -> SharedOperationRegistry
   -> ProviderRegistry
@@ -19,23 +19,22 @@ loopback RPC -> StorageMaintenanceService -> ResultRepository / ProcessLock
 
 Providers adapt upstream protocols only. They never register tools, inspect DSH Sessions, choose cache paths, resolve credentials, or generate model prose. Tools never call fetch, parse ZIP files, or construct storage paths.
 
-## Persistent contracts
+## Domain contracts
 
-- IDs use validated branded strings: `mj_`, `mr_`, `mf_`, `mp_`, and `mo_`.
-- Job, canonical request, cache key spec, and result manifest are independently versioned.
+- Plugin domain IDs use validated branded strings: `mr_`, `mf_`, `mp_`, and `mo_`; native background IDs are issued by DSH as `mineru-N`.
+- Canonical request, cache key spec, and result manifest are independently versioned.
 - Canonical requests persist file ID/name/bytes/SHA-256, never the local source path. `PreparedSourceFile.path` is ephemeral.
-- ProviderJobRef persists only task/batch IDs and dataId/fileId/name mappings. Never add upload, CDN, status, or result URLs.
+- ProviderJobRef is transient inside provider execution and contains task/batch IDs and dataId/fileId/name mappings. Never add upload, CDN, status, or result URLs.
 - Result manifests contain normalized relative artifact paths. Resolve absolute paths only in ResultRepository.
 - Published results are immutable and single-file. Batch support must fan out cache keys and manifests per source file.
 
 ## Session and concurrency rules
 
-- Every tool requires `exec.agent.session`; use `session.header.id` for ownership.
-- JobRepository public operations require a Session-shaped object, not a naked session ID.
-- Each submit creates a distinct session Job even on a cache hit or shared operation.
-- SharedOperation owns the producer AbortController. Waiter cancellation only stops that invocation's wait.
-- Persist the provider ref to every waiter immediately after upstream acceptance so restart recovery works.
-- An uploading Job without a complete ref becomes `INTERRUPTED_UPLOAD` after restart.
+- Every tool requires `exec.agent.session`; pass the exact live Agent as the native DSH background job owner.
+- `mineru_submit_parse_job` registers `kind: mineru` with `ctx.jobs.start`; generic `job_output`, `job_list`, and `job_kill` own async control.
+- `mineru_parse_document` returns results directly and never creates a plugin Job.
+- SharedOperation owns the producer AbortController. Waiter cancellation, including native `job_kill`, only stops that invocation's wait.
+- Native job hooks omit `readOutput`, settle with a non-rejecting final-output Promise, and never expose provider refs.
 
 ## Security invariants
 
@@ -48,19 +47,19 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 - Result publication is staging validation followed by same-filesystem atomic rename. EXDEV is an error, not a copy fallback.
 - Retry only idempotent GET and official PUT with a fresh source stream. Never auto-retry official batch-allocation POST or self-hosted multipart POST.
 - Retry diagnostics contain only typed operation/status/count fields, never error messages, URLs, headers, bodies, credentials, or local paths.
-- Storage maintenance requires the held ProcessLock, never follows symlinks, defaults to read-only/dry-run, and fails GC closed when Job/result scans are incomplete.
+- Storage maintenance requires the held ProcessLock, never follows symlinks, defaults to read-only/dry-run, and blocks destructive work while SharedOperations or storage readers are active.
 - Destructive maintenance stays loopback-only and requires explicit confirmation. Never expose maintenance as a model tool.
 
 ## Main files
 
-- `src/domain/*`: IDs, requests, jobs, results, failures, strict persistent parsers.
+- `src/domain/*`: IDs, requests, provider states, results, failures, strict boundary parsers.
 - `src/providers/provider.ts`, `src/providers/retry.ts`: shared Provider/ArtifactSink contracts and bounded retry policy.
 - `src/providers/self-hosted-v2.ts`: streaming multipart v2 adapter.
 - `src/providers/official-v4.ts`: official API, bare PUT, status, and collection adapter.
 - `src/providers/safe-zip.ts`: bounded ZIP scanner/extractor.
-- `src/storage/*`: validated paths, process lock, Job/Result repositories, staging sink, and privileged maintenance service.
-- `src/service/mineru-service.ts`: complete use-case orchestration and recovery.
-- `src/tools.ts`: five defineTool schemas and pure renderers.
+- `src/storage/*`: validated paths, process lock, ResultRepository, staging sink, and privileged maintenance service.
+- `src/service/mineru-service.ts`: direct-result use-case orchestration and same-process operation coalescing.
+- `src/tools.ts`: three defineTool schemas, native DSH job adaptation, and pure renderers.
 - `src/rpc.ts`, `src/client/*`: loopback config/maintenance RPC and Provider-aware settings page.
 - `src/observability.ts`: typed, non-throwing structured diagnostic events.
 - `scripts/smoke-official-v4.mjs`: explicit live smoke through the built plugin tool chain.

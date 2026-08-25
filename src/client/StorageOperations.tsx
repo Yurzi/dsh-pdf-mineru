@@ -217,7 +217,6 @@ export function StorageOperations({ rpc, t }: StorageOperationsProps) {
           <div className={css.metricHeaders}><span /> <span>{t('ops.bytes')}</span><span>{t('ops.entries')}</span></div>
           <dl className={css.metrics}>
             <AreaMetric label={t('ops.results')} area={state.stats.publishedResults} />
-            <AreaMetric label={t('ops.jobs')} area={state.stats.persistedJobs} />
             <AreaMetric label={t('ops.staging')} area={state.stats.staging} />
             <AreaMetric label={t('ops.quarantine')} area={state.stats.quarantine} />
           </dl>
@@ -255,7 +254,7 @@ export function StorageOperations({ rpc, t }: StorageOperationsProps) {
             <span>{t('ops.cleanupPlanned')}: {state.cacheClear.plannedCount}</span>
             <span>{t('ops.cleanupDeleted')}: {state.cacheClear.deletedCount}</span>
             <span>{formatBytes(state.cacheClear.dryRun ? state.cacheClear.plannedBytes : state.cacheClear.deletedBytes)}</span>
-            <span>{t('ops.activeJobs')}: {state.cacheClear.activeJobCount}</span>
+            <span>{t('ops.activeOperations')}: {state.cacheClear.activeOperationCount}</span>
           </div>
         </div>
       )}

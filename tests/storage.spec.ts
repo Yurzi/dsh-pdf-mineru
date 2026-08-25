@@ -141,27 +141,19 @@ describe('StoragePaths & Traversal Prevention', () => {
     const root = await createTempRoot()
     const paths = new StoragePaths(root)
 
-    const sessionA = asSessionId('session-a_123')
-    const jobId = asJobId('mj_0123456789abcdef')
     const cacheKey = asCacheKey('f'.repeat(64))
     const opId = asOperationId('mo_op123')
 
-    expect(paths.jobDir(sessionA)).toBe(join(root, 'jobs', 'session-a_123'))
-    expect(paths.jobFile(sessionA, jobId)).toBe(join(root, 'jobs', 'session-a_123', 'mj_0123456789abcdef.json'))
     expect(paths.resultDir(cacheKey)).toBe(join(root, 'results', 'sha256', 'ff', 'f'.repeat(64)))
     expect(paths.manifestFile(cacheKey)).toBe(join(root, 'results', 'sha256', 'ff', 'f'.repeat(64), 'manifest.json'))
     expect(paths.stagingDir(opId)).toBe(join(root, 'staging', 'mo_op123'))
     expect(paths.processLockFile()).toBe(join(root, '.process.lock'))
   })
 
-  it('rejects path traversal attempts in session and job IDs', async () => {
-    const root = await createTempRoot()
-    const paths = new StoragePaths(root)
-
-    expect(() => paths.jobDir('../session-evil')).toThrow(TypeError)
-    expect(() => paths.jobDir('..')).toThrow(TypeError)
-    expect(() => paths.jobDir('/absolute')).toThrow(TypeError)
-    expect(() => paths.jobFile('session-1', '../mj_evil')).toThrow(TypeError)
+  it('does not expose a filesystem Job layout', () => {
+    const paths = new StoragePaths('/tmp/mineru-test')
+    expect('jobsDir' in paths).toBe(false)
+    expect('jobFile' in paths).toBe(false)
   })
 
   it('rejects artifact relative paths that escape directory bounds', async () => {
@@ -260,7 +252,7 @@ describe('JobRepository & Session A/B Isolation', () => {
   it('creates, retrieves, and enforces strict session A/B isolation', async () => {
     const root = await createTempRoot()
     const paths = new StoragePaths(root)
-    const repo = new JobRepository(paths)
+    const repo = new JobRepository()
 
     const sessionA = asSessionId('session-alice')
     const sessionB = asSessionId('session-bob')
@@ -280,14 +272,6 @@ describe('JobRepository & Session A/B Isolation', () => {
     })
 
     // If a job record inside sessionB's folder has a mismatched sessionId, throw JOB_ACCESS_DENIED
-    const tamperedJob = { ...jobA, id: createJobId() }
-    const sessionBDir = paths.jobDir(sessionB)
-    await mkdir(sessionBDir, { recursive: true })
-    await writeFile(paths.jobFile(sessionB, tamperedJob.id), JSON.stringify(tamperedJob))
-    await expect(repo.get(sessionObject(sessionB), tamperedJob.id)).rejects.toMatchObject({
-      failure: { code: 'JOB_ACCESS_DENIED' },
-    })
-
     // Non-existent job returns undefined for get, throws JOB_NOT_FOUND for require
     const nonExistent = asJobId('mj_nonexistent999999999999')
     expect(await repo.get(sessionObject(sessionA), nonExistent)).toBeUndefined()
@@ -309,7 +293,7 @@ describe('JobRepository & Session A/B Isolation', () => {
   it('updates jobs with state machine transition checks and concurrency serialization', async () => {
     const root = await createTempRoot()
     const paths = new StoragePaths(root)
-    const repo = new JobRepository(paths)
+    const repo = new JobRepository()
 
     const session = asSessionId('session-trans')
     const job = sampleJob(session)
@@ -346,7 +330,7 @@ describe('JobRepository & Session A/B Isolation', () => {
   it('rejects updates that attempt to change immutable job metadata', async () => {
     const root = await createTempRoot()
     const paths = new StoragePaths(root)
-    const repo = new JobRepository(paths)
+    const repo = new JobRepository()
 
     const session = asSessionId('session-immut')
     const job = sampleJob(session)
@@ -367,6 +351,49 @@ describe('JobRepository & Session A/B Isolation', () => {
         id: createJobId(),
       })),
     ).rejects.toThrow(TypeError)
+  })
+
+  it('releases session Jobs and rejects an update racing session disposal', async () => {
+    const repo = new JobRepository()
+    const sessionId = asSessionId('session-dispose')
+    const owner = sessionObject(sessionId)
+    const job = sampleJob(sessionId)
+    await repo.create(owner, job)
+
+    let release!: () => void
+    let started!: () => void
+    const entered = new Promise<void>(resolve => { started = resolve })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const updating = repo.update(owner, job.id, async current => {
+      started()
+      await gate
+      return { ...current, state: 'uploading' }
+    })
+    await entered
+    expect(repo.deleteSession(owner)).toBe(1)
+    release()
+    await expect(updating).rejects.toMatchObject({ failure: { code: 'JOB_NOT_FOUND' } })
+    await expect(repo.get(owner, job.id)).resolves.toBeUndefined()
+  })
+
+  it('rejects late Job creation after the owning Session is disposed', async () => {
+    const repo = new JobRepository()
+    const sessionId = asSessionId('session-late-create')
+    const owner = sessionObject(sessionId)
+    expect(repo.deleteSession(owner)).toBe(0)
+    await expect(repo.create(owner, sampleJob(sessionId)))
+      .rejects.toMatchObject({ failure: { code: 'JOB_NOT_FOUND' } })
+    expect(repo.snapshot()).toHaveLength(0)
+  })
+
+  it('invalidates Jobs whose cache keys were evicted', async () => {
+    const repo = new JobRepository()
+    const sessionId = asSessionId('session-evict')
+    const owner = sessionObject(sessionId)
+    const job = sampleJob(sessionId)
+    await repo.create(owner, job)
+    expect(repo.deleteByCacheKeys(new Set([job.cacheKey]))).toBe(1)
+    await expect(repo.get(owner, job.id)).resolves.toBeUndefined()
   })
 
   it('requires an Agent-backed DSH Session object', () => {

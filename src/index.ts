@@ -7,7 +7,6 @@ import { SharedOperationRegistry } from './service/shared-operations.js'
 import { StoragePaths } from './storage/paths.js'
 import { ProcessLock } from './storage/process-lock.js'
 import { StorageAccessGate } from './storage/access-gate.js'
-import { JobRepository } from './storage/job-repository.js'
 import { ResultRepository } from './storage/result-repository.js'
 import { StorageMaintenanceService } from './storage/maintenance-service.js'
 import { registerTools } from './tools.js'
@@ -16,7 +15,7 @@ import { createStructuredDiagnosticSink } from './observability.js'
 import type {} from '@deepseek-ai/dsh-client-connection'
 
 export const name = 'dsh-pdf-mineru'
-export const inject = ['tools']
+export const inject = ['tools', 'jobs']
 
 const ProviderSchema = z.union([
   z.object({
@@ -118,7 +117,8 @@ function parseDraftProvider(value: unknown, current: MinerUConfig): ProviderConf
 export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<() => Promise<void>> {
   let persistedConfig = migrateConfig(entryConfig)
   let settingsScope: SettingsScope | undefined
-  let toolDisposer: (() => void) | undefined
+  let toolDisposer: (() => Promise<void>) | undefined
+  let operations: SharedOperationRegistry | undefined
   const startup = new AbortController()
 
   // Cordis invalidates the fiber before it awaits cleanup. Abort startup work
@@ -141,23 +141,23 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
   try {
     await lock.acquire(startup.signal)
     startup.signal.throwIfAborted()
-    const operations = new SharedOperationRegistry()
+    const operationRegistry = new SharedOperationRegistry()
+    operations = operationRegistry
     const accessGate = new StorageAccessGate()
-    const jobs = new JobRepository(paths)
     const results = new ResultRepository(paths, {
       maxArtifactBytes: persistedConfig.limits.maxZipEntryBytes,
       maxJsonValidationBytes: Math.min(persistedConfig.limits.maxZipEntryBytes, 64 * 1024 * 1024),
     })
     await results.cleanupStaging(
-      persistedConfig.storage.stagingTtlMs, operations.activeOperationIds(), startup.signal,
+      persistedConfig.storage.stagingTtlMs, operationRegistry.activeOperationIds(), startup.signal,
     )
     startup.signal.throwIfAborted()
-    const maintenance = new StorageMaintenanceService(paths, results, lock, accessGate)
+    const maintenance = new StorageMaintenanceService(paths, results, operationRegistry, lock, accessGate)
 
     const providers = new ProviderRegistry(runtimeConfig)
     const diagnostics = createStructuredDiagnosticSink(ctx.logger)
     const service = new MinerUService({
-      getConfig: runtimeConfig, providers, jobs, results, operations, diagnostics,
+      getConfig: runtimeConfig, providers, results, operations: operationRegistry, diagnostics,
       resolveCredential: async (reference, signal) => {
         signal.throwIfAborted()
         const credentials = ctx.get('credentials') as CredentialService | undefined
@@ -201,15 +201,20 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
       })
     })
 
-    const dispose = async () => {
-      operations.dispose()
-      toolDisposer?.()
-      await lock.release()
+    let disposing: Promise<void> | undefined
+    const dispose = (): Promise<void> => {
+      disposing ??= (async () => {
+        await toolDisposer?.()
+        await operationRegistry.shutdown()
+        await lock.release()
+      })()
+      return disposing
     }
     ctx.effect(() => async () => { await dispose() }, 'dsh-pdf-mineru lifecycle')
     return dispose
   } catch (error) {
-    toolDisposer?.()
+    await toolDisposer?.()
+    if (operations !== undefined) await operations.shutdown()
     await lock.release()
     if (startup.signal.aborted || isInactiveContextError(error)) return async () => undefined
     throw error
@@ -219,7 +224,6 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
 export * from './config.js'
 export * from './domain/ids.js'
 export * from './domain/request.js'
-export * from './domain/job.js'
 export * from './domain/result.js'
 export * from './domain/errors.js'
 export * from './providers/provider.js'

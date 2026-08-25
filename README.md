@@ -6,10 +6,10 @@ DSH MinerU 文档解析插件。模型通过统一工具接口使用自托管 Mi
 
 - 自托管 v2：`GET /health`、multipart `POST /tasks`、任务轮询和 JSON 结果收集。
 - 官方 v4：`POST /file-urls/batch`、裸 PUT 上传、`GET /extract-results/batch/{batch_id}`、安全 ZIP 收集。
-- 会话 Job：每次提交创建独立 `job_id`，只能由创建它的 DSH Session 查询。
+- 会话 Job：每次提交创建独立 `job_id`，只能由创建它的 live DSH Session 查询；session 结束或进程重启后句柄失效。
 - 全局结果缓存：按源 SHA-256、规范解析语义、产物集合、Provider compatibility key 和 schema 版本寻址。
 - 单进程请求合并：相同 CacheKey 只提交一次上游解析，每个会话仍保留独立 Job；单个等待者取消不取消 producer。
-- 持久恢复：上游接受任务后立即持久化不含秘密的 ProviderJobRef，重启后可继续轮询和收集。
+- 同进程续接：上游接受任务后在内存保存不含秘密的 ProviderJobRef，活动 session 可继续轮询和收集；不提供进程重启恢复。
 - staging、完整校验、原子 rename 发布、损坏缓存隔离和 storageRoot 进程锁。
 - 安全网络重试：幂等 GET 与官方裸 PUT 使用有界 backoff/Retry-After；模糊提交 POST 不重放。
 - loopback 存储运维：统计、只读完整性扫描、GC preview、quarantine 列表和二次确认清理。
@@ -88,10 +88,9 @@ defaults:
 
 ### 存储与限制
 
-默认 storageRoot 为 `$DSH_HOME/dsh-pdf-mineru/v1`，布局如下：
+默认 storageRoot 为 `$DSH_HOME/cache/pdf-mineru`，布局如下。升级不会自动迁移旧缓存；旧根目录需要显式配置或人工按运维策略处理，插件不会迁移 Jobs 或 staging。
 
 ```text
-jobs/<session-id>/<job-id>.json
 results/sha256/<prefix>/<cache-key>/manifest.json
 staging/<operation-id>/
 quarantine/<timestamp_reason_id>/
@@ -104,23 +103,21 @@ quarantine/<timestamp_reason_id>/
 
 Settings 的“存储运维”区域按需执行，不会自动扫描磁盘：
 
-- 统计 results、jobs、staging 和 quarantine 的字节与条目。
+- 统计 results、staging 和 quarantine 的字节与条目；DSH 后台任务和 SharedOperation 都只存在于进程内存。
 - 完整性扫描默认只读；显式隔离无效结果需要确认。
-- GC 只生成引用保留策略下的 preview，不删除已发布结果；Job 扫描不完整或结果扫描截断时 `eligible=false`。
-- “清除缓存”先预览全部已发布结果，二次确认后删除；若预览后结果集合发生变化则必须重新预览。活动 Job、Job 扫描不完整、结果扫描截断或不安全目录会让操作 fail closed。历史 Job 会保留，但其结果读取将返回 `CACHE_EVICTED`，重新提交会重新解析。
+- GC 只生成 preview，不删除已发布结果；插件不再用 session Job 引用保留缓存，所有通过验证的结果均可成为候选。
+- “清除缓存”先预览全部已发布结果，二次确认后删除；活动 SharedOperation、存储读租约、扫描截断或不安全目录会让操作 fail closed。
 - quarantine 删除默认 dry-run，只删除显式选中的安全 entry ID；实际删除需要二次确认。
 
 ## 模型工具
 
-所有工具都要求 `exec.agent.session`。模型只看到插件 `job_id`，不会看到上游 `task_id`、`batch_id`、上传 URL、CDN URL 或状态 URL。
+所有工具都要求 `exec.agent.session`。上游 `task_id`、`batch_id`、上传 URL、CDN URL 和状态 URL 不会暴露给模型。
 
 - `mineru_health`：探测当前 Provider 的连通性、鉴权和协议版本。
-- `mineru_submit_parse_job`：创建会话 Job，返回 `source: cache | shared-operation | provider`。
-- `mineru_get_parse_status`：返回统一 Job 状态和逐文件状态。
-- `mineru_get_parse_result`：返回受限 Markdown preview、manifest 路径和产物路径。
-- `mineru_parse_document`：submit、等待、result 的组合工具；等待超时保留 Job，可稍后继续查询。
+- `mineru_submit_parse_job`：注册原生 DSH 后台任务并立即返回 `mineru-N`；使用通用 `job_output`、`job_list` 和 `job_kill` 读取、列出或取消。
+- `mineru_parse_document`：同步等待并直接返回 immutable result、Markdown preview、manifest 路径和产物路径，不创建插件 Job。
 
-工具仅接受 `file_paths/model/ocr/language/formula/table/pages/artifacts`；状态和结果查询仅接受插件 `job_id`。旧 flat config 与旧工具参数不再解析，传入时会由闭合 schema 或配置校验直接拒绝。
+同步等待超时只结束当前等待，SharedOperation 生产者可继续完成并写入缓存；再次提交同一规范请求会重新加入该操作。旧 flat config、`mineru_get_parse_status` 和 `mineru_get_parse_result` 不再接受或注册。
 
 ## 官方 v4 安全边界
 

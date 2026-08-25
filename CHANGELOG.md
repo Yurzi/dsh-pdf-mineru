@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.0.2
+## 0.0.3
+
+### Changed
+
+- Async parsing now registers native DSH `mineru-N` background jobs with owner isolation, completion delivery, `job_output`, and `job_kill`; plugin `mj_` session Jobs were removed.
+- Synchronous parsing returns immutable results directly without creating a Job. `mineru_get_parse_status` and `mineru_get_parse_result` were removed in favor of generic DSH job controls.
+- The default cache root is now `$DSH_HOME/cache/pdf-mineru`; existing `$DSH_HOME/dsh-pdf-mineru/v1` data is not migrated automatically.
+- Shared operation shutdown now waits for background provider runners before the storage process lock is released.
 
 ### Added
 
@@ -11,9 +18,9 @@
 - An opt-in official v4 smoke command that executes the built `mineru_parse_document` tool chain.
 - Loopback storage statistics, read-only integrity scanning, bounded quarantine management, and fail-closed GC preview.
 - Storage operations in the settings UI with dry-run cleanup and explicit deletion confirmation.
-- A preview-first, confirmation-gated cache clear operation that evicts all safely scanned published results while retaining Job records.
+- A preview-first, confirmation-gated cache clear operation that evicts all safely scanned published results while no SharedOperation or storage reader is active.
 
-### Changed
+### Notes
 
 - Published result inspection now has a strict non-mutating path and rejects symlinked or undeclared tree entries.
 - The GUI verifier injects the current workspace bundle into an isolated existing-shell boot graph and covers desktop/mobile maintenance workflows.
@@ -24,10 +31,10 @@
 - Official batch-allocation POST and self-hosted multipart POST are never automatically retried.
 - Retry diagnostics no longer carry free-form upstream error strings, URLs, headers, bodies, credentials, or local paths.
 - Quarantine isolation accepts only complete staging-operation or content-addressed result directories.
-- Maintenance scans read manifests and persisted Jobs through explicit streaming byte limits.
-- Destructive maintenance remains loopback-only and confirmation-gated. GC remains preview-only; explicit cache clearing fails closed for active Jobs, incomplete scans, and unsafe result trees.
+- Maintenance scans read manifests with bounded limits and no longer depend on plugin Job references.
+- Destructive maintenance remains loopback-only and confirmation-gated. GC remains preview-only; explicit cache clearing fails closed for active SharedOperations, storage readers, incomplete scans, and unsafe result trees.
 
-No Job, canonical request, CacheKey, ProviderJobRef, or result manifest schema version changed.
+No canonical request, CacheKey, ProviderJobRef, or result manifest schema version changed.
 
 ## 0.0.1
 

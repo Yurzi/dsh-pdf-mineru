@@ -207,6 +207,10 @@ interface MinerUResultManifest {
   readonly createdAt: number;
 }
 //#endregion
+//#region src/domain/job.d.ts
+type MinerUFileState = 'queued' | 'uploading' | 'processing' | 'completed' | 'failed';
+type MinerUJobState = MinerUFileState | 'collecting' | 'partially-completed';
+//#endregion
 //#region src/providers/retry.d.ts
 type ProviderRetryOperation = 'probe' | 'submit' | 'inspect' | 'collect' | 'api-json' | 'presigned-put' | 'cdn-download';
 interface ProviderRetryEvent {
@@ -396,59 +400,6 @@ interface MinerUProvider {
 }
 declare function validateProviderCapabilities(request: CanonicalParseRequest, capabilities: ProviderCapabilities): void;
 //#endregion
-//#region src/domain/job.d.ts
-declare const MINERU_JOB_SCHEMA_VERSION: 1;
-type MinerUFileState = 'queued' | 'uploading' | 'processing' | 'completed' | 'failed';
-type MinerUJobState = MinerUFileState | 'collecting' | 'partially-completed';
-type JobResolution = {
-  readonly kind: 'cache-hit';
-} | {
-  readonly kind: 'shared-operation';
-  readonly operationId: OperationId;
-  readonly ref?: ProviderJobRef;
-} | {
-  readonly kind: 'provider';
-  readonly ref?: ProviderJobRef;
-};
-interface JobSourceFile {
-  readonly fileId: MinerUFileId;
-  readonly name: string;
-  readonly bytes: number;
-  readonly sha256: string;
-}
-interface MinerUFileStatus {
-  readonly fileId: MinerUFileId;
-  readonly name: string;
-  readonly cacheKey: CacheKey;
-  readonly state: MinerUFileState;
-  readonly resultId?: MinerUResultId;
-  readonly failure?: MinerUFailure;
-  readonly progress?: {
-    readonly completed: number;
-    readonly total: number;
-  };
-}
-interface MinerUJobRecord {
-  readonly schemaVersion: typeof MINERU_JOB_SCHEMA_VERSION;
-  readonly id: MinerUJobId;
-  readonly sessionId: SessionId;
-  readonly providerId: MinerUProviderId;
-  readonly providerConfigId: ProviderConfigId;
-  readonly providerCompatibilityKey: string;
-  readonly sourceFiles: readonly JobSourceFile[];
-  readonly request: CanonicalParseRequest;
-  readonly cacheKey: CacheKey;
-  readonly state: MinerUJobState;
-  readonly resolution: JobResolution;
-  readonly files: readonly MinerUFileStatus[];
-  readonly resultId?: MinerUResultId;
-  readonly failure?: MinerUFailure;
-  readonly createdAt: number;
-  readonly updatedAt: number;
-}
-declare function isTerminalJobState(state: MinerUJobState): boolean;
-declare function assertJobTransition(previous: MinerUJobState, next: MinerUJobState): void;
-//#endregion
 //#region src/providers/self-hosted-v2.d.ts
 interface SelfHostedV2ProviderConfig {
   readonly id: ProviderConfigId;
@@ -538,84 +489,13 @@ declare class ProviderRegistry {
   constructor(getConfig: () => MinerUConfig, options?: ProviderOptions | undefined);
   active(): ResolvedProvider;
   resolve(configId: ProviderConfigId): ResolvedProvider;
-  resolveForJob(job: MinerUJobRecord): Promise<ResolvedProvider>;
   create(config: ProviderConfig): MinerUProvider;
-}
-//#endregion
-//#region src/service/shared-operations.d.ts
-interface SharedWaiter {
-  readonly jobId: MinerUJobId;
-  readonly session: {
-    readonly header: {
-      readonly id: SessionId | string;
-    };
-  };
-}
-interface SharedSubmission {
-  readonly ref?: ProviderJobRef;
-  readonly state: MinerUJobState;
-  readonly resultId?: MinerUResultId;
-  readonly failure?: MinerUFailure;
-}
-interface SharedOutcome {
-  readonly state: Extract<MinerUJobState, 'completed' | 'partially-completed' | 'failed'>;
-  readonly resultId?: MinerUResultId;
-}
-declare class SharedOperation {
-  readonly cacheKey: CacheKey;
-  readonly id: OperationId;
-  readonly waiters: Map<MinerUJobId, SharedWaiter>;
-  readonly controller: AbortController;
-  private readonly submission;
-  private readonly outcome;
-  private submitted;
-  private settled;
-  private accepted;
-  private submissionValue;
-  private outcomeValue;
-  constructor(cacheKey: CacheKey);
-  attach(waiter: SharedWaiter): void;
-  get acceptedRef(): ProviderJobRef | undefined;
-  get submittedValue(): SharedSubmission | undefined;
-  get settledValue(): SharedOutcome | undefined;
-  markAccepted(ref: ProviderJobRef): void;
-  markSubmitted(value: SharedSubmission): void;
-  resolve(value: SharedOutcome): void;
-  reject(error: unknown): void;
-  waitForSubmission(signal: AbortSignal): Promise<SharedSubmission>;
-  waitForOutcome(signal: AbortSignal): Promise<SharedOutcome>;
-  abort(reason: unknown): void;
-}
-declare class SharedOperationRegistry {
-  private readonly operations;
-  private disposed;
-  private readonly coordinatorDisposers;
-  private readonly operationKeys;
-  private readonly operationTimeouts;
-  private readonly started;
-  reserve(cacheKey: CacheKey, authority: ProviderConfigId, timeoutMs: number): {
-    readonly operation: SharedOperation;
-    readonly created: boolean;
-  };
-  start(operation: SharedOperation, runner: (operation: SharedOperation) => Promise<SharedOutcome>): void;
-  acquire(cacheKey: CacheKey, authority: ProviderConfigId, timeoutMs: number, runner: (operation: SharedOperation) => Promise<SharedOutcome>): {
-    readonly operation: SharedOperation;
-    readonly created: boolean;
-  };
-  registerCoordinator(dispose: () => void): () => void;
-  get(cacheKey: CacheKey, authority: ProviderConfigId): SharedOperation | undefined;
-  activeOperationIds(): ReadonlySet<OperationId>;
-  dispose(): void;
 }
 //#endregion
 //#region src/storage/paths.d.ts
 declare class StoragePaths {
   readonly root: string;
   constructor(root?: string);
-  jobsDir(): string;
-  jobDir(sessionId: SessionId | string): string;
-  jobFile(sessionId: SessionId | string, jobId: MinerUJobId | string): string;
-  jobTempFile(sessionId: SessionId | string, jobId: MinerUJobId | string, token: string): string;
   resultsDir(): string;
   resultDir(cacheKey: CacheKey | string): string;
   manifestFile(cacheKey: CacheKey | string): string;
@@ -630,24 +510,6 @@ declare class StoragePaths {
   processLockFile(): string;
   resolveArtifactPath(cacheKey: CacheKey | string, relativePath: string): string;
   resolveStagingArtifactPath(operationId: OperationId | string, relativePath: string): string;
-}
-//#endregion
-//#region src/storage/job-repository.d.ts
-interface SessionIdentifier {
-  readonly header: {
-    readonly id: SessionId | string;
-  };
-}
-declare class JobRepository {
-  readonly paths: StoragePaths;
-  private readonly mutex;
-  constructor(paths: StoragePaths);
-  create(session: SessionIdentifier, job: MinerUJobRecord): Promise<MinerUJobRecord>;
-  get(session: SessionIdentifier, jobId: MinerUJobId | string): Promise<MinerUJobRecord | undefined>;
-  require(session: SessionIdentifier, jobId: MinerUJobId | string): Promise<MinerUJobRecord>;
-  update(session: SessionIdentifier, jobId: MinerUJobId | string, mutator: (current: MinerUJobRecord) => MinerUJobRecord | Promise<MinerUJobRecord>): Promise<MinerUJobRecord>;
-  list(session: SessionIdentifier): Promise<readonly MinerUJobRecord[]>;
-  private atomicWrite;
 }
 //#endregion
 //#region src/storage/result-repository.d.ts
@@ -744,40 +606,64 @@ interface MinerUStructuredLogger {
 declare function createStructuredDiagnosticSink(logger: MinerUStructuredLogger): MinerUDiagnosticSink;
 declare function emitDiagnostic(sink: MinerUDiagnosticSink | undefined, event: MinerUDiagnosticEvent): void;
 //#endregion
+//#region src/service/shared-operations.d.ts
+interface SharedOutcome {
+  readonly state: 'completed' | 'failed';
+  readonly resultId?: MinerUResultId;
+  readonly failure?: MinerUFailure;
+}
+/** One process-local producer shared by foreground calls and native DSH jobs. */
+declare class SharedOperation {
+  readonly cacheKey: CacheKey;
+  readonly id: OperationId;
+  readonly controller: AbortController;
+  private readonly outcome;
+  private settled;
+  private outcomeValue;
+  private waiters;
+  constructor(cacheKey: CacheKey);
+  get settledValue(): SharedOutcome | undefined;
+  get waiterCount(): number;
+  resolve(value: SharedOutcome): void;
+  reject(error: unknown): void;
+  waitForOutcome(signal: AbortSignal): Promise<SharedOutcome>;
+  abort(reason: unknown): void;
+}
+declare class SharedOperationRegistry {
+  private readonly operations;
+  private disposed;
+  private readonly coordinatorDisposers;
+  private readonly operationKeys;
+  private readonly operationTimeouts;
+  private readonly started;
+  private readonly runners;
+  reserve(cacheKey: CacheKey, authority: ProviderConfigId, timeoutMs: number): {
+    readonly operation: SharedOperation;
+    readonly created: boolean;
+  };
+  start(operation: SharedOperation, runner: (operation: SharedOperation) => Promise<SharedOutcome>): void;
+  release(operation: SharedOperation, error: unknown): boolean;
+  acquire(cacheKey: CacheKey, authority: ProviderConfigId, timeoutMs: number, runner: (operation: SharedOperation) => Promise<SharedOutcome>): {
+    readonly operation: SharedOperation;
+    readonly created: boolean;
+  };
+  registerCoordinator(dispose: () => void): () => void;
+  get(cacheKey: CacheKey, authority: ProviderConfigId): SharedOperation | undefined;
+  activeOperationIds(): ReadonlySet<OperationId>;
+  activeOperationCount(): number;
+  dispose(): void;
+  shutdown(): Promise<void>;
+}
+//#endregion
 //#region src/service/mineru-service.d.ts
-interface ServiceSession extends SessionIdentifier {
+interface ServiceSession {
   readonly header: {
-    readonly id: SessionId | string;
+    readonly id: string;
     readonly cwd?: string;
   };
 }
 type CredentialResolver = (reference: string, signal: AbortSignal) => Promise<string | undefined>;
 type SubmissionSource = 'cache' | 'shared-operation' | 'provider';
-interface FileStatusView {
-  readonly file_id: string;
-  readonly name: string;
-  readonly state: string;
-  /** Present only in a multi-file submission; single-file output remains unchanged. */
-  readonly job_id?: string;
-  readonly progress?: {
-    readonly completed: number;
-    readonly total: number;
-  };
-  readonly failure?: MinerUFailure;
-}
-interface SubmitView {
-  readonly job_id: string;
-  readonly state: MinerUJobState;
-  readonly source: SubmissionSource;
-  readonly provider: MinerUProviderId;
-  readonly files: readonly FileStatusView[];
-  readonly result_available: boolean;
-  readonly failure?: MinerUFailure;
-}
-interface StatusView extends SubmitView {
-  readonly created_at: number;
-  readonly updated_at: number;
-}
 interface ArtifactView {
   readonly kind: string;
   readonly path: string;
@@ -787,18 +673,11 @@ interface ResultFileView {
   readonly file_id: string;
   readonly name: string;
   readonly artifacts: readonly ArtifactView[];
-  /** Present only in a multi-file folded result. */
-  readonly job_id?: string;
-  readonly state?: string;
-  readonly result_id?: string;
-  readonly manifest_path?: string;
-  readonly cache_hit?: boolean;
-  readonly failure?: MinerUFailure;
   readonly artifacts_truncated?: boolean;
 }
 interface ResultView {
-  readonly job_id: string;
-  readonly state: Extract<MinerUJobState, 'completed' | 'partially-completed'>;
+  readonly state: 'completed';
+  readonly source: SubmissionSource;
   readonly cache_hit: boolean;
   readonly result_id: string;
   readonly files: readonly ResultFileView[];
@@ -807,6 +686,19 @@ interface ResultView {
   readonly manifest_path: string;
   readonly output_limit_chars: number;
 }
+interface FailedParseView {
+  readonly state: 'failed';
+  readonly source: SubmissionSource;
+  readonly file_id: string;
+  readonly name: string;
+  readonly failure: MinerUFailure;
+}
+interface BatchParseDocumentView {
+  readonly kind: 'batch';
+  readonly state: 'completed' | 'partially-completed' | 'failed';
+  readonly results: readonly (ResultView | FailedParseView)[];
+}
+type ParseDocumentView = ResultView | BatchParseDocumentView;
 interface ProbeView {
   readonly available: boolean;
   readonly provider: MinerUProviderId;
@@ -822,25 +714,9 @@ interface ProbeView {
   };
   readonly diagnostics?: string;
 }
-interface BatchSubmitView {
-  readonly kind: 'batch';
-  readonly state: MinerUJobState;
-  readonly jobs: readonly SubmitView[];
-}
-interface BatchParseDocumentView {
-  readonly kind: 'batch';
-  readonly state: MinerUJobState;
-  readonly jobs: readonly (ResultView | StatusView)[];
-  readonly poll_timed_out?: true;
-}
-type SubmitDocumentView = SubmitView | BatchSubmitView;
-type ParseDocumentView = ResultView | (StatusView & {
-  readonly poll_timed_out?: true;
-}) | BatchParseDocumentView;
 interface MinerUServiceOptions {
   readonly getConfig: () => MinerUConfig;
   readonly providers: ProviderRegistry;
-  readonly jobs: JobRepository;
   readonly results: ResultRepository;
   readonly operations: SharedOperationRegistry;
   readonly resolveCredential: CredentialResolver;
@@ -853,24 +729,15 @@ declare class MinerUService {
   private diagnostic;
   private callContext;
   probe(signal: AbortSignal, draft?: ProviderConfig): Promise<ProbeView>;
-  submit(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal): Promise<SubmitDocumentView>;
-  private submitJobs;
-  private newJob;
-  private syncAcceptedRef;
-  private syncSubmission;
-  private replayOperation;
-  private updateWaiters;
-  private snapshotFiles;
+  private prepare;
   private startBatch;
   private runOperation;
-  status(session: ServiceSession, jobId: string, signal: AbortSignal): Promise<StatusView>;
   private markdownPreview;
   private fitResult;
-  result(session: ServiceSession, jobId: string, signal: AbortSignal): Promise<ResultView>;
   private projectResult;
-  private batchEnvelope;
-  private parseBatchDocument;
-  parseDocument(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal, pollTimeoutMs?: number): Promise<ParseDocumentView>;
+  private createWaitSignal;
+  /** Parse directly to immutable results. No plugin Job is created for this call. */
+  parseDocument(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal, pollTimeoutMs?: number | null): Promise<ParseDocumentView>;
 }
 //#endregion
 //#region src/storage/process-lock.d.ts
@@ -897,7 +764,7 @@ declare class StorageAccessGate {
 }
 //#endregion
 //#region src/storage/maintenance-service.d.ts
-type StorageMaintenanceArea = 'published-results' | 'persisted-jobs' | 'staging' | 'quarantine';
+type StorageMaintenanceArea = 'published-results' | 'staging' | 'quarantine';
 type StorageMaintenanceDiagnosticCode = 'unexpected-entry' | 'symlink-skipped' | 'unreadable-entry' | 'corrupt-result' | 'missing-result' | 'unsafe-result' | 'malformed-job' | 'inconsistent-job' | 'quarantine-failed';
 interface StorageMaintenanceDiagnostic {
   readonly area: StorageMaintenanceArea;
@@ -924,7 +791,6 @@ interface StorageAreaStatistics {
 interface StorageStatistics {
   readonly generatedAt: number;
   readonly publishedResults: StorageAreaStatistics;
-  readonly persistedJobs: StorageAreaStatistics;
   readonly staging: StorageAreaStatistics;
   readonly quarantine: StorageAreaStatistics;
 }
@@ -1018,12 +884,10 @@ interface GcCandidate {
   readonly byteUsageSaturated: boolean;
 }
 interface JobReferenceScan {
-  readonly complete: boolean;
-  readonly scannedJobCount: number;
+  readonly complete: true;
+  readonly sessionJobCount: number;
+  readonly activeJobCount: number;
   readonly referencedCacheKeyCount: number;
-  readonly malformedJobCount: number;
-  readonly unreadableJobCount: number;
-  readonly unsafeJobEntryCount: number;
 }
 /**
  * This operation never deletes data. It reports only fully validated, unreferenced
@@ -1032,7 +896,7 @@ interface JobReferenceScan {
 interface GcDryRunReport {
   readonly generatedAt: number;
   readonly dryRun: true;
-  readonly referencePolicy: 'job-reference-retention';
+  readonly referencePolicy: 'no-plugin-job-retention';
   readonly eligible: boolean;
   readonly candidateCount: number;
   readonly candidateBytes: number;
@@ -1062,6 +926,7 @@ interface CacheClearReport {
   readonly dryRun: boolean;
   readonly eligible: boolean;
   readonly activeJobCount: number;
+  readonly activeOperationCount: number;
   readonly activeAccessCount: number;
   readonly confirmationToken?: string;
   readonly plannedCount: number;
@@ -1075,17 +940,14 @@ interface CacheClearReport {
   readonly scan: ScanMetadata;
   readonly diagnostics: readonly StorageMaintenanceDiagnostic[];
 }
-/**
- * Storage maintenance is deliberately separate from JobRepository's session-scoped
- * public API. It reads persisted jobs with the same strict parser, but it neither
- * exposes them nor bypasses session access for model-facing operations.
- */
+/** Storage maintenance is loopback-only and blocks destructive work while parse operations are active. */
 declare class StorageMaintenanceService {
   readonly paths: StoragePaths;
   readonly results: ResultRepository;
+  readonly operations: SharedOperationRegistry;
   readonly lock: ProcessLock;
   readonly accessGate: StorageAccessGate;
-  constructor(paths: StoragePaths, results: ResultRepository, lock: ProcessLock, accessGate?: StorageAccessGate);
+  constructor(paths: StoragePaths, results: ResultRepository, operations: SharedOperationRegistry, lock: ProcessLock, accessGate?: StorageAccessGate);
   getStatistics(signal?: AbortSignal): Promise<StorageStatistics>;
   scanIntegrity(options?: IntegrityScanOptions): Promise<CacheIntegrityScanReport>;
   listQuarantine(options?: QuarantineListOptions): Promise<QuarantineListReport>;
@@ -1095,12 +957,10 @@ declare class StorageMaintenanceService {
   gcDryRun(options?: GcDryRunOptions): Promise<GcDryRunReport>;
   private assertLockHeld;
   private countPublishedResultDirectories;
-  private countPersistedJobFiles;
   private countDirectDirectories;
   private visitPublishedResults;
   private recordDirectoryIssue;
   private collectJobReferences;
-  private addJobReferences;
 }
 //#endregion
 //#region src/index.d.ts
@@ -1109,4 +969,4 @@ declare const inject: string[];
 declare const Config: z<unknown>;
 declare function apply(ctx: Context, entryConfig?: unknown): Promise<() => Promise<void>>;
 //#endregion
-export { ARTIFACT_KINDS, ArtifactInput, ArtifactKind, ArtifactRef, ArtifactSink, ArtifactView, ArtifactWriteOptions, BatchParseDocumentView, BatchSubmitView, CACHE_KEY_SPEC_VERSION, CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, CacheClearOptions, CacheClearReport, CacheIntegrityScanReport, CacheKey, CanonicalParseRequest, CanonicalSourceFile, Config, CredentialResolver, DEFAULT_RETRY_POLICY, FileStatusView, GcCandidate, GcDryRunOptions, GcDryRunReport, IntegrityScanOptions, JobReferenceScan, JobResolution, JobSourceFile, MINERU_JOB_SCHEMA_VERSION, MINERU_RESULT_MANIFEST_SCHEMA_VERSION, MinerUConfig, MinerUDiagnosticEvent, MinerUDiagnosticLevel, MinerUDiagnosticPhase, MinerUDiagnosticSink, MinerUError, MinerUErrorCode, MinerUFailure, MinerUFileId, MinerUFileState, MinerUFileStatus, MinerUJobId, MinerUJobRecord, MinerUJobState, MinerUModel, MinerUProvider, MinerUProviderId, MinerUResultId, MinerUResultManifest, MinerUService, MinerUServiceOptions, MinerUStructuredLogger, OfficialV4Config, OfficialV4Provider, OperationId, OutputConfig, ParseDefaults, ParseDocumentView, ParseMethod, ParseRequestInput, ParseSemantics, ParsedDocumentManifest, PollingConfig, PreparedParseRequest, PreparedSourceFile, ProbeView, ProviderCallContext, ProviderCallLimits, ProviderCapabilities, ProviderCollectedFile, ProviderCollection, ProviderCompatibilityContext, ProviderConfig, ProviderConfigId, ProviderFileSnapshot, ProviderJobRef, ProviderJobSnapshot, ProviderOptions, ProviderProbeResult, ProviderRetryEvent, ProviderRetryHook, ProviderRetryHooks, ProviderRetryOperation, ProviderRetryOptions, ProviderRetryPolicy, ProviderSubmission, ProviderSubmittedFile, QuarantineCleanupOptions, QuarantineCleanupReport, QuarantineEntry, QuarantineListOptions, QuarantineListReport, RESULT_SCHEMA_VERSION, ResultFileView, ResultProducer, ResultView, RetryConfig, RetryExecutionContext, ScanMetadata, SecurityLimits, SelfHostedFileParseResult, SelfHostedHealthResponse, SelfHostedTaskResultResponse, SelfHostedTaskSubmitResponse, SelfHostedV2Config, SelfHostedV2Provider, SelfHostedV2ProviderConfig, ServiceSession, SessionId, StatusView, StorageAreaStatistics, StorageConfig, StorageMaintenanceArea, StorageMaintenanceDiagnostic, StorageMaintenanceDiagnosticCode, StorageMaintenanceService, StorageStatistics, SubmissionSource, SubmitDocumentView, SubmitView, TemporaryArtifact, apply, asCacheKey, asFileId, asJobId, asOperationId, asProviderConfigId, asResultId, asSessionId, assertJobTransition, assertSafePathSegment, calculateBackoffDelay, createFileId, createJobId, createOperationId, createStructuredDiagnosticSink, defaultMinerUConfig, defaultSleep, emitDiagnostic, executeWithRetry, failure, inject, isRetryableError, isRetryableHttpStatus, isTerminalJobState, mergeRetryOptions, migrateConfig, name, normalizeArtifactKinds, normalizePageRanges, parseRetryAfter, providerById, readBoundedResponseText, resolveRetryPolicy, resultIdForCacheKey, sanitizeDiagnostic, throwMinerU, toMinerUFailure, validateProviderCapabilities };
+export { ARTIFACT_KINDS, ArtifactInput, ArtifactKind, ArtifactRef, ArtifactSink, ArtifactView, ArtifactWriteOptions, BatchParseDocumentView, CACHE_KEY_SPEC_VERSION, CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, CacheClearOptions, CacheClearReport, CacheIntegrityScanReport, CacheKey, CanonicalParseRequest, CanonicalSourceFile, Config, CredentialResolver, DEFAULT_RETRY_POLICY, FailedParseView, GcCandidate, GcDryRunOptions, GcDryRunReport, IntegrityScanOptions, JobReferenceScan, MINERU_RESULT_MANIFEST_SCHEMA_VERSION, MinerUConfig, MinerUDiagnosticEvent, MinerUDiagnosticLevel, MinerUDiagnosticPhase, MinerUDiagnosticSink, MinerUError, MinerUErrorCode, MinerUFailure, MinerUFileId, MinerUJobId, MinerUModel, MinerUProvider, MinerUProviderId, MinerUResultId, MinerUResultManifest, MinerUService, MinerUServiceOptions, MinerUStructuredLogger, OfficialV4Config, OfficialV4Provider, OperationId, OutputConfig, ParseDefaults, ParseDocumentView, ParseMethod, ParseRequestInput, ParseSemantics, ParsedDocumentManifest, PollingConfig, PreparedParseRequest, PreparedSourceFile, ProbeView, ProviderCallContext, ProviderCallLimits, ProviderCapabilities, ProviderCollectedFile, ProviderCollection, ProviderCompatibilityContext, ProviderConfig, ProviderConfigId, ProviderFileSnapshot, ProviderJobRef, ProviderJobSnapshot, ProviderOptions, ProviderProbeResult, ProviderRetryEvent, ProviderRetryHook, ProviderRetryHooks, ProviderRetryOperation, ProviderRetryOptions, ProviderRetryPolicy, ProviderSubmission, ProviderSubmittedFile, QuarantineCleanupOptions, QuarantineCleanupReport, QuarantineEntry, QuarantineListOptions, QuarantineListReport, RESULT_SCHEMA_VERSION, ResultFileView, ResultProducer, ResultView, RetryConfig, RetryExecutionContext, ScanMetadata, SecurityLimits, SelfHostedFileParseResult, SelfHostedHealthResponse, SelfHostedTaskResultResponse, SelfHostedTaskSubmitResponse, SelfHostedV2Config, SelfHostedV2Provider, SelfHostedV2ProviderConfig, ServiceSession, SessionId, StorageAreaStatistics, StorageConfig, StorageMaintenanceArea, StorageMaintenanceDiagnostic, StorageMaintenanceDiagnosticCode, StorageMaintenanceService, StorageStatistics, SubmissionSource, TemporaryArtifact, apply, asCacheKey, asFileId, asJobId, asOperationId, asProviderConfigId, asResultId, asSessionId, assertSafePathSegment, calculateBackoffDelay, createFileId, createJobId, createOperationId, createStructuredDiagnosticSink, defaultMinerUConfig, defaultSleep, emitDiagnostic, executeWithRetry, failure, inject, isRetryableError, isRetryableHttpStatus, mergeRetryOptions, migrateConfig, name, normalizeArtifactKinds, normalizePageRanges, parseRetryAfter, providerById, readBoundedResponseText, resolveRetryPolicy, resultIdForCacheKey, sanitizeDiagnostic, throwMinerU, toMinerUFailure, validateProviderCapabilities };

@@ -164,7 +164,7 @@ describe('plugin composition lifecycle', () => {
     release.mockRestore()
   })
 
-  it('registers five tools and loopback RPC only after acquiring storage lock', async () => {
+  it('registers three tools and loopback RPC only after acquiring storage lock', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mineru-index-'))
     roots.push(root)
     const base = defaultMinerUConfig()
@@ -173,7 +173,7 @@ describe('plugin composition lifecycle', () => {
     const { apply, name } = await import('../src/index.js')
     expect(name).toBe('dsh-pdf-mineru')
     const dispose = await apply(runtime.ctx, config)
-    expect(runtime.definitions).toHaveLength(5)
+    expect(runtime.definitions).toHaveLength(3)
     expect(runtime.rpc.authority).toBe('loopback')
     expect(await stat(join(config.storage.storageRoot, '.process.lock'))).toBeDefined()
     expect(runtime.effects.length).toBeGreaterThan(0)
