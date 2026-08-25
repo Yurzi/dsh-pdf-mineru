@@ -22,16 +22,22 @@ interface FakeRuntime {
     disposeCount: number
     handler?: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>
   }
+  readonly settingsReplace: ReturnType<typeof vi.fn>
 }
 
-function fakeContext(config: ReturnType<typeof defaultMinerUConfig>, failToolRegistration = false): FakeRuntime {
+function fakeContext(
+  config: ReturnType<typeof defaultMinerUConfig>,
+  failToolRegistration = false,
+  storedConfig: ReturnType<typeof defaultMinerUConfig> = config,
+): FakeRuntime {
   const definitions: unknown[] = []
   const effects: Array<() => void | Promise<void>> = []
   const rpc: FakeRuntime['rpc'] = { authority: undefined, disposeCount: 0 }
+  const settingsReplace = vi.fn((_section: object) => Promise.resolve())
   const scope = {
-    get: () => config,
+    get: () => storedConfig,
     watch: (_callback: (next: unknown) => void) => () => undefined,
-    replace: (_section: object) => Promise.resolve(),
+    replace: settingsReplace,
   }
   const value = {
     tools: {
@@ -56,7 +62,12 @@ function fakeContext(config: ReturnType<typeof defaultMinerUConfig>, failToolReg
       },
     },
     get: (name: string) => name === 'settings'
-      ? { register: () => scope }
+      ? {
+          register: (_namespace: string, _schema: unknown, options: { validate(value: unknown): void }) => {
+            options.validate(storedConfig)
+            return scope
+          },
+        }
       : undefined,
     effect: (factory: () => unknown) => {
       const cleanup = factory()
@@ -71,7 +82,7 @@ function fakeContext(config: ReturnType<typeof defaultMinerUConfig>, failToolReg
     },
     logger: { info: () => undefined, warn: () => undefined, error: () => undefined, debug: () => undefined },
   }
-  return { ctx: value as unknown as Context, definitions, effects, rpc }
+  return { ctx: value as unknown as Context, definitions, effects, rpc, settingsReplace }
 }
 
 function cancellableContext(config: ReturnType<typeof defaultMinerUConfig>): FakeRuntime & { disposeContext(): Promise<void> } {
@@ -190,6 +201,35 @@ describe('plugin composition lifecycle', () => {
     await dispose()
     await expect(stat(join(config.storage.storageRoot, '.process.lock'))).rejects.toThrow()
     expect(runtime.rpc.disposeCount).toBe(1)
+  })
+
+  it('resolves persisted settings before fixing the storage root and persists RPC updates', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mineru-index-settings-'))
+    roots.push(root)
+    const base = defaultMinerUConfig()
+    const entryConfig = { ...base, storage: { ...base.storage, storageRoot: join(root, 'new-default') } }
+    const storedConfig = {
+      ...base,
+      storage: { ...base.storage, storageRoot: join(root, 'persisted-user-root') },
+      output: { maxInlineChars: 123456 },
+    }
+    const runtime = fakeContext(entryConfig, false, storedConfig)
+    const { apply, inject } = await import('../src/index.js')
+
+    expect(inject).toContain('settings')
+    const dispose = await apply(runtime.ctx, entryConfig)
+    expect(await stat(join(storedConfig.storage.storageRoot, '.process.lock'))).toBeDefined()
+    await expect(stat(join(entryConfig.storage.storageRoot, '.process.lock'))).rejects.toThrow()
+
+    const next = { ...storedConfig, output: { maxInlineChars: 234567 } }
+    const response = await runtime.rpc.handler?.(
+      'mineru/config.set', { config: next }, new AbortController().signal,
+    ) as { ok: boolean; value?: { config: typeof next } }
+    expect(response).toMatchObject({ ok: true, value: { config: next } })
+    expect(runtime.settingsReplace).toHaveBeenCalledOnce()
+    expect(runtime.settingsReplace).toHaveBeenCalledWith(next)
+
+    await dispose()
   })
 
   it('releases the process lock when initialization fails after lock acquisition', async () => {

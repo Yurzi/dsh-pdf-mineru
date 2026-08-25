@@ -15,7 +15,7 @@ import { createStructuredDiagnosticSink } from './observability.js'
 import type {} from '@deepseek-ai/dsh-client-connection'
 
 export const name = 'dsh-pdf-mineru'
-export const inject = ['tools', 'jobs']
+export const inject = ['tools', 'jobs', 'settings']
 
 const ProviderSchema = z.union([
   z.object({
@@ -116,7 +116,7 @@ function parseDraftProvider(value: unknown, current: MinerUConfig): ProviderConf
 
 export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<() => Promise<void>> {
   let persistedConfig = migrateConfig(entryConfig)
-  let settingsScope: SettingsScope | undefined
+  let fixedStorageRoot: string | undefined
   let toolDisposer: (() => Promise<void>) | undefined
   let operations: SharedOperationRegistry | undefined
   const startup = new AbortController()
@@ -125,15 +125,30 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
   // synchronously so an in-flight initialization never resumes into ctx APIs.
   ctx.effect(() => () => startup.abort(), 'dsh-pdf-mineru startup cancellation')
 
-  const fixedStorageRoot = persistedConfig.storage.storageRoot
   const validateRuntimeConfig = (value: unknown): MinerUConfig => {
     const next = migrateConfig(value)
-    if (next.storage.storageRoot !== fixedStorageRoot) {
+    if (fixedStorageRoot !== undefined && next.storage.storageRoot !== fixedStorageRoot) {
       throw new TypeError('storage.storageRoot cannot change while the MinerU plugin is running')
     }
     return next
   }
   const runtimeConfig = (): MinerUConfig => persistedConfig
+
+  // The user layer can retain a storage root from an older bundle default.
+  // Resolve it before fixing the process-wide root and acquiring its lock.
+  const settings = ctx.get('settings') as SettingsService | undefined
+  if (settings === undefined) throw new Error('settings service is unavailable')
+  const settingsScope = settings.register('dsh-pdf-mineru', Config, {
+    base: asObject(persistedConfig),
+    applies: 'live',
+    validate: value => { validateRuntimeConfig(value) },
+  })
+  persistedConfig = validateRuntimeConfig(settingsScope.get())
+  fixedStorageRoot = persistedConfig.storage.storageRoot
+  ctx.effect(
+    () => settingsScope.watch(next => { persistedConfig = validateRuntimeConfig(next) }),
+    'dsh-pdf-mineru settings watch',
+  )
 
   const paths = new StoragePaths(fixedStorageRoot)
   const lock = new ProcessLock(paths)
@@ -171,26 +186,12 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
 
     toolDisposer = registerTools(ctx, () => service, accessGate)
 
-    ctx.inject(['settings'], (settingsCtx: Context) => {
-      const settings = (settingsCtx.get('settings') ?? ctx.get('settings')) as SettingsService | undefined
-      if (settings !== undefined) {
-        settingsScope = settings.register('dsh-pdf-mineru', Config, {
-          base: asObject(persistedConfig),
-          applies: 'live',
-          validate: value => { validateRuntimeConfig(value) },
-        })
-        persistedConfig = validateRuntimeConfig(settingsScope.get())
-        return settingsScope.watch(next => { persistedConfig = validateRuntimeConfig(next) })
-      }
-      return undefined
-    })
-
     ctx.inject(['connection'], (connectionCtx: Context) => {
       return registerRpc(connectionCtx, {
         getConfig: () => persistedConfig,
         setConfig: async value => {
           const next = validateRuntimeConfig(value)
-          if (settingsScope !== undefined) await settingsScope.replace(asObject(next))
+          await settingsScope.replace(asObject(next))
           persistedConfig = next
           return next
         },
