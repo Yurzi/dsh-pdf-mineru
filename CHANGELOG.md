@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.0.4
+
+### Added
+
+- MinerU API keys can now be stored and managed through the DSH credentials service while configuration retains only credential references.
+
+### Fixed
+
+- Official v4 health checks now recognize MinerU's current `-60012` missing-task probe sentinel while continuing to reject unrelated business errors.
+- Persisted user settings are resolved before the storage root is fixed, preserving Provider and parsing configuration across rebuilds, reinstalls, upgrades, and process reloads.
+- Configuration saves can no longer report success after changing only in-memory state; every successful save now completes through the settings persistence scope.
+
 ## 0.0.3
 
 ### Changed
