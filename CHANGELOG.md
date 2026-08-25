@@ -11,6 +11,7 @@
 - An opt-in official v4 smoke command that executes the built `mineru_parse_document` tool chain.
 - Loopback storage statistics, read-only integrity scanning, bounded quarantine management, and fail-closed GC preview.
 - Storage operations in the settings UI with dry-run cleanup and explicit deletion confirmation.
+- A preview-first, confirmation-gated cache clear operation that evicts all safely scanned published results while retaining Job records.
 
 ### Changed
 
@@ -24,7 +25,7 @@
 - Retry diagnostics no longer carry free-form upstream error strings, URLs, headers, bodies, credentials, or local paths.
 - Quarantine isolation accepts only complete staging-operation or content-addressed result directories.
 - Maintenance scans read manifests and persisted Jobs through explicit streaming byte limits.
-- Destructive maintenance remains loopback-only, selection-bound, and confirmation-gated. GC remains preview-only.
+- Destructive maintenance remains loopback-only and confirmation-gated. GC remains preview-only; explicit cache clearing fails closed for active Jobs, incomplete scans, and unsafe result trees.
 
 No Job, canonical request, CacheKey, ProviderJobRef, or result manifest schema version changed.
 

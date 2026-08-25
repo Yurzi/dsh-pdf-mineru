@@ -107,6 +107,7 @@ Settings 的“存储运维”区域按需执行，不会自动扫描磁盘：
 - 统计 results、jobs、staging 和 quarantine 的字节与条目。
 - 完整性扫描默认只读；显式隔离无效结果需要确认。
 - GC 只生成引用保留策略下的 preview，不删除已发布结果；Job 扫描不完整或结果扫描截断时 `eligible=false`。
+- “清除缓存”先预览全部已发布结果，二次确认后删除；若预览后结果集合发生变化则必须重新预览。活动 Job、Job 扫描不完整、结果扫描截断或不安全目录会让操作 fail closed。历史 Job 会保留，但其结果读取将返回 `CACHE_EVICTED`，重新提交会重新解析。
 - quarantine 删除默认 dry-run，只删除显式选中的安全 entry ID；实际删除需要二次确认。
 
 ## 模型工具

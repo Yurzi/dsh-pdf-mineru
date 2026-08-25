@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import type { ClientConnectionRpc } from '@deepseek-ai/dsh-client-connection/client'
 import type {
+  CacheClearReport,
   CacheIntegrityScanReport,
   GcDryRunReport,
   QuarantineCleanupReport,
@@ -16,7 +17,7 @@ export interface StorageOperationsProps {
   readonly t: (key: MineruKey) => string
 }
 
-type MaintenanceAction = 'stats' | 'scan' | 'gc' | 'quarantine' | 'cleanup-preview' | 'cleanup-delete'
+type MaintenanceAction = 'stats' | 'scan' | 'gc' | 'cache-clear-preview' | 'cache-clear-delete' | 'quarantine' | 'cleanup-preview' | 'cleanup-delete'
 
 interface MaintenanceState {
   readonly busy?: MaintenanceAction
@@ -24,6 +25,7 @@ interface MaintenanceState {
   readonly stats?: StorageStatistics
   readonly scan?: CacheIntegrityScanReport
   readonly gc?: GcDryRunReport
+  readonly cacheClear?: CacheClearReport
   readonly quarantine?: QuarantineListReport
   readonly cleanup?: QuarantineCleanupReport
 }
@@ -63,11 +65,13 @@ export function StorageOperations({ rpc, t }: StorageOperationsProps) {
   const [state, setState] = useState<MaintenanceState>({})
   const [selected, setSelected] = useState<readonly string[]>([])
   const [confirmingDelete, setConfirmingDelete] = useState(false)
+  const [confirmingCacheClear, setConfirmingCacheClear] = useState(false)
 
   const run = async <T,>(
     action: MaintenanceAction, endpoint: string, payload: unknown,
     apply: (value: T) => MaintenanceState,
   ): Promise<T | undefined> => {
+    if (action !== 'cache-clear-preview' && action !== 'cache-clear-delete') setConfirmingCacheClear(false)
     setState(current => ({ ...current, busy: action, error: undefined }))
     try {
       const value = await callMaintenance<T>(rpc, endpoint, payload)
@@ -98,6 +102,31 @@ export function StorageOperations({ rpc, t }: StorageOperationsProps) {
     )
   }
 
+  const clearCache = async (): Promise<void> => {
+    setConfirmingDelete(false)
+    if (!confirmingCacheClear) {
+      const preview = await run<CacheClearReport>(
+        'cache-clear-preview', 'mineru/storage.cache.clear',
+        { dry_run: true, diagnostic_limit: 50 }, cacheClear => ({ cacheClear }),
+      )
+      if (preview?.eligible === true && preview.plannedCount > 0 && preview.confirmationToken !== undefined) {
+        setConfirmingCacheClear(true)
+      }
+      return
+    }
+
+    const report = await run<CacheClearReport>(
+      'cache-clear-delete', 'mineru/storage.cache.clear',
+      {
+        dry_run: false, confirm: true, diagnostic_limit: 50,
+        confirmation_token: state.cacheClear?.confirmationToken,
+      },
+      cacheClear => ({ cacheClear }),
+    )
+    setConfirmingCacheClear(false)
+    if (report !== undefined) await refreshStats()
+  }
+
   const listQuarantine = async (): Promise<QuarantineListReport | undefined> => {
     const report = await run<QuarantineListReport>(
       'quarantine', 'mineru/storage.quarantine.list', { limit: 100 }, quarantine => ({ quarantine }),
@@ -111,11 +140,13 @@ export function StorageOperations({ rpc, t }: StorageOperationsProps) {
   }
 
   const toggleSelected = (id: string): void => {
+    setConfirmingCacheClear(false)
     setSelected(current => current.includes(id) ? current.filter(value => value !== id) : [...current, id])
     setConfirmingDelete(false)
   }
 
   const toggleAll = (): void => {
+    setConfirmingCacheClear(false)
     const entries = state.quarantine?.entries ?? []
     setSelected(current => current.length === entries.length ? [] : entries.map(entry => entry.id))
     setConfirmingDelete(false)
@@ -131,6 +162,7 @@ export function StorageOperations({ rpc, t }: StorageOperationsProps) {
   }
 
   const deleteSelected = async (): Promise<void> => {
+    setConfirmingCacheClear(false)
     if (selected.length === 0) return
     if (!confirmingDelete) {
       setConfirmingDelete(true)
@@ -163,6 +195,14 @@ export function StorageOperations({ rpc, t }: StorageOperationsProps) {
         </button>
         <button type="button" className={css.secondaryButton} disabled={busy} onClick={() => void previewGc()}>
           {state.busy === 'gc' ? t('action.running') : t('action.gcPreview')}
+        </button>
+        <button
+          type="button" className={confirmingCacheClear ? css.dangerButton : css.secondaryButton}
+          disabled={busy} onClick={() => void clearCache()}
+        >
+          {state.busy === 'cache-clear-preview' || state.busy === 'cache-clear-delete'
+            ? t('action.running')
+            : confirmingCacheClear ? t('action.cacheClearConfirm') : t('action.cacheClear')}
         </button>
         <button type="button" className={css.secondaryButton} disabled={busy} onClick={() => void listQuarantine()}>
           {state.busy === 'quarantine' ? t('action.running') : t('action.quarantineList')}
@@ -203,6 +243,19 @@ export function StorageOperations({ rpc, t }: StorageOperationsProps) {
             <span>{state.gc.eligible ? t('ops.gcEligible') : t('ops.gcBlocked')}</span>
             <span>{t('ops.gcCandidates')}: {state.gc.candidateCount}</span>
             <span>{formatBytes(state.gc.candidateBytes, state.gc.candidateBytesSaturated)}</span>
+          </div>
+        </div>
+      )}
+
+      {state.cacheClear !== undefined && (
+        <div className={css.operationResult}>
+          <div className={css.resultTitle}>{t('action.cacheClear')}</div>
+          <div className={css.summaryLine}>
+            <span>{state.cacheClear.eligible ? t('ops.clearReady') : t('ops.clearBlocked')}</span>
+            <span>{t('ops.cleanupPlanned')}: {state.cacheClear.plannedCount}</span>
+            <span>{t('ops.cleanupDeleted')}: {state.cacheClear.deletedCount}</span>
+            <span>{formatBytes(state.cacheClear.dryRun ? state.cacheClear.plannedBytes : state.cacheClear.deletedBytes)}</span>
+            <span>{t('ops.activeJobs')}: {state.cacheClear.activeJobCount}</span>
           </div>
         </div>
       )}

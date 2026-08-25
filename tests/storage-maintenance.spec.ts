@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -319,6 +319,124 @@ describe('StorageMaintenanceService quarantine operations', () => {
     expect(skipped.skippedCount).toBe(1)
     await expect(stat(unsafe)).resolves.toBeDefined()
     expect(await readFile(outside, 'utf8')).toBe('safe outside')
+  })
+})
+
+describe('StorageMaintenanceService cache clear', () => {
+  it('previews then deletes published results while retaining persisted jobs', async () => {
+    const { paths, results, jobs, maintenance } = await createMaintenanceFixture()
+    const referenced = await publish(results, 'a'.repeat(64), '# referenced')
+    const orphan = await publish(results, 'b'.repeat(64), '# orphan')
+    const session = asSessionId('cache-clear-session')
+    const job = sampleJob(session, sampleRequest('a'.repeat(64)), sampleProducer())
+    await jobs.create(sessionObject(session), {
+      ...job,
+      cacheKey: referenced.cacheKey,
+      files: job.files.map(file => ({ ...file, cacheKey: referenced.cacheKey })),
+    })
+
+    const preview = await maintenance.clearCache()
+    expect(preview.dryRun).toBe(true)
+    expect(preview.eligible).toBe(true)
+    expect(preview.activeJobCount).toBe(0)
+    expect(preview.plannedCount).toBe(2)
+    expect(preview.deletedCount).toBe(0)
+    await expect(stat(paths.resultDir(referenced.cacheKey))).resolves.toBeDefined()
+    await expect(stat(paths.resultDir(orphan.cacheKey))).resolves.toBeDefined()
+
+    expect(preview.confirmationToken).toBeDefined()
+    const cleared = await maintenance.clearCache({
+      dryRun: false,
+      confirmationToken: preview.confirmationToken,
+    })
+    expect(cleared.eligible).toBe(true)
+    expect(cleared.deletedCount).toBe(2)
+    expect(cleared.deletedBytes).toBeGreaterThan(0)
+    expect(cleared.skippedCount).toBe(0)
+    await expect(stat(paths.resultDir(referenced.cacheKey))).rejects.toThrow()
+    await expect(stat(paths.resultDir(orphan.cacheKey))).rejects.toThrow()
+    await expect(jobs.get(sessionObject(session), job.id)).resolves.toBeDefined()
+  })
+
+  it('fails closed while a persisted job is active', async () => {
+    const { paths, results, jobs, maintenance } = await createMaintenanceFixture()
+    const published = await publish(results, 'c'.repeat(64), '# active')
+    const session = asSessionId('cache-clear-active-session')
+    const job = sampleJob(session, sampleRequest('c'.repeat(64)), sampleProducer())
+    await jobs.create(sessionObject(session), {
+      ...job,
+      state: 'processing',
+      resolution: { kind: 'provider' },
+      files: job.files.map(file => ({ ...file, cacheKey: published.cacheKey, state: 'processing' })),
+    })
+
+    const report = await maintenance.clearCache({ dryRun: false })
+    expect(report.eligible).toBe(false)
+    expect(report.activeJobCount).toBe(1)
+    expect(report.deletedCount).toBe(0)
+    await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
+  })
+
+  it('blocks deletion while a model tool holds shared storage access', async () => {
+    const { paths, results, maintenance } = await createMaintenanceFixture()
+    const published = await publish(results, 'e'.repeat(64), '# leased')
+    let release!: () => void
+    const held = maintenance.accessGate.runShared(async () => await new Promise<void>(resolve => { release = resolve }))
+
+    const report = await maintenance.clearCache({ dryRun: false, confirmationToken: 'stale' })
+    expect(report.eligible).toBe(false)
+    expect(report.activeAccessCount).toBe(1)
+    expect(report.deletedCount).toBe(0)
+    await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
+    release()
+    await held
+  })
+
+  it('rejects a stale preview when the result set changes', async () => {
+    const { paths, results, maintenance } = await createMaintenanceFixture()
+    const first = await publish(results, 'f'.repeat(64), '# first')
+    const preview = await maintenance.clearCache()
+    const second = await publish(results, '1'.repeat(64), '# second')
+
+    const report = await maintenance.clearCache({
+      dryRun: false,
+      confirmationToken: preview.confirmationToken,
+    })
+    expect(report.eligible).toBe(false)
+    expect(report.deletedCount).toBe(0)
+    await expect(stat(paths.resultDir(first.cacheKey))).resolves.toBeDefined()
+    await expect(stat(paths.resultDir(second.cacheKey))).resolves.toBeDefined()
+  })
+
+  it('rejects symlinked result ancestors without touching the target', async () => {
+    const { paths, results, maintenance } = await createMaintenanceFixture()
+    const published = await publish(results, '2'.repeat(64), '# ancestor')
+    const outside = join(paths.root, 'outside-results')
+    await mkdir(outside)
+    await rename(paths.resultsDir(), join(outside, 'sha256'))
+    await rm(join(paths.root, 'results'), { recursive: true })
+    await symlink(outside, join(paths.root, 'results'))
+
+    const report = await maintenance.clearCache()
+    expect(report.eligible).toBe(false)
+    expect(report.confirmationToken).toBeUndefined()
+    await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
+  })
+
+  it('never follows symlinks while clearing cache', async () => {
+    const { paths, results, maintenance } = await createMaintenanceFixture()
+    const published = await publish(results, 'd'.repeat(64), '# linked')
+    const outside = join(paths.root, 'outside-cache.txt')
+    await writeFile(outside, 'preserve me')
+    await makePublishedWritable(paths, published.cacheKey, published.fileId)
+    await symlink(outside, join(paths.fileDir(published.cacheKey, published.fileId), 'outside-link'))
+
+    const report = await maintenance.clearCache({ dryRun: false })
+    expect(report.eligible).toBe(false)
+    expect(report.deletedCount).toBe(0)
+    expect(report.skippedCount).toBe(1)
+    expect(await readFile(outside, 'utf8')).toBe('preserve me')
+    await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
   })
 })
 

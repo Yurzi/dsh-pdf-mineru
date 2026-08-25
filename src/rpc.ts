@@ -24,7 +24,7 @@ export interface MineruRpcDeps {
   readonly setConfig: (value: unknown) => Promise<MinerUConfig>
   readonly probe: (providerDraft: unknown | undefined, signal: AbortSignal) => Promise<ProbeView>
   readonly maintenance: Pick<StorageMaintenanceService,
-    'getStatistics' | 'scanIntegrity' | 'listQuarantine' | 'cleanupQuarantine' | 'gcDryRun'>
+    'getStatistics' | 'scanIntegrity' | 'listQuarantine' | 'cleanupQuarantine' | 'gcDryRun' | 'clearCache'>
 }
 
 export type RpcResult<T> =
@@ -149,6 +149,30 @@ export function registerRpc(ctx: Context, deps: MineruRpcDeps): () => void | Pro
             ctx.logger?.info('dsh-pdf-mineru', {
               phase: 'maintenance', operation: dryRun ? 'quarantine-cleanup-preview' : 'quarantine-cleanup',
               requested: report.requestedCount, deleted: report.deletedCount, bytes: report.deletedBytes,
+            })
+            return ok(report)
+          }
+
+          case 'mineru/storage.cache.clear': {
+            const p = payloadRecord(payload)
+            const dryRun = optionalBoolean(p, 'dry_run', true)
+            if (!dryRun && p.confirm !== true) {
+              throw new TypeError('confirm must be true when clearing published cache results')
+            }
+            if (!dryRun && (typeof p.confirmation_token !== 'string' || p.confirmation_token.length === 0)) {
+              throw new TypeError('confirmation_token from a cache clear preview is required')
+            }
+            const report = await deps.maintenance.clearCache({
+              resultLimit: optionalLimit(p, 'result_limit'),
+              diagnosticLimit: optionalLimit(p, 'diagnostic_limit'),
+              dryRun,
+              ...(typeof p.confirmation_token === 'string' ? { confirmationToken: p.confirmation_token } : {}),
+              signal,
+            })
+            ctx.logger?.info('dsh-pdf-mineru', {
+              phase: 'maintenance', operation: dryRun ? 'cache-clear-preview' : 'cache-clear',
+              eligible: report.eligible, planned: report.plannedCount,
+              deleted: report.deletedCount, bytes: report.deletedBytes,
             })
             return ok(report)
           }

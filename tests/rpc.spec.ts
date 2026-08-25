@@ -77,6 +77,7 @@ function maintenanceDeps(): Pick<MineruRpcDeps, 'maintenance'> {
       listQuarantine: vi.fn(),
       cleanupQuarantine: vi.fn(),
       gcDryRun: vi.fn(),
+      clearCache: vi.fn(),
     } as unknown as MineruRpcDeps['maintenance'],
   }
 }
@@ -254,6 +255,7 @@ describe('MinerU RPC (registerRpc)', () => {
   it('requires explicit confirmation for destructive maintenance operations', async () => {
     const { ctx, getHandler } = createMockContext()
     const cleanup = { generatedAt: 1, dryRun: false, requestedCount: 1, deletedCount: 1, deletedBytes: 10 }
+    const cacheClear = { generatedAt: 1, dryRun: true, eligible: true, confirmationToken: 'preview-token', plannedCount: 2, deletedCount: 0, deletedBytes: 0 }
     const scan = { generatedAt: 1, readOnly: false, isolateInvalid: true, quarantinedCount: 1, scan: { scanned: 1 } }
     const maintenance = {
       getStatistics: vi.fn(),
@@ -261,6 +263,7 @@ describe('MinerU RPC (registerRpc)', () => {
       listQuarantine: vi.fn(),
       cleanupQuarantine: vi.fn(async () => cleanup),
       gcDryRun: vi.fn(),
+      clearCache: vi.fn(async () => cacheClear),
     }
     const deps: MineruRpcDeps = {
       getConfig: vi.fn(() => defaultMinerUConfig()), setConfig: vi.fn(), probe: vi.fn(),
@@ -281,6 +284,31 @@ describe('MinerU RPC (registerRpc)', () => {
     )
     expect(acceptedCleanup).toEqual({ ok: true, value: cleanup })
     expect(maintenance.cleanupQuarantine).toHaveBeenCalledWith({ entryIds: ['entry_1'], dryRun: false, signal })
+
+    const refusedCacheClear = await handler(
+      'mineru/storage.cache.clear', { dry_run: false, confirm: true }, signal,
+    )
+    expect(refusedCacheClear).toMatchObject({ ok: false, error: { code: 'invalid-argument' } })
+    expect(maintenance.clearCache).not.toHaveBeenCalled()
+
+    const previewCacheClear = await handler(
+      'mineru/storage.cache.clear', { dry_run: true, result_limit: 50, diagnostic_limit: 10 }, signal,
+    )
+    expect(previewCacheClear).toEqual({ ok: true, value: cacheClear })
+    expect(maintenance.clearCache).toHaveBeenLastCalledWith({
+      resultLimit: 50, diagnosticLimit: 10, dryRun: true, signal,
+    })
+
+    const acceptedCacheClear = await handler(
+      'mineru/storage.cache.clear', {
+        dry_run: false, confirm: true, confirmation_token: 'preview-token',
+      }, signal,
+    )
+    expect(acceptedCacheClear).toEqual({ ok: true, value: cacheClear })
+    expect(maintenance.clearCache).toHaveBeenLastCalledWith({
+      resultLimit: undefined, diagnosticLimit: undefined, dryRun: false,
+      confirmationToken: 'preview-token', signal,
+    })
 
     const refusedIsolation = await handler(
       'mineru/storage.integrity.scan', { isolate_invalid: true }, signal,

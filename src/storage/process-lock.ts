@@ -64,6 +64,7 @@ export class ProcessLock {
 
     await mkdir(this.paths.root, { recursive: true, mode: 0o700 })
     await chmod(this.paths.root, 0o700)
+    signal?.throwIfAborted()
     const payload: ProcessLockPayload = {
       pid: process.pid,
       ownerToken: this.ownerToken,
@@ -72,11 +73,15 @@ export class ProcessLock {
     }
 
     if (process.platform !== 'linux') {
+      let createdMetadata = false
       try {
         await writeFile(this.lockFilePath, JSON.stringify(payload, null, 2), { flag: 'wx', mode: 0o600 })
+        createdMetadata = true
+        signal?.throwIfAborted()
         this.acquired = true
         return
       } catch (error) {
+        if (createdMetadata) await unlink(this.lockFilePath).catch(() => undefined)
         if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
           throwMinerU('STORAGE_LOCKED', 'MinerU storage is already locked by another process')
         }
@@ -92,7 +97,9 @@ export class ProcessLock {
         server.once('listening', onListening)
         server.listen(this.socketName)
       })
+      signal?.throwIfAborted()
     } catch (error) {
+      await new Promise<void>(resolve => server.close(() => resolve()))
       if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') {
         throwMinerU('STORAGE_LOCKED', 'MinerU storage is already locked by another process')
       }
@@ -103,9 +110,11 @@ export class ProcessLock {
     try {
       await writeFile(this.lockFilePath, JSON.stringify(payload, null, 2), { flag: 'w', mode: 0o600 })
       await chmod(this.lockFilePath, 0o600)
+      signal?.throwIfAborted()
       this.acquired = true
     } catch (error) {
       this.server = undefined
+      await unlink(this.lockFilePath).catch(() => undefined)
       await new Promise<void>(resolve => server.close(() => resolve()))
       throw error
     }

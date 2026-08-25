@@ -270,6 +270,24 @@ describe('OfficialV4Provider', () => {
       expect(result.authentication).toBe('valid')
     })
 
+    it('accepts the current official missing-task probe sentinel', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+        code: -500, msg: 'task not found or expire',
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      const result = await new OfficialV4Provider(makeConfig()).probe(makeContext())
+      expect(result.available).toBe(true)
+      expect(result.authentication).toBe('valid')
+    })
+
+    it('does not accept an unrelated -500 response as a probe sentinel', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+        code: -500, msg: 'Internal service error',
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      const result = await new OfficialV4Provider(makeConfig()).probe(makeContext())
+      expect(result.available).toBe(false)
+      expect(result.authentication).toBe('unknown')
+    })
+
     it('does not report a generic proxy 400 as a valid authenticated provider', async () => {
       globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ msg: 'Bad request' }), {
         status: 400, headers: { 'content-type': 'application/json' },

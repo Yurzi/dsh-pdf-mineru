@@ -100,6 +100,12 @@ function mapOfficialFileState(rawState: string | undefined): MinerUFileState {
   }
 }
 
+function isMissingBatchProbeSentinel(code: number | string, message: string): boolean {
+  const normalizedCode = String(code).toUpperCase()
+  if (normalizedCode === 'BATCH_NOT_FOUND') return true
+  return normalizedCode === '-500' && /^task not found or expire(?:d)?[.!]?$/i.test(message.trim())
+}
+
 function officialBusinessFailure(code: number | string, message: string, traceId?: string): MinerUError {
   const providerCode = String(code)
   const normalized = providerCode.toUpperCase()
@@ -708,7 +714,8 @@ export class OfficialV4Provider implements MinerUProvider {
         const envelope = parsed as unknown as OfficialV4ApiResponse<unknown>
         if (envelope.code !== 0) {
           const normalizedCode = String(envelope.code).toUpperCase()
-          const probeSentinel = businessValidation === 'probe' && normalizedCode === 'BATCH_NOT_FOUND'
+          const probeSentinel = businessValidation === 'probe'
+            && isMissingBatchProbeSentinel(envelope.code, envelope.msg)
           if (probeSentinel) return parsed
           const businessError = officialBusinessFailure(
             envelope.code,

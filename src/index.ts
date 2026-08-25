@@ -6,6 +6,7 @@ import { MinerUService } from './service/mineru-service.js'
 import { SharedOperationRegistry } from './service/shared-operations.js'
 import { StoragePaths } from './storage/paths.js'
 import { ProcessLock } from './storage/process-lock.js'
+import { StorageAccessGate } from './storage/access-gate.js'
 import { JobRepository } from './storage/job-repository.js'
 import { ResultRepository } from './storage/result-repository.js'
 import { StorageMaintenanceService } from './storage/maintenance-service.js'
@@ -97,6 +98,12 @@ interface CredentialService {
   resolve(reference: string): Promise<{ readonly value: string } | undefined>
 }
 
+function isInactiveContextError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  return (error as Error & { readonly code?: unknown }).code === 'INACTIVE_EFFECT'
+    || error.message === 'cannot create effect on inactive context'
+}
+
 function asObject(value: MinerUConfig): object {
   return value as unknown as object
 }
@@ -111,6 +118,12 @@ function parseDraftProvider(value: unknown, current: MinerUConfig): ProviderConf
 export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<() => Promise<void>> {
   let persistedConfig = migrateConfig(entryConfig)
   let settingsScope: SettingsScope | undefined
+  let toolDisposer: (() => void) | undefined
+  const startup = new AbortController()
+
+  // Cordis invalidates the fiber before it awaits cleanup. Abort startup work
+  // synchronously so an in-flight initialization never resumes into ctx APIs.
+  ctx.effect(() => () => startup.abort(), 'dsh-pdf-mineru startup cancellation')
 
   const fixedStorageRoot = persistedConfig.storage.storageRoot
   const validateRuntimeConfig = (value: unknown): MinerUConfig => {
@@ -124,17 +137,22 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
 
   const paths = new StoragePaths(fixedStorageRoot)
   const lock = new ProcessLock(paths)
-  await lock.acquire()
 
   try {
+    await lock.acquire(startup.signal)
+    startup.signal.throwIfAborted()
     const operations = new SharedOperationRegistry()
+    const accessGate = new StorageAccessGate()
     const jobs = new JobRepository(paths)
     const results = new ResultRepository(paths, {
       maxArtifactBytes: persistedConfig.limits.maxZipEntryBytes,
       maxJsonValidationBytes: Math.min(persistedConfig.limits.maxZipEntryBytes, 64 * 1024 * 1024),
     })
-    await results.cleanupStaging(persistedConfig.storage.stagingTtlMs, operations.activeOperationIds())
-    const maintenance = new StorageMaintenanceService(paths, results, lock)
+    await results.cleanupStaging(
+      persistedConfig.storage.stagingTtlMs, operations.activeOperationIds(), startup.signal,
+    )
+    startup.signal.throwIfAborted()
+    const maintenance = new StorageMaintenanceService(paths, results, lock, accessGate)
 
     const providers = new ProviderRegistry(runtimeConfig)
     const diagnostics = createStructuredDiagnosticSink(ctx.logger)
@@ -151,7 +169,7 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
       },
     })
 
-    const toolDisposer = registerTools(ctx, () => service)
+    toolDisposer = registerTools(ctx, () => service, accessGate)
 
     ctx.inject(['settings'], (settingsCtx: Context) => {
       const settings = (settingsCtx.get('settings') ?? ctx.get('settings')) as SettingsService | undefined
@@ -185,13 +203,15 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
 
     const dispose = async () => {
       operations.dispose()
-      toolDisposer()
+      toolDisposer?.()
       await lock.release()
     }
     ctx.effect(() => async () => { await dispose() }, 'dsh-pdf-mineru lifecycle')
     return dispose
   } catch (error) {
+    toolDisposer?.()
     await lock.release()
+    if (startup.signal.aborted || isInactiveContextError(error)) return async () => undefined
     throw error
   }
 }

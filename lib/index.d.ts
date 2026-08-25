@@ -887,6 +887,15 @@ declare class ProcessLock {
   release(): Promise<void>;
 }
 //#endregion
+//#region src/storage/access-gate.d.ts
+declare class StorageAccessGate {
+  private activeReaders;
+  private exclusive;
+  get activeReaderCount(): number;
+  runShared<T>(operation: () => Promise<T>): Promise<T>;
+  tryAcquireExclusive(): (() => void) | undefined;
+}
+//#endregion
 //#region src/storage/maintenance-service.d.ts
 type StorageMaintenanceArea = 'published-results' | 'persisted-jobs' | 'staging' | 'quarantine';
 type StorageMaintenanceDiagnosticCode = 'unexpected-entry' | 'symlink-skipped' | 'unreadable-entry' | 'corrupt-result' | 'missing-result' | 'unsafe-result' | 'malformed-job' | 'inconsistent-job' | 'quarantine-failed';
@@ -1038,6 +1047,34 @@ interface GcDryRunReport {
   readonly scan: ScanMetadata;
   readonly diagnostics: readonly StorageMaintenanceDiagnostic[];
 }
+interface CacheClearOptions {
+  /** Maximum published result directories inspected. The operation fails closed when truncated. */
+  readonly resultLimit?: number;
+  readonly diagnosticLimit?: number;
+  /** Defaults to true. Deletion requires an explicit false value and RPC confirmation. */
+  readonly dryRun?: boolean;
+  /** Opaque fingerprint returned by an eligible dry run. Required for deletion. */
+  readonly confirmationToken?: string;
+  readonly signal?: AbortSignal;
+}
+interface CacheClearReport {
+  readonly generatedAt: number;
+  readonly dryRun: boolean;
+  readonly eligible: boolean;
+  readonly activeJobCount: number;
+  readonly activeAccessCount: number;
+  readonly confirmationToken?: string;
+  readonly plannedCount: number;
+  readonly plannedBytes: number;
+  readonly plannedBytesSaturated: boolean;
+  readonly deletedCount: number;
+  readonly deletedBytes: number;
+  readonly deletedBytesSaturated: boolean;
+  readonly skippedCount: number;
+  readonly jobScan: JobReferenceScan;
+  readonly scan: ScanMetadata;
+  readonly diagnostics: readonly StorageMaintenanceDiagnostic[];
+}
 /**
  * Storage maintenance is deliberately separate from JobRepository's session-scoped
  * public API. It reads persisted jobs with the same strict parser, but it neither
@@ -1047,11 +1084,14 @@ declare class StorageMaintenanceService {
   readonly paths: StoragePaths;
   readonly results: ResultRepository;
   readonly lock: ProcessLock;
-  constructor(paths: StoragePaths, results: ResultRepository, lock: ProcessLock);
+  readonly accessGate: StorageAccessGate;
+  constructor(paths: StoragePaths, results: ResultRepository, lock: ProcessLock, accessGate?: StorageAccessGate);
   getStatistics(signal?: AbortSignal): Promise<StorageStatistics>;
   scanIntegrity(options?: IntegrityScanOptions): Promise<CacheIntegrityScanReport>;
   listQuarantine(options?: QuarantineListOptions): Promise<QuarantineListReport>;
   cleanupQuarantine(options: QuarantineCleanupOptions): Promise<QuarantineCleanupReport>;
+  clearCache(options?: CacheClearOptions): Promise<CacheClearReport>;
+  private clearCacheInternal;
   gcDryRun(options?: GcDryRunOptions): Promise<GcDryRunReport>;
   private assertLockHeld;
   private countPublishedResultDirectories;
@@ -1069,4 +1109,4 @@ declare const inject: string[];
 declare const Config: z<unknown>;
 declare function apply(ctx: Context, entryConfig?: unknown): Promise<() => Promise<void>>;
 //#endregion
-export { ARTIFACT_KINDS, ArtifactInput, ArtifactKind, ArtifactRef, ArtifactSink, ArtifactView, ArtifactWriteOptions, BatchParseDocumentView, BatchSubmitView, CACHE_KEY_SPEC_VERSION, CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, CacheIntegrityScanReport, CacheKey, CanonicalParseRequest, CanonicalSourceFile, Config, CredentialResolver, DEFAULT_RETRY_POLICY, FileStatusView, GcCandidate, GcDryRunOptions, GcDryRunReport, IntegrityScanOptions, JobReferenceScan, JobResolution, JobSourceFile, MINERU_JOB_SCHEMA_VERSION, MINERU_RESULT_MANIFEST_SCHEMA_VERSION, MinerUConfig, MinerUDiagnosticEvent, MinerUDiagnosticLevel, MinerUDiagnosticPhase, MinerUDiagnosticSink, MinerUError, MinerUErrorCode, MinerUFailure, MinerUFileId, MinerUFileState, MinerUFileStatus, MinerUJobId, MinerUJobRecord, MinerUJobState, MinerUModel, MinerUProvider, MinerUProviderId, MinerUResultId, MinerUResultManifest, MinerUService, MinerUServiceOptions, MinerUStructuredLogger, OfficialV4Config, OfficialV4Provider, OperationId, OutputConfig, ParseDefaults, ParseDocumentView, ParseMethod, ParseRequestInput, ParseSemantics, ParsedDocumentManifest, PollingConfig, PreparedParseRequest, PreparedSourceFile, ProbeView, ProviderCallContext, ProviderCallLimits, ProviderCapabilities, ProviderCollectedFile, ProviderCollection, ProviderCompatibilityContext, ProviderConfig, ProviderConfigId, ProviderFileSnapshot, ProviderJobRef, ProviderJobSnapshot, ProviderOptions, ProviderProbeResult, ProviderRetryEvent, ProviderRetryHook, ProviderRetryHooks, ProviderRetryOperation, ProviderRetryOptions, ProviderRetryPolicy, ProviderSubmission, ProviderSubmittedFile, QuarantineCleanupOptions, QuarantineCleanupReport, QuarantineEntry, QuarantineListOptions, QuarantineListReport, RESULT_SCHEMA_VERSION, ResultFileView, ResultProducer, ResultView, RetryConfig, RetryExecutionContext, ScanMetadata, SecurityLimits, SelfHostedFileParseResult, SelfHostedHealthResponse, SelfHostedTaskResultResponse, SelfHostedTaskSubmitResponse, SelfHostedV2Config, SelfHostedV2Provider, SelfHostedV2ProviderConfig, ServiceSession, SessionId, StatusView, StorageAreaStatistics, StorageConfig, StorageMaintenanceArea, StorageMaintenanceDiagnostic, StorageMaintenanceDiagnosticCode, StorageMaintenanceService, StorageStatistics, SubmissionSource, SubmitDocumentView, SubmitView, TemporaryArtifact, apply, asCacheKey, asFileId, asJobId, asOperationId, asProviderConfigId, asResultId, asSessionId, assertJobTransition, assertSafePathSegment, calculateBackoffDelay, createFileId, createJobId, createOperationId, createStructuredDiagnosticSink, defaultMinerUConfig, defaultSleep, emitDiagnostic, executeWithRetry, failure, inject, isRetryableError, isRetryableHttpStatus, isTerminalJobState, mergeRetryOptions, migrateConfig, name, normalizeArtifactKinds, normalizePageRanges, parseRetryAfter, providerById, readBoundedResponseText, resolveRetryPolicy, resultIdForCacheKey, sanitizeDiagnostic, throwMinerU, toMinerUFailure, validateProviderCapabilities };
+export { ARTIFACT_KINDS, ArtifactInput, ArtifactKind, ArtifactRef, ArtifactSink, ArtifactView, ArtifactWriteOptions, BatchParseDocumentView, BatchSubmitView, CACHE_KEY_SPEC_VERSION, CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, CacheClearOptions, CacheClearReport, CacheIntegrityScanReport, CacheKey, CanonicalParseRequest, CanonicalSourceFile, Config, CredentialResolver, DEFAULT_RETRY_POLICY, FileStatusView, GcCandidate, GcDryRunOptions, GcDryRunReport, IntegrityScanOptions, JobReferenceScan, JobResolution, JobSourceFile, MINERU_JOB_SCHEMA_VERSION, MINERU_RESULT_MANIFEST_SCHEMA_VERSION, MinerUConfig, MinerUDiagnosticEvent, MinerUDiagnosticLevel, MinerUDiagnosticPhase, MinerUDiagnosticSink, MinerUError, MinerUErrorCode, MinerUFailure, MinerUFileId, MinerUFileState, MinerUFileStatus, MinerUJobId, MinerUJobRecord, MinerUJobState, MinerUModel, MinerUProvider, MinerUProviderId, MinerUResultId, MinerUResultManifest, MinerUService, MinerUServiceOptions, MinerUStructuredLogger, OfficialV4Config, OfficialV4Provider, OperationId, OutputConfig, ParseDefaults, ParseDocumentView, ParseMethod, ParseRequestInput, ParseSemantics, ParsedDocumentManifest, PollingConfig, PreparedParseRequest, PreparedSourceFile, ProbeView, ProviderCallContext, ProviderCallLimits, ProviderCapabilities, ProviderCollectedFile, ProviderCollection, ProviderCompatibilityContext, ProviderConfig, ProviderConfigId, ProviderFileSnapshot, ProviderJobRef, ProviderJobSnapshot, ProviderOptions, ProviderProbeResult, ProviderRetryEvent, ProviderRetryHook, ProviderRetryHooks, ProviderRetryOperation, ProviderRetryOptions, ProviderRetryPolicy, ProviderSubmission, ProviderSubmittedFile, QuarantineCleanupOptions, QuarantineCleanupReport, QuarantineEntry, QuarantineListOptions, QuarantineListReport, RESULT_SCHEMA_VERSION, ResultFileView, ResultProducer, ResultView, RetryConfig, RetryExecutionContext, ScanMetadata, SecurityLimits, SelfHostedFileParseResult, SelfHostedHealthResponse, SelfHostedTaskResultResponse, SelfHostedTaskSubmitResponse, SelfHostedV2Config, SelfHostedV2Provider, SelfHostedV2ProviderConfig, ServiceSession, SessionId, StatusView, StorageAreaStatistics, StorageConfig, StorageMaintenanceArea, StorageMaintenanceDiagnostic, StorageMaintenanceDiagnosticCode, StorageMaintenanceService, StorageStatistics, SubmissionSource, SubmitDocumentView, SubmitView, TemporaryArtifact, apply, asCacheKey, asFileId, asJobId, asOperationId, asProviderConfigId, asResultId, asSessionId, assertJobTransition, assertSafePathSegment, calculateBackoffDelay, createFileId, createJobId, createOperationId, createStructuredDiagnosticSink, defaultMinerUConfig, defaultSleep, emitDiagnostic, executeWithRetry, failure, inject, isRetryableError, isRetryableHttpStatus, isTerminalJobState, mergeRetryOptions, migrateConfig, name, normalizeArtifactKinds, normalizePageRanges, parseRetryAfter, providerById, readBoundedResponseText, resolveRetryPolicy, resultIdForCacheKey, sanitizeDiagnostic, throwMinerU, toMinerUFailure, validateProviderCapabilities };

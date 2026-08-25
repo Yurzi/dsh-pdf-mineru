@@ -4,6 +4,7 @@
 
 export * from './paths.js'
 export * from './process-lock.js'
+export * from './access-gate.js'
 export * from './job-repository.js'
 export * from './artifact-sink.js'
 export * from './result-repository.js'
