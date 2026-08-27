@@ -365,4 +365,4 @@ MINERU_API_KEY=<token> pnpm run smoke:official-v4 -- /absolute/path/sample.pdf
 
 本项目使用 [MIT License](./LICENSE) 开源。
 
-感谢 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 提供插件运行时，感谢 [MinerU](https://github.com/opendatalab/MinerU) 提供文档解析能力，也感谢 [Huanlin/dsh-plugin-mineru](https://github.com/HuanLinOTO/dsh-plugin-mineru) 带来的早期实现灵感。
+感谢 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 提供插件运行时，感谢 [MinerU](https://github.com/opendatalab/MinerU) 提供文档解析能力，也感谢 [Huanlin/dsh-plugin-mineru](https://github.com/HuanLinOTO/dsh-plugin-mineru) 带来的早期实现灵感。Banner 中的 DeepSeek 鲸鱼娘形象源自上善无形的原创角色与 ZipZipPipe 的 DeepSeek 二创设计，相关形象遵循 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh-hans) 许可。
