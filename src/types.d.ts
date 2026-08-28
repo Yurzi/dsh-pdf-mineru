@@ -1,8 +1,8 @@
 /**
- * types.d.ts — peer 依赖与运行时上下文的最小环境声明。
+ * types.d.ts — CSS modules and legacy Host-context declarations used by this package.
  *
- * `@deepseek-ai/dsh-tools`、`cordis` 与客户端模块是运行时由宿主 dsh 提供的 peer 依赖
- * （私有包，不能 npm install）。本文件为 src/* 的独立 typecheck 提供声明。
+ * DSH 0.1.2 Client packages are not published yet. The narrow, labelled Client
+ * subsets below mirror the audited alpha source and deliberately omit removed facades.
  */
 
 declare module '*.module.css' {
@@ -186,50 +186,29 @@ declare module 'cordis' {
   }
 }
 
+/** Host-side marker exported by the current Connection package. */
 declare module '@deepseek-ai/dsh-client-connection' {
   export interface Connection {}
 }
 
+/** Current alpha Client carrier subset used while 0.1.2 packages are not yet published. */
 declare module '@deepseek-ai/dsh-client-connection/client' {
   export interface ClientConnectionRpc {
     call<T = unknown>(channel: string, endpoint: string, payload?: unknown): Promise<RpcResult<T>>
     call<T = unknown>(endpoint: string, payload?: unknown): Promise<RpcResult<T>>
   }
-  export type RpcResult<T> = { ok: true; value: T } | { ok: false; error: { code?: string; message: string; details?: unknown } }
+  export type RpcResult<T> =
+    | { ok: true; value: T }
+    | { ok: false; error: { code?: string; message: string; details?: unknown } }
   export interface ConnectionHandle {
-    rpc: ClientConnectionRpc
+    readonly rpc: ClientConnectionRpc
   }
 }
 
-declare module '@deepseek-ai/dsh-client-runtime/client' {
-  import type { ConnectionHandle, ClientConnectionRpc } from '@deepseek-ai/dsh-client-connection/client'
-
-  export interface ClientContext {
-    inject(services: readonly string[], callback: (ctx: ClientContext) => void): void
-    effect(fn: () => unknown, label?: string): () => void
-    get(name: string): unknown
-    readonly locale: {
-      register(ns: string, dicts: Record<string, Record<string, string>>): () => void
-      subscribe(listener: () => void): () => void
-      bind(ns: string): (key: string) => string
-    }
-    readonly connection: ConnectionHandle | { readonly rpc: ClientConnectionRpc }
-    readonly slots: {
-      inject(slotName: string, factory: (ctx: ClientContext) => unknown): void
-      register(options: { name: string; id: string; order?: number; label: () => string; inject: () => unknown }, component: unknown): () => void
-    }
-  }
-}
-
+/** Static shell slot props used by the MinerU settings component. */
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   export type PropsRuntime<K extends string = string> = { slotName?: K }
-  export type PropsLocale<N extends string = string> = { localeNamespace?: N }
-}
-
-declare module '@deepseek-ai/dsh-client-ui-settings/client' {
-  export interface SettingsHost {}
-}
-
-declare module '@deepseek-ai/dsh-client-locale/client' {
-  export interface LocaleHost {}
+  export type PropsLocale<N extends string = string> = {
+    t: (key: string, params?: Record<string, unknown>) => string
+  }
 }

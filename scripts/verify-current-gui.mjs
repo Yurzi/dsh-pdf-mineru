@@ -2,14 +2,17 @@ import { readFile } from 'node:fs/promises'
 import { chromium } from 'playwright-core'
 
 const bundle = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
-const webUrl = new URL(process.env.DSH_WEB_URL ?? 'http://127.0.0.1:3080')
+const requestedWebUrl = new URL(
+  process.env.DSH_WEB_AUTH_URL ?? process.env.DSH_WEB_URL ?? 'http://127.0.0.1:3080',
+)
+const webUrl = new URL(requestedWebUrl)
+webUrl.search = ''
+webUrl.hash = ''
 const clientInject = [
-  '@deepseek-ai/dsh-client-runtime',
-  '@deepseek-ai/dsh-client-locale',
   '@deepseek-ai/dsh-client-connection',
+  '@deepseek-ai/dsh-client-locale',
   '@deepseek-ai/dsh-client-ui-settings',
-  '@deepseek-ai/dsh-client-ui-slots',
-  '@deepseek-ai/dsh-client-ui-primitives',
+  '@deepseek-ai/dsh-api-remotes',
 ]
 
 function injectCurrentPlugin(html) {
@@ -21,13 +24,37 @@ function injectCurrentPlugin(html) {
   if (jsonEnd < 0) throw new Error('DSH shell boot payload is unterminated')
   const boot = JSON.parse(html.slice(jsonStart, jsonEnd))
   if (!Array.isArray(boot.entries)) throw new Error('DSH shell boot payload has no entries')
+  if (!Array.isArray(boot.batches)) throw new Error('DSH shell boot payload has no batches')
+
+  const pluginId = 'dsh-pdf-mineru'
+  const pluginUrl = '/plugins/??dsh-pdf-mineru/client.js&rev=workspace-current'
+  const retainedEntries = boot.entries.filter(entry => entry.id !== pluginId)
+  const retainedById = new Map(retainedEntries.map(entry => [entry.id, entry]))
+  const retainedBatches = []
+  for (const batch of boot.batches) {
+    if (!Array.isArray(batch.entries)) throw new Error('DSH shell boot batch has no entries')
+    if (!batch.entries.includes(pluginId)) {
+      retainedBatches.push(batch)
+      continue
+    }
+    // A combo containing the installed MinerU bundle must not remain the
+    // initial URL for its neighbours: split those rows onto their single-entry
+    // URLs so the stale factory can be preloaded but never executed.
+    for (const id of batch.entries.filter(entryId => entryId !== pluginId)) {
+      const entry = retainedById.get(id)
+      if (entry === undefined) throw new Error(`DSH shell boot batch names unknown entry ${id}`)
+      retainedBatches.push({ phase: batch.phase, url: entry.url, rev: entry.rev, entries: [id] })
+    }
+  }
   boot.entries = [
-    ...boot.entries.filter(entry => entry.id !== 'dsh-pdf-mineru'),
-    {
-      id: 'dsh-pdf-mineru', url: '/plugins/dsh-pdf-mineru/client.js?rev=workspace-current',
-      rev: 'workspace-current', inject: clientInject,
-    },
+    ...retainedEntries,
+    { id: pluginId, url: pluginUrl, rev: 'workspace-current', inject: clientInject },
   ]
+  boot.batches = [
+    ...retainedBatches,
+    { phase: 'application', url: pluginUrl, rev: 'workspace-current', entries: [pluginId] },
+  ]
+  boot.rev = 'workspace-current'
   return html.slice(0, jsonStart) + JSON.stringify(boot) + html.slice(jsonEnd)
 }
 
@@ -102,8 +129,20 @@ const browser = await chromium.launch({
   args: ['--no-sandbox', '--disable-features=LocalNetworkAccessChecks'],
 })
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } })
+const authResponse = await page.goto(requestedWebUrl.toString(), {
+  waitUntil: 'domcontentloaded', timeout: 30_000,
+})
+if (authResponse?.status() === 401) {
+  await browser.close()
+  throw new Error(
+    'DSH Web authentication is required; set DSH_WEB_AUTH_URL to the tokenized URL printed by dsh web',
+  )
+}
+await page.goto('about:blank')
 const errors = []
 const rpcCalls = []
+const credentialCalls = []
+let credentialConfigured = true
 let bundleIntercepts = 0
 page.on('console', message => {
   if (message.type() === 'error') {
@@ -122,10 +161,51 @@ await page.route(
     await route.fulfill({ response, body: html, contentType: 'text/html; charset=utf-8' })
   },
 )
-await page.route('**/plugins/dsh-pdf-mineru/client.js?*', route => {
-  bundleIntercepts++
-  return route.fulfill({ status: 200, contentType: 'text/javascript; charset=utf-8', body: bundle })
-})
+await page.route(
+  url => url.origin === webUrl.origin
+    && url.pathname === '/plugins/'
+    && url.search.startsWith('??dsh-pdf-mineru/client.js&rev='),
+  route => {
+    bundleIntercepts++
+    return route.fulfill({ status: 200, contentType: 'text/javascript; charset=utf-8', body: bundle })
+  },
+)
+await page.route(
+  url => url.origin === webUrl.origin && url.pathname.startsWith('/api/credentials/'),
+  async route => {
+    const url = new URL(route.request().url())
+    const endpoint = url.pathname.slice('/api/'.length)
+    const payloadText = route.request().postData()
+    const envelope = payloadText ? JSON.parse(payloadText) : {}
+    const args = Array.isArray(envelope.payload?.args) ? envelope.payload.args : []
+    let result
+    if (endpoint === 'credentials/describe') {
+      const refs = Array.isArray(args[0]) ? args[0].filter(ref => typeof ref === 'string') : []
+      credentialCalls.push({ method: 'describe', refs })
+      result = {
+        ok: true,
+        value: Object.fromEntries(refs.map(ref => [ref, { configured: credentialConfigured, source: 'file', writable: true }])),
+      }
+    } else if (endpoint === 'credentials/set') {
+      const ref = typeof args[0] === 'string' ? args[0] : '<invalid>'
+      if (typeof args[1] !== 'string' || args[1].length === 0) throw new Error('credential set mock received no secret')
+      credentialConfigured = true
+      credentialCalls.push({ method: 'set', ref })
+      result = { ok: true }
+    } else if (endpoint === 'credentials/unset') {
+      const ref = typeof args[0] === 'string' ? args[0] : '<invalid>'
+      credentialConfigured = false
+      credentialCalls.push({ method: 'unset', ref })
+      result = { ok: true }
+    } else {
+      result = { ok: false, error: { code: 'not-found', message: endpoint } }
+    }
+    await route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ type: 'server-response', rpcId: envelope.rpcId, result }),
+    })
+  },
+)
 await page.route('**/dsh-pdf-mineru-api/**', async route => {
   const url = new URL(route.request().url())
   const endpoint = url.pathname.slice('/dsh-pdf-mineru-api/'.length)
@@ -168,9 +248,10 @@ await page.waitForTimeout(300)
 await page.getByRole('button', { name: 'MinerU', exact: true }).click()
 await page.waitForTimeout(1500)
 if (await page.getByText('Provider Settings', { exact: true }).count() === 0) {
-  console.error(JSON.stringify({ bundleIntercepts, rpcCalls, errors, body: (await page.locator('body').innerText()).slice(0, 8000) }, null, 2))
+  console.error(JSON.stringify({ bundleIntercepts, rpcCalls, credentialCalls, errors, body: (await page.locator('body').innerText()).slice(0, 8000) }, null, 2))
 }
 await page.getByText('Provider Settings', { exact: true }).waitFor({ timeout: 10_000 })
+if (bundleIntercepts !== 1) throw new Error(`workspace bundle was fetched ${bundleIntercepts} times during desktop boot`)
 const credentialInput = page.getByLabel('API Key', { exact: true })
 await credentialInput.waitFor({ timeout: 5000 })
 if (await credentialInput.getAttribute('type') !== 'password') throw new Error('API key control is not a password input')
@@ -189,8 +270,13 @@ await page.getByRole('button', { name: 'Test Active Provider', exact: true }).cl
 await page.getByText(/Connection Healthy/).waitFor({ timeout: 5000 })
 await providerType.selectOption('self-hosted-v2')
 await page.getByLabel('Maximum Attempts').fill('4')
+await credentialInput.fill('gui-verifier-secret')
 await page.getByRole('button', { name: 'Save Configuration', exact: true }).click()
 await page.getByRole('button', { name: 'Saved', exact: true }).waitFor({ timeout: 5000 })
+await page.getByText('A credential is configured. Saving with this field blank keeps it unchanged.', { exact: true }).waitFor({ timeout: 5000 })
+if (await credentialInput.inputValue() !== '') throw new Error('credential input retained the submitted secret')
+await page.getByRole('button', { name: 'Clear API Key', exact: true }).click()
+await page.getByText('No credential is configured. Enter a key and save the configuration to store it.', { exact: true }).waitFor({ timeout: 5000 })
 await page.getByRole('button', { name: 'Refresh Statistics', exact: true }).click()
 await page.getByText('Published Results', { exact: true }).waitFor({ timeout: 5000 })
 await page.getByRole('button', { name: 'Verify Cache', exact: true }).click()
@@ -227,6 +313,7 @@ await page.getByRole('button', { name: 'Settings', exact: true }).click()
 await page.waitForTimeout(300)
 await page.getByRole('button', { name: 'MinerU', exact: true }).click()
 await page.getByText('Provider Settings', { exact: true }).waitFor({ timeout: 5000 })
+if (bundleIntercepts !== 2) throw new Error(`workspace bundle was fetched ${bundleIntercepts} times after mobile reload`)
 const mobileCredentialInput = page.getByLabel('API Key', { exact: true })
 await mobileCredentialInput.waitFor({ timeout: 5000 })
 if (await mobileCredentialInput.inputValue() !== '') throw new Error('credential value was restored into the mobile browser')
@@ -296,6 +383,8 @@ if (providerHeadingBox === null || providerHeadingBox.x < 0 || providerHeadingBo
 }
 if (visibleControlBoxes.some(box => box.x < -1 || box.right > 391)) throw new Error('a visible mobile control crosses the viewport')
 if (errors.length > 0) throw new Error(`browser errors: ${errors.join('; ')}`)
+if (!credentialCalls.some(call => call.method === 'set' && call.ref === 'MINERU_API_KEY')) throw new Error('credential set did not use the Remote positional API')
+if (!credentialCalls.some(call => call.method === 'unset' && call.ref === 'MINERU_API_KEY')) throw new Error('credential unset did not use the Remote positional API')
 const probe = rpcCalls.find(call => call.endpoint === 'mineru/probe')
 if (probe?.payload?.provider?.type !== 'official-v4') throw new Error('draft probe did not carry official provider')
 const save = rpcCalls.find(call => call.endpoint === 'mineru/config.set')
@@ -313,6 +402,8 @@ if (cleanupDeleteCall?.payload?.confirm !== true) throw new Error('cleanup delet
 console.log(JSON.stringify({
   providerSwitch: true, draftProbe: true, save: true, credentialUi: true, maintenance: true, errors, desktopMetrics, mobileMetrics, sectionBox, providerHeadingBox, layoutDiagnostics, visibleControlBoxes,
   rpcEndpoints: rpcCalls.map(call => call.endpoint),
+  credentialCalls,
+  bundleIntercepts,
   screenshots: [
     '/tmp/mineru-current-settings-credential-desktop.png',
     '/tmp/mineru-current-settings-desktop.png',

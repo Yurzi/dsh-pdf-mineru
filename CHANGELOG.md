@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Restored the MinerU settings page on the DSH 0.1.2 client architecture by removing obsolete/static client graph edges, using the Cordis client context, and registering the current Remote credentials dependency.
+- Migrated API-key status and writes from the removed `connection.api.credentials` facade to `remote.credentials`.
+- Updated the existing-shell GUI verifier for authenticated Web startup, versioned application batches, current combo URLs, and isolated redacted credential Remote mocks.
+- Removed the obsolete BetterLocale bridge and the local facade for the deleted Client Runtime package.
+
 ## 0.0.4
 
 ### Added

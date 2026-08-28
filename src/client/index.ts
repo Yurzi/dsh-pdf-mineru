@@ -1,11 +1,7 @@
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { Context as CordisContext } from '@deepseek-ai/cordis'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client'
-import type {} from '@deepseek-ai/dsh-client-connection/client'
-import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
-import type {} from '@deepseek-ai/dsh-client-locale/client'
 import { SettingsPage, type CredentialClient, type MineruSettingsInjected } from './SettingsPage.js'
 import { en, NS, zh, type MineruKey } from './locales.js'
-import { dicts } from './dictionaries.js'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -13,40 +9,38 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
   }
 }
 
-export const inject = ['slots', 'locale', 'connection']
+type ClientContext = CordisContext & {
+  readonly locale: {
+    register(ns: string, dictionaries: Record<string, Record<string, string>>): () => void
+    bind(ns: string): (key: MineruKey) => string
+  }
+  readonly slots: {
+    inject(slotName: string, factory: () => unknown): void
+    register(options: {
+      name: string
+      id: string
+      order?: number
+      label: () => string
+      locale?: string
+      inject: () => unknown
+    }, component: unknown): () => void
+  }
+  readonly remote: { readonly credentials: CredentialClient }
+}
+
+export const inject = ['slots', 'locale', 'connection', 'remote', 'remote.credentials']
 
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-pdf-mineru: dictionaries')
 
-  ctx.effect(() => {
-    let dispose: (() => void) | undefined
-    const sync = (): void => {
-      dispose?.()
-      dispose = undefined
-      const store = ctx.get('betterLocale') as
-        | { register(ns: string, dicts: Record<string, Record<string, string>>): () => void }
-        | undefined
-      if (store !== undefined) {
-        dispose = store.register(NS, dicts)
-      }
-    }
-    sync()
-    const unsubscribe = ctx.locale.subscribe(sync)
-    return () => {
-      unsubscribe()
-      dispose?.()
-    }
-  }, 'dsh-pdf-mineru: better-locale override dicts')
-
-  const connection = ctx.connection as unknown as ConnectionHandle & {
-    readonly api: { readonly credentials: CredentialClient }
-  }
-  const t = ctx.locale.bind(NS) as (key: string) => string
+  const connection = ctx.get('connection') as ConnectionHandle | undefined
+  if (connection === undefined) throw new Error('dsh-pdf-mineru: connection service is unavailable')
+  const credentials = ctx.remote.credentials
+  const t = ctx.locale.bind(NS)
 
   const settingsInjected = (): MineruSettingsInjected => ({
     rpc: connection.rpc,
-    credentials: connection.api.credentials,
-    t,
+    credentials,
   })
 
   ctx.slots.inject('settings.section', () => ctx.slots.register({
@@ -54,6 +48,7 @@ export function apply(ctx: ClientContext): void {
     id: 'dsh-pdf-mineru',
     order: 40,
     label: () => t('nav'),
+    locale: NS,
     inject: settingsInjected,
   }, SettingsPage))
 }

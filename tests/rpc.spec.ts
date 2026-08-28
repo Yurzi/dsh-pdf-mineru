@@ -32,6 +32,7 @@ import {
   type CredentialClient,
 } from '../src/client/SettingsPage.js'
 import { formatBytes } from '../src/client/StorageOperations.js'
+import { apply as applyClient, inject as clientInject } from '../src/client/index.js'
 
 type RpcHandler = (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<RpcResult<unknown>>
 
@@ -370,27 +371,55 @@ describe('MinerU RPC (registerRpc)', () => {
 })
 
 describe('Client UI Pure Helpers (SettingsPage)', () => {
+  it('registers the settings section through current Client services', () => {
+    const rpc = { call: vi.fn() }
+    const credentials = { describe: vi.fn(), set: vi.fn(), unset: vi.fn() }
+    const register = vi.fn(() => vi.fn())
+    const slotInject = vi.fn((_slot: string, factory: () => unknown) => factory())
+    const ctx = {
+      effect: (factory: () => unknown) => { factory(); return vi.fn() },
+      get: (name: string) => name === 'connection' ? { rpc } : undefined,
+      locale: {
+        register: vi.fn(() => vi.fn()),
+        subscribe: vi.fn(() => vi.fn()),
+        bind: vi.fn(() => (key: string) => key),
+      },
+      remote: { credentials },
+      slots: { inject: slotInject, register },
+    } as never
+
+    expect(clientInject).toEqual(['slots', 'locale', 'connection', 'remote', 'remote.credentials'])
+    applyClient(ctx)
+
+    expect(slotInject).toHaveBeenCalledWith('settings.section', expect.any(Function))
+    expect(register).toHaveBeenCalledOnce()
+    const [options] = register.mock.calls[0]!
+    expect(options).toMatchObject({
+      name: 'settings.section', id: 'dsh-pdf-mineru', order: 40, locale: 'dsh-pdf-mineru',
+    })
+    expect(options.label()).toBe('nav')
+    expect(options.inject()).toEqual({ rpc, credentials })
+  })
+
   it('uses the Harness credential API without exposing stored values', async () => {
     const describe = vi.fn(async () => ({
-      result: {
-        ok: true as const,
-        value: { credentials: { MINERU_API_KEY: { configured: true, source: 'file', writable: true } } },
-      },
+      ok: true as const,
+      value: { MINERU_API_KEY: { configured: true, source: 'file', writable: true } },
     }))
-    const set = vi.fn(async () => ({ result: { ok: true as const, value: {} } }))
-    const unset = vi.fn(async () => ({ result: { ok: true as const, value: {} } }))
+    const set = vi.fn(async () => ({ ok: true as const, value: undefined }))
+    const unset = vi.fn(async () => ({ ok: true as const, value: undefined }))
     const credentials = { describe, set, unset } as CredentialClient
 
     const view = await describeCredential(credentials, 'MINERU_API_KEY')
     expect(view).toEqual({ configured: true, source: 'file', writable: true })
     expect(view).not.toHaveProperty('value')
-    expect(describe).toHaveBeenCalledWith({ refs: ['MINERU_API_KEY'] })
+    expect(describe).toHaveBeenCalledWith(['MINERU_API_KEY'])
 
     await storeCredential(credentials, 'MINERU_API_KEY', '  secret-mineru-key  ')
-    expect(set).toHaveBeenCalledWith({ ref: 'MINERU_API_KEY', value: 'secret-mineru-key' })
+    expect(set).toHaveBeenCalledWith('MINERU_API_KEY', 'secret-mineru-key')
 
     await clearCredential(credentials, 'MINERU_API_KEY')
-    expect(unset).toHaveBeenCalledWith({ ref: 'MINERU_API_KEY' })
+    expect(unset).toHaveBeenCalledWith('MINERU_API_KEY')
   })
 
   it('rejects blank or Host-rejected credential writes and keeps references separate', async () => {
@@ -399,10 +428,8 @@ describe('Client UI Pure Helpers (SettingsPage)', () => {
     expect(credentialReference({ ...base.providers[0]!, apiKeyEnv: undefined })).toBeUndefined()
 
     const set = vi.fn(async () => ({
-      result: {
-        ok: false as const,
-        error: { code: 'credential-rejected', message: 'credential is shadowed by a read-only source' },
-      },
+      ok: false as const,
+      error: { code: 'credential-rejected', message: 'credential is shadowed by a read-only source' },
     }))
     const credentials = {
       describe: vi.fn(),

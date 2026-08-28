@@ -11,7 +11,6 @@ import css from './SettingsPage.module.css'
 export interface MineruSettingsInjected {
   readonly rpc: ClientConnectionRpc
   readonly credentials: CredentialClient
-  readonly t: (key: MineruKey) => string
 }
 
 export interface CredentialView {
@@ -20,16 +19,11 @@ export interface CredentialView {
   readonly writable: boolean
 }
 
-interface CredentialResponse<T> {
-  readonly result: RpcResult<T>
-}
-
+/** Current `ctx.remote.credentials` face in DSH 0.1.2. */
 export interface CredentialClient {
-  describe(payload: { readonly refs: string[] }): Promise<CredentialResponse<{
-    readonly credentials: Readonly<Record<string, CredentialView>>
-  }>>
-  set(payload: { readonly ref: string; readonly value: string }): Promise<CredentialResponse<Record<string, never>>>
-  unset(payload: { readonly ref: string }): Promise<CredentialResponse<Record<string, never>>>
+  describe(refs: string[]): Promise<RpcResult<Readonly<Record<string, CredentialView>>>>
+  set(ref: string, value: string): Promise<RpcResult<void>>
+  unset(ref: string): Promise<RpcResult<void>>
 }
 
 type SettingsPageProps = PropsRuntime<'settings.section'> & PropsLocale<'dsh-pdf-mineru'> & MineruSettingsInjected
@@ -130,9 +124,9 @@ export function credentialReference(provider: ProviderConfig | undefined): strin
 }
 
 export async function describeCredential(credentials: CredentialClient, reference: string): Promise<CredentialView> {
-  const response = await credentials.describe({ refs: [reference] })
-  if (!response.result.ok) throw new Error(response.result.error.message)
-  return response.result.value.credentials[reference] ?? { configured: false, writable: true }
+  const result = await credentials.describe([reference])
+  if (!result.ok) throw new Error(result.error.message)
+  return result.value[reference] ?? { configured: false, writable: true }
 }
 
 export async function storeCredential(
@@ -142,13 +136,13 @@ export async function storeCredential(
 ): Promise<void> {
   const secret = value.trim()
   if (secret.length === 0) throw new TypeError('API key must not be empty')
-  const response = await credentials.set({ ref: reference, value: secret })
-  if (!response.result.ok) throw new Error(response.result.error.message)
+  const result = await credentials.set(reference, secret)
+  if (!result.ok) throw new Error(result.error.message)
 }
 
 export async function clearCredential(credentials: CredentialClient, reference: string): Promise<void> {
-  const response = await credentials.unset({ ref: reference })
-  if (!response.result.ok) throw new Error(response.result.error.message)
+  const result = await credentials.unset(reference)
+  if (!result.ok) throw new Error(result.error.message)
 }
 
 export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
