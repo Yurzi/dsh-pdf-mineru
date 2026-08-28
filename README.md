@@ -16,7 +16,7 @@
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-2EA44F?style=flat-square" alt="MIT License"></a>
 </p>
 
-[✨ 核心亮点](#-核心亮点) · [🚀 快速开始](#-快速开始) · [💬 对话示例](#-对话与提示词示例) · [⚙️ 设置与配置](#️-设置与配置) · [🔌 Provider 选型](#-provider-选型对比) · [❓ 常见问题](#-常见问题-faq) · [🛠️ 开发者指南](#️-开发者指南)
+[✨ 核心亮点](#-核心亮点) · [🚀 快速开始](#-快速开始) · [💬 对话示例](#-对话与提示词示例) · [⚙️ 模型工具](#️-模型工具与参数参考) · [🏗️ 工作架构](#️-工作架构与流程) · [🔌 Provider 选型](#-provider-选型对比) · [🛠️ 设置与配置](#️-设置与配置参考) · [❓ 常见问题](#-常见问题-faq) · [🧑‍💻 开发者指南](#-开发者指南)
 
 </div>
 
@@ -117,6 +117,36 @@ Agent 会自动根据文档长度和指令意图，智能选择同步返回或�
 | `artifacts` | `string[]` | `["markdown"]` | 需要提取保留的产物类型：`markdown`、`images`、`layout`、`content-list` |
 
 ---
+
+## 🏗️ 工作架构与流程
+
+```mermaid
+flowchart LR
+    Agent[DSH Agent] --> Health[mineru_health]
+    Agent --> Sync[mineru_parse_document]
+    Agent --> Async[mineru_submit_parse_job]
+
+    Async --> Jobs[DSH JobRegistry]
+    Jobs --> Service[MinerUService]
+    Sync --> Service
+    Health --> Providers[ProviderRegistry]
+
+    Service --> Cache{Result cache}
+    Cache -->|hit| Result[Immutable result]
+    Cache -->|miss| Shared[SharedOperationRegistry]
+    Shared --> Providers
+    Providers --> V2[Self-hosted v2]
+    Providers --> V4[Official v4]
+    V2 --> Staging[Validated staging]
+    V4 --> Staging
+    Staging --> Publish[Atomic publish]
+    Publish --> Result
+```
+
+- **统一工具分发**：Agent 发起的同步请求（`mineru_parse_document`）直接返回结果，异步长任务（`mineru_submit_parse_job`）交由 DSH 原生 JobRegistry 调度。
+- **智能缓存命中**：每次解析计算文件 SHA-256 与参数指纹，若命中缓存则秒级返回不可变产物。
+- **并发请求合并**：同进程内的并发重复请求由 `SharedOperationRegistry` 合并，避免重复向上游提交。
+- **双 Provider 适配**：上游适配自建 FastAPI v2 或官方云 v4，解析产物经校验后原子发布。
 
 ## 🔌 Provider 选型对比
 
