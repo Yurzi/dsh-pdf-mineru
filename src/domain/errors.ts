@@ -27,7 +27,6 @@ export type MinerUErrorCode =
   | 'CANCELLED'
   | 'UNAUTHENTICATED_SESSION'
   | 'JOB_NOT_FOUND'
-  | 'JOB_ACCESS_DENIED'
   | 'STORAGE_LOCKED'
 
 export interface MinerUFailure {

@@ -44,8 +44,6 @@ export type StorageMaintenanceDiagnosticCode =
   | 'corrupt-result'
   | 'missing-result'
   | 'unsafe-result'
-  | 'malformed-job'
-  | 'inconsistent-job'
   | 'quarantine-failed'
 
 export interface StorageMaintenanceDiagnostic {
@@ -178,21 +176,14 @@ export interface GcCandidate {
   readonly byteUsageSaturated: boolean
 }
 
-export interface JobReferenceScan {
-  readonly complete: true
-  readonly sessionJobCount: number
-  readonly activeJobCount: number
-  readonly referencedCacheKeyCount: number
-}
-
 /**
- * This operation never deletes data. It reports only fully validated, unreferenced
- * published result directories under the current job-reference retention policy.
+ * This operation never deletes data. It reports only fully validated published
+ * result directories that are eligible under the current retention policy.
  */
 export interface GcDryRunReport {
   readonly generatedAt: number
   readonly dryRun: true
-  readonly referencePolicy: 'no-plugin-job-retention'
+  readonly referencePolicy: 'all-published-results'
   readonly eligible: boolean
   readonly candidateCount: number
   readonly candidateBytes: number
@@ -200,10 +191,8 @@ export interface GcDryRunReport {
   readonly candidates: readonly GcCandidate[]
   readonly candidatesTruncated: boolean
   readonly candidateTotalsComplete: boolean
-  readonly referencedResultCount: number
   readonly invalidResultCount: number
   readonly unsafeResultCount: number
-  readonly jobReferences: JobReferenceScan
   readonly scan: ScanMetadata
   readonly diagnostics: readonly StorageMaintenanceDiagnostic[]
 }
@@ -223,7 +212,6 @@ export interface CacheClearReport {
   readonly generatedAt: number
   readonly dryRun: boolean
   readonly eligible: boolean
-  readonly activeJobCount: number
   readonly activeOperationCount: number
   readonly activeAccessCount: number
   readonly confirmationToken?: string
@@ -234,7 +222,6 @@ export interface CacheClearReport {
   readonly deletedBytes: number
   readonly deletedBytesSaturated: boolean
   readonly skippedCount: number
-  readonly jobScan: JobReferenceScan
   readonly scan: ScanMetadata
   readonly diagnostics: readonly StorageMaintenanceDiagnostic[]
 }
@@ -260,12 +247,6 @@ interface TraversalSummary {
   readonly scanned: number
   readonly truncated: boolean
   readonly complete: boolean
-}
-
-interface ReferenceCollection {
-  readonly cacheKeys: ReadonlySet<CacheKey>
-  readonly activeJobCount: number
-  readonly report: JobReferenceScan
 }
 
 interface DiagnosticCollector {
@@ -342,8 +323,6 @@ function diagnosticMessage(code: StorageMaintenanceDiagnosticCode): string {
     case 'corrupt-result': return 'Published result failed strict manifest or artifact validation.'
     case 'missing-result': return 'Published result was incomplete or disappeared during validation.'
     case 'unsafe-result': return 'Published result contained unsafe or unsupported filesystem data.'
-    case 'malformed-job': return 'Persisted job failed strict schema validation.'
-    case 'inconsistent-job': return 'Persisted job contained inconsistent result references.'
     case 'quarantine-failed': return 'Could not move an invalid result to quarantine.'
   }
 }
@@ -586,6 +565,17 @@ export class StorageMaintenanceService {
 
   async scanIntegrity(options: IntegrityScanOptions = {}): Promise<CacheIntegrityScanReport> {
     this.assertLockHeld()
+    if (options.isolateInvalid !== true) return await this.scanIntegrityInternal(options)
+
+    const releaseExclusive = this.acquireDestructiveAccess()
+    try {
+      return await this.scanIntegrityInternal(options)
+    } finally {
+      releaseExclusive()
+    }
+  }
+
+  private async scanIntegrityInternal(options: IntegrityScanOptions): Promise<CacheIntegrityScanReport> {
     const resultLimit = boundedLimit(options.resultLimit, DEFAULT_RESULT_SCAN_LIMIT, MAX_RESULT_SCAN_LIMIT, 'resultLimit')
     const diagnosticLimit = boundedLimit(options.diagnosticLimit, DEFAULT_DIAGNOSTIC_LIMIT, MAX_DIAGNOSTIC_LIMIT, 'diagnosticLimit')
     const isolateInvalid = options.isolateInvalid === true
@@ -727,6 +717,17 @@ export class StorageMaintenanceService {
 
   async cleanupQuarantine(options: QuarantineCleanupOptions): Promise<QuarantineCleanupReport> {
     this.assertLockHeld()
+    if (options.dryRun !== false) return await this.cleanupQuarantineInternal(options)
+
+    const releaseExclusive = this.acquireDestructiveAccess()
+    try {
+      return await this.cleanupQuarantineInternal(options)
+    } finally {
+      releaseExclusive()
+    }
+  }
+
+  private async cleanupQuarantineInternal(options: QuarantineCleanupOptions): Promise<QuarantineCleanupReport> {
     if (!Array.isArray(options.entryIds)) throw new TypeError('entryIds must be an array')
     if (options.entryIds.length > MAX_QUARANTINE_CLEANUP_ENTRIES) {
       throw new TypeError('entryIds cannot contain more than ' + String(MAX_QUARANTINE_CLEANUP_ENTRIES) + ' entries')
@@ -868,7 +869,6 @@ export class StorageMaintenanceService {
     const diagnosticLimit = boundedLimit(options.diagnosticLimit, DEFAULT_DIAGNOSTIC_LIMIT, MAX_DIAGNOSTIC_LIMIT, 'diagnosticLimit')
     const dryRun = options.dryRun !== false
     const diagnostics = createDiagnostics(diagnosticLimit)
-    const references = await this.collectJobReferences(options.signal, diagnostics)
     const planned: Array<{ readonly cacheKey: CacheKey; readonly resultDir: string; readonly byteUsage: number; readonly byteUsageSaturated: boolean }> = []
     const plannedTotals = { value: 0, saturated: false }
     const deletedTotals = { value: 0, saturated: false }
@@ -884,7 +884,7 @@ export class StorageMaintenanceService {
     if (!safeResultsRoot) {
       traversal = { scanned: 0, truncated: false, complete: false }
       addDiagnostic(diagnostics, 'published-results', 'results', resultsKind === 'symlink' ? 'symlink-skipped' : 'unsafe-result')
-    } else if (references.report.complete && resultsKind === 'directory') {
+    } else if (resultsKind === 'directory') {
       traversal = await this.visitPublishedResults(resultLimit, options.signal, diagnostics, async (cacheKey, resultDir) => {
         if (!await isSafeExistingDirectoryChain(resultDir, options.signal)) {
           unsafeResultCount++
@@ -906,9 +906,7 @@ export class StorageMaintenanceService {
 
     const token = cacheClearConfirmationToken(planned.map(entry => entry.cacheKey))
     const activeOperationCount = this.operations.activeOperationCount()
-    const preflightEligible = references.report.complete
-      && references.activeJobCount === 0
-      && activeOperationCount === 0
+    const preflightEligible = activeOperationCount === 0
       && activeAccessCount === 0
       && traversal.complete
       && !traversal.truncated
@@ -953,7 +951,6 @@ export class StorageMaintenanceService {
       generatedAt: Date.now(),
       dryRun,
       eligible,
-      activeJobCount: references.activeJobCount,
       activeOperationCount,
       activeAccessCount,
       ...(dryRun && preflightEligible && planned.length > 0 ? { confirmationToken: token } : {}),
@@ -964,7 +961,6 @@ export class StorageMaintenanceService {
       deletedBytes: deletedTotals.value,
       deletedBytesSaturated: deletedTotals.saturated,
       skippedCount,
-      jobScan: references.report,
       scan: {
         limit: resultLimit,
         scanned: traversal.scanned,
@@ -983,17 +979,14 @@ export class StorageMaintenanceService {
     const candidateLimit = boundedLimit(options.candidateLimit, DEFAULT_GC_CANDIDATE_LIMIT, MAX_GC_CANDIDATE_LIMIT, 'candidateLimit')
     const diagnosticLimit = boundedLimit(options.diagnosticLimit, DEFAULT_DIAGNOSTIC_LIMIT, MAX_DIAGNOSTIC_LIMIT, 'diagnosticLimit')
     const diagnostics = createDiagnostics(diagnosticLimit)
-    const references = await this.collectJobReferences(options.signal, diagnostics)
     const candidates: GcCandidate[] = []
     const candidateTotals = { value: 0, saturated: false }
     let candidateCount = 0
-    let referencedResultCount = 0
     let invalidResultCount = 0
     let unsafeResultCount = 0
     let traversal: TraversalSummary = { scanned: 0, truncated: false, complete: true }
 
-    if (references.report.complete) {
-      traversal = await this.visitPublishedResults(resultLimit, options.signal, diagnostics, async (cacheKey, resultDir) => {
+    traversal = await this.visitPublishedResults(resultLimit, options.signal, diagnostics, async (cacheKey, resultDir) => {
         const inspection = await this.results.inspectPublished(cacheKey, options.signal)
         if (inspection.status !== 'valid') {
           invalidResultCount++
@@ -1013,11 +1006,6 @@ export class StorageMaintenanceService {
           return
         }
 
-        if (references.cacheKeys.has(cacheKey)) {
-          referencedResultCount++
-          return
-        }
-
         candidateCount++
         addTotal(candidateTotals, usage.bytes, usage.bytesSaturated)
         if (candidates.length < candidateLimit) {
@@ -1028,24 +1016,21 @@ export class StorageMaintenanceService {
             byteUsageSaturated: usage.bytesSaturated,
           })
         }
-      })
-    }
+    })
 
     return {
       generatedAt: Date.now(),
       dryRun: true,
-      referencePolicy: 'no-plugin-job-retention',
-      eligible: references.report.complete && traversal.complete && !traversal.truncated,
+      referencePolicy: 'all-published-results',
+      eligible: traversal.complete && !traversal.truncated,
       candidateCount,
       candidateBytes: candidateTotals.value,
       candidateBytesSaturated: candidateTotals.saturated,
       candidates,
       candidatesTruncated: candidateCount > candidates.length,
-      candidateTotalsComplete: references.report.complete && traversal.complete && !traversal.truncated,
-      referencedResultCount,
+      candidateTotalsComplete: traversal.complete && !traversal.truncated,
       invalidResultCount,
       unsafeResultCount,
-      jobReferences: references.report,
       scan: {
         limit: resultLimit,
         scanned: traversal.scanned,
@@ -1055,6 +1040,21 @@ export class StorageMaintenanceService {
       },
       diagnostics: diagnostics.diagnostics,
     }
+  }
+
+  private acquireDestructiveAccess(): () => void {
+    if (this.operations.activeOperationCount() > 0) {
+      throwMinerU('STORAGE_LOCKED', 'MinerU storage is in use by an active parse operation')
+    }
+    const releaseExclusive = this.accessGate.tryAcquireExclusive()
+    if (releaseExclusive === undefined) {
+      throwMinerU('STORAGE_LOCKED', 'MinerU storage is in use by an active reader')
+    }
+    if (this.operations.activeOperationCount() > 0) {
+      releaseExclusive()
+      throwMinerU('STORAGE_LOCKED', 'MinerU storage is in use by an active parse operation')
+    }
+    return releaseExclusive
   }
 
   private assertLockHeld(): void {
@@ -1176,17 +1176,4 @@ export class StorageMaintenanceService {
     else addDiagnostic(diagnostics, area, entry, 'unexpected-entry')
   }
 
-  private async collectJobReferences(signal: AbortSignal | undefined, _diagnostics: DiagnosticCollector): Promise<ReferenceCollection> {
-    signal?.throwIfAborted()
-    return {
-      cacheKeys: new Set<CacheKey>(),
-      activeJobCount: 0,
-      report: {
-        complete: true,
-        sessionJobCount: 0,
-        activeJobCount: 0,
-        referencedCacheKeyCount: 0,
-      },
-    }
-  }
 }

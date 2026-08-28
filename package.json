@@ -17,7 +17,6 @@
     ".": { "types": "./lib/types/index.d.ts", "default": "./lib/index.js" },
     "./client": { "types": "./lib/types/client/index.d.ts", "default": "./lib/client.js" },
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./src/*": "./src/*",
     "./package.json": "./package.json"
   },
   "files": ["lib/index.js", "lib/client.js", "lib/client.js.map", "lib/types/**/*.d.ts", "cordis.patch.yml", "CHANGELOG.md"],

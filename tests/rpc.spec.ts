@@ -28,7 +28,6 @@ import {
   patchActiveProvider,
   storeCredential,
   switchProviderType,
-  updateConfigSection,
   type CredentialClient,
 } from '../src/client/SettingsPage.js'
 import { formatBytes } from '../src/client/StorageOperations.js'
@@ -525,25 +524,5 @@ describe('Client UI Pure Helpers (SettingsPage)', () => {
     expect(updated.activeProvider).toBe(config.activeProvider)
   })
 
-  it('updateConfigSection updates a specific subsection immutably', () => {
-    const config = defaultMinerUConfig()
 
-    const withStorage = updateConfigSection(config, 'storage', {
-      cacheEnabled: false,
-      stagingTtlMs: 7200000,
-    })
-    expect(withStorage.storage.cacheEnabled).toBe(false)
-    expect(withStorage.storage.stagingTtlMs).toBe(7200000)
-    expect(withStorage.storage.storageRoot).toBe(config.storage.storageRoot)
-
-    const withPolling = updateConfigSection(config, 'polling', {
-      pollIntervalMs: 5000,
-    })
-    expect(withPolling.polling.pollIntervalMs).toBe(5000)
-    expect(withPolling.polling.pollTimeoutMs).toBe(config.polling.pollTimeoutMs)
-
-    const withRetry = updateConfigSection(config, 'retry', { maxAttempts: 4 })
-    expect(withRetry.retry.maxAttempts).toBe(4)
-    expect(withRetry.retry.maxDelayMs).toBe(config.retry.maxDelayMs)
-  })
 })

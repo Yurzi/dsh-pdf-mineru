@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
+  asCacheKey,
   asProviderConfigId,
   createFileId,
   createOperationId,
@@ -74,6 +75,28 @@ async function createMaintenanceFixture(): Promise<MaintenanceFixture> {
   await lock.acquire()
   heldLocks.push(lock)
   return { paths, results, operations, maintenance: new StorageMaintenanceService(paths, results, operations, lock), lock }
+}
+
+type MaintenanceBlocker = 'operation' | 'reader'
+
+async function holdMaintenanceBlocker(
+  fixture: MaintenanceFixture,
+  blocker: MaintenanceBlocker,
+): Promise<() => Promise<void>> {
+  if (blocker === 'operation') {
+    const reservation = fixture.operations.reserve(
+      asCacheKey('9'.repeat(64)), asProviderConfigId('mp_maintenance'), 1000,
+    )
+    if (!reservation.created) throw new Error('failed to reserve maintenance test operation')
+    return async () => { fixture.operations.dispose() }
+  }
+
+  let release!: () => void
+  const held = fixture.maintenance.accessGate.runShared(async () => await new Promise<void>(resolve => { release = resolve }))
+  return async () => {
+    release()
+    await held
+  }
 }
 
 async function publish(
@@ -167,6 +190,25 @@ describe('StorageMaintenanceService statistics and integrity', () => {
     expect(await readFile(outside, 'utf8')).toBe('# outside')
   })
 
+  it.each(['operation', 'reader'] as const)(
+    'blocks destructive isolation while storage has an active %s',
+    async blocker => {
+      const fixture = await createMaintenanceFixture()
+      const published = await publish(fixture.results, '8'.repeat(64), '# invalid')
+      await makePublishedWritable(fixture.paths, published.cacheKey, published.fileId)
+      await writeFile(fixture.paths.manifestFile(published.cacheKey), '{invalid json')
+      const release = await holdMaintenanceBlocker(fixture, blocker)
+
+      try {
+        await expect(fixture.maintenance.scanIntegrity({ isolateInvalid: true }))
+          .rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
+      } finally {
+        await release()
+      }
+      await expect(stat(fixture.paths.resultDir(published.cacheKey))).resolves.toBeDefined()
+    },
+  )
+
   it('reports scan truncation and undeclared published data without mutating valid results', async () => {
     const { paths, results, maintenance } = await createMaintenanceFixture()
     const first = await publish(results, 'a'.repeat(64), '# first')
@@ -241,6 +283,25 @@ describe('StorageMaintenanceService quarantine operations', () => {
     expect(await readFile(outside, 'utf8')).toBe('outside')
   })
 
+  it.each(['operation', 'reader'] as const)(
+    'blocks destructive cleanup while storage has an active %s',
+    async blocker => {
+      const fixture = await createMaintenanceFixture()
+      const entry = fixture.paths.quarantineDir('blocked_entry')
+      await mkdir(entry, { recursive: true })
+      await writeFile(join(entry, 'payload.txt'), 'preserve')
+      const release = await holdMaintenanceBlocker(fixture, blocker)
+
+      try {
+        await expect(fixture.maintenance.cleanupQuarantine({ entryIds: ['blocked_entry'], dryRun: false }))
+          .rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
+      } finally {
+        await release()
+      }
+      await expect(stat(entry)).resolves.toBeDefined()
+    },
+  )
+
   it('refuses a symlinked quarantine root without touching its target', async () => {
     const { paths, maintenance } = await createMaintenanceFixture()
     const outside = await mkdtemp(join(tmpdir(), 'mineru-maintenance-outside-'))
@@ -292,7 +353,6 @@ describe('StorageMaintenanceService cache clear', () => {
     const preview = await maintenance.clearCache()
     expect(preview.dryRun).toBe(true)
     expect(preview.eligible).toBe(true)
-    expect(preview.activeJobCount).toBe(0)
     expect(preview.plannedCount).toBe(2)
     expect(preview.deletedCount).toBe(0)
     await expect(stat(paths.resultDir(first.cacheKey))).resolves.toBeDefined()
@@ -315,7 +375,6 @@ describe('StorageMaintenanceService cache clear', () => {
 
     const report = await maintenance.clearCache({ dryRun: false })
     expect(report.eligible).toBe(false)
-    expect(report.activeJobCount).toBe(0)
     expect(report.activeOperationCount).toBe(1)
     expect(report.deletedCount).toBe(0)
     await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
@@ -385,7 +444,7 @@ describe('StorageMaintenanceService cache clear', () => {
 })
 
 describe('StorageMaintenanceService GC dry run', () => {
-  it('returns bounded candidates without retaining obsolete plugin Job references', async () => {
+  it('returns bounded candidates without deleting published results', async () => {
     const { paths, results, maintenance } = await createMaintenanceFixture()
     const first = await publish(results, 'a'.repeat(64), '# first')
     const second = await publish(results, 'b'.repeat(64), '# second')
@@ -393,8 +452,6 @@ describe('StorageMaintenanceService GC dry run', () => {
     const report = await maintenance.gcDryRun({ candidateLimit: 1 })
     expect(report.dryRun).toBe(true)
     expect(report.eligible).toBe(true)
-    expect(report.jobReferences).toMatchObject({ complete: true, sessionJobCount: 0, activeJobCount: 0 })
-    expect(report.referencedResultCount).toBe(0)
     expect(report.candidateCount).toBe(2)
     expect(report.candidates).toHaveLength(1)
     expect(report.candidatesTruncated).toBe(true)

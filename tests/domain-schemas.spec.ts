@@ -4,24 +4,16 @@ import {
   parseArtifactRef,
   parseCanonicalParseRequest,
   parseCanonicalSourceFile,
-  parseJobResolution,
-  parseJobSourceFile,
-  parseMinerUFailure,
-  parseMinerUFileStatus,
-  parseMinerUJobRecord,
   parseMinerUResultManifest,
   parseParsedDocumentManifest,
-  parseParseSemantics,
   parseProviderJobRef,
   parseProviderSubmittedFile,
   parseResultProducer,
 } from '../src/domain/schemas.js'
-import { asCacheKey, asFileId, asJobId, asOperationId, asProviderConfigId, asResultId, asSessionId } from '../src/domain/ids.js'
+import { asCacheKey, asFileId, asProviderConfigId, asResultId } from '../src/domain/ids.js'
 import { CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, type ArtifactKind } from '../src/domain/request.js'
-import { MINERU_JOB_SCHEMA_VERSION } from '../src/domain/job.js'
 import { MINERU_RESULT_MANIFEST_SCHEMA_VERSION } from '../src/domain/result.js'
 import type { CanonicalParseRequest } from '../src/domain/request.js'
-import type { MinerUJobRecord } from '../src/domain/job.js'
 import type { MinerUResultManifest } from '../src/domain/result.js'
 import type { ProviderJobRef } from '../src/providers/provider.js'
 
@@ -48,52 +40,6 @@ const validCanonicalRequest: CanonicalParseRequest = {
     pages: '1-10,15',
   },
   requiredArtifacts: ['markdown', 'layout', 'images'],
-}
-
-const validJobRecord: MinerUJobRecord = {
-  schemaVersion: 1,
-  id: asJobId('mj_abc123456789'),
-  sessionId: asSessionId('session-xyz-123'),
-  providerId: 'official-v4',
-  providerConfigId: asProviderConfigId('mp_default'),
-  providerCompatibilityKey: 'official-v4:v4:pipeline',
-  sourceFiles: [
-    {
-      fileId: asFileId('mf_0123456789abcdef0123456789ab_0'),
-      name: 'document.pdf',
-      bytes: 1048576,
-      sha256: SHA256_A,
-    },
-  ],
-  request: validCanonicalRequest,
-  cacheKey: asCacheKey(SHA256_A),
-  state: 'processing',
-  resolution: {
-    kind: 'shared-operation',
-    operationId: asOperationId('mo_op12345'),
-    ref: {
-      provider: 'official-v4',
-      batchId: 'batch_98765',
-      files: [
-        {
-          dataId: 'data_001',
-          fileId: asFileId('mf_0123456789abcdef0123456789ab_0'),
-          name: 'document.pdf',
-        },
-      ],
-    },
-  },
-  files: [
-    {
-      fileId: asFileId('mf_0123456789abcdef0123456789ab_0'),
-      name: 'document.pdf',
-      cacheKey: asCacheKey(SHA256_A),
-      state: 'processing',
-      progress: { completed: 5, total: 10 },
-    },
-  ],
-  createdAt: 1700000000000,
-  updatedAt: 1700000005000,
 }
 
 const validResultManifest: MinerUResultManifest = {
@@ -220,14 +166,6 @@ describe('Domain Schemas Runtime Parsers', () => {
       }
     })
 
-    it('rejects invalid page ranges in ParseSemantics', () => {
-      expect(() =>
-        parseParseSemantics({
-          ...validCanonicalRequest.semantics,
-          pages: 'invalid-range',
-        }),
-      ).toThrow(/pages|page range/)
-    })
   })
 
   describe('ProviderJobRef', () => {
@@ -314,60 +252,6 @@ describe('Domain Schemas Runtime Parsers', () => {
     })
   })
 
-  describe('MinerUJobRecord', () => {
-    it('successfully parses valid MinerUJobRecord round-trip', () => {
-      const parsed = parseMinerUJobRecord(validJobRecord)
-      expect(parsed).toEqual(validJobRecord)
-      expect(parsed.schemaVersion).toBe(MINERU_JOB_SCHEMA_VERSION)
-    })
-
-    it('rejects unknown schemaVersion in MinerUJobRecord', () => {
-      expect(() => parseMinerUJobRecord({ ...validJobRecord, schemaVersion: 2 })).toThrow(/schemaVersion/)
-    })
-
-    it('rejects unsafe identifiers in JobRecord', () => {
-      expect(() => parseMinerUJobRecord({ ...validJobRecord, id: 'invalid_id_format' })).toThrow(/invalid mj identifier/)
-      expect(() => parseMinerUJobRecord({ ...validJobRecord, id: 'mj_../../traversal' })).toThrow(/invalid mj identifier/)
-      expect(() => parseMinerUJobRecord({ ...validJobRecord, sessionId: '../unsafe-session' })).toThrow(/safe path segment/)
-      expect(() => parseMinerUJobRecord({ ...validJobRecord, providerConfigId: 'wrong_prefix' })).toThrow(/invalid mp identifier/)
-      expect(() => parseMinerUJobRecord({ ...validJobRecord, cacheKey: 'not-a-sha256' })).toThrow(/SHA-256/)
-    })
-
-    it('rejects additional properties in MinerUJobRecord', () => {
-      expect(() =>
-        parseMinerUJobRecord({
-          ...validJobRecord,
-          token: 'secret-token',
-        }),
-      ).toThrow(/unknown property "token"/)
-    })
-
-    it('parses all JobResolution variants correctly', () => {
-      expect(parseJobResolution({ kind: 'cache-hit' })).toEqual({ kind: 'cache-hit' })
-
-      const shared = parseJobResolution({
-        kind: 'shared-operation',
-        operationId: 'mo_12345',
-        ref: {
-          provider: 'self-hosted-v2',
-          taskId: 'task_001',
-          files: [],
-        },
-      })
-      expect(shared.kind).toBe('shared-operation')
-
-      const provider = parseJobResolution({
-        kind: 'provider',
-        ref: {
-          provider: 'official-v4',
-          batchId: 'batch_001',
-          files: [],
-        },
-      })
-      expect(provider.kind).toBe('provider')
-    })
-  })
-
   describe('MinerUResultManifest & ArtifactRef', () => {
     it('successfully parses valid MinerUResultManifest round-trip', () => {
       const parsed = parseMinerUResultManifest(validResultManifest)
@@ -442,37 +326,5 @@ describe('Domain Schemas Runtime Parsers', () => {
     })
   })
 
-  describe('MinerUFailure parser', () => {
-    it('parses valid MinerUFailure', () => {
-      const failure = parseMinerUFailure({
-        code: 'PROVIDER_RATE_LIMITED',
-        message: 'Rate limit exceeded; retry after 5 seconds',
-        retryable: true,
-        provider: 'official-v4',
-        providerCode: '429',
-        traceId: 'trace-12345',
-        fileId: 'mf_0123456789abcdef0123456789ab_0',
-      })
-      expect(failure.code).toBe('PROVIDER_RATE_LIMITED')
-      expect(failure.retryable).toBe(true)
-    })
 
-    it('rejects invalid error code or non-boolean retryable', () => {
-      expect(() =>
-        parseMinerUFailure({
-          code: 'NON_EXISTENT_CODE',
-          message: 'Error',
-          retryable: true,
-        }),
-      ).toThrow(/invalid MinerUFailure.code/)
-
-      expect(() =>
-        parseMinerUFailure({
-          code: 'INVALID_REQUEST',
-          message: 'Error',
-          retryable: 'true' as unknown as boolean,
-        }),
-      ).toThrow(/retryable must be a boolean/)
-    })
-  })
 })

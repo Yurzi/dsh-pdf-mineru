@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto'
 
 type Brand<T, Name extends string> = T & { readonly __brand: Name }
 
-export type MinerUJobId = Brand<string, 'MinerUJobId'>
 export type MinerUResultId = Brand<string, 'MinerUResultId'>
 export type MinerUFileId = Brand<string, 'MinerUFileId'>
 export type ProviderConfigId = Brand<string, 'ProviderConfigId'>
@@ -11,7 +10,7 @@ export type OperationId = Brand<string, 'OperationId'>
 export type SessionId = Brand<string, 'SessionId'>
 
 const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
-const PREFIXED_ID = /^(?:mj|mr|mf|mp|mo)_[A-Za-z0-9][A-Za-z0-9._-]{0,123}$/
+const PREFIXED_ID = /^(?:mr|mf|mp|mo)_[A-Za-z0-9][A-Za-z0-9._-]{0,123}$/
 const CACHE_KEY = /^[a-f0-9]{64}$/
 
 export function assertSafePathSegment(value: string, label: string): string {
@@ -28,7 +27,6 @@ function assertPrefixedId(value: string, prefix: string): string {
   return value
 }
 
-export const asJobId = (value: string): MinerUJobId => assertPrefixedId(value, 'mj') as MinerUJobId
 export const asResultId = (value: string): MinerUResultId => assertPrefixedId(value, 'mr') as MinerUResultId
 export const asFileId = (value: string): MinerUFileId => assertPrefixedId(value, 'mf') as MinerUFileId
 export const asProviderConfigId = (value: string): ProviderConfigId => assertPrefixedId(value, 'mp') as ProviderConfigId
@@ -43,12 +41,11 @@ export function asCacheKey(value: string): CacheKey {
   return value as CacheKey
 }
 
-function randomId(prefix: 'mj' | 'mo'): string {
-  return `${prefix}_${randomUUID().replaceAll('-', '')}`
+function randomOperationId(): string {
+  return `mo_${randomUUID().replaceAll('-', '')}`
 }
 
-export const createJobId = (): MinerUJobId => asJobId(randomId('mj'))
-export const createOperationId = (): OperationId => asOperationId(randomId('mo'))
+export const createOperationId = (): OperationId => asOperationId(randomOperationId())
 
 export function createFileId(sha256: string, index = 0): MinerUFileId {
   if (!CACHE_KEY.test(sha256)) throw new TypeError('source SHA-256 is invalid')

@@ -348,36 +348,11 @@ inspect 调用 GET /extract-results/batch/{batchId}，保留逐文件状态并�
 
 collect 只处理终态文件。对 full_zip_url 去重下载；一个 ZIP 可对应多个结果条目。下载请求不得携带 API Token。Provider 使用安全 ZIP reader 将条目写入 ArtifactSink，并支持官方单文件根目录和多文件子目录布局。文件归属优先使用 data_id 和提交 manifest；无法无歧义关联时失败，不按相似文件名猜测。
 
-## 11. 任务模型与状态机
+## 11. 任务所有权与 Provider 状态
 
-### 11.1 任务记录
+### 11.1 原生任务所有权
 
-~~~ts
-interface MinerUJobRecord {
-  schemaVersion: 1
-  id: MinerUJobId
-  sessionId: SessionId
-  providerId: MinerUProviderId
-  providerConfigId: ProviderConfigId
-  sourceFiles: readonly JobSourceFile[]
-  request: CanonicalParseRequest
-  cacheKey: CacheKey
-  state: MinerUJobState
-  resolution: JobResolution
-  files: readonly MinerUFileStatus[]
-  resultId?: MinerUResultId
-  failure?: MinerUFailure
-  createdAt: number
-  updatedAt: number
-}
-
-type JobResolution =
-  | { kind: 'cache-hit' }
-  | { kind: 'shared-operation'; operationId: string; ref?: ProviderJobRef }
-  | { kind: 'provider'; ref?: ProviderJobRef }
-~~~
-
-本地 sourceFiles 仅保存 fileId、展示名、字节数和 SHA-256；任务记录不依赖原文件路径完成 status/result。当前实现 retainSources 固定为 false，不保存任意绝对路径。共享 producer 获得 ProviderJobRef 后立即把 ref 原子广播到所有 waiter Job。
+异步入口只向 DSH `JobRegistry` 注册 `mineru-N` 原生任务，并传递精确的 owner Agent。DSH 负责会话隔离、取消、完成通知和输出保留；插件不生成 `mj_` 标识、不维护 JobRepository，也不持久化第二套任务记录。ProviderJobRef 只存在于一次 Provider 执行期间。
 
 ### 11.2 统一任务状态
 

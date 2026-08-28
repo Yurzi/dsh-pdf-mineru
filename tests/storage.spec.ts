@@ -2,11 +2,9 @@
  * storage.spec.ts — Unit and integration tests for MinerU storage subsystem.
  *
  * Tests:
- *   - Session A/B isolation & access denial
  *   - Path traversal prevention & ID boundary validation
  *   - ArtifactRef boundaries & escaping prevention
  *   - Process lock (active process conflict, stale PID cleanup, release safety)
- *   - JobRepository atomic temp+rename, state machine transitions, concurrent updates
  *   - ArtifactSink streaming, SHA-256 calculation, and byte limit enforcement
  *   - ResultRepository begin/commit, duplicate reuse, conflict quarantine
  *   - Cache hit validation, missing artifact detection, and corrupt cache quarantine
@@ -24,31 +22,24 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   asCacheKey,
   asFileId,
-  asJobId,
   asOperationId,
   asProviderConfigId,
   asResultId,
-  asSessionId,
   createFileId,
-  createJobId,
   createOperationId,
   resultIdForCacheKey,
-  type SessionId,
 } from '../src/domain/ids.js'
 import { MinerUError } from '../src/domain/errors.js'
 import { CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, type CanonicalParseRequest } from '../src/domain/request.js'
-import { MINERU_JOB_SCHEMA_VERSION, type MinerUJobRecord } from '../src/domain/job.js'
 import type { ArtifactRef, MinerUResultManifest, ResultProducer } from '../src/domain/result.js'
 import { computeCacheKey } from '../src/service/cache-key.js'
 import {
-  JobRepository,
   ProcessLock,
   BatchArtifactRouter,
   ResultRepository,
   StagingArtifactSink,
   StoragePaths,
   defaultStorageRoot,
-  extractSessionId,
 } from '../src/storage/index.js'
 
 const tempRoots: string[] = []
@@ -95,47 +86,6 @@ function sampleProducer(): ResultProducer {
   }
 }
 
-function sessionObject(id: SessionId): { readonly header: { readonly id: SessionId } } {
-  return { header: { id } }
-}
-
-function sampleJob(sessionId: SessionId, req = sampleRequest(), producer = sampleProducer()): MinerUJobRecord {
-  const file = req.files[0]!
-  const cacheKey = computeCacheKey(req, file, producer.compatibilityKey)
-  const id = createJobId()
-
-  return {
-    schemaVersion: MINERU_JOB_SCHEMA_VERSION,
-    id,
-    sessionId,
-    providerId: producer.providerId,
-    providerConfigId: producer.providerConfigId,
-    providerCompatibilityKey: producer.compatibilityKey,
-    sourceFiles: [
-      {
-        fileId: file.fileId,
-        name: file.name,
-        bytes: file.bytes,
-        sha256: file.sha256,
-      },
-    ],
-    request: req,
-    cacheKey,
-    state: 'queued',
-    resolution: { kind: 'provider' },
-    files: [
-      {
-        fileId: file.fileId,
-        name: file.name,
-        cacheKey,
-        state: 'queued',
-      },
-    ],
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-  }
-}
-
 describe('StoragePaths & Traversal Prevention', () => {
   it('derives safe POSIX layout and validates IDs', async () => {
     const root = await createTempRoot()
@@ -148,12 +98,6 @@ describe('StoragePaths & Traversal Prevention', () => {
     expect(paths.manifestFile(cacheKey)).toBe(join(root, 'results', 'sha256', 'ff', 'f'.repeat(64), 'manifest.json'))
     expect(paths.stagingDir(opId)).toBe(join(root, 'staging', 'mo_op123'))
     expect(paths.processLockFile()).toBe(join(root, '.process.lock'))
-  })
-
-  it('does not expose a filesystem Job layout', () => {
-    const paths = new StoragePaths('/tmp/mineru-test')
-    expect('jobsDir' in paths).toBe(false)
-    expect('jobFile' in paths).toBe(false)
   })
 
   it('rejects artifact relative paths that escape directory bounds', async () => {
@@ -245,161 +189,6 @@ describe('ProcessLock', () => {
       expect(current.pid).toBe(process.pid)
       await lock.release()
     }
-  })
-})
-
-describe('JobRepository & Session A/B Isolation', () => {
-  it('creates, retrieves, and enforces strict session A/B isolation', async () => {
-    const root = await createTempRoot()
-    const paths = new StoragePaths(root)
-    const repo = new JobRepository()
-
-    const sessionA = asSessionId('session-alice')
-    const sessionB = asSessionId('session-bob')
-
-    const jobA = sampleJob(sessionA)
-    const createdA = await repo.create(sessionObject(sessionA), jobA)
-    expect(createdA.id).toBe(jobA.id)
-
-    // Session A can read Job A
-    const readA = await repo.get(sessionObject(sessionA), jobA.id)
-    expect(readA?.id).toBe(jobA.id)
-
-    // Session B cannot read Job A (returns undefined, isolated)
-    expect(await repo.get(sessionObject(sessionB), jobA.id)).toBeUndefined()
-    await expect(repo.require(sessionObject(sessionB), jobA.id)).rejects.toMatchObject({
-      failure: { code: 'JOB_NOT_FOUND' },
-    })
-
-    // If a job record inside sessionB's folder has a mismatched sessionId, throw JOB_ACCESS_DENIED
-    // Non-existent job returns undefined for get, throws JOB_NOT_FOUND for require
-    const nonExistent = asJobId('mj_nonexistent999999999999')
-    expect(await repo.get(sessionObject(sessionA), nonExistent)).toBeUndefined()
-    await expect(repo.require(sessionObject(sessionA), nonExistent)).rejects.toMatchObject({
-      failure: { code: 'JOB_NOT_FOUND' },
-    })
-
-    // Listing is isolated per session
-    const jobB = sampleJob(sessionB)
-    await repo.create(sessionObject(sessionB), jobB)
-
-    const listA = await repo.list(sessionObject(sessionA))
-    expect(listA.map(j => j.id)).toEqual([jobA.id])
-
-    const listB = await repo.list(sessionObject(sessionB))
-    expect(listB.map(j => j.id)).toEqual([jobB.id])
-  })
-
-  it('updates jobs with state machine transition checks and concurrency serialization', async () => {
-    const root = await createTempRoot()
-    const paths = new StoragePaths(root)
-    const repo = new JobRepository()
-
-    const session = asSessionId('session-trans')
-    const job = sampleJob(session)
-    await repo.create(sessionObject(session), job)
-
-    // Valid state transitions: queued -> uploading -> processing -> collecting -> completed
-    const updated1 = await repo.update(sessionObject(session), job.id, current => ({
-      ...current,
-      state: 'uploading',
-    }))
-    expect(updated1.state).toBe('uploading')
-
-    const updated2 = await repo.update(sessionObject(session), job.id, current => ({
-      ...current,
-      state: 'processing',
-    }))
-    expect(updated2.state).toBe('processing')
-
-    const updated3 = await repo.update(sessionObject(session), job.id, current => ({
-      ...current,
-      state: 'completed',
-    }))
-    expect(updated3.state).toBe('completed')
-
-    // Invalid transition from terminal 'completed' to 'processing' throws TypeError
-    await expect(
-      repo.update(sessionObject(session), job.id, current => ({
-        ...current,
-        state: 'processing',
-      })),
-    ).rejects.toThrow(TypeError)
-  })
-
-  it('rejects updates that attempt to change immutable job metadata', async () => {
-    const root = await createTempRoot()
-    const paths = new StoragePaths(root)
-    const repo = new JobRepository()
-
-    const session = asSessionId('session-immut')
-    const job = sampleJob(session)
-    await repo.create(sessionObject(session), job)
-
-    // Attempting to change sessionId
-    await expect(
-      repo.update(sessionObject(session), job.id, current => ({
-        ...current,
-        sessionId: asSessionId('session-tampered'),
-      })),
-    ).rejects.toThrow(TypeError)
-
-    // Attempting to change jobId
-    await expect(
-      repo.update(sessionObject(session), job.id, current => ({
-        ...current,
-        id: createJobId(),
-      })),
-    ).rejects.toThrow(TypeError)
-  })
-
-  it('releases session Jobs and rejects an update racing session disposal', async () => {
-    const repo = new JobRepository()
-    const sessionId = asSessionId('session-dispose')
-    const owner = sessionObject(sessionId)
-    const job = sampleJob(sessionId)
-    await repo.create(owner, job)
-
-    let release!: () => void
-    let started!: () => void
-    const entered = new Promise<void>(resolve => { started = resolve })
-    const gate = new Promise<void>(resolve => { release = resolve })
-    const updating = repo.update(owner, job.id, async current => {
-      started()
-      await gate
-      return { ...current, state: 'uploading' }
-    })
-    await entered
-    expect(repo.deleteSession(owner)).toBe(1)
-    release()
-    await expect(updating).rejects.toMatchObject({ failure: { code: 'JOB_NOT_FOUND' } })
-    await expect(repo.get(owner, job.id)).resolves.toBeUndefined()
-  })
-
-  it('rejects late Job creation after the owning Session is disposed', async () => {
-    const repo = new JobRepository()
-    const sessionId = asSessionId('session-late-create')
-    const owner = sessionObject(sessionId)
-    expect(repo.deleteSession(owner)).toBe(0)
-    await expect(repo.create(owner, sampleJob(sessionId)))
-      .rejects.toMatchObject({ failure: { code: 'JOB_NOT_FOUND' } })
-    expect(repo.snapshot()).toHaveLength(0)
-  })
-
-  it('invalidates Jobs whose cache keys were evicted', async () => {
-    const repo = new JobRepository()
-    const sessionId = asSessionId('session-evict')
-    const owner = sessionObject(sessionId)
-    const job = sampleJob(sessionId)
-    await repo.create(owner, job)
-    expect(repo.deleteByCacheKeys(new Set([job.cacheKey]))).toBe(1)
-    await expect(repo.get(owner, job.id)).resolves.toBeUndefined()
-  })
-
-  it('requires an Agent-backed DSH Session object', () => {
-    expect(extractSessionId({ header: { id: asSessionId('sess-hdr') } })).toBe(asSessionId('sess-hdr'))
-    expect(() => extractSessionId('sess-raw' as unknown as { header: { id: SessionId } })).toThrow(TypeError)
-    expect(() => extractSessionId({ id: asSessionId('sess-id') } as unknown as { header: { id: SessionId } })).toThrow(TypeError)
   })
 })
 

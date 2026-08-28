@@ -12,7 +12,7 @@ import type { ProcessLock } from './process-lock.js';
 import { StorageAccessGate } from './access-gate.js';
 import type { StoragePaths } from './paths.js';
 export type StorageMaintenanceArea = 'published-results' | 'staging' | 'quarantine';
-export type StorageMaintenanceDiagnosticCode = 'unexpected-entry' | 'symlink-skipped' | 'unreadable-entry' | 'corrupt-result' | 'missing-result' | 'unsafe-result' | 'malformed-job' | 'inconsistent-job' | 'quarantine-failed';
+export type StorageMaintenanceDiagnosticCode = 'unexpected-entry' | 'symlink-skipped' | 'unreadable-entry' | 'corrupt-result' | 'missing-result' | 'unsafe-result' | 'quarantine-failed';
 export interface StorageMaintenanceDiagnostic {
     readonly area: StorageMaintenanceArea;
     readonly entry: string;
@@ -130,20 +130,14 @@ export interface GcCandidate {
     readonly byteUsage: number;
     readonly byteUsageSaturated: boolean;
 }
-export interface JobReferenceScan {
-    readonly complete: true;
-    readonly sessionJobCount: number;
-    readonly activeJobCount: number;
-    readonly referencedCacheKeyCount: number;
-}
 /**
- * This operation never deletes data. It reports only fully validated, unreferenced
- * published result directories under the current job-reference retention policy.
+ * This operation never deletes data. It reports only fully validated published
+ * result directories that are eligible under the current retention policy.
  */
 export interface GcDryRunReport {
     readonly generatedAt: number;
     readonly dryRun: true;
-    readonly referencePolicy: 'no-plugin-job-retention';
+    readonly referencePolicy: 'all-published-results';
     readonly eligible: boolean;
     readonly candidateCount: number;
     readonly candidateBytes: number;
@@ -151,10 +145,8 @@ export interface GcDryRunReport {
     readonly candidates: readonly GcCandidate[];
     readonly candidatesTruncated: boolean;
     readonly candidateTotalsComplete: boolean;
-    readonly referencedResultCount: number;
     readonly invalidResultCount: number;
     readonly unsafeResultCount: number;
-    readonly jobReferences: JobReferenceScan;
     readonly scan: ScanMetadata;
     readonly diagnostics: readonly StorageMaintenanceDiagnostic[];
 }
@@ -172,7 +164,6 @@ export interface CacheClearReport {
     readonly generatedAt: number;
     readonly dryRun: boolean;
     readonly eligible: boolean;
-    readonly activeJobCount: number;
     readonly activeOperationCount: number;
     readonly activeAccessCount: number;
     readonly confirmationToken?: string;
@@ -183,7 +174,6 @@ export interface CacheClearReport {
     readonly deletedBytes: number;
     readonly deletedBytesSaturated: boolean;
     readonly skippedCount: number;
-    readonly jobScan: JobReferenceScan;
     readonly scan: ScanMetadata;
     readonly diagnostics: readonly StorageMaintenanceDiagnostic[];
 }
@@ -197,15 +187,17 @@ export declare class StorageMaintenanceService {
     constructor(paths: StoragePaths, results: ResultRepository, operations: SharedOperationRegistry, lock: ProcessLock, accessGate?: StorageAccessGate);
     getStatistics(signal?: AbortSignal): Promise<StorageStatistics>;
     scanIntegrity(options?: IntegrityScanOptions): Promise<CacheIntegrityScanReport>;
+    private scanIntegrityInternal;
     listQuarantine(options?: QuarantineListOptions): Promise<QuarantineListReport>;
     cleanupQuarantine(options: QuarantineCleanupOptions): Promise<QuarantineCleanupReport>;
+    private cleanupQuarantineInternal;
     clearCache(options?: CacheClearOptions): Promise<CacheClearReport>;
     private clearCacheInternal;
     gcDryRun(options?: GcDryRunOptions): Promise<GcDryRunReport>;
+    private acquireDestructiveAccess;
     private assertLockHeld;
     private countPublishedResultDirectories;
     private countDirectDirectories;
     private visitPublishedResults;
     private recordDirectoryIssue;
-    private collectJobReferences;
 }
