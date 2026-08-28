@@ -48,7 +48,7 @@ dsh plugin --profile web add link:/absolute/path/to/dsh-pdf-mineru
 
 ### 2. 连接 MinerU
 
-打开 **Settings → MinerU**，选择活动 Provider：
+打开 **Settings → Plugins → MinerU**，选择活动 Provider：
 
 - **Self-hosted v2**：默认连接 `http://localhost:18000`，本地 HTTP 需要显式启用 `Allow Insecure HTTP`。
 - **Official v4**：默认连接 `https://mineru.net/api/v4`，并通过 DSH Credential 或环境变量提供 Token。
@@ -166,7 +166,7 @@ Provider 不注册工具、不访问 DSH Session、不决定存储路径，也�
 
 ## 配置
 
-推荐通过 **Settings → MinerU** 编辑配置。Provider、解析默认值、轮询、重试和输出限制对新任务实时生效；`storageRoot` 变更需要重启插件进程。
+推荐通过 **Settings → Plugins → MinerU** 编辑配置。插件通过 Harness 的 `settings.plugin.item` 扩展点贡献设置卡片，并为尚未提供该扩展点的旧客户端保留独立 Settings section fallback。Provider、解析默认值、轮询、重试和输出限制对新任务实时生效；`storageRoot` 变更需要重启插件进程。
 
 <p align="center">
   <img src="./docs/assets/mineru-settings-preview.png" width="800" alt="dsh-pdf-mineru 在 DSH Settings 中的 Provider 与解析默认值界面">
@@ -350,12 +350,18 @@ pnpm test
 pnpm run build
 git diff --check
 
+# 与 Harness 内部包一致的别名
+pnpm run bundle
+pnpm run watch
+
 # 在已运行的 DSH Web shell 中隔离加载当前 client bundle
 pnpm run verify:gui
 
 # 显式执行 Official v4 真实链路 smoke
 MINERU_API_KEY=<token> pnpm run smoke:official-v4 -- /absolute/path/sample.pdf
 ```
+
+`typecheck` 通过 host/client TypeScript project references 生成 `lib/types` 声明；`build` 随后分别产出 Node host 和浏览器 client bundle。CSS Modules 使用与 Harness 内部客户端包相同的 Lightning CSS 转换与内联注入方式。
 
 默认测试使用 mock HTTP 和本地 ZIP fixture，不需要真实 Token。`smoke:official-v4` 必须显式提供真实 Token 和 PDF，不进入默认测试。
 

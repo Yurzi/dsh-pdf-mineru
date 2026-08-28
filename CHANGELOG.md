@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.0.5
+
+### Changed
+
+- Aligned package exports, host/client TypeScript project references, `lib/types` declarations, tsdown faces, CSS Modules transformation, Node/pnpm constraints, and bundle/watch scripts with the DeepSeek Harness internal package conventions.
+- Migrated the browser plugin to contribute through `settings.plugin.item`, with a compatibility fallback to `settings.section` for older Harness clients.
 
 ### Fixed
 

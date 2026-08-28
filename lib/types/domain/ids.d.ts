@@ -1,0 +1,23 @@
+type Brand<T, Name extends string> = T & {
+    readonly __brand: Name;
+};
+export type MinerUJobId = Brand<string, 'MinerUJobId'>;
+export type MinerUResultId = Brand<string, 'MinerUResultId'>;
+export type MinerUFileId = Brand<string, 'MinerUFileId'>;
+export type ProviderConfigId = Brand<string, 'ProviderConfigId'>;
+export type CacheKey = Brand<string, 'CacheKey'>;
+export type OperationId = Brand<string, 'OperationId'>;
+export type SessionId = Brand<string, 'SessionId'>;
+export declare function assertSafePathSegment(value: string, label: string): string;
+export declare const asJobId: (value: string) => MinerUJobId;
+export declare const asResultId: (value: string) => MinerUResultId;
+export declare const asFileId: (value: string) => MinerUFileId;
+export declare const asProviderConfigId: (value: string) => ProviderConfigId;
+export declare const asOperationId: (value: string) => OperationId;
+export declare function asSessionId(value: string): SessionId;
+export declare function asCacheKey(value: string): CacheKey;
+export declare const createJobId: () => MinerUJobId;
+export declare const createOperationId: () => OperationId;
+export declare function createFileId(sha256: string, index?: number): MinerUFileId;
+export declare function resultIdForCacheKey(cacheKey: CacheKey): MinerUResultId;
+export {};

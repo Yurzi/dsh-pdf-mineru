@@ -371,7 +371,7 @@ describe('MinerU RPC (registerRpc)', () => {
 })
 
 describe('Client UI Pure Helpers (SettingsPage)', () => {
-  it('registers the settings section through current Client services', () => {
+  function clientContext(pluginSlot: boolean) {
     const rpc = { call: vi.fn() }
     const credentials = { describe: vi.fn(), set: vi.fn(), unset: vi.fn() }
     const register = vi.fn(() => vi.fn())
@@ -381,18 +381,30 @@ describe('Client UI Pure Helpers (SettingsPage)', () => {
       get: (name: string) => name === 'connection' ? { rpc } : undefined,
       locale: {
         register: vi.fn(() => vi.fn()),
-        subscribe: vi.fn(() => vi.fn()),
         bind: vi.fn(() => (key: string) => key),
       },
       remote: { credentials },
-      slots: { inject: slotInject, register },
+      slots: { inject: slotInject, register, spec: () => pluginSlot ? {} : undefined },
     } as never
+    return { ctx, rpc, credentials, register, slotInject }
+  }
 
+  it('contributes a card to the Harness plugins settings slot', () => {
+    const { ctx, rpc, credentials, register, slotInject } = clientContext(true)
     expect(clientInject).toEqual(['slots', 'locale', 'connection', 'remote', 'remote.credentials'])
     applyClient(ctx)
 
+    expect(slotInject).toHaveBeenCalledWith('settings.plugin.item', expect.any(Function))
+    const [options] = register.mock.calls[0]!
+    expect(options).toMatchObject({ name: 'settings.plugin.item', key: 'dsh-pdf-mineru', locale: 'dsh-pdf-mineru' })
+    expect(options.inject()).toEqual({ rpc, credentials })
+  })
+
+  it('falls back to a settings section on pre-slot Harness clients', () => {
+    const { ctx, rpc, credentials, register, slotInject } = clientContext(false)
+    applyClient(ctx)
+
     expect(slotInject).toHaveBeenCalledWith('settings.section', expect.any(Function))
-    expect(register).toHaveBeenCalledOnce()
     const [options] = register.mock.calls[0]!
     expect(options).toMatchObject({
       name: 'settings.section', id: 'dsh-pdf-mineru', order: 40, locale: 'dsh-pdf-mineru',

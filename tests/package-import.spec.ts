@@ -11,6 +11,11 @@ describe('built package import', () => {
       dsh?: { client?: { inject?: string[] } }
       peerDependencies?: Record<string, string>
       devDependencies?: Record<string, string>
+      exports?: Record<string, unknown>
+      scripts?: Record<string, string>
+      engines?: Record<string, string>
+      packageManager?: string
+      types?: string
     }
     expect(manifest.dsh?.client?.inject).toEqual([
       '@deepseek-ai/dsh-client-connection',
@@ -32,6 +37,12 @@ describe('built package import', () => {
     expect(manifest.peerDependencies).not.toHaveProperty('@deepseek-ai/dsh-client-ui-slots')
     expect(manifest.peerDependencies).not.toHaveProperty('@deepseek-ai/dsh-client-ui-primitives')
     expect(manifest.peerDependencies).not.toHaveProperty('react')
+    expect(manifest.types).toBe('./lib/types/index.d.ts')
+    expect(manifest.exports).toHaveProperty('./client')
+    expect(manifest.exports).toHaveProperty('./cordis.patch.yml')
+    expect(manifest.scripts?.build).toContain('build:types')
+    expect(manifest.packageManager).toBe('pnpm@11.7.0')
+    expect(manifest.engines?.node).toBe('^22.19.0 || >=24.0.0')
   })
 
   it('resolves runtime peers when installed through a workspace link', async () => {

@@ -1,0 +1,17 @@
+import z from '@deepseek-ai/schemastery';
+import type { Context } from 'cordis';
+export declare const name = "dsh-pdf-mineru";
+export declare const inject: string[];
+export declare const Config: z<unknown>;
+export declare function apply(ctx: Context, entryConfig?: unknown): Promise<() => Promise<void>>;
+export * from './config.js';
+export * from './domain/ids.js';
+export * from './domain/request.js';
+export * from './domain/result.js';
+export * from './domain/errors.js';
+export * from './providers/provider.js';
+export * from './providers/self-hosted-v2.js';
+export * from './providers/official-v4.js';
+export * from './service/mineru-service.js';
+export * from './observability.js';
+export * from './storage/maintenance-service.js';

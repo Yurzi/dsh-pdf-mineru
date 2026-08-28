@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": { "lib": ["ES2024", "DOM", "DOM.Iterable"], "types": ["node"], "tsBuildInfoFile": ".vitest-cache/tsbuild/host.tsbuildinfo" },
+  "include": ["src/**/*.ts", "src/types.d.ts"],
+  "exclude": ["src/client/**", "src/css-modules.ts"]
+}
