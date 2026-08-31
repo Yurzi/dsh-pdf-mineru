@@ -79,19 +79,34 @@ function dshHome(): string {
   return resolve(env)
 }
 
+export function defaultProviderConfig(type: 'self-hosted-v2' | 'official-v4'): ProviderConfig {
+  if (type === 'official-v4') {
+    return {
+      id: asProviderConfigId('mp_official'),
+      type,
+      baseURL: 'https://mineru.net/api/v4',
+      apiKeyEnv: 'MINERU_API_KEY',
+      models: ['pipeline', 'vlm'],
+      configuredVersion: 'v4',
+    }
+  }
+  return {
+    id: asProviderConfigId('mp_self_hosted'),
+    type,
+    baseURL: 'http://localhost:18000',
+    apiKeyEnv: 'MINERU_API_KEY',
+    modelMap: { pipeline: 'pipeline', vlm: 'vlm-engine' },
+    allowInsecureHttp: true,
+  }
+}
+
 export function defaultMinerUConfig(): MinerUConfig {
-  const id = asProviderConfigId('mp_self_hosted')
+  const selfHosted = defaultProviderConfig('self-hosted-v2')
+  const official = defaultProviderConfig('official-v4')
   return {
     schemaVersion: 1,
-    activeProvider: id,
-    providers: [{
-      id,
-      type: 'self-hosted-v2',
-      baseURL: 'http://localhost:18000',
-      apiKeyEnv: 'MINERU_API_KEY',
-      modelMap: { pipeline: 'pipeline', vlm: 'vlm-engine' },
-      allowInsecureHttp: true,
-    }],
+    activeProvider: selfHosted.id,
+    providers: [selfHosted, official],
     defaults: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true, artifacts: ['markdown'] },
     storage: { storageRoot: join(dshHome(), 'cache', 'pdf-mineru'), cacheEnabled: true, retainSources: false, stagingTtlMs: 24 * 60 * 60 * 1000 },
     polling: { pollIntervalMs: 2000, pollTimeoutMs: 600000, requestTimeoutMs: 60000, operationTimeoutMs: 60 * 60 * 1000 },

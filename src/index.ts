@@ -20,7 +20,7 @@ export const inject = ['tools', 'jobs', 'settings']
 const ProviderSchema = z.union([
   z.object({
     id: z.string(),
-    type: z.string(),
+    type: z.const('self-hosted-v2'),
     baseURL: z.string(),
     apiKeyEnv: z.string().role('credential-ref'),
     modelMap: z.object({ pipeline: z.string(), vlm: z.string() }),
@@ -29,7 +29,7 @@ const ProviderSchema = z.union([
   }),
   z.object({
     id: z.string(),
-    type: z.string(),
+    type: z.const('official-v4'),
     baseURL: z.string(),
     apiKeyEnv: z.string().role('credential-ref'),
     models: z.array(z.union(['pipeline', 'vlm'])),

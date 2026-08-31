@@ -11,7 +11,6 @@ export type MineruKey =
   | 'section.output'
   | 'section.limits'
   | 'field.activeProvider'
-  | 'field.providerType'
   | 'field.baseURL'
   | 'field.baseURL.placeholder'
   | 'field.apiKeyEnv'
@@ -133,7 +132,6 @@ export const en: Record<MineruKey, string> = {
   'section.limits': 'Security & Payload Limits',
 
   'field.activeProvider': 'Active Provider',
-  'field.providerType': 'Provider Type',
   'field.baseURL': 'API Base URL',
   'field.baseURL.placeholder': 'https://mineru.net/api/v4 or http://localhost:18000',
   'field.apiKeyEnv': 'Credential Reference',
@@ -262,7 +260,6 @@ export const zh: Record<MineruKey, string> = {
   'section.limits': '安全与资源上限',
 
   'field.activeProvider': '当前激活的 Provider',
-  'field.providerType': 'Provider 类型',
   'field.baseURL': 'API 服务地址',
   'field.baseURL.placeholder': 'https://mineru.net/api/v4 或 http://localhost:18000',
   'field.apiKeyEnv': '凭据引用名',

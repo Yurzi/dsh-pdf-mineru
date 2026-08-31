@@ -3,11 +3,15 @@ import { defaultMinerUConfig, migrateConfig, providerById } from '../src/config.
 import { asProviderConfigId } from '../src/domain/ids.js'
 
 describe('MinerU config parsing and validation', () => {
-  it('creates a complete self-hosted default', () => {
+  it('creates complete independent self-hosted and official defaults', () => {
     const config = defaultMinerUConfig()
     expect(config.schemaVersion).toBe(1)
     expect(config.activeProvider).toBe('mp_self_hosted')
-    expect(config.providers[0]).toMatchObject({ type: 'self-hosted-v2', allowInsecureHttp: true })
+    expect(config.providers).toHaveLength(2)
+    expect(config.providers[0]).toMatchObject({ id: 'mp_self_hosted', type: 'self-hosted-v2', allowInsecureHttp: true })
+    expect(config.providers[1]).toMatchObject({
+      id: 'mp_official', type: 'official-v4', baseURL: 'https://mineru.net/api/v4', models: ['pipeline', 'vlm'],
+    })
     expect(config.defaults).toMatchObject({ model: 'pipeline', parseMethod: 'auto', ocr: false })
     expect(config.retry).toEqual({ maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 10000 })
     expect(config.limits.maxFilesPerRequest).toBe(1)

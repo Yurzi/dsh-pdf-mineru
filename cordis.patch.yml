@@ -15,6 +15,14 @@
             modelMap:
               pipeline: pipeline
               vlm: vlm-engine
+          - id: mp_official
+            type: official-v4
+            baseURL: 'https://mineru.net/api/v4'
+            apiKeyEnv: MINERU_API_KEY
+            models:
+              - pipeline
+              - vlm
+            configuredVersion: v4
         defaults:
           model: pipeline
           ocr: false

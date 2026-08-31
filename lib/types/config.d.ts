@@ -59,6 +59,7 @@ export interface MinerUConfig {
     readonly output: OutputConfig;
     readonly limits: SecurityLimits;
 }
+export declare function defaultProviderConfig(type: 'self-hosted-v2' | 'official-v4'): ProviderConfig;
 export declare function defaultMinerUConfig(): MinerUConfig;
 export declare function migrateConfig(value: unknown): MinerUConfig;
 export declare function providerById(config: MinerUConfig, id: ProviderConfigId): ProviderConfig | undefined;

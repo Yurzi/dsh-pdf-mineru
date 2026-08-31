@@ -232,6 +232,21 @@ describe('plugin composition lifecycle', () => {
     await dispose()
   })
 
+  it('keeps provider schema branches discriminated by type', async () => {
+    const { Config } = await import('../src/index.js')
+    const validate = Config as unknown as (value: unknown) => Record<string, unknown>
+    const base = defaultMinerUConfig()
+    const parsed = validate(base) as unknown as typeof base
+
+    expect(parsed.providers).toHaveLength(2)
+    expect(parsed.providers[1]).toEqual(base.providers[1])
+    expect(parsed.providers[1]).not.toHaveProperty('modelMap')
+    expect(() => validate({
+      ...base,
+      providers: [{ ...base.providers[0], type: 'unsupported-provider' }],
+    })).toThrow()
+  })
+
   it('releases the process lock when initialization fails after lock acquisition', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mineru-index-fail-'))
     roots.push(root)

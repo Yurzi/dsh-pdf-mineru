@@ -59,7 +59,7 @@ function optionalBoolean(payload: Record<string, unknown>, key: string, fallback
   return value
 }
 
-function fail<T = unknown>(message: string, code = 'internal'): RpcResult<T> {
+function fail<T = unknown>(message: string, code = 'mineru/internal'): RpcResult<T> {
   return {
     ok: false,
     error: { code, message: sanitizeDiagnostic(message) },
@@ -193,12 +193,12 @@ export function registerRpc(ctx: Context, deps: MineruRpcDeps): () => void | Pro
           }
 
           default: {
-            return fail(`unknown endpoint: ${endpoint}`, 'not-found')
+            return fail(`unknown endpoint: ${endpoint}`, 'mineru/not-found')
           }
         }
       } catch (err: unknown) {
         const rawMsg = err instanceof Error ? err.message : String(err)
-        return fail(rawMsg, err instanceof TypeError ? 'invalid-argument' : 'internal')
+        return fail(rawMsg, err instanceof TypeError ? 'mineru/invalid-argument' : 'mineru/internal')
       }
     },
     { authority: 'loopback' },

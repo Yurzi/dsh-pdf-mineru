@@ -21,13 +21,14 @@ import { asProviderConfigId } from '../src/domain/ids.js'
 import { registerRpc, RPC_CHANNEL, type MineruRpcDeps, type RpcResult } from '../src/rpc.js'
 import type { ProbeView } from '../src/service/mineru-service.js'
 import {
+  activateProvider,
   clearCredential,
   credentialReference,
   describeCredential,
+  ensureProviderProfiles,
   normalizeProviderDefaults,
   patchActiveProvider,
   storeCredential,
-  switchProviderType,
   type CredentialClient,
 } from '../src/client/SettingsPage.js'
 import { formatBytes } from '../src/client/StorageOperations.js'
@@ -162,7 +163,7 @@ describe('MinerU RPC (registerRpc)', () => {
     const flat = await handler('mineru/config.set', { config: {
       baseURL: 'http://custom-host:18000', defaultBackend: 'vlm-engine',
     } }, new AbortController().signal)
-    expect(flat).toMatchObject({ ok: false, error: { code: 'invalid-argument' } })
+    expect(flat).toMatchObject({ ok: false, error: { code: 'mineru/invalid-argument' } })
 
     // 3. Invalid or missing config returns failure without persisting defaults
     const invalidRes = await handler('mineru/config.set', { config: { activeProvider: 'invalid-id' } }, new AbortController().signal)
@@ -170,7 +171,7 @@ describe('MinerU RPC (registerRpc)', () => {
     const callsBeforeMissingConfig = vi.mocked(deps.setConfig).mock.calls.length
     for (const payload of [{}, [], { config: undefined }, { config: null }]) {
       const missingRes = await handler('mineru/config.set', payload, new AbortController().signal)
-      expect(missingRes).toMatchObject({ ok: false, error: { code: 'invalid-argument' } })
+      expect(missingRes).toMatchObject({ ok: false, error: { code: 'mineru/invalid-argument' } })
     }
     expect(deps.setConfig).toHaveBeenCalledTimes(callsBeforeMissingConfig)
   })
@@ -225,7 +226,7 @@ describe('MinerU RPC (registerRpc)', () => {
     // Probing a draft MUST NOT persist/call setConfig. Malformed payloads fail before probing.
     expect(setConfigMock).not.toHaveBeenCalled()
     const malformed = await handler('mineru/probe', 'not-an-object', controller.signal)
-    expect(malformed).toMatchObject({ ok: false, error: { code: 'invalid-argument' } })
+    expect(malformed).toMatchObject({ ok: false, error: { code: 'mineru/invalid-argument' } })
     expect(probeMock).toHaveBeenCalledTimes(1)
   })
 
@@ -281,7 +282,7 @@ describe('MinerU RPC (registerRpc)', () => {
     const refusedCleanup = await handler(
       'mineru/storage.quarantine.cleanup', { entry_ids: ['entry_1'], dry_run: false }, signal,
     )
-    expect(refusedCleanup).toMatchObject({ ok: false, error: { code: 'invalid-argument' } })
+    expect(refusedCleanup).toMatchObject({ ok: false, error: { code: 'mineru/invalid-argument' } })
     expect(maintenance.cleanupQuarantine).not.toHaveBeenCalled()
 
     const acceptedCleanup = await handler(
@@ -293,7 +294,7 @@ describe('MinerU RPC (registerRpc)', () => {
     const refusedCacheClear = await handler(
       'mineru/storage.cache.clear', { dry_run: false, confirm: true }, signal,
     )
-    expect(refusedCacheClear).toMatchObject({ ok: false, error: { code: 'invalid-argument' } })
+    expect(refusedCacheClear).toMatchObject({ ok: false, error: { code: 'mineru/invalid-argument' } })
     expect(maintenance.clearCache).not.toHaveBeenCalled()
 
     const previewCacheClear = await handler(
@@ -318,7 +319,7 @@ describe('MinerU RPC (registerRpc)', () => {
     const refusedIsolation = await handler(
       'mineru/storage.integrity.scan', { isolate_invalid: true }, signal,
     )
-    expect(refusedIsolation).toMatchObject({ ok: false, error: { code: 'invalid-argument' } })
+    expect(refusedIsolation).toMatchObject({ ok: false, error: { code: 'mineru/invalid-argument' } })
     const acceptedIsolation = await handler(
       'mineru/storage.integrity.scan', { isolate_invalid: true, confirm: true }, signal,
     )
@@ -349,7 +350,7 @@ describe('MinerU RPC (registerRpc)', () => {
     }
   })
 
-  it('returns not-found for unknown RPC endpoints', async () => {
+  it('returns mineru/not-found for unknown RPC endpoints', async () => {
     const { ctx, getHandler } = createMockContext()
     const deps: MineruRpcDeps = {
       ...maintenanceDeps(),
@@ -364,7 +365,7 @@ describe('MinerU RPC (registerRpc)', () => {
     const res = await handler('mineru/unknown_action', {}, new AbortController().signal)
     expect(res.ok).toBe(false)
     if (!res.ok) {
-      expect(res.error.code).toBe('not-found')
+      expect(res.error.code).toBe('mineru/not-found')
     }
   })
 })
@@ -440,7 +441,7 @@ describe('Client UI Pure Helpers (SettingsPage)', () => {
 
     const set = vi.fn(async () => ({
       ok: false as const,
-      error: { code: 'credential-rejected', message: 'credential is shadowed by a read-only source' },
+      error: { code: 'credential/rejected', message: 'credential is shadowed by a read-only source' },
     }))
     const credentials = {
       describe: vi.fn(),
@@ -461,41 +462,50 @@ describe('Client UI Pure Helpers (SettingsPage)', () => {
     expect(formatBytes(-1)).toBe('N/A')
   })
 
-  it('switchProviderType converts between self-hosted-v2 and official-v4 preserving IDs and cleaning invalid fields', () => {
+  it('completes legacy single-provider drafts and preserves both profiles across switching', () => {
+    const base = defaultMinerUConfig()
     const selfHosted: SelfHostedV2Config = {
       id: asProviderConfigId('mp_primary'),
       type: 'self-hosted-v2',
-      baseURL: 'http://localhost:18000',
-      apiKeyEnv: 'CUSTOM_KEY',
-      modelMap: { pipeline: 'pipeline', vlm: 'vlm-engine' },
+      baseURL: 'http://gpu-server:18000',
+      apiKeyEnv: 'LOCAL_KEY',
+      modelMap: { pipeline: 'pipeline', vlm: 'hybrid-engine' },
       allowInsecureHttp: true,
       configuredVersion: 'v2.1',
     }
+    const legacySingle = { ...base, activeProvider: selfHosted.id, providers: [selfHosted] }
 
-    // 1. Switch self-hosted -> official-v4
-    const official = switchProviderType(selfHosted, 'official-v4')
-    expect(official.id).toBe(selfHosted.id)
-    expect(official.type).toBe('official-v4')
-    expect(official.baseURL).toBe('https://mineru.net/api/v4')
-    expect(official.apiKeyEnv).toBe('CUSTOM_KEY')
-    expect((official as OfficialV4Config).models).toEqual(['pipeline', 'vlm'])
-    expect((official as OfficialV4Config).configuredVersion).toBe('v4')
-    // Old fields cleaned
-    expect('modelMap' in official).toBe(false)
-    expect('allowInsecureHttp' in official).toBe(false)
+    const completed = ensureProviderProfiles(legacySingle)
+    expect(completed.providers).toHaveLength(2)
+    expect(completed.providers[0]).toEqual(selfHosted)
+    const official = completed.providers.find(provider => provider.type === 'official-v4')
+    expect(official).toMatchObject({
+      id: 'mp_official',
+      baseURL: 'https://mineru.net/api/v4',
+      models: ['pipeline', 'vlm'],
+    })
 
-    // 2. Switch official-v4 -> self-hosted-v2
-    const backToSelfHosted = switchProviderType(official, 'self-hosted-v2')
-    expect(backToSelfHosted.id).toBe(official.id)
-    expect(backToSelfHosted.type).toBe('self-hosted-v2')
-    expect(backToSelfHosted.baseURL).toBe('http://localhost:18000')
-    expect((backToSelfHosted as SelfHostedV2Config).modelMap).toEqual({ pipeline: 'pipeline', vlm: 'vlm-engine' })
-    expect((backToSelfHosted as SelfHostedV2Config).allowInsecureHttp).toBe(true)
-    // Official-only fields cleaned
-    expect('models' in backToSelfHosted).toBe(false)
+    const officialActive = activateProvider(completed, official!.id)
+    const officialEdited = patchActiveProvider(officialActive, {
+      baseURL: 'https://gateway.example/api/v4',
+      models: ['vlm'],
+    })
+    const backToSelfHosted = activateProvider(officialEdited, selfHosted.id)
 
-    // 3. Idempotent on same type
-    expect(switchProviderType(selfHosted, 'self-hosted-v2')).toBe(selfHosted)
+    expect(backToSelfHosted.providers.find(provider => provider.id === selfHosted.id)).toEqual(selfHosted)
+    expect(backToSelfHosted.providers.find(provider => provider.id === official!.id)).toMatchObject({
+      baseURL: 'https://gateway.example/api/v4',
+      models: ['vlm'],
+    })
+  })
+
+  it('uses a unique ID when completing a legacy profile with a colliding canonical ID', () => {
+    const base = defaultMinerUConfig()
+    const official = { ...base.providers[1]!, id: asProviderConfigId('mp_self_hosted') } as OfficialV4Config
+    const completed = ensureProviderProfiles({ ...base, activeProvider: official.id, providers: [official] })
+
+    expect(completed.providers.map(provider => provider.id)).toEqual(['mp_self_hosted', 'mp_self_hosted_2'])
+    expect(completed.providers.map(provider => provider.type)).toEqual(['official-v4', 'self-hosted-v2'])
   })
 
   it('normalizes defaults to the active official provider capabilities', () => {

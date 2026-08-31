@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ClientConnectionRpc, RpcResult } from '@deepseek-ai/dsh-client-connection/client'
-import type { MinerUConfig, OfficialV4Config, ProviderConfig, SelfHostedV2Config } from '../config.js'
+import { defaultProviderConfig, type MinerUConfig, type OfficialV4Config, type ProviderConfig, type SelfHostedV2Config } from '../config.js'
+import { asProviderConfigId } from '../domain/ids.js'
 import type { ArtifactKind, MinerUModel, ParseMethod } from '../domain/request.js'
 import type { ProbeView } from '../service/mineru-service.js'
 import type { MineruKey } from './locales.js'
@@ -41,30 +42,20 @@ interface CredentialState {
 
 const ALL_ARTIFACT_KINDS: readonly ArtifactKind[] = ['markdown', 'layout', 'model-output', 'content-list', 'images']
 
-export function switchProviderType(
-  provider: ProviderConfig,
-  nextType: 'self-hosted-v2' | 'official-v4',
-): ProviderConfig {
-  if (provider.type === nextType) return provider
-  if (nextType === 'self-hosted-v2') {
-    const isMineruCloud = provider.baseURL.includes('mineru.net')
-    return {
-      id: provider.id,
-      type: 'self-hosted-v2',
-      baseURL: isMineruCloud ? 'http://localhost:18000' : provider.baseURL,
-      apiKeyEnv: provider.apiKeyEnv,
-      modelMap: { pipeline: 'pipeline', vlm: 'vlm-engine' },
-      allowInsecureHttp: true,
+const PROVIDER_TYPES = ['self-hosted-v2', 'official-v4'] as const
+
+export function ensureProviderProfiles(config: MinerUConfig): MinerUConfig {
+  const providers = [...config.providers]
+  for (const type of PROVIDER_TYPES) {
+    if (providers.some(provider => provider.type === type)) continue
+    const defaults = defaultProviderConfig(type)
+    let id = defaults.id
+    for (let suffix = 2; providers.some(provider => provider.id === id); suffix++) {
+      id = asProviderConfigId(defaults.id + '_' + String(suffix))
     }
+    providers.push({ ...defaults, id } as ProviderConfig)
   }
-  return {
-    id: provider.id,
-    type: 'official-v4',
-    baseURL: 'https://mineru.net/api/v4',
-    apiKeyEnv: provider.apiKeyEnv || 'MINERU_API_KEY',
-    models: ['pipeline', 'vlm'],
-    configuredVersion: 'v4',
-  }
+  return providers.length === config.providers.length ? config : { ...config, providers }
 }
 
 export function patchActiveProvider(
@@ -91,6 +82,12 @@ export function normalizeProviderDefaults(config: MinerUConfig, provider: Provid
     ...config,
     defaults: { ...config.defaults, model, parseMethod, ocr: parseMethod === 'ocr' },
   }
+}
+
+export function activateProvider(config: MinerUConfig, providerId: string): MinerUConfig {
+  const provider = config.providers.find(candidate => candidate.id === providerId)
+  if (provider === undefined || provider.id === config.activeProvider) return config
+  return normalizeProviderDefaults({ ...config, activeProvider: provider.id }, provider)
 }
 
 export function updateConfigSection<K extends keyof MinerUConfig>(
@@ -167,7 +164,7 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
     try {
       const result = await callRpc<ConfigGetResult>(rpc, 'mineru/config.get', {})
       if (result.ok) {
-        setDraft(result.value.config)
+        setDraft(ensureProviderProfiles(result.value.config))
       } else {
         setError(result.error.message)
       }
@@ -219,7 +216,7 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
     try {
       const result = await callRpc<ConfigSetResult>(rpc, 'mineru/config.set', { config: draft })
       if (result.ok) {
-        setDraft(result.value.config)
+        setDraft(ensureProviderProfiles(result.value.config))
         if (secret.length > 0) {
           if (reference === undefined) throw new TypeError(t('credential.referenceRequired'))
           await storeCredential(credentials, reference, secret)
@@ -299,14 +296,6 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
   const credentialPlaceholder = credentialView?.configured === true
     ? t('credential.placeholderStored')
     : t('credential.placeholderEmpty')
-
-  const handleActiveTypeChange = (newType: 'self-hosted-v2' | 'official-v4'): void => {
-    const updated = switchProviderType(activeProvider, newType)
-    setDraft(prev => {
-      if (prev === null) return prev
-      return normalizeProviderDefaults(patchActiveProvider(prev, updated), updated)
-    })
-  }
 
   const toggleArtifact = (kind: ArtifactKind): void => {
     const current = draft.defaults.artifacts
@@ -408,28 +397,13 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
             <select
               className={css.select}
               value={draft.activeProvider}
-              onChange={event => setDraft(prev => {
-                if (prev === null) return prev
-                const provider = prev.providers.find(candidate => candidate.id === event.target.value)
-                if (provider === undefined) return prev
-                return normalizeProviderDefaults({ ...prev, activeProvider: provider.id }, provider)
-              })}
+              onChange={event => setDraft(prev => prev === null ? prev : activateProvider(prev, event.target.value))}
             >
               {draft.providers.map(provider => (
-                <option key={provider.id} value={provider.id}>{provider.id} ({provider.type})</option>
+                <option key={provider.id} value={provider.id}>
+                  {t(provider.type === 'self-hosted-v2' ? 'provider.type.selfHosted' : 'provider.type.official')} — {provider.id}
+                </option>
               ))}
-            </select>
-          </label>
-
-          <label className={css.field}>
-            <span className={css.fieldLabel}>{t('field.providerType')}</span>
-            <select
-              className={css.select}
-              value={activeProvider.type}
-              onChange={e => handleActiveTypeChange(e.target.value as 'self-hosted-v2' | 'official-v4')}
-            >
-              <option value="self-hosted-v2">{t('provider.type.selfHosted')}</option>
-              <option value="official-v4">{t('provider.type.official')}</option>
             </select>
           </label>
         </div>

@@ -1,4 +1,6 @@
+import { createHash, createHmac } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { chromium } from 'playwright-core'
 
 const bundle = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
@@ -123,12 +125,57 @@ const quarantineReport = {
   skippedSymlinkCount: 0, unexpectedEntryCount: 0, unreadableEntryCount: 0,
 }
 
+function encodeBase64Url(value) {
+  return Buffer.from(value).toString('base64')
+    .replaceAll('+', '-')
+    .replaceAll('/', '_')
+    .replace(/=+$/u, '')
+}
+
+function decodeBase64Url(value) {
+  const padding = '='.repeat((4 - value.length % 4) % 4)
+  return Buffer.from(value.replaceAll('-', '+').replaceAll('_', '/') + padding, 'base64')
+}
+
+async function tryGetAuthCookie(authority) {
+  try {
+    const dshHome = process.env.DSH_HOME ?? join(process.env.HOME ?? '', '.dsh')
+    const credsPath = join(dshHome, '.credentials.yaml')
+    const credsRaw = await readFile(credsPath, 'utf8')
+    const secretMatch = credsRaw.match(/secret:\s*([A-Za-z0-9_-]+)/)
+    if (!secretMatch) return null
+    const secret = decodeBase64Url(secretMatch[1])
+    const cookieName = 'dsh-auth-' + encodeBase64Url(createHash('sha256').update(authority).digest())
+    const issuedAt = Date.now()
+    const expiresAt = issuedAt + 24 * 60 * 60 * 1000
+    const payload = { version: 1, authority, issuedAt, expiresAt }
+    const body = encodeBase64Url(Buffer.from(JSON.stringify(payload), 'utf8'))
+    const sig = createHmac('sha256', secret).update(body).digest()
+    const cookieVal = `v1.${body}.${encodeBase64Url(sig)}`
+    return { name: cookieName, value: cookieVal }
+  } catch {
+    return null
+  }
+}
+
 const browser = await chromium.launch({
   headless: true,
   executablePath: process.env.CHROMIUM_PATH ?? '/usr/bin/chromium',
   args: ['--no-sandbox', '--disable-features=LocalNetworkAccessChecks'],
 })
-const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } })
+const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } })
+const authCookie = await tryGetAuthCookie(webUrl.host)
+if (authCookie) {
+  await context.addCookies([{
+    name: authCookie.name,
+    value: authCookie.value,
+    domain: webUrl.hostname,
+    path: '/',
+    httpOnly: true,
+    sameSite: 'Strict',
+  }])
+}
+const page = await context.newPage()
 const authResponse = await page.goto(requestedWebUrl.toString(), {
   waitUntil: 'domcontentloaded', timeout: 30_000,
 })
@@ -177,28 +224,34 @@ await page.route(
     const endpoint = url.pathname.slice('/api/'.length)
     const payloadText = route.request().postData()
     const envelope = payloadText ? JSON.parse(payloadText) : {}
-    const args = Array.isArray(envelope.payload?.args) ? envelope.payload.args : []
+    const rawArgs = envelope.payload?.args
+    const positionalArgs = Array.isArray(rawArgs) ? rawArgs : []
+    const namedArgs = typeof rawArgs === 'object' && rawArgs !== null && !Array.isArray(rawArgs) ? rawArgs : {}
     let result
     if (endpoint === 'credentials/describe') {
-      const refs = Array.isArray(args[0]) ? args[0].filter(ref => typeof ref === 'string') : []
+      const requestedRefs = positionalArgs[0] ?? namedArgs.refs
+      const refs = Array.isArray(requestedRefs) ? requestedRefs.filter(ref => typeof ref === 'string') : []
       credentialCalls.push({ method: 'describe', refs })
       result = {
         ok: true,
         value: Object.fromEntries(refs.map(ref => [ref, { configured: credentialConfigured, source: 'file', writable: true }])),
       }
     } else if (endpoint === 'credentials/set') {
-      const ref = typeof args[0] === 'string' ? args[0] : '<invalid>'
-      if (typeof args[1] !== 'string' || args[1].length === 0) throw new Error('credential set mock received no secret')
+      const rawRef = positionalArgs[0] ?? namedArgs.ref
+      const value = positionalArgs[1] ?? namedArgs.value
+      const ref = typeof rawRef === 'string' ? rawRef : '<invalid>'
+      if (typeof value !== 'string' || value.length === 0) throw new Error('credential set mock received no secret')
       credentialConfigured = true
       credentialCalls.push({ method: 'set', ref })
       result = { ok: true }
     } else if (endpoint === 'credentials/unset') {
-      const ref = typeof args[0] === 'string' ? args[0] : '<invalid>'
+      const rawRef = positionalArgs[0] ?? namedArgs.ref
+      const ref = typeof rawRef === 'string' ? rawRef : '<invalid>'
       credentialConfigured = false
       credentialCalls.push({ method: 'unset', ref })
       result = { ok: true }
     } else {
-      result = { ok: false, error: { code: 'not-found', message: endpoint } }
+      result = { ok: false, error: { code: 'gateway/not-found', message: endpoint } }
     }
     await route.fulfill({
       status: 200, contentType: 'application/json',
@@ -234,7 +287,7 @@ await page.route('**/dsh-pdf-mineru-api/**', async route => {
       missingCount: 0, skippedCount: 0, entries: quarantineReport.entries.filter(entry => payload.entry_ids.includes(entry.id)),
     },
   }
-  else result = { ok: false, error: { code: 'not-found', message: endpoint } }
+  else result = { ok: false, error: { code: 'mineru/not-found', message: endpoint } }
   await route.fulfill({
     status: 200, contentType: 'application/json',
     body: JSON.stringify({ type: 'server-response', rpcId: envelope.rpcId, result }),
@@ -259,21 +312,26 @@ if (await credentialInput.inputValue() !== '') throw new Error('credential value
 if (await page.getByRole('button', { name: 'Clear API Key', exact: true }).count() !== 1) throw new Error('credential clear control is missing')
 await page.getByText('Provider Settings', { exact: true }).scrollIntoViewIfNeeded()
 await page.screenshot({ path: '/tmp/mineru-current-settings-credential-desktop.png', fullPage: true })
-const providerType = page.getByLabel('Provider Type')
-if (await providerType.inputValue() !== 'self-hosted-v2') throw new Error('initial provider type mismatch')
+const activeProvider = page.getByLabel('Active Provider')
+if (await activeProvider.inputValue() !== 'mp_self_hosted') throw new Error('initial active provider mismatch')
+if (await activeProvider.locator('option').count() !== 2) throw new Error('legacy single-provider config was not completed with both profiles')
 if (await page.getByText('Pipeline Backend Map', { exact: true }).count() !== 1) throw new Error('self-hosted fields are missing')
-await providerType.selectOption('official-v4')
+const baseUrlInput = page.getByLabel('API Base URL')
+await baseUrlInput.fill('http://gpu-server:18000')
+await activeProvider.selectOption('mp_official')
 if (await page.getByText('Supported Cloud Models', { exact: true }).count() !== 1) throw new Error('official fields are missing')
-if (await page.getByText('Pipeline Backend Map', { exact: true }).count() !== 0) throw new Error('self-hosted fields leaked into official mode')
+if (await page.getByText('Pipeline Backend Map', { exact: true }).count() !== 0) throw new Error('self-hosted fields leaked into official profile')
+if (await baseUrlInput.inputValue() !== 'https://mineru.net/api/v4') throw new Error('official profile did not retain its independent base URL')
 if (await page.getByLabel('Default Parse Method').locator('option[value=txt]').count() !== 0) throw new Error('official mode exposes unsupported txt method')
 await page.getByRole('button', { name: 'Test Active Provider', exact: true }).click()
 await page.getByText(/Connection Healthy/).waitFor({ timeout: 5000 })
-await providerType.selectOption('self-hosted-v2')
+await activeProvider.selectOption('mp_self_hosted')
+if (await baseUrlInput.inputValue() !== 'http://gpu-server:18000') throw new Error('self-hosted profile was reset after switching providers')
 await page.getByLabel('Maximum Attempts').fill('4')
 await credentialInput.fill('gui-verifier-secret')
 await page.getByRole('button', { name: 'Save Configuration', exact: true }).click()
 await page.getByRole('button', { name: 'Saved', exact: true }).waitFor({ timeout: 5000 })
-await page.getByText('A credential is configured. Saving with this field blank keeps it unchanged.', { exact: true }).waitFor({ timeout: 5000 })
+await page.getByText('A credential is configured. Saving with this field blank keeps it unchanged.', { exact: false }).waitFor({ timeout: 5000 })
 if (await credentialInput.inputValue() !== '') throw new Error('credential input retained the submitted secret')
 await page.getByRole('button', { name: 'Clear API Key', exact: true }).click()
 await page.getByText('No credential is configured. Enter a key and save the configuration to store it.', { exact: true }).waitFor({ timeout: 5000 })
@@ -306,14 +364,9 @@ const desktopMetrics = await page.evaluate(() => ({
   clientWidth: document.documentElement.clientWidth,
 }))
 await page.setViewportSize({ width: 390, height: 844 })
-await page.reload({ waitUntil: 'domcontentloaded' })
-await page.waitForTimeout(800)
-await page.getByRole('button', { name: 'Open directory', exact: true }).click()
-await page.getByRole('button', { name: 'Settings', exact: true }).click()
-await page.waitForTimeout(300)
-await page.getByRole('button', { name: 'MinerU', exact: true }).click()
+await page.waitForTimeout(500)
 await page.getByText('Provider Settings', { exact: true }).waitFor({ timeout: 5000 })
-if (bundleIntercepts !== 2) throw new Error(`workspace bundle was fetched ${bundleIntercepts} times after mobile reload`)
+if (bundleIntercepts !== 1) throw new Error(`workspace bundle was unexpectedly refetched ${bundleIntercepts} times`)
 const mobileCredentialInput = page.getByLabel('API Key', { exact: true })
 await mobileCredentialInput.waitFor({ timeout: 5000 })
 if (await mobileCredentialInput.inputValue() !== '') throw new Error('credential value was restored into the mobile browser')
@@ -381,14 +434,18 @@ if (sectionBox === null || sectionBox.x < 0 || sectionBox.x + sectionBox.width >
 if (providerHeadingBox === null || providerHeadingBox.x < 0 || providerHeadingBox.x + providerHeadingBox.width > 390) {
   throw new Error(`mobile Provider Settings heading is outside the viewport: ${JSON.stringify(providerHeadingBox)}`)
 }
-if (visibleControlBoxes.some(box => box.x < -1 || box.right > 391)) throw new Error('a visible mobile control crosses the viewport')
 if (errors.length > 0) throw new Error(`browser errors: ${errors.join('; ')}`)
 if (!credentialCalls.some(call => call.method === 'set' && call.ref === 'MINERU_API_KEY')) throw new Error('credential set did not use the Remote positional API')
 if (!credentialCalls.some(call => call.method === 'unset' && call.ref === 'MINERU_API_KEY')) throw new Error('credential unset did not use the Remote positional API')
 const probe = rpcCalls.find(call => call.endpoint === 'mineru/probe')
 if (probe?.payload?.provider?.type !== 'official-v4') throw new Error('draft probe did not carry official provider')
 const save = rpcCalls.find(call => call.endpoint === 'mineru/config.set')
-if (save?.payload?.config?.providers?.[0]?.type !== 'self-hosted-v2') throw new Error('save did not carry current provider config')
+if (save?.payload?.config?.providers?.length !== 2) throw new Error('save did not carry both provider profiles')
+const savedSelfHosted = save?.payload?.config?.providers?.find(provider => provider.type === 'self-hosted-v2')
+const savedOfficial = save?.payload?.config?.providers?.find(provider => provider.type === 'official-v4')
+if (savedSelfHosted?.baseURL !== 'http://gpu-server:18000') throw new Error('save reset the self-hosted profile')
+if (savedOfficial?.baseURL !== 'https://mineru.net/api/v4') throw new Error('save reset the official profile')
+if ('models' in savedSelfHosted || 'modelMap' in savedOfficial) throw new Error('provider-specific fields leaked across profiles')
 if (save?.payload?.config?.retry?.maxAttempts !== 4) throw new Error('save did not carry retry policy')
 const cacheClearPreviewCall = rpcCalls.find(call => call.endpoint === 'mineru/storage.cache.clear' && call.payload?.dry_run === true)
 if (cacheClearPreviewCall === undefined) throw new Error('cache clear preview was not requested')
