@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.0.6
+
+### Changed
+
+- New installations now provision independent self-hosted v2 and official v4 Provider profiles, while existing single-Provider settings drafts are completed without overwriting their configured values.
+- Expanded peer compatibility for the current DSH 0.1.2 alpha packages, Cordis 4.0.2, and Schemastery 3.18.2.
+
+### Fixed
+
+- Provider switching now changes only the active profile instead of destructively converting and resetting the current Provider configuration.
+- Provider settings schemas now use literal type discriminants, preventing fields from leaking between self-hosted and official Provider records.
+- Namespaced loopback RPC error codes and extended the existing-shell GUI verifier to cover lossless multi-Provider switching and current credential Remote payloads.
+
 ## 0.0.5
 
 ### Changed
