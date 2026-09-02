@@ -110,6 +110,7 @@ describe('MinerU settings card', () => {
     const register = vi.fn((..._args: unknown[]) => () => {})
     const ctx = {
       effect: (effect: () => unknown) => effect(),
+      inject: (_deps: string[], callback: (scope: unknown) => void) => callback(ctx),
       get: () => ({ rpc: props.rpc }),
       locale: { register: () => () => {}, bind: () => props.t },
       remote: { credentials: props.credentials },

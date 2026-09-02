@@ -72,12 +72,14 @@ window.__ModuleLoader__ = {load:({factory}) => {
  const jsxs = (type,{children,...props},key) => React.createElement(type, key===undefined ? props : {...props,key}, ...children);
  const modules = {'react':React,'react/jsx-runtime':{jsx,jsxs,Fragment:React.Fragment}};
  const plugin = factory(name => {if(!(name in modules)) throw Error('Unexpected module '+name);return modules[name]});
- plugin.apply({
+ const ctx = {
+  inject:(_deps,callback)=>callback(ctx),
   effect:effect=>effect(),get:name=>name==='connection'?{rpc}:undefined,
   locale:{register:(_ns,dicts)=>{dict=dicts[lang];return ()=>{}},bind:()=>key=>dict[key]},
   remote:{credentials},
   slots:{spec:()=>({}),inject:(_name,factory)=>factory(),register:(options,component)=>{registration={options,component};return ()=>{}}}
- });
+ };
+ plugin.apply(ctx);
  ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(registration.component,{...registration.options.inject(),t:key=>dict[key]}));
 }};
 </script><script src="/client.js"></script></html>`

@@ -52,6 +52,6 @@ The existing full suite includes POSIX-style path-string assertions and symlink
 fixtures requiring additional privileges on Windows. Linux CI runs the full
 suite; Windows CI runs the lock regression and composition-lifecycle suites.
 
-This fork change is limited to storage locking. It does not incorporate the
-separate local DSH RC2 `remote.credentials` client compatibility patch. Do not
-replace a patched RC2 installation with an unadapted client bundle.
+The fork also includes the RC2 credential compatibility adapter and the
+collapsible settings card. See [credential compatibility](credential-compatibility.md)
+for the supported client API paths and validation.

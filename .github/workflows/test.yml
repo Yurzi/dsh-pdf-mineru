@@ -25,8 +25,8 @@ jobs:
           require-lockfile: true
           cache: true
       - run: pnpm run typecheck
-      - name: Settings card regression
-        run: pnpm exec vitest run tests/client-settings-card.spec.ts
+      - name: Settings and credential compatibility
+        run: pnpm exec vitest run tests/client-settings-card.spec.ts tests/client-credentials.spec.ts
       - name: Windows crash recovery and lifecycle
         if: runner.os == 'Windows'
         run: pnpm exec vitest run tests/process-lock-windows.spec.ts tests/index.spec.ts tests/storage.spec.ts -t 'ProcessLock|plugin composition lifecycle'
