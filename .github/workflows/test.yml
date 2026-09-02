@@ -1,0 +1,35 @@
+name: Storage lock regression
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/setup@v2
+        with:
+          runtime: node@24
+          require-lockfile: true
+          cache: true
+      - run: pnpm run typecheck
+      - name: Windows crash recovery and lifecycle
+        if: runner.os == 'Windows'
+        run: pnpm exec vitest run tests/process-lock-windows.spec.ts tests/index.spec.ts tests/storage.spec.ts -t 'ProcessLock|plugin composition lifecycle'
+      - name: Linux full suite
+        if: runner.os == 'Linux'
+        run: pnpm test
+      - name: Build package
+        run: pnpm run build

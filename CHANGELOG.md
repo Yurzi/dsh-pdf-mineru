@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased (s1lencewill fork)
+
+### Fixed
+
+- Windows can recover a `.process.lock` left by a terminated same-host process. A canonical-root named pipe serializes recovery and acquisition, and complete metadata is atomically published without overwriting a competing owner's file lock.
+- Legacy live owners, reused live PIDs, foreign-host records, malformed metadata, and uncertain process probes remain fail-closed. Recovery never scans or deletes parsed results or staging data.
+- Release removes owned metadata before relinquishing IPC authority, avoiding a hand-off race with the next owner.
+
+### Tests
+
+- Added real Windows child-process crash/restart and concurrent recovery tests, plus legacy-owner, cancellation, metadata-replacement, and path-alias coverage.
+- Kept Linux abstract-socket-only tests platform-specific and added Windows/Linux CI checks.
+
 ## 0.0.6
 
 ### Changed
