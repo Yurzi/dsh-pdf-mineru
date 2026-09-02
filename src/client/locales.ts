@@ -2,6 +2,7 @@ export type MineruKey =
   | 'nav'
   | 'page.title'
   | 'page.intro'
+  | 'card.description'
   | 'section.provider'
   | 'section.defaults'
   | 'section.storage'
@@ -121,6 +122,7 @@ export const NS = 'dsh-pdf-mineru'
 export const en: Record<MineruKey, string> = {
   'nav': 'MinerU',
   'page.title': 'MinerU Configuration',
+  'card.description': 'Configure parsing providers, credentials, and cache settings.',
   'page.intro': 'Configure MinerU document parsing providers, global content-addressed caching, and execution limits.',
   'section.provider': 'Provider Settings',
   'section.defaults': 'Parsing Defaults',
@@ -249,6 +251,7 @@ export const en: Record<MineruKey, string> = {
 export const zh: Record<MineruKey, string> = {
   'nav': 'MinerU',
   'page.title': 'MinerU 配置',
+  'card.description': '配置解析服务、凭据与缓存设置。',
   'page.intro': '配置 MinerU 文档解析 Provider、全局内容寻址缓存及执行资源上限。',
   'section.provider': 'Provider 适配与鉴权',
   'section.defaults': '统一解析默认值',

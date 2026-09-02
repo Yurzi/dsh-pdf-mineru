@@ -4,12 +4,15 @@
 
 ### Fixed
 
+- MinerU settings now appear as a default-collapsed plugin card, matching the marketplace style. Native keyboard-accessible disclosure keeps unsaved form edits mounted when collapsed; the legacy standalone settings page remains expanded.
+- Settings fields stack on narrow screens instead of overflowing the expanded card horizontally.
 - Windows can recover a `.process.lock` left by a terminated same-host process. A canonical-root named pipe serializes recovery and acquisition, and complete metadata is atomically published without overwriting a competing owner's file lock.
 - Legacy live owners, reused live PIDs, foreign-host records, malformed metadata, and uncertain process probes remain fail-closed. Recovery never scans or deletes parsed results or staging data.
 - Release removes owned metadata before relinquishing IPC authority, avoiding a hand-off race with the next owner.
 
 ### Tests
 
+- Added settings-card tests for initial state, locale labels, draft preservation, saving, and legacy slot fallback, plus an isolated fixture preview (`node scripts/preview-settings.mjs`, optional `?lang=en&theme=dark`).
 - Added real Windows child-process crash/restart and concurrent recovery tests, plus legacy-owner, cancellation, metadata-replacement, and path-alias coverage.
 - Kept Linux abstract-socket-only tests platform-specific and added Windows/Linux CI checks.
 

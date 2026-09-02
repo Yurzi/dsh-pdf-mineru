@@ -27,7 +27,10 @@ export interface CredentialClient {
   unset(ref: string): Promise<RpcResult<void>>
 }
 
-type SettingsPageProps = PropsRuntime<'settings.section'> & PropsLocale<'dsh-pdf-mineru'> & MineruSettingsInjected
+export type SettingsPageProps = PropsRuntime & PropsLocale<'dsh-pdf-mineru'> & MineruSettingsInjected & {
+  /** The parent plugin card already supplies the page title. */
+  readonly embedded?: boolean
+}
 
 type ConfigGetResult = RpcResult<{ readonly config: MinerUConfig }>
 type ConfigSetResult = RpcResult<{ readonly config: MinerUConfig }>
@@ -142,7 +145,7 @@ export async function clearCredential(credentials: CredentialClient, reference: 
   if (!result.ok) throw new Error(result.error.message)
 }
 
-export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
+export function SettingsPage({ rpc, credentials, t, embedded = false }: SettingsPageProps) {
   const [draft, setDraft] = useState<MinerUConfig | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -282,7 +285,7 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
   if (loading || draft === null) {
     return (
       <section className={css.section}>
-        <h2 className={css.title}>{t('page.title')}</h2>
+        {!embedded && <h2 className={css.title}>{t('page.title')}</h2>}
         <div className={css.loading}>…</div>
       </section>
     )
@@ -324,7 +327,7 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
 
   return (
     <section className={css.section}>
-      <h2 className={css.title}>{t('page.title')}</h2>
+      {!embedded && <h2 className={css.title}>{t('page.title')}</h2>}
       {error !== undefined && (
         <div className={css.error}>
           <span>{error}</span>

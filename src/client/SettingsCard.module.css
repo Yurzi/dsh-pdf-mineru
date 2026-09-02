@@ -1,0 +1,53 @@
+/* Match the host plugin-card tokens without depending on another plugin. */
+.card {
+  min-width: 0;
+  color: var(--dsw-alias-label-primary, #1f2328);
+  background: var(--dsw-alias-bg-layer-3, #fff);
+  border: 1px solid var(--dsw-alias-border-l2, #e5e7eb);
+  border-radius: 12px;
+}
+
+.card:hover { border-color: var(--dsw-alias-label-dimmed, #c8ccd4); }
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.header::-webkit-details-marker { display: none; }
+
+.header:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary, #4f6ef7);
+  outline-offset: -2px;
+}
+
+.heading {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.title { font-size: 14px; line-height: 20px; font-weight: 600; }
+
+.description {
+  color: var(--dsw-alias-label-tertiary, #8b93a1);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.chevron { flex: none; color: var(--dsw-alias-label-tertiary, #8b93a1); }
+.card[open] > .header .chevron { transform: rotate(180deg); }
+
+.body {
+  margin: 0 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--dsw-alias-border-l2, #e5e7eb);
+}

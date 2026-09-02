@@ -85,6 +85,7 @@
 }
 
 .field {
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -508,7 +509,7 @@
 
 @media (max-width: 520px) {
   .row {
-    flex-wrap: nowrap;
+    flex-direction: column;
   }
 
   .row > .field {

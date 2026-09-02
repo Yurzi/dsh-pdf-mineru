@@ -16,7 +16,10 @@ export interface CredentialClient {
     set(ref: string, value: string): Promise<RpcResult<void>>;
     unset(ref: string): Promise<RpcResult<void>>;
 }
-type SettingsPageProps = PropsRuntime<'settings.section'> & PropsLocale<'dsh-pdf-mineru'> & MineruSettingsInjected;
+export type SettingsPageProps = PropsRuntime & PropsLocale<'dsh-pdf-mineru'> & MineruSettingsInjected & {
+    /** The parent plugin card already supplies the page title. */
+    readonly embedded?: boolean;
+};
 export declare function ensureProviderProfiles(config: MinerUConfig): MinerUConfig;
 export declare function patchActiveProvider(config: MinerUConfig, patch: Partial<ProviderConfig>): MinerUConfig;
 export declare function normalizeProviderDefaults(config: MinerUConfig, provider: ProviderConfig): MinerUConfig;
@@ -26,5 +29,4 @@ export declare function credentialReference(provider: ProviderConfig | undefined
 export declare function describeCredential(credentials: CredentialClient, reference: string): Promise<CredentialView>;
 export declare function storeCredential(credentials: CredentialClient, reference: string, value: string): Promise<void>;
 export declare function clearCredential(credentials: CredentialClient, reference: string): Promise<void>;
-export declare function SettingsPage({ rpc, credentials, t }: SettingsPageProps): import("react").JSX.Element;
-export {};
+export declare function SettingsPage({ rpc, credentials, t, embedded }: SettingsPageProps): import("react").JSX.Element;

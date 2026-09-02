@@ -1,6 +1,7 @@
 import type { Context as CordisContext } from '@deepseek-ai/cordis'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client'
 import { SettingsPage, type CredentialClient, type MineruSettingsInjected } from './SettingsPage.js'
+import { SettingsCard } from './SettingsCard.js'
 import { en, NS, zh, type MineruKey } from './locales.js'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -48,7 +49,7 @@ export function apply(ctx: ClientContext): void {
       key: NS,
       locale: NS,
       inject: injected,
-    }, SettingsPage))
+    }, SettingsCard))
     return
   }
 
