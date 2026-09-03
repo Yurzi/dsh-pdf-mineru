@@ -135,8 +135,10 @@ declare module '@deepseek-ai/dsh-tools' {
     readonly output: {
       readonly schema: ValueSchemaSpec
       render(args: unknown, value: unknown): ContentBlock[]
+      presentationMeta?(args: unknown, value: unknown): JsonValue
     }
     readonly timeoutMs?: number
+    isConcurrencySafe?(args: unknown): boolean
     execute(args: unknown, exec: ToolRunContext): Promise<unknown>
   }
 

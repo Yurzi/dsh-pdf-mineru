@@ -153,6 +153,16 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
     }
   })
 
+  it('declares isConcurrencySafe on all tools for parallel tool dispatch', () => {
+    const { ctx, registeredTools } = createMockContext()
+    registerTools(ctx, () => ({} as MinerUService))
+
+    for (const tool of registeredTools) {
+      expect(typeof tool.isConcurrencySafe).toBe('function')
+      expect(tool.isConcurrencySafe?.({})).toBe(true)
+    }
+  })
+
   it('rejects execute on all 3 tools when agent session is missing', async () => {
     const { ctx, registeredTools } = createMockContext()
     registerTools(ctx, () => ({} as MinerUService))
@@ -212,6 +222,27 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
       expect(rendered[0]?.text).toContain('not-configured')
       expect(rendered[0]?.text).not.toContain('Server Version')
       expect(rendered[0]?.text).not.toContain('Queue:')
+    })
+
+    it('projects structured presentation metadata', () => {
+      const { ctx, registeredTools } = createMockContext()
+      registerTools(ctx, () => ({} as MinerUService))
+      const healthTool = registeredTools.find(t => t.name === 'mineru_health')!
+
+      const probeResult: ProbeView = {
+        available: true,
+        provider: 'official-v4',
+        authentication: 'valid',
+        protocol_version: 'v4',
+        server_version: '4.1.0',
+      }
+      expect(healthTool.output.presentationMeta?.({}, probeResult)).toEqual({
+        available: true,
+        provider: 'official-v4',
+        authentication: 'valid',
+        protocol_version: 'v4',
+        server_version: '4.1.0',
+      })
     })
   })
 
@@ -466,6 +497,17 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
       expect(outcome.output).toBe('[FILE_TOO_LARGE] Input exceeds limit')
     })
 
+    it('projects structured presentation metadata for submitted jobs', () => {
+      const { ctx, registeredTools } = createMockContext()
+      registerTools(ctx, () => ({} as MinerUService))
+      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+
+      expect(submitTool.output.presentationMeta?.({}, { job_id: 'mineru-1', state: 'running' })).toEqual({
+        job_id: 'mineru-1',
+        state: 'running',
+      })
+    })
+
     it('wraps background execution with storage access gate when provided', async () => {
       const { registry, specs } = createMockJobRegistry()
       const { ctx, registeredTools } = createMockContext(registry)
@@ -543,6 +585,40 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
       expect(rendered[0]?.text).toContain('Synchronous Direct Result')
       expect(rendered[0]?.text).toContain('/cache/sync/full.md')
       expect(rendered[0]?.text).toContain('Cache Hit: No')
+    })
+
+    it('projects structured presentation metadata for single result and batch result', () => {
+      const { ctx, registeredTools } = createMockContext()
+      registerTools(ctx, () => ({} as MinerUService))
+      const parseTool = registeredTools.find(t => t.name === 'mineru_parse_document')!
+
+      const singleResult: ResultView = {
+        state: 'completed',
+        source: 'cache',
+        cache_hit: true,
+        result_id: 'mr_test_1',
+        files: [{ file_id: 'mf_1', name: 'paper.pdf', artifacts: [{ kind: 'markdown', path: '/p/out.md', bytes: 50 }] }],
+        manifest_path: '/p/manifest.json',
+      }
+      expect(parseTool.output.presentationMeta?.({}, singleResult)).toEqual({
+        result_id: 'mr_test_1',
+        source: 'cache',
+        cache_hit: true,
+        manifest_path: '/p/manifest.json',
+        files: [{ file_id: 'mf_1', name: 'paper.pdf', artifacts: [{ kind: 'markdown', path: '/p/out.md', bytes: 50 }] }],
+      })
+
+      const batchResult: BatchParseDocumentView = {
+        kind: 'batch',
+        state: 'completed',
+        results: [singleResult],
+      }
+      expect(parseTool.output.presentationMeta?.({}, batchResult)).toEqual({
+        kind: 'batch',
+        state: 'completed',
+        results_count: 1,
+        manifests: ['/p/manifest.json'],
+      })
     })
 
     it('rejects invalid poll timeouts before invoking the service', async () => {

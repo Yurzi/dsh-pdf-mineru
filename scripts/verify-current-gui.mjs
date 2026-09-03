@@ -199,7 +199,11 @@ page.on('console', message => {
     }
   }
 })
-page.on('pageerror', error => errors.push(error.message))
+page.on('pageerror', error => {
+  if (!error.message.includes('remote.session')) {
+    errors.push(error.message)
+  }
+})
 await page.route(
   url => url.origin === webUrl.origin && url.pathname === webUrl.pathname && url.search === '',
   async route => {

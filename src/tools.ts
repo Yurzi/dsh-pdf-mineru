@@ -2,7 +2,7 @@
 import type { Context } from 'cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { JobOutcome, JobRegistry } from '@deepseek-ai/dsh-jobs'
-import type { ContentBlock, ObjectValueSchemaSpec, ParameterSchemaSpec, ToolRunContext, ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
+import type { ContentBlock, JsonValue, ObjectValueSchemaSpec, ParameterSchemaSpec, ToolRunContext, ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
 import { MinerUError, failure, toMinerUFailure } from './domain/errors.js'
 import type { ParseRequestInput } from './domain/request.js'
 import type { StorageAccessGate } from './storage/access-gate.js'
@@ -213,7 +213,18 @@ export function registerTools(ctx: Context, getService: () => MinerUService, acc
         additionalProperties: false,
       },
       render: (_args: unknown, value: unknown) => renderHealth(value as ProbeView),
+      presentationMeta: (_args: unknown, value: unknown) => {
+        const probe = value as ProbeView
+        return {
+          available: probe.available,
+          provider: probe.provider,
+          authentication: probe.authentication,
+          protocol_version: probe.protocol_version,
+          ...(probe.server_version !== undefined ? { server_version: probe.server_version } : {}),
+        }
+      },
     },
+    isConcurrencySafe: () => true,
     execute: async (_args: unknown, exec: ToolRunContext) => {
       requireAgent(exec)
       return await getService().probe(exec.signal)
@@ -234,7 +245,15 @@ export function registerTools(ctx: Context, getService: () => MinerUService, acc
         const output = value as { readonly job_id: string }
         return [{ type: 'text', text: 'Started native MinerU background job ' + output.job_id + '.' }]
       },
+      presentationMeta: (_args: unknown, value: unknown) => {
+        const output = value as { readonly job_id: string; readonly state: string }
+        return {
+          job_id: output.job_id,
+          state: output.state,
+        }
+      },
     },
+    isConcurrencySafe: () => true,
     execute: async (args: unknown, exec: ToolRunContext) => {
       const agent = requireAgent(exec)
       exec.signal.throwIfAborted()
@@ -279,7 +298,34 @@ export function registerTools(ctx: Context, getService: () => MinerUService, acc
         description: 'Maximum synchronous wait in milliseconds. A timeout leaves the shared producer running; retry the same request to rejoin it.',
       },
     },
-    output: { schema: parseOutputSchema, render: (_args: unknown, value: unknown) => renderParseDocument(value as ParseDocumentView) },
+    output: {
+      schema: parseOutputSchema,
+      render: (_args: unknown, value: unknown) => renderParseDocument(value as ParseDocumentView),
+      presentationMeta: (_args: unknown, value: unknown): JsonValue => {
+        const doc = value as ParseDocumentView
+        if ('kind' in doc && doc.kind === 'batch') {
+          return {
+            kind: 'batch',
+            state: doc.state,
+            results_count: doc.results.length,
+            manifests: doc.results.flatMap(r => r.state === 'completed' ? [r.manifest_path] : []),
+          }
+        }
+        const single = doc as ResultView
+        return {
+          result_id: single.result_id,
+          source: single.source,
+          cache_hit: single.cache_hit,
+          manifest_path: single.manifest_path,
+          files: single.files.map(f => ({
+            file_id: f.file_id,
+            name: f.name,
+            artifacts: f.artifacts.map(a => ({ kind: a.kind, path: a.path, bytes: a.bytes })),
+          })),
+        }
+      },
+    },
+    isConcurrencySafe: () => true,
     execute: async (args: unknown, exec: ToolRunContext) => {
       const agent = requireAgent(exec)
       const { input, pollTimeoutMs } = parseInput(args)

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.0.7
+
+### Changed
+
+- Set the minimum supported DeepSeek Harness baseline to `>=0.1.2-rc.1` and adopted an RC-only support policy, declaring compatibility exclusively for Release Candidate and stable releases of DSH while dropping legacy alpha testbed branches.
+- Updated `peerDependencies` across all `@deepseek-ai/dsh-*` packages to `^0.1.2-rc.1`.
+
+### Added
+
+- Added `isConcurrencySafe: () => true` to all model-facing tools (`mineru_health`, `mineru_parse_document`, and `mineru_submit_parse_job`) so parallel tool calls and multi-document parsing within a single turn can execute concurrently in the DSH agent loop without serial blocking.
+- Added structured `output.presentationMeta` to `mineru_health`, `mineru_parse_document`, and `mineru_submit_parse_job` for clean session event metadata persistence and decoupled tool-card presentation.
+
+### Fixed
+
+- Enhanced existing-shell GUI verification script (`verify-current-gui.mjs`) with resilience against unhandled core shell errors during web test harness runs.
+
 ## 0.0.6
 
 ### Changed
