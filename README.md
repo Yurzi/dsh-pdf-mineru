@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./docs/assets/deepseek-mineru-banner.png" width="100%" alt="DeepSeek 娘与 MinerU 文档解析插件横幅">
+<img src="./docs/assets/deepseek-mineru-banner.webp" width="100%" alt="DeepSeek 娘与 MinerU 文档解析插件横幅">
 
 # dsh-pdf-mineru
 
@@ -9,6 +9,7 @@
 支持 **MinerU 官方云 (v4)** 与 **私有化自建服务 (v2)**，为 AI Agent 提供高精度的文档版面分析、公式与表格提取、图文解析，原生支持后台异步任务与智能缓存。
 
 <p>
+  <a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin"></a>
   <a href="https://www.npmjs.com/package/dsh-pdf-mineru"><img src="https://img.shields.io/npm/v/dsh-pdf-mineru?style=flat-square&amp;label=npm&amp;color=CB3837" alt="npm version"></a>
   <a href="./package.json"><img src="https://img.shields.io/badge/Node.js-%3E%3D22.19.0-339933?style=flat-square&amp;logo=nodedotjs&amp;logoColor=white" alt="Node.js 22.19.0 or newer"></a>
   <img src="https://img.shields.io/badge/DSH-%3E%3D0.1.2--rc.1%20(RC%20only)-111827?style=flat-square" alt="DSH >=0.1.2-rc.1 (RC only)">
@@ -56,7 +57,7 @@ dsh plugin --profile web add dsh-pdf-mineru
 打开 DSH 界面中的 **Settings → Plugins → MinerU**，根据您的使用场景选择 Provider：
 
 <p align="center">
-  <img src="./docs/assets/mineru-settings-preview.png" width="780" alt="dsh-pdf-mineru 在 DSH Settings 中的设置界面">
+  <img src="./docs/assets/mineru-settings-preview.webp" width="780" alt="dsh-pdf-mineru 在 DSH Settings 中的设置界面">
 </p>
 
 #### 方案 A：使用 MinerU 官方云（推荐，免部署）
@@ -299,4 +300,5 @@ MINERU_API_KEY=<token> pnpm run smoke:official-v4 -- /path/to/sample.pdf
 - 感谢 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 提供的卓越插件体系。
 - 感谢 [OpenDataLab MinerU](https://github.com/opendatalab/MinerU) 提供的文档解析能力。
 - 感谢 [Huanlin/dsh-plugin-mineru](https://github.com/HuanLinOTO/dsh-plugin-mineru) 带来的早期设计灵感。
+- 本插件已被 [Awesome DeepSeek Harness Plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) 社区精选列表收录（[收录详情页](https://awesome-dsh-plugin.com/p/Yurzi/dsh-pdf-mineru)）。
 - Banner 图像中的 DeepSeek 鲸鱼娘形象由上善无形原创角色与 ZipZipPipe 二创设计衍生，遵循 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh-hans) 许可。
