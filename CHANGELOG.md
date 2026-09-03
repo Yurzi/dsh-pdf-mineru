@@ -6,6 +6,7 @@
 
 - Set the minimum supported DeepSeek Harness baseline to `>=0.1.2-rc.1` and adopted an RC-only support policy, declaring compatibility exclusively for Release Candidate and stable releases of DSH while dropping legacy alpha testbed branches.
 - Updated `peerDependencies` across all `@deepseek-ai/dsh-*` packages to `^0.1.2-rc.1`.
+- Removed the misleading `settings.plugin.item` branch in the browser client and standardized on a dedicated top-level `settings.section` for comprehensive Provider configuration, credential management, and storage maintenance.
 
 ### Added
 

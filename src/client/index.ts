@@ -11,8 +11,7 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 
 type SlotOptions = {
   name: string
-  id?: string
-  key?: string
+  id: string
   order?: number
   label?: () => string
   locale?: string
@@ -27,7 +26,6 @@ type ClientContext = CordisContext & {
   readonly slots: {
     inject(slotName: string, factory: () => unknown): void
     register(options: SlotOptions, component: unknown): () => void
-    spec?(slotName: string): unknown
   }
   readonly remote: { readonly credentials: CredentialClient }
 }
@@ -41,16 +39,6 @@ export function apply(ctx: ClientContext): void {
   if (connection === undefined) throw new Error('dsh-pdf-mineru: connection service is unavailable')
   const t = ctx.locale.bind(NS)
   const injected = (): MineruSettingsInjected => ({ rpc: connection.rpc, credentials: ctx.remote.credentials })
-
-  if (ctx.slots.spec?.('settings.plugin.item') !== undefined) {
-    ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
-      name: 'settings.plugin.item',
-      key: NS,
-      locale: NS,
-      inject: injected,
-    }, SettingsPage))
-    return
-  }
 
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section',

@@ -8,8 +8,7 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 }
 type SlotOptions = {
     name: string;
-    id?: string;
-    key?: string;
+    id: string;
     order?: number;
     label?: () => string;
     locale?: string;
@@ -23,7 +22,6 @@ type ClientContext = CordisContext & {
     readonly slots: {
         inject(slotName: string, factory: () => unknown): void;
         register(options: SlotOptions, component: unknown): () => void;
-        spec?(slotName: string): unknown;
     };
     readonly remote: {
         readonly credentials: CredentialClient;
