@@ -11,7 +11,7 @@
 ### Changed
 
 - Set the minimum supported DeepSeek Harness baseline to `>=0.1.2-rc.1` and adopted an RC-only support policy, declaring compatibility exclusively for Release Candidate and stable releases of DSH while dropping legacy alpha testbed branches.
-- Updated `peerDependencies` across all `@deepseek-ai/dsh-*` packages to `^0.1.2-rc.1`.
+- Unified all `@deepseek-ai/dsh-*` devDependencies and peerDependencies to `^0.1.2-rc.1`, aligned Cordis packages (`@deepseek-ai/cordis@^4.0.2`, `cordis-plugin-include@^1.0.7`, `cordis-plugin-loader@^1.0.3`, `schemastery@^3.18.2`), and declared `engines.dsh: ">=0.1.2-rc.1"`.
 - Removed the misleading `settings.plugin.item` branch in the browser client and standardized on a dedicated top-level `settings.section` for comprehensive Provider configuration, credential management, and storage maintenance.
 
 ### Added
