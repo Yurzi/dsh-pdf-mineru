@@ -152,7 +152,7 @@ describe('ProcessLock', () => {
   })
 
 
-  it('reacquires after a socket-owning process is killed without cleanup', async () => {
+  it.runIf(process.platform === 'linux')('reacquires after a socket-owning process is killed without cleanup', async () => {
     const root = await createTempRoot()
     const paths = new StoragePaths(root)
     const rootHash = createHash('sha256').update(paths.root).digest('hex').slice(0, 32)
@@ -174,7 +174,7 @@ describe('ProcessLock', () => {
     await lock.release()
   })
 
-  it('replaces stale metadata only after acquiring OS lock authority', async () => {
+  it.runIf(process.platform === 'linux')('replaces stale metadata only after acquiring OS lock authority', async () => {
     const root = await createTempRoot()
     const paths = new StoragePaths(root)
     const staleValues = [

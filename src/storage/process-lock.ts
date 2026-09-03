@@ -2,14 +2,15 @@
  * process-lock.ts — Fail-closed single-process storageRoot lock.
  *
  * Prevents multiple concurrent DSH processes from mutating the same storageRoot.
- * Lock authority is a Linux abstract Unix socket, which the OS releases on
- * process death. The pathname file is ownership metadata only and can safely be
- * replaced after socket acquisition.
+ * Linux uses an abstract Unix socket. Windows uses a named pipe to serialize
+ * metadata acquisition/recovery; both IPC endpoints disappear on process death.
+ * Windows also honors the file lock used by older plugin versions: only a
+ * valid same-host record with a definitively dead PID may be reclaimed.
  */
 
 import { createHash, randomUUID } from 'node:crypto'
 import { createServer, type Server } from 'node:net'
-import { chmod, mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { chmod, link, lstat, mkdir, readFile, realpath, unlink, writeFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { throwMinerU } from '../domain/errors.js'
 import type { StoragePaths } from './paths.js'
@@ -38,7 +39,6 @@ function parseLockPayload(raw: string): ProcessLockPayload {
     hostname: record.hostname,
   }
 }
-
 
 export class ProcessLock {
   private readonly lockFilePath: string
@@ -72,7 +72,7 @@ export class ProcessLock {
       hostname: hostname(),
     }
 
-    if (process.platform !== 'linux') {
+    if (process.platform !== 'linux' && process.platform !== 'win32') {
       let createdMetadata = false
       try {
         await writeFile(this.lockFilePath, JSON.stringify(payload, null, 2), { flag: 'wx', mode: 0o600 })
@@ -88,14 +88,20 @@ export class ProcessLock {
         throw error
       }
     }
-    const server = createServer()
+
+    // Canonicalize Windows aliases/casing so one physical root has one gate.
+    // Keep the Linux endpoint unchanged for compatibility with running versions.
+    const socketName = process.platform === 'win32'
+      ? `\\\\.\\pipe\\dsh-pdf-mineru-${createHash('sha256').update((await realpath(this.paths.root)).toLowerCase()).digest('hex').slice(0, 32)}`
+      : this.socketName
+    const server = createServer(socket => socket.destroy())
     try {
       await new Promise<void>((resolve, reject) => {
         const onError = (error: Error): void => { server.removeListener('listening', onListening); reject(error) }
         const onListening = (): void => { server.removeListener('error', onError); resolve() }
         server.once('error', onError)
         server.once('listening', onListening)
-        server.listen(this.socketName)
+        server.listen(socketName)
       })
       signal?.throwIfAborted()
     } catch (error) {
@@ -108,15 +114,81 @@ export class ProcessLock {
     server.unref()
     this.server = server
     try {
-      await writeFile(this.lockFilePath, JSON.stringify(payload, null, 2), { flag: 'w', mode: 0o600 })
+      if (process.platform === 'win32') {
+        await this.acquireWindowsMetadata(payload, signal)
+      } else {
+        await writeFile(this.lockFilePath, JSON.stringify(payload, null, 2), { flag: 'w', mode: 0o600 })
+      }
       await chmod(this.lockFilePath, 0o600)
       signal?.throwIfAborted()
       this.acquired = true
     } catch (error) {
       this.server = undefined
-      await unlink(this.lockFilePath).catch(() => undefined)
+      // Never remove a legacy/live owner's metadata when acquisition failed.
+      await this.removeOwnedMetadata()
       await new Promise<void>(resolve => server.close(() => resolve()))
       throw error
+    }
+  }
+
+  private async acquireWindowsMetadata(payload: ProcessLockPayload, signal?: AbortSignal): Promise<void> {
+    const temporary = `${this.lockFilePath}.${this.ownerToken}.tmp`
+    // Publish a complete record atomically without overwriting an existing lock.
+    // A crash before publication leaves only a harmless, uniquely named temp file.
+    await writeFile(temporary, JSON.stringify(payload, null, 2), { flag: 'wx', mode: 0o600 })
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        signal?.throwIfAborted()
+        try {
+          await link(temporary, this.lockFilePath)
+          return
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+          if (attempt !== 0) throwMinerU('STORAGE_LOCKED', 'MinerU storage lock changed during recovery; retry startup')
+        }
+        await this.reclaimDeadWindowsMetadata()
+      }
+    } finally {
+      await unlink(temporary).catch(() => undefined)
+    }
+  }
+
+  private async reclaimDeadWindowsMetadata(): Promise<void> {
+    try {
+      const before = await lstat(this.lockFilePath)
+      if (!before.isFile() || before.isSymbolicLink()) throw new Error('not a regular lock file')
+      const raw = await readFile(this.lockFilePath, 'utf8')
+      const existing = parseLockPayload(raw)
+      if (existing.hostname.toLowerCase() !== hostname().toLowerCase()) throw new Error('foreign lock owner')
+      try {
+        process.kill(existing.pid, 0)
+        throw new Error('lock owner is alive')
+      } catch (error) {
+        // EPERM, PID reuse, and all ambiguous states must remain fail-closed.
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+      }
+      const after = await lstat(this.lockFilePath)
+      if (!after.isFile() || after.isSymbolicLink()
+        || before.dev !== after.dev || before.ino !== after.ino
+        || before.mtimeMs !== after.mtimeMs
+        || await readFile(this.lockFilePath, 'utf8') !== raw) throw new Error('lock changed')
+      // New versions are serialized by the pipe. A legacy contender can only
+      // win after this unlink, and the subsequent exclusive link will detect it.
+      await unlink(this.lockFilePath)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+      throwMinerU('STORAGE_LOCKED', 'MinerU storage lock is active or cannot be safely recovered; verify its owner before manual recovery')
+    }
+  }
+
+  private async removeOwnedMetadata(): Promise<void> {
+    try {
+      const existing = parseLockPayload(await readFile(this.lockFilePath, 'utf8'))
+      if (existing.ownerToken === this.ownerToken && existing.pid === process.pid) {
+        await unlink(this.lockFilePath)
+      }
+    } catch {
+      // Ignore if already unlinked or inaccessible; never remove unknown data.
     }
   }
 
@@ -125,18 +197,14 @@ export class ProcessLock {
     this.acquired = false
     const server = this.server
     this.server = undefined
-    if (server !== undefined) {
-      await new Promise<void>(resolve => server.close(() => resolve()))
-    }
-
+    // Remove metadata before relinquishing IPC authority. Otherwise a new owner
+    // could publish its record between our ownership check and unlink.
     try {
-      const raw = await readFile(this.lockFilePath, 'utf8')
-      const existing = parseLockPayload(raw)
-      if (existing.ownerToken === this.ownerToken && existing.pid === process.pid) {
-        await unlink(this.lockFilePath)
+      await this.removeOwnedMetadata()
+    } finally {
+      if (server !== undefined) {
+        await new Promise<void>(resolve => server.close(() => resolve()))
       }
-    } catch {
-      // Ignore if already unlinked or inaccessible
     }
   }
 }

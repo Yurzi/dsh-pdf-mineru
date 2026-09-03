@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Recover stale Windows `.process.lock` files safely after abnormal DSH exits using named pipe serialization and fail-closed PID liveness verification.
+
 ## 0.0.7
 
 ### Changed

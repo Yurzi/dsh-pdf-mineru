@@ -2,9 +2,10 @@
  * process-lock.ts — Fail-closed single-process storageRoot lock.
  *
  * Prevents multiple concurrent DSH processes from mutating the same storageRoot.
- * Lock authority is a Linux abstract Unix socket, which the OS releases on
- * process death. The pathname file is ownership metadata only and can safely be
- * replaced after socket acquisition.
+ * Linux uses an abstract Unix socket. Windows uses a named pipe to serialize
+ * metadata acquisition/recovery; both IPC endpoints disappear on process death.
+ * Windows also honors the file lock used by older plugin versions: only a
+ * valid same-host record with a definitively dead PID may be reclaimed.
  */
 import type { StoragePaths } from './paths.js';
 export interface ProcessLockPayload {
@@ -23,5 +24,8 @@ export declare class ProcessLock {
     constructor(paths: StoragePaths);
     isHeld(): boolean;
     acquire(signal?: AbortSignal): Promise<void>;
+    private acquireWindowsMetadata;
+    private reclaimDeadWindowsMetadata;
+    private removeOwnedMetadata;
     release(): Promise<void>;
 }
