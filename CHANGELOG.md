@@ -1,21 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.0.8
 
 ### Changed
 
-- Refactored model tool surface to decoupled, specialized tools: `read_pdf` (synchronous reading with page slicing via `pages`, content focus filtering via `focus`, and reading-order multimodal figure inlining) and `async_parse_pdf` (native background parsing with document structure summary).
+- Refactored model tool surface to decoupled, specialized single-document tools: `read_pdf` (synchronous reading with page slicing via `pages`, content focus filtering via `focus`, and reading-order multimodal figure inlining) and `async_parse_pdf` (native background parsing with document structure summary).
+- Enforced single `file_path` across tools, pipeline, Zod schema, and SettingsPage, removing multi-file parameters (`file_paths`) and `maxFilesPerRequest` limit while preserving underlying provider batch primitives.
 - Completely decoupled proprietary MinerU parameters (`model`, `ocr`, `formula`, `table`, `language`, `artifacts`, `max_inline_images`) from tool arguments; always request all artifacts from providers for permanent local caching.
-- Enhanced `pages` parsing to flexibly accept single numbers, number arrays, and range strings; added `focus` filtering based on cached `content_list.json` with graceful fallback to Markdown.
-- Strictly ordered inline images by natural document reading order, linked to page selection, and eliminated rigid image quotas.
-- Supported both `file_path` and `file_paths` with internal normalization.
-- Re-architected model output and tool descriptions to strict Plain Text English with zero emoji, eliminating hallucinated guidance references to deprecated fields (`is_truncated`).
-- Decoupled document presentation, outline (TOC) extraction, character budget allocation, and prose formatting from `MinerUService` into `src/service/result-presenter.ts`.
+- Replaced markdown preview fields with full `markdown_content` and authoritative `content_status` (`complete`, `partial`, `not_requested`), featuring fair character budget allocation, clean paragraph-boundary truncation, and resume line offsets for partial deliveries.
+- Enhanced `pages` parsing to flexibly accept single numbers, number arrays, and range strings (e.g. `"1-3, 5"`); added `focus` filtering based on cached `content_list.json` with graceful fallback to Markdown.
+- Strictly ordered inline images by natural document reading order, linked to page selection, bound markdown captions, and eliminated rigid image quotas.
+- Re-architected model output and tool descriptions to strict Plain Text English with zero emoji, eliminating hallucinated guidance references to deprecated fields.
+- Decoupled document presentation, outline (TOC) extraction, character budget allocation, and prose formatting from `MinerUService` into dedicated `src/service/result-presenter.ts`.
 - Consolidated shared HTTP request pipelines, timeout management, error body diagnostics, and retry policies into `src/providers/http-client.ts`, eliminating duplicate logic across official and self-hosted providers.
 - Upgraded `self-hosted-v2` multipart streaming to Node 22 native `FormData` and `openAsBlob`, removing third-party `form-data` package dependency.
 - Replaced hand-rolled streaming JSON parser in `safe-zip` with standard V8 `JSON.parse`, and standardized delay timers across all modules using `node:timers/promises`.
+- Adopted scoped locking (`withLock`) across mutating storage operations (`clearCache`, `commitTransaction`, `quarantine`) with contention backoff, eliminating startup lifetime lock holding to allow concurrent multi-process initialization.
 - Eliminated self-inflicted read-only (`0o400`/`0o500`) permission cycles in `result-repository`, streamlining cache cleanup and quarantine deletions.
 - Modernized single-process storage lock (`ProcessLock`) to use atomic file creation (`flag: 'wx'`) with cross-platform dead PID reclamation, retiring abstract Unix sockets and Windows named pipes.
+
+### Removed
+
+- Removed `mineru_health` from the model-facing tool surface, keeping it strictly as an internal loopback RPC probe for the Web GUI.
+- Removed obsolete batch coordination (`batch-coordinator.ts`, `batchViewSchema`) in favor of unified `ResultView`.
 
 ## 0.0.7
 
