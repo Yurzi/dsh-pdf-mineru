@@ -22,7 +22,6 @@ import type {
 import { ProviderRegistry } from '../src/providers/registry.js'
 import {
   MinerUService,
-  type BatchParseDocumentView,
   type ParseDocumentView,
   type ResultView,
   type ServiceSession,
@@ -215,11 +214,6 @@ function asResult(value: ParseDocumentView): ResultView {
   return value
 }
 
-function asBatch(value: ParseDocumentView): BatchParseDocumentView {
-  if (!('kind' in value)) throw new TypeError('Expected a batch result view')
-  return value
-}
-
 async function harness(): Promise<Harness> {
   const root = await mkdtemp(join(tmpdir(), 'mineru-service-'))
   const file = join(root, 'input.pdf')
@@ -236,7 +230,6 @@ async function harness(): Promise<Harness> {
     storage: { ...base.storage, storageRoot: join(root, 'store') },
     polling: { ...base.polling, pollIntervalMs: 2, pollTimeoutMs: 100, operationTimeoutMs: 5000 },
     output: { maxInlineChars: 2048 },
-    limits: { ...base.limits, maxFilesPerRequest: 10 },
   }
   const paths = new StoragePaths(config.storage.storageRoot)
   const results = new ResultRepository(paths, { maxArtifactBytes: config.limits.maxZipEntryBytes })
@@ -294,14 +287,14 @@ describe('MinerUService direct parsing', () => {
     h.provider.complete = true
 
     const first = asResult(await h.service.parseDocument(
-      session('session-cache'), { file_paths: [h.file] }, new AbortController().signal, null,
+      session('session-cache'), { file_path: h.file }, new AbortController().signal, null,
     ))
     expect(first).toMatchObject({ state: 'completed', source: 'provider', cache_hit: false })
     expect('job_id' in first).toBe(false)
     expect(h.provider.submitCount).toBe(1)
 
     const second = asResult(await h.service.parseDocument(
-      session('session-cache'), { file_paths: [h.file] }, new AbortController().signal, null,
+      session('session-cache'), { file_path: h.file }, new AbortController().signal, null,
     ))
     expect(second).toMatchObject({
       state: 'completed',
@@ -374,7 +367,7 @@ describe('MinerUService direct parsing', () => {
 
     try {
       await expect(h.service.parseDocument(
-        session('session-reserve-failure'), { file_paths: [h.file] }, new AbortController().signal, null,
+        session('session-reserve-failure'), { file_path: h.file }, new AbortController().signal, null,
       )).rejects.toThrow('second cache read failed')
       expect(h.operations.activeOperationCount()).toBe(0)
     } finally {
@@ -383,35 +376,10 @@ describe('MinerUService direct parsing', () => {
 
     h.provider.complete = true
     const retried = asResult(await h.service.parseDocument(
-      session('session-reserve-retry'), { file_paths: [h.file] }, new AbortController().signal, null,
+      session('session-reserve-retry'), { file_path: h.file }, new AbortController().signal, null,
     ))
     expect(retried.state).toBe('completed')
     expect(h.provider.submitCount).toBe(1)
-  })
-
-  it('releases earlier reservations when a later initial cache read fails', async () => {
-    const h = await harness()
-    const original = h.results.get.bind(h.results)
-    let reads = 0
-    const get = vi.spyOn(h.results, 'get').mockImplementation(async (cacheKey, artifacts, signal) => {
-      reads++
-      if (reads === 2) throw new Error('later initial cache read failed')
-      return await original(cacheKey, artifacts, signal)
-    })
-
-    await expect(h.service.parseDocument(
-      session('session-initial-failure'),
-      { file_paths: [h.file, h.fileTwo] },
-      new AbortController().signal,
-      null,
-    )).rejects.toThrow('later initial cache read failed')
-    expect(h.operations.activeOperationCount()).toBe(0)
-    get.mockRestore()
-
-    h.provider.complete = true
-    await expect(h.service.parseDocument(
-      session('session-initial-retry'), { file_paths: [h.file] }, new AbortController().signal, null,
-    )).resolves.toMatchObject({ state: 'completed' })
   })
 
   it('coalesces concurrent parses to one upstream producer', async () => {
@@ -420,11 +388,11 @@ describe('MinerUService direct parsing', () => {
     h.provider.submitGate = new Promise(resolve => { release = resolve })
 
     const firstPromise = h.service.parseDocument(
-      session('session-one'), { file_paths: [h.file] }, new AbortController().signal, null,
+      session('session-one'), { file_path: h.file }, new AbortController().signal, null,
     )
     await waitFor(() => h.provider.submitCount === 1, 'first producer did not start')
     const secondPromise = h.service.parseDocument(
-      session('session-two'), { file_paths: [h.file] }, new AbortController().signal, null,
+      session('session-two'), { file_path: h.file }, new AbortController().signal, null,
     )
     await new Promise(resolve => setTimeout(resolve, 5))
     expect(h.provider.submitCount).toBe(1)
@@ -447,12 +415,12 @@ describe('MinerUService direct parsing', () => {
     h.provider.submitGate = new Promise(resolve => { release = resolve })
 
     const kept = h.service.parseDocument(
-      session('session-keep'), { file_paths: [h.file] }, new AbortController().signal, null,
+      session('session-keep'), { file_path: h.file }, new AbortController().signal, null,
     )
     await waitFor(() => h.provider.submitCount === 1, 'shared producer did not start')
     const controller = new AbortController()
     const cancelled = h.service.parseDocument(
-      session('session-cancelled'), { file_paths: [h.file] }, controller.signal, null,
+      session('session-cancelled'), { file_path: h.file }, controller.signal, null,
     )
     await new Promise(resolve => setTimeout(resolve, 5))
     controller.abort(new DOMException('Caller stopped waiting', 'AbortError'))
@@ -470,12 +438,12 @@ describe('MinerUService direct parsing', () => {
     h.provider.submitGate = new Promise(resolve => { release = resolve })
 
     await expect(h.service.parseDocument(
-      session('session-timeout'), { file_paths: [h.file] }, new AbortController().signal, 10,
+      session('session-timeout'), { file_path: h.file }, new AbortController().signal, 10,
     )).rejects.toMatchObject({ failure: { code: 'POLL_TIMEOUT' } })
     expect(h.provider.submitCount).toBe(1)
 
     const rejoined = h.service.parseDocument(
-      session('session-rejoin'), { file_paths: [h.file] }, new AbortController().signal, null,
+      session('session-rejoin'), { file_path: h.file }, new AbortController().signal, null,
     )
     await new Promise(resolve => setTimeout(resolve, 5))
     h.provider.complete = true
@@ -485,65 +453,7 @@ describe('MinerUService direct parsing', () => {
     expect(h.provider.submitCount).toBe(1)
   })
 
-  it('returns a batch of independent direct results for cache misses', async () => {
-    const h = await harness()
-    h.provider.completeAfterInspect = 1
 
-    const parsed = asBatch(await h.service.parseDocument(
-      session('session-batch-misses'), { file_paths: [h.file, h.fileTwo] }, new AbortController().signal, null,
-    ))
-    expect(parsed).toMatchObject({ kind: 'batch', state: 'completed' })
-    expect(parsed.results).toHaveLength(2)
-    expect(parsed.results.every(result => result.state === 'completed')).toBe(true)
-    expect(h.provider.submitCount).toBe(1)
-    expect(h.provider.submittedRequests[0]?.files.map(file => file.name)).toEqual(['input.pdf', 'input-two.pdf'])
-    expect(h.provider.inspectCount).toBe(1)
-    expect(h.provider.collectCount).toBe(1)
-    expect('job_id' in parsed).toBe(false)
-    for (const result of parsed.results) {
-      expect('job_id' in result).toBe(false)
-      if (result.state === 'completed') {
-        expect(result.files).toHaveLength(1)
-        expect(result.manifest_path).toEqual(expect.any(String))
-      }
-    }
-  })
-
-  it('does not upload cached sources when another batch source misses', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    await h.service.parseDocument(
-      session('session-mixed-cache'), { file_paths: [h.file] }, new AbortController().signal, null,
-    )
-    const submissionsBefore = h.provider.submitCount
-
-    const parsed = asBatch(await h.service.parseDocument(
-      session('session-mixed-cache'), { file_paths: [h.file, h.fileTwo] }, new AbortController().signal, null,
-    ))
-    expect(h.provider.submitCount).toBe(submissionsBefore + 1)
-    expect(h.provider.submittedRequests.at(-1)?.files.map(file => file.name)).toEqual(['input-two.pdf'])
-    const cached = parsed.results.find(result => result.state === 'completed' && result.files[0]?.name === 'input.pdf')
-    const uploaded = parsed.results.find(result => result.state === 'completed' && result.files[0]?.name === 'input-two.pdf')
-    expect(cached).toMatchObject({ state: 'completed', source: 'cache', cache_hit: true })
-    expect(uploaded).toMatchObject({ state: 'completed', source: 'provider', cache_hit: false })
-  })
-
-  it('keeps batch partial successes and failures isolated per source', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    h.provider.failedNames.add('input-two.pdf')
-
-    const parsed = asBatch(await h.service.parseDocument(
-      session('session-batch-partial'), { file_paths: [h.file, h.fileTwo] }, new AbortController().signal, null,
-    ))
-    expect(parsed).toMatchObject({ kind: 'batch', state: 'partially-completed' })
-    const success = parsed.results.find(result => result.state === 'completed' && result.files[0]?.name === 'input.pdf')
-    const failed = parsed.results.find(result => result.state === 'failed' && result.name === 'input-two.pdf')
-    expect(success).toMatchObject({ state: 'completed', result_id: expect.any(String), manifest_path: expect.any(String) })
-    expect(failed).toMatchObject({ state: 'failed', failure: { code: 'REMOTE_PARSE_FAILED' } })
-    expect(h.provider.collectCount).toBe(1)
-    expect('job_id' in parsed).toBe(false)
-  })
 
   it('bounds canonical result JSON and preview metadata together', async () => {
     const h = await harness()
@@ -551,7 +461,7 @@ describe('MinerUService direct parsing', () => {
     h.provider.complete = true
 
     const parsed = asResult(await h.service.parseDocument(
-      session('session-limit'), { file_paths: [h.file] }, new AbortController().signal, null,
+      session('session-limit'), { file_path: h.file }, new AbortController().signal, null,
     ))
     expect(parsed.state).toBe('completed')
     expect(JSON.stringify(parsed).length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
@@ -566,7 +476,7 @@ describe('MinerUService direct parsing', () => {
     h.provider.complete = true
 
     const parsed = asResult(await h.service.parseDocument(
-      session('session-direct-content'), { file_paths: [h.file] }, new AbortController().signal, null,
+      session('session-direct-content'), { file_path: h.file }, new AbortController().signal, null,
     ))
     expect(parsed.state).toBe('completed')
     expect(parsed.content_status).toBe('complete')
@@ -581,7 +491,7 @@ describe('MinerUService direct parsing', () => {
     h.provider.complete = true
 
     const parsed = asResult(await h.service.parseDocument(
-      session('session-empty-md'), { file_paths: [h.file] }, new AbortController().signal, null,
+      session('session-empty-md'), { file_path: h.file }, new AbortController().signal, null,
     ))
     expect(parsed.state).toBe('completed')
     expect(parsed.content_status).toBe('complete')
@@ -596,7 +506,7 @@ describe('MinerUService direct parsing', () => {
 
     const parsed = asResult(await h.service.parseDocument(
       session('session-no-md'),
-      { file_paths: [h.file], artifacts: ['layout'] },
+      { file_path: h.file, artifacts: ['layout'] },
       new AbortController().signal,
       null,
     ))
@@ -618,7 +528,7 @@ describe('MinerUService direct parsing', () => {
 
     await expect(h.service.parseDocument(
       session('session-missing-md'),
-      { file_paths: [h.file], artifacts: ['markdown'] },
+      { file_path: h.file, artifacts: ['markdown'] },
       new AbortController().signal,
       null,
     )).rejects.toMatchObject({ failure: { code: 'PROVIDER_UNAVAILABLE' } })
@@ -760,77 +670,7 @@ describe('MinerUService direct parsing', () => {
     })
   })
 
-  it('applies fair share reclamation in multi-file batch so short file is complete and long file gets remainder', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    const shortText = '# Short Document\nThis is a short paragraph.\n'
-    const longText = Array.from({ length: 100 }, (_, i) => `Line ${i + 1}: ${'Lorem ipsum '.repeat(5)}`).join('\n')
-    h.provider.markdownByFileName.set('input.pdf', shortText)
-    h.provider.markdownByFileName.set('input-two.pdf', longText)
 
-    const parsed = asBatch(await h.service.parseDocument(
-      session('session-reclaim-batch'),
-      { file_paths: [h.file, h.fileTwo] },
-      new AbortController().signal,
-      null,
-    ))
-
-    expect(parsed.kind).toBe('batch')
-    expect(parsed.state).toBe('completed')
-    expect(parsed.content_status).toBe('partial')
-    expect(parsed.results).toHaveLength(2)
-
-    const shortRes = parsed.results.find(r => r.state === 'completed' && r.files[0]?.name === 'input.pdf') as ResultView
-    const longRes = parsed.results.find(r => r.state === 'completed' && r.files[0]?.name === 'input-two.pdf') as ResultView
-
-    expect(shortRes.content_status).toBe('complete')
-    expect(shortRes.markdown_content).toBe(shortText)
-
-    expect(longRes.content_status).toBe('partial')
-    expect(longRes.read_offset_line).toBeGreaterThan(1)
-    expect(longRes.markdown_path).toBeDefined()
-
-    expect(JSON.stringify(parsed).length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
-    const rendered = renderParseDocument(parsed)
-    expect(rendered[0]?.text.length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
-    expect(rendered[0]?.text).toContain('input.pdf')
-    expect(rendered[0]?.text).toContain('input-two.pdf')
-    expect(rendered[0]?.text).toContain('Status: Content complete. Full document markdown delivered above.')
-    expect(rendered[0]?.text).toContain('Status: Content partial (truncated to output limit)')
-  })
-
-  it('preserves failure info and visible text when batch has mixed success and failure under tight budget', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    h.provider.failedNames.add('input-two.pdf')
-    h.provider.markdownByFileName.set('input.pdf', '# Succeeded\n' + 'Content line.\n'.repeat(20))
-
-    const parsed = asBatch(await h.service.parseDocument(
-      session('session-mixed-fail'),
-      { file_paths: [h.file, h.fileTwo] },
-      new AbortController().signal,
-      null,
-    ))
-
-    expect(parsed.kind).toBe('batch')
-    expect(parsed.state).toBe('partially-completed')
-    expect(parsed.results).toHaveLength(2)
-
-    const failed = parsed.results.find(r => r.state === 'failed')!
-    expect(failed.name).toBe('input-two.pdf')
-    expect(failed.failure.code).toBe('REMOTE_PARSE_FAILED')
-
-    const success = parsed.results.find(r => r.state === 'completed' && r.files[0]?.name === 'input.pdf') as ResultView
-    expect(success.files[0]?.name).toBe('input.pdf')
-    expect(success.markdown_content).toBeDefined()
-
-    const rendered = renderParseDocument(parsed)
-    const text = rendered[0]?.text ?? ''
-    expect(text).toContain('input-two.pdf')
-    expect(text).toContain('REMOTE_PARSE_FAILED')
-    expect(text).toContain('input.pdf')
-    expect(text.length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
-  })
 
   it('prioritizes text over secondary artifacts when budget is tight', async () => {
     const h = await harness()
@@ -843,7 +683,7 @@ describe('MinerUService direct parsing', () => {
 
     const parsed = asResult(await h.service.parseDocument(
       session('session-priority'),
-      { file_paths: [h.file] },
+      { file_path: h.file },
       new AbortController().signal,
       null,
     ))
@@ -872,7 +712,7 @@ describe('MinerUService direct parsing', () => {
 
     await expect(tinyService.parseDocument(
       session('session-tiny-limit'),
-      { file_paths: [h.file] },
+      { file_path: h.file },
       new AbortController().signal,
       null,
     )).rejects.toMatchObject({ failure: { code: 'RESULT_TOO_LARGE' } })
@@ -885,7 +725,7 @@ describe('MinerUService direct parsing', () => {
 
     const parsed = asResult(await h.service.parseDocument(
       session('session-consistency'),
-      { file_paths: [h.file] },
+      { file_path: h.file },
       new AbortController().signal,
       null,
     ))
@@ -917,7 +757,7 @@ describe('MinerUService direct parsing', () => {
 
     const parsed = asResult(await h.service.parseDocument(
       session('session-toc-partial'),
-      { file_paths: [h.file] },
+      { file_path: h.file },
       new AbortController().signal,
       null,
     ))

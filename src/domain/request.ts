@@ -64,7 +64,6 @@ export interface PreparedParseRequest {
 
 export interface ParseRequestInput {
   readonly file_path?: string
-  readonly file_paths?: readonly string[]
   readonly model?: MinerUModel
   readonly ocr?: boolean
   readonly language?: string

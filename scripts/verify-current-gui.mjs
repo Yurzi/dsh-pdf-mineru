@@ -73,7 +73,7 @@ const config = {
   retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 10000 },
   output: { maxInlineChars: 200000 },
   limits: {
-    maxFilesPerRequest: 1, maxFileBytes: 209715200, maxApiResponseBytes: 8388608,
+    maxFileBytes: 209715200, maxApiResponseBytes: 8388608,
     maxZipDownloadBytes: 536870912, maxZipEntries: 10000, maxZipEntryBytes: 268435456,
     maxZipTotalBytes: 2147483648, maxZipCompressionRatio: 200,
   },

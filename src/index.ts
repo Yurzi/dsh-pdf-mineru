@@ -69,7 +69,6 @@ export const Config = z.object({
   }),
   output: z.object({ maxInlineChars: z.number() }),
   limits: z.object({
-    maxFilesPerRequest: z.number(),
     maxFileBytes: z.number(),
     maxApiResponseBytes: z.number(),
     maxZipDownloadBytes: z.number(),

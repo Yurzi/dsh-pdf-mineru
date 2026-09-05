@@ -779,16 +779,6 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
 
         <div className={css.row}>
           <label className={css.field}>
-            <span className={css.fieldLabel}>{t('field.maxFilesPerRequest')}</span>
-            <input
-              className={css.input}
-              type="number"
-              value={draft.limits.maxFilesPerRequest}
-              onChange={e => setDraft(prev => prev === null ? prev : updateConfigSection(prev, 'limits', { maxFilesPerRequest: Number(e.target.value) }))}
-            />
-          </label>
-
-          <label className={css.field}>
             <span className={css.fieldLabel}>{t('field.maxFileBytes')}</span>
             <input
               className={css.input}

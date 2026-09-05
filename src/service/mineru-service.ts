@@ -14,16 +14,13 @@ import type {
 } from '../providers/provider.js'
 import { validateProviderCapabilities } from '../providers/provider.js'
 import { ProviderRegistry, type ResolvedProvider } from '../providers/registry.js'
-import { BatchArtifactRouter } from '../storage/batch-artifact-router.js'
 import type { ResultRepository, ResultTransaction } from '../storage/result-repository.js'
 import { emitDiagnostic, type MinerUDiagnosticEvent, type MinerUDiagnosticSink } from '../observability.js'
-import { BatchCoordinator, type BatchParticipant } from './batch-coordinator.js'
 import { computeCacheKey } from './cache-key.js'
 import { RequestNormalizer, assertSourcesUnchanged } from './request-normalizer.js'
 import { SharedOperationRegistry, type SharedOperation, type SharedOutcome } from './shared-operations.js'
 import type {
   ArtifactView,
-  BatchParseDocumentView,
   ContentListBlock,
   ContentStatus,
   DocumentHeading,
@@ -36,7 +33,6 @@ import type {
   SubmissionSource,
 } from './result-presenter.js'
 import {
-  allocateReclaimedShares,
   computeDocumentSummary,
   extractBlocksMarkdown,
   extractMarkdownHeadings,
@@ -93,16 +89,6 @@ interface PendingFileParse {
   resultId?: MinerUResultId
   operation?: SharedOperation
   created?: boolean
-}
-
-function singlePreparedRequest(prepared: PreparedParseRequest, index: number): PreparedParseRequest {
-  const file = prepared.request.files[index]
-  const source = prepared.sources[index]
-  if (file === undefined || source === undefined) throw new TypeError('Prepared request source mapping is incomplete')
-  return {
-    request: { ...prepared.request, files: [file] },
-    sources: [source],
-  }
 }
 
 type RawParsedItem =
@@ -201,13 +187,12 @@ export class MinerUService {
     session: ServiceSession,
     input: ParseRequestInput,
     signal: AbortSignal,
-  ): Promise<{ readonly pending: readonly PendingFileParse[]; readonly resolved: ResolvedProvider; readonly compatibility: string }> {
+  ): Promise<{ readonly pending: PendingFileParse; readonly resolved: ResolvedProvider; readonly compatibility: string }> {
     const resolved = this.options.providers.active()
     const current = this.config()
     const normalizer = new RequestNormalizer({
       defaults: current.defaults,
       cwd: session.header.cwd,
-      maxFiles: Math.min(current.limits.maxFilesPerRequest, resolved.provider.capabilities.maxFilesPerSubmission),
       maxFileBytes: Math.min(current.limits.maxFileBytes, resolved.provider.capabilities.maxFileBytes ?? current.limits.maxFileBytes),
     })
     const backendInput: ParseRequestInput = {
@@ -216,165 +201,76 @@ export class MinerUService {
       pages: undefined,
     }
     const prepared = await normalizer.normalize(backendInput, signal)
-    const maxTotalRequestBytes = current.limits.maxFileBytes * current.limits.maxFilesPerRequest
-    const totalRequestBytes = prepared.request.files.reduce((total, file) => total + file.bytes, 0)
-    if (!Number.isSafeInteger(maxTotalRequestBytes) || totalRequestBytes > maxTotalRequestBytes) {
-      throw new MinerUError(failure('FILE_TOO_LARGE', 'Combined request files exceed the derived total byte limit'))
+    const file = prepared.request.files[0]!
+    if (file.bytes > current.limits.maxFileBytes) {
+      throw new MinerUError(failure('FILE_TOO_LARGE', `${file.name} exceeds the configured file-size limit`))
     }
     validateProviderCapabilities(prepared.request, resolved.provider.capabilities)
     const compatibility = await resolved.provider.compatibilityKey(prepared.request, {
       configuredVersion: 'configuredVersion' in resolved.config ? resolved.config.configuredVersion : undefined,
     })
-    const pending: PendingFileParse[] = []
     const markdownRequested = input.artifacts === undefined || input.artifacts.includes('markdown')
+    const cacheKey = computeCacheKey(prepared.request, file, compatibility)
 
-    try {
-      for (let index = 0; index < prepared.request.files.length; index++) {
-        const one = singlePreparedRequest(prepared, index)
-        const file = one.request.files[0]!
-        const cacheKey = computeCacheKey(one.request, file, compatibility)
-        const hit = current.storage.cacheEnabled
-          ? await this.options.results.get(cacheKey, one.request.requiredArtifacts, signal)
-          : undefined
-        if (hit !== undefined) {
-          pending.push({
-            prepared: one,
-            cacheKey,
-            markdownRequested,
-            inputPages: input.pages,
-            inputFocus: input.focus,
-            source: 'cache',
-            resultId: hit.id,
-          })
-          this.diagnostic({
-            level: 'info', phase: 'cache-hit', provider: resolved.provider.id,
-            bytes: file.bytes, cacheHit: true,
-          })
-          continue
-        }
-        const reservation = this.options.operations.reserve(
-          cacheKey,
-          resolved.config.id,
-          current.polling.operationTimeoutMs,
-        )
-        pending.push({
-          prepared: one,
-          cacheKey,
-          markdownRequested,
-          inputPages: input.pages,
-          inputFocus: input.focus,
-          source: reservation.created ? 'provider' : 'shared-operation',
-          operation: reservation.operation,
-          created: reservation.created,
-        })
+    const hit = current.storage.cacheEnabled
+      ? await this.options.results.get(cacheKey, prepared.request.requiredArtifacts, signal)
+      : undefined
+
+    if (hit !== undefined) {
+      const pending: PendingFileParse = {
+        prepared,
+        cacheKey,
+        markdownRequested,
+        inputPages: input.pages,
+        inputFocus: input.focus,
+        source: 'cache',
+        resultId: hit.id,
       }
-    } catch (error) {
-      for (const item of pending) {
-        if (item.created === true && item.operation !== undefined) this.options.operations.release(item.operation, error)
-      }
-      throw error
+      this.diagnostic({
+        level: 'info', phase: 'cache-hit', provider: resolved.provider.id,
+        bytes: file.bytes, cacheHit: true,
+      })
+      return { pending, resolved, compatibility }
     }
 
-    const created = pending.filter(item => item.created === true)
-    try {
-      const producers: PendingFileParse[] = []
-      for (const item of created) {
+    const reservation = this.options.operations.reserve(
+      cacheKey,
+      resolved.config.id,
+      current.polling.operationTimeoutMs,
+    )
+    const pending: PendingFileParse = {
+      prepared,
+      cacheKey,
+      markdownRequested,
+      inputPages: input.pages,
+      inputFocus: input.focus,
+      source: reservation.created ? 'provider' : 'shared-operation',
+      operation: reservation.operation,
+      created: reservation.created,
+    }
+
+    if (reservation.created) {
+      try {
         const cached = current.storage.cacheEnabled
-          ? await this.options.results.get(item.cacheKey, item.prepared.request.requiredArtifacts, signal)
+          ? await this.options.results.get(cacheKey, prepared.request.requiredArtifacts, signal)
           : undefined
-        if (cached === undefined) {
-          producers.push(item)
-          continue
+        if (cached !== undefined) {
+          pending.source = 'cache'
+          pending.resultId = cached.id
+          this.options.operations.start(reservation.operation, async () => ({ state: 'completed', resultId: cached.id }))
+        } else {
+          this.options.operations.start(
+            reservation.operation,
+            operation => this.runOperation(operation, prepared, resolved, compatibility),
+          )
         }
-        item.source = 'cache'
-        item.resultId = cached.id
-        this.options.operations.start(item.operation!, async () => ({ state: 'completed', resultId: cached.id }))
+      } catch (error) {
+        this.options.operations.release(reservation.operation, error)
+        throw error
       }
-      if (producers.length === 1) {
-        const item = producers[0]!
-        this.options.operations.start(
-          item.operation!,
-          operation => this.runOperation(operation, item.prepared, resolved, compatibility),
-        )
-      } else if (producers.length > 1) {
-        this.startBatch(producers, resolved, compatibility, current)
-      }
-    } catch (error) {
-      for (const item of created) {
-        if (item.operation !== undefined) this.options.operations.release(item.operation, error)
-      }
-      throw error
     }
 
     return { pending, resolved, compatibility }
-  }
-
-  private startBatch(
-    items: readonly PendingFileParse[],
-    resolved: ResolvedProvider,
-    compatibility: string,
-    current: MinerUConfig,
-  ): void {
-    const transactions = new Map<string, ResultTransaction>()
-    for (const item of items) {
-      const operation = item.operation!
-      const fileId = item.prepared.request.files[0]!.fileId
-      transactions.set(fileId, this.options.results.beginTransaction(
-        operation.id,
-        item.prepared.request,
-        { providerId: resolved.provider.id, providerConfigId: resolved.config.id, compatibilityKey: compatibility },
-      ))
-    }
-    const router = new BatchArtifactRouter(items.map(item => ({
-      fileId: item.prepared.request.files[0]!.fileId,
-      transaction: transactions.get(item.prepared.request.files[0]!.fileId)!,
-    })))
-    let unregister = (): void => undefined
-    const coordinator = new BatchCoordinator({
-      participants: items.map(item => {
-        const operation = item.operation!
-        const file = item.prepared.request.files[0]!
-        const transaction = transactions.get(file.fileId)!
-        const fail = async (error: unknown): Promise<SharedOutcome> => {
-          await transaction.abort().catch(() => undefined)
-          return { state: 'failed', failure: toMinerUFailure(error) }
-        }
-        return {
-          request: item.prepared.request,
-          source: item.prepared.sources[0]!,
-          operation,
-          collected: async collected => {
-            if (collected.failure !== undefined) return fail(new MinerUError(collected.failure))
-            const manifest = transaction.buildManifest(file, collected.artifacts)
-            const published = await this.options.results.commitTransaction(
-              transaction,
-              manifest,
-              coordinator.controller.signal,
-            )
-            return { state: 'completed', resultId: published.resultId }
-          },
-          failed: fail,
-        } satisfies BatchParticipant
-      }),
-      resolved,
-      sink: router,
-      pollIntervalMs: current.polling.pollIntervalMs,
-      timeoutMs: current.polling.operationTimeoutMs,
-      createContext: signal => this.callContext(resolved.config, signal, items[0]!.operation!.id),
-      unregister: () => unregister(),
-    })
-    unregister = this.options.operations.registerCoordinator(() => coordinator.abort(
-      new MinerUError(failure('CANCELLED', 'MinerU plugin disposed', true)),
-    ))
-    for (const item of items) {
-      const operation = item.operation!
-      this.options.operations.start(operation, async () => {
-        await coordinator.run().catch(() => undefined)
-        const settled = operation.settledValue
-        if (settled === undefined) throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Batch participant did not settle'))
-        return settled
-      })
-    }
   }
 
   private async runOperation(
@@ -724,312 +620,6 @@ export class MinerUService {
     return view
   }
 
-  private async projectBatch(
-    rawItems: readonly RawParsedItem[],
-    limit: number,
-  ): Promise<BatchParseDocumentView> {
-    const completedItems = rawItems.filter((i): i is Extract<RawParsedItem, { state: 'completed' }> => i.state === 'completed')
-
-    const itemExtractions = new Map<string, {
-      fullSourceText: string
-      orderedImages: ImageCandidateView[]
-      docSummary?: DocumentSummary
-      toc?: readonly DocumentHeading[]
-    }>()
-
-    for (const item of completedItems) {
-      if (item.markdownRequested) {
-        const contentListArtifact = item.secondaryArtifacts.find(a => a.kind === 'content-list')
-        let contentList: ContentListBlock[] | undefined
-        if (contentListArtifact) {
-          try {
-            const rawJson = await readFile(contentListArtifact.path, 'utf8')
-            const parsed = JSON.parse(rawJson)
-            if (Array.isArray(parsed)) contentList = parsed
-            else if (Array.isArray((parsed as any)?.list)) contentList = (parsed as any).list
-            else if (Array.isArray((parsed as any)?.content_list)) contentList = (parsed as any).content_list
-          } catch {
-            contentList = undefined
-          }
-        }
-        const pagesSet = normalizePageSelection(item.inputPages)
-        const focusSet = normalizeFocusSelection(item.inputFocus)
-        const imageArtifacts = item.secondaryArtifacts.filter(a => a.kind === 'images')
-
-        if (contentList && contentList.length > 0) {
-          let rawFallback = ''
-          if (item.markdownPath) {
-            try { rawFallback = await readFile(item.markdownPath, 'utf8') } catch { /* ignore */ }
-          }
-          const summary = computeDocumentSummary(contentList, rawFallback)
-          const extracted = extractBlocksMarkdown(contentList, pagesSet, focusSet, imageArtifacts)
-          itemExtractions.set(item.fileId, {
-            fullSourceText: extracted.text,
-            orderedImages: extracted.orderedImages,
-            docSummary: summary,
-            toc: summary.toc,
-          })
-        } else if (item.markdownPath) {
-          let rawText = ''
-          try {
-            rawText = await readFile(item.markdownPath, 'utf8')
-          } catch {
-            rawText = ''
-          }
-          const fallback = fallbackExtractFromMarkdown(rawText, imageArtifacts)
-          itemExtractions.set(item.fileId, {
-            fullSourceText: fallback.text,
-            orderedImages: fallback.orderedImages,
-            docSummary: fallback.summary,
-            toc: fallback.summary.toc,
-          })
-        }
-      }
-    }
-
-    const skeletonResults: Array<ResultView | FailedParseView> = rawItems.map(item => {
-      if (item.state === 'failed') return item.failureView
-      const markdownArtifact: ArtifactView | undefined = item.markdownPath ? {
-        kind: 'markdown',
-        path: item.markdownPath,
-        bytes: item.markdownBytes ?? 0,
-      } : undefined
-      return {
-        state: 'completed',
-        source: item.item.source,
-        cache_hit: item.item.source === 'cache',
-        result_id: item.manifest.id,
-        files: [{
-          file_id: item.fileId,
-          name: item.fileName,
-          artifacts: markdownArtifact ? [markdownArtifact] : [],
-          markdown_path: item.markdownPath,
-        }],
-        content_status: item.markdownRequested ? 'complete' : 'not_requested',
-        markdown_path: item.markdownPath,
-        manifest_path: item.manifestPath,
-        output_limit_chars: limit,
-        ...(item.markdownRequested ? { markdown_content: '' } : {}),
-      }
-    })
-
-    const completedCount = completedItems.length
-    const batchState: BatchParseDocumentView['state'] =
-      completedCount === rawItems.length ? 'completed' : completedCount === 0 ? 'failed' : 'partially-completed'
-
-    let batchSkeleton: BatchParseDocumentView = {
-      kind: 'batch',
-      state: batchState,
-      output_limit_chars: limit,
-      content_status: 'complete',
-      results: skeletonResults,
-    }
-
-    let overhead = Math.max(JSON.stringify(batchSkeleton).length, formatParseDocumentProse(batchSkeleton).length)
-    let baseArtifactsStripped = false
-    if (overhead > limit) {
-      const strippedResults = skeletonResults.map(r => {
-        if (r.state === 'failed') return r
-        return {
-          ...r,
-          files: r.files.map(f => ({ ...f, artifacts: [], artifacts_truncated: true })),
-        }
-      })
-      batchSkeleton = { ...batchSkeleton, results: strippedResults }
-      overhead = Math.max(JSON.stringify(batchSkeleton).length, formatParseDocumentProse(batchSkeleton).length)
-      if (overhead > limit) {
-        throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds configured model output limit'))
-      }
-      baseArtifactsStripped = true
-    }
-
-    const avail = Math.max(0, limit - overhead)
-    const totalTextBudget = Math.floor(avail / 1.05)
-
-    const mdItems = completedItems.filter(i => i.markdownRequested)
-    const lengths = mdItems.map(i => itemExtractions.get(i.fileId)?.fullSourceText.length ?? 0)
-    const shares = allocateReclaimedShares(lengths, totalTextBudget)
-
-    const finalResults: Array<ResultView | FailedParseView> = await Promise.all(rawItems.map(async item => {
-      if (item.state === 'failed') return item.failureView
-      if (!item.markdownRequested) {
-        return {
-          state: 'completed',
-          source: item.item.source,
-          cache_hit: item.item.source === 'cache',
-          result_id: item.manifest.id,
-          files: [{
-            file_id: item.fileId,
-            name: item.fileName,
-            artifacts: baseArtifactsStripped ? [] : [...item.secondaryArtifacts],
-            ...(baseArtifactsStripped && item.secondaryArtifacts.length > 0 ? { artifacts_truncated: true } : {}),
-            markdown_path: undefined,
-          }],
-          content_status: 'not_requested',
-          manifest_path: item.manifestPath,
-          output_limit_chars: limit,
-        }
-      }
-
-      const mdIndex = mdItems.indexOf(item)
-      const share = shares[mdIndex] ?? 0
-      const ext = itemExtractions.get(item.fileId)
-      const fullSourceText = ext?.fullSourceText ?? ''
-      const markdownArtifact: ArtifactView = {
-        kind: 'markdown',
-        path: item.markdownPath!,
-        bytes: item.markdownBytes ?? 0,
-      }
-
-      let contentStatus: ContentStatus
-      let content: string
-      let readOffsetLine: number | undefined
-      let artifactsTruncated = baseArtifactsStripped
-      let toc: readonly DocumentHeading[] | undefined = ext?.toc
-
-      if (fullSourceText.length <= share) {
-        contentStatus = 'complete'
-        content = fullSourceText
-        readOffsetLine = undefined
-      } else {
-        contentStatus = 'partial'
-        const cut = truncateAtCleanBoundary(fullSourceText, share)
-        content = cut.text
-        readOffsetLine = cut.resumeLine
-        if (item.secondaryArtifacts.length > 0 || baseArtifactsStripped) {
-          artifactsTruncated = true
-        }
-        if (!toc || toc.length === 0) {
-          toc = extractMarkdownHeadings(fullSourceText)
-        }
-      }
-
-      const fileArtifacts = baseArtifactsStripped ? [] : [markdownArtifact]
-
-      return {
-        state: 'completed',
-        source: item.item.source,
-        cache_hit: item.item.source === 'cache',
-        result_id: item.manifest.id,
-        files: [{
-          file_id: item.fileId,
-          name: item.fileName,
-          artifacts: fileArtifacts,
-          ...(artifactsTruncated ? { artifacts_truncated: true } : {}),
-          markdown_path: item.markdownPath,
-        }],
-        content_status: contentStatus,
-        markdown_path: item.markdownPath,
-        ...(readOffsetLine !== undefined ? { read_offset_line: readOffsetLine } : {}),
-        manifest_path: item.manifestPath,
-        output_limit_chars: limit,
-        markdown_content: content,
-        ordered_images: ext?.orderedImages,
-        summary: ext?.docSummary,
-        ...(contentStatus === 'partial' || contentStatus === 'complete' ? { toc } : {}),
-      }
-    }))
-
-    let batchContentStatus: ContentStatus
-    const completedResults = finalResults.filter((r): r is ResultView => r.state === 'completed')
-    if (completedResults.length === 0 || completedResults.every(r => r.content_status === 'not_requested')) {
-      batchContentStatus = 'not_requested'
-    } else if (completedResults.some(r => r.content_status === 'partial')) {
-      batchContentStatus = 'partial'
-    } else {
-      batchContentStatus = 'complete'
-    }
-
-    let batchView: BatchParseDocumentView = {
-      kind: 'batch',
-      state: batchState,
-      output_limit_chars: limit,
-      content_status: batchContentStatus,
-      results: finalResults,
-    }
-
-    while (JSON.stringify(batchView).length > limit || formatParseDocumentProse(batchView).length > limit) {
-      let strippedAnyArtifacts = false
-      const strippedResults = batchView.results.map(r => {
-        if (r.state === 'completed' && r.files.some(f => f.artifacts.length > 0)) {
-          strippedAnyArtifacts = true
-          return {
-            ...r,
-            files: r.files.map(f => ({ ...f, artifacts: [], artifacts_truncated: true })),
-          }
-        }
-        return r
-      })
-      if (strippedAnyArtifacts) {
-        batchView = { ...batchView, results: strippedResults }
-        continue
-      }
-
-      let strippedAnyExtras = false
-      const strippedExtrasResults = batchView.results.map(r => {
-        if (r.state === 'completed' && (r.summary !== undefined || (r.ordered_images !== undefined && r.ordered_images.length > 0))) {
-          strippedAnyExtras = true
-          return {
-            ...r,
-            summary: undefined,
-            ordered_images: undefined,
-          }
-        }
-        return r
-      })
-      if (strippedAnyExtras) {
-        batchView = { ...batchView, results: strippedExtrasResults }
-        continue
-      }
-
-      const partialCandidates = batchView.results
-        .filter((r): r is ResultView => r.state === 'completed' && r.content_status === 'partial' && Boolean(r.markdown_content && r.markdown_content.length > 0))
-      const candidates = partialCandidates.length > 0
-        ? partialCandidates
-        : batchView.results.filter((r): r is ResultView => r.state === 'completed' && Boolean(r.markdown_content && r.markdown_content.length > 0))
-      if (candidates.length > 0) {
-        candidates.sort((a, b) => (b.markdown_content?.length ?? 0) - (a.markdown_content?.length ?? 0))
-        const target = candidates[0]!
-        const excess = Math.max(JSON.stringify(batchView).length - limit, formatParseDocumentProse(batchView).length - limit, 10)
-        const targetLen = Math.max(0, (target.markdown_content?.length ?? 0) - excess)
-        const fullSourceText = itemExtractions.get(target.files[0]?.file_id ?? '')?.fullSourceText ?? target.markdown_content!
-        const cut = truncateAtCleanBoundary(fullSourceText, targetLen)
-        const activeToc = target.toc ?? (target.summary?.toc ?? extractMarkdownHeadings(fullSourceText))
-        const updatedTarget: ResultView = {
-          ...target,
-          content_status: 'partial',
-          markdown_content: cut.text,
-          read_offset_line: cut.resumeLine,
-          toc: activeToc,
-        }
-        batchView = {
-          ...batchView,
-          content_status: 'partial',
-          results: batchView.results.map(r => r === target ? updatedTarget : r),
-        }
-      } else {
-        const tocCandidates = batchView.results
-          .filter((r): r is ResultView => r.state === 'completed' && Boolean(r.toc && r.toc.length > 0))
-        if (tocCandidates.length > 0) {
-          const target = tocCandidates[0]!
-          const nextToc = target.toc!.slice(0, Math.max(0, Math.floor(target.toc!.length / 2)))
-          const updatedTarget: ResultView = {
-            ...target,
-            ...(nextToc.length > 0 ? { toc: nextToc } : { toc: undefined }),
-          }
-          batchView = {
-            ...batchView,
-            results: batchView.results.map(r => r === target ? updatedTarget : r),
-          }
-        } else {
-          throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds configured model output limit'))
-        }
-      }
-    }
-
-    return batchView
-  }
-
   private createWaitSignal(signal: AbortSignal, pollTimeoutMs: number | null | undefined): {
     readonly signal: AbortSignal
     readonly timedOut: () => boolean
@@ -1065,16 +655,18 @@ export class MinerUService {
     input: ParseRequestInput,
     signal: AbortSignal,
     pollTimeoutMs?: number | null,
-  ): Promise<ParseDocumentView> {
+  ): Promise<ResultView> {
     const { pending } = await this.prepare(session, input, signal)
     const wait = this.createWaitSignal(signal, pollTimeoutMs)
-    let outcomes: SharedOutcome[]
+    let outcome: SharedOutcome
     try {
-      outcomes = await Promise.all(pending.map(async item => {
-        if (item.resultId !== undefined) return { state: 'completed', resultId: item.resultId } as const
-        if (item.operation === undefined) throw new TypeError('Pending parse has no result or shared operation')
-        return await item.operation.waitForOutcome(wait.signal)
-      }))
+      if (pending.resultId !== undefined) {
+        outcome = { state: 'completed', resultId: pending.resultId }
+      } else if (pending.operation === undefined) {
+        throw new TypeError('Pending parse has no result or shared operation')
+      } else {
+        outcome = await pending.operation.waitForOutcome(wait.signal)
+      }
     } catch (error) {
       if (signal.aborted) throw signal.reason ?? error
       if (wait.timedOut()) {
@@ -1085,95 +677,54 @@ export class MinerUService {
       wait.dispose()
     }
 
-    const rawItems: RawParsedItem[] = []
+    if (outcome.state === 'failed' || outcome.resultId === undefined) {
+      throw new MinerUError(outcome.failure ?? failure('REMOTE_PARSE_FAILED', 'Remote parse failed'))
+    }
 
-    for (let index = 0; index < outcomes.length; index++) {
-      const outcome = outcomes[index]!
-      const item = pending[index]!
-      const file = item.prepared.request.files[0]!
-      if (outcome.state === 'failed' || outcome.resultId === undefined) {
-        rawItems.push({
-          state: 'failed',
-          failureView: {
-            state: 'failed',
-            source: item.source,
-            file_id: file.fileId,
-            name: file.name,
-            failure: outcome.failure ?? failure('REMOTE_PARSE_FAILED', 'Remote parse failed'),
-          },
-        })
-        continue
-      }
-      const manifest = await this.options.results.get(
-        item.cacheKey,
-        item.prepared.request.requiredArtifacts,
-        signal,
-      )
-      if (manifest === undefined || manifest.id !== outcome.resultId) {
-        rawItems.push({
-          state: 'failed',
-          failureView: {
-            state: 'failed',
-            source: item.source,
-            file_id: file.fileId,
-            name: file.name,
-            failure: failure('CACHE_EVICTED', 'Published MinerU result is missing or corrupt'),
-          },
-        })
-        continue
-      }
-      const document = manifest.files[0]!
-      const markdownRequested = item.markdownRequested
-      const markdownRef = document.artifacts.find(artifact => artifact.kind === 'markdown')
-      if (markdownRequested && markdownRef === undefined) {
-        rawItems.push({
-          state: 'failed',
-          failureView: {
-            state: 'failed',
-            source: item.source,
-            file_id: document.fileId,
-            name: item.prepared.request.files[0]?.name ?? document.name,
-            failure: failure('REMOTE_PARSE_FAILED', 'Extracted markdown artifact is missing from result'),
-          },
-        })
-        continue
-      }
+    const manifest = await this.options.results.get(
+      pending.cacheKey,
+      pending.prepared.request.requiredArtifacts,
+      signal,
+    )
+    if (manifest === undefined || manifest.id !== outcome.resultId) {
+      throw new MinerUError(failure('CACHE_EVICTED', 'Published MinerU result is missing or corrupt'))
+    }
 
-      const markdownPath = markdownRef !== undefined
-        ? this.options.results.resolveArtifactAbsolutePath(item.cacheKey, markdownRef.relativePath)
-        : undefined
-      const manifestPath = this.options.results.manifestAbsolutePath(item.cacheKey)
-      const secondaryArtifacts = document.artifacts
-        .filter(a => a.kind !== 'markdown')
-        .map((a: ArtifactRef): ArtifactView => ({
-          kind: a.kind,
-          path: this.options.results.resolveArtifactAbsolutePath(item.cacheKey, a.relativePath),
-          bytes: a.bytes,
-        }))
+    const document = manifest.files[0]!
+    const markdownRequested = pending.markdownRequested
+    const markdownRef = document.artifacts.find(artifact => artifact.kind === 'markdown')
+    if (markdownRequested && markdownRef === undefined) {
+      throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Extracted markdown artifact is missing from result'))
+    }
 
-      rawItems.push({
-        state: 'completed',
-        item,
-        manifest,
-        fileId: document.fileId,
-        fileName: item.prepared.request.files[0]?.name ?? document.name,
-        markdownRequested,
-        markdownPath,
-        markdownBytes: markdownRef?.bytes,
-        manifestPath,
-        secondaryArtifacts,
-        inputPages: item.inputPages,
-        inputFocus: item.inputFocus,
-      })
+    const markdownPath = markdownRef !== undefined
+      ? this.options.results.resolveArtifactAbsolutePath(pending.cacheKey, markdownRef.relativePath)
+      : undefined
+    const manifestPath = this.options.results.manifestAbsolutePath(pending.cacheKey)
+    const secondaryArtifacts = document.artifacts
+      .filter(a => a.kind !== 'markdown')
+      .map((a: ArtifactRef): ArtifactView => ({
+        kind: a.kind,
+        path: this.options.results.resolveArtifactAbsolutePath(pending.cacheKey, a.relativePath),
+        bytes: a.bytes,
+      }))
+
+    const rawItem: RawParsedItem = {
+      state: 'completed',
+      item: pending,
+      manifest,
+      fileId: document.fileId,
+      fileName: pending.prepared.request.files[0]?.name ?? document.name,
+      markdownRequested,
+      markdownPath,
+      markdownBytes: markdownRef?.bytes,
+      manifestPath,
+      secondaryArtifacts,
+      inputPages: pending.inputPages,
+      inputFocus: pending.inputFocus,
     }
 
     const limit = this.config().output.maxInlineChars
-    if (rawItems.length === 1) {
-      const first = rawItems[0]!
-      if (first.state === 'failed') throw new MinerUError(first.failureView.failure)
-      return await this.projectSingle(first, limit)
-    }
-
-    return await this.projectBatch(rawItems, limit)
+    return await this.projectSingle(rawItem, limit)
   }
 }

@@ -40,7 +40,7 @@ describe('request normalization', () => {
   it('applies defaults and strips local paths from the canonical request', async () => {
     const { root, path } = await fixture()
     const normalizer = new RequestNormalizer({ defaults, cwd: root })
-    const prepared = await normalizer.normalize({ file_paths: [path] }, new AbortController().signal)
+    const prepared = await normalizer.normalize({ file_path: path }, new AbortController().signal)
     expect(prepared.request.semantics).toEqual({
       model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true,
     })
@@ -53,7 +53,7 @@ describe('request normalization', () => {
     const { path } = await fixture()
     const normalizer = new RequestNormalizer({ defaults })
     const prepared = await normalizer.normalize({
-      file_paths: [path], model: 'vlm', ocr: true, language: 'en', pages: '1-5',
+      file_path: path, model: 'vlm', ocr: true, language: 'en', pages: '1-5',
       artifacts: ['markdown', 'content-list', 'images'],
     }, new AbortController().signal)
     expect(prepared.request.semantics).toMatchObject({
@@ -94,7 +94,7 @@ describe('request normalization', () => {
       start_page_id: 0, end_page_id: 1,
     }
     for (const [key, value] of Object.entries(aliases)) {
-      const input = { file_paths: [path], [key]: value } as unknown as ParseRequestInput
+      const input = { file_path: path, [key]: value } as unknown as ParseRequestInput
       await expect(normalizer.normalize(input, new AbortController().signal))
         .rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
     }
@@ -103,7 +103,7 @@ describe('request normalization', () => {
   it('detects a file changed after hashing and before upload', async () => {
     const { path } = await fixture()
     const normalizer = new RequestNormalizer({ defaults })
-    const prepared = await normalizer.normalize({ file_paths: [path] }, new AbortController().signal)
+    const prepared = await normalizer.normalize({ file_path: path }, new AbortController().signal)
     await writeFile(path, '%PDF-1.4 changed')
     const now = new Date(Date.now() + 2000)
     await utimes(path, now, now)

@@ -17,7 +17,6 @@ import type {
   ValueSchemaSpec,
 } from '@deepseek-ai/dsh-tools'
 import type {
-  BatchParseDocumentView,
   FailedParseView,
   MinerUService,
   ParseDocumentView,
@@ -167,7 +166,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
 
     for (const tool of registeredTools) {
       await expect(
-        tool.execute({ file_paths: ['/doc.pdf'] }, unauthenticatedExec),
+        tool.execute({ file_path: '/doc.pdf' }, unauthenticatedExec),
       ).rejects.toThrow(/UNAUTHENTICATED_SESSION/)
     }
   })
@@ -179,7 +178,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
       const exec = createMockExec(true)
 
-      await expect(submitTool.execute({ file_paths: ['/doc.pdf'] }, exec)).rejects.toMatchObject({
+      await expect(submitTool.execute({ file_path: '/doc.pdf' }, exec)).rejects.toMatchObject({
         failure: { code: 'PROVIDER_UNAVAILABLE' },
       })
     })
@@ -194,7 +193,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       controller.abort()
       const exec = createMockExec(true, controller.signal)
 
-      await expect(submitTool.execute({ file_paths: ['/doc.pdf'] }, exec)).rejects.toThrow()
+      await expect(submitTool.execute({ file_path: '/doc.pdf' }, exec)).rejects.toThrow()
       expect(registry.start).not.toHaveBeenCalled()
     })
 
@@ -209,7 +208,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
 
       const exec = createMockExec(true)
       const inputArgs = {
-        file_paths: ['/data/one.pdf', '/data/two.pdf'],
+        file_path: '/data/one.pdf',
       }
 
       const result = await submitTool.execute(inputArgs, exec)
@@ -219,7 +218,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
 
       const captured = specs[0]!
       expect(captured.kind).toBe('mineru')
-      expect(captured.label).toBe('Parse 2 PDF documents with MinerU')
+      expect(captured.label).toBe('Parse one.pdf with MinerU')
       expect(captured.owner).toBe(exec.agent)
       expect(typeof captured.run).toBe('function')
 
@@ -261,7 +260,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
 
       const exec = createMockExec(true)
-      const inputArgs = { file_paths: ['/sample.pdf'] }
+      const inputArgs = { file_path: '/sample.pdf' }
       await submitTool.execute(inputArgs, exec)
 
       const hooks = specs[0]!.run()
@@ -269,7 +268,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
 
       expect(mockService.parseDocument).toHaveBeenCalledWith(
         exec.agent?.session,
-        { file_paths: ['/sample.pdf'] },
+        { file_path: '/sample.pdf' },
         expect.any(AbortSignal),
         null,
       )
@@ -280,76 +279,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       expect(outcome.output).toContain('read_pdf')
     })
 
-    it('resolves done hook with batch detail when batch parse settles', async () => {
-      const { registry, specs } = createMockJobRegistry()
-      const { ctx, registeredTools } = createMockContext(registry)
 
-      const batchResult: BatchParseDocumentView = {
-        kind: 'batch',
-        state: 'partially-completed',
-        results: [
-          {
-            state: 'completed',
-            source: 'provider',
-            cache_hit: true,
-            result_id: 'mr_1',
-            files: [{ file_id: 'mf_1', name: 'good.pdf', artifacts: [] }],
-            markdown_content: '# Good',
-            content_status: 'complete',
-            manifest_path: '/cache/good/manifest.json',
-            output_limit_chars: 2000,
-          },
-          {
-            state: 'failed',
-            source: 'provider',
-            file_id: 'mf_2',
-            name: 'bad.pdf',
-            failure: failure('REMOTE_PARSE_FAILED', 'Document corrupted'),
-          },
-        ],
-      }
-
-      const mockService = {
-        parseDocument: vi.fn(async () => batchResult),
-      } as unknown as MinerUService
-      registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
-
-      const exec = createMockExec(true)
-      await submitTool.execute({ file_paths: ['/good.pdf', '/bad.pdf'] }, exec)
-
-      const hooks = specs[0]!.run()
-      const outcome = await hooks.done
-
-      expect(outcome.status).toBe('completed')
-      expect(outcome.detail).toBe('partially-completed')
-      expect(outcome.output).toContain('**MinerU Batch Parse Summary**')
-      expect(outcome.output).toContain('bad.pdf')
-      expect(outcome.output).toContain('REMOTE_PARSE_FAILED')
-    })
-
-    it('marks an all-failed batch as a failed native job outcome', async () => {
-      const { registry, specs } = createMockJobRegistry()
-      const { ctx, registeredTools } = createMockContext(registry)
-      const failedBatch: BatchParseDocumentView = {
-        kind: 'batch',
-        state: 'failed',
-        results: [{
-          state: 'failed', source: 'provider', file_id: 'mf_1', name: 'bad.pdf',
-          failure: failure('REMOTE_PARSE_FAILED', 'Document corrupted'),
-        }],
-      }
-      const mockService = { parseDocument: vi.fn(async () => failedBatch) } as unknown as MinerUService
-      registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
-
-      await submitTool.execute({ file_paths: ['/bad.pdf'] }, createMockExec(true))
-      const outcome = await specs[0]!.run().done
-
-      expect(outcome.status).toBe('failed')
-      expect(outcome.detail).toBe('batch-failed')
-      expect(outcome.output).toContain('REMOTE_PARSE_FAILED')
-    })
 
     it('handles cancelation and resolves done with killed status', async () => {
       const { registry, specs } = createMockJobRegistry()
@@ -368,7 +298,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
 
       const exec = createMockExec(true)
-      await submitTool.execute({ file_paths: ['/hang.pdf'] }, exec)
+      await submitTool.execute({ file_path: '/hang.pdf' }, exec)
 
       const hooks = specs[0]!.run()
       hooks.cancel('User requested cancellation')
@@ -392,7 +322,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const dispose = registerTools(ctx, () => mockService)
       const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
 
-      await submitTool.execute({ file_paths: ['/hang.pdf'] }, createMockExec(true))
+      await submitTool.execute({ file_path: '/hang.pdf' }, createMockExec(true))
       const hooks = specs[0]!.run()
       await dispose()
 
@@ -412,7 +342,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
 
       const exec = createMockExec(true)
-      await submitTool.execute({ file_paths: ['/giant.pdf'] }, exec)
+      await submitTool.execute({ file_path: '/giant.pdf' }, exec)
 
       const hooks = specs[0]!.run()
       const outcome = await hooks.done
@@ -457,7 +387,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
 
       const exec = createMockExec(true)
-      await submitTool.execute({ file_paths: ['/doc.pdf'] }, exec)
+      await submitTool.execute({ file_path: '/doc.pdf' }, exec)
 
       const hooks = specs[0]!.run()
       const outcome = await hooks.done
@@ -495,12 +425,12 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const parseTool = registeredTools.find(t => t.name === 'read_pdf')!
 
       const exec = createMockExec(true)
-      const args = { file_paths: ['/sync.pdf'], poll_timeout_ms: 30000 }
+      const args = { file_path: '/sync.pdf', poll_timeout_ms: 30000 }
       const result = await parseTool.execute(args, exec)
 
       expect(mockService.parseDocument).toHaveBeenCalledWith(
         exec.agent?.session,
-        { file_paths: ['/sync.pdf'] },
+        { file_path: '/sync.pdf' },
         exec.signal,
         30000,
       )
@@ -540,7 +470,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       await readTool.execute({ file_path: '/single.pdf' }, exec)
       expect(mockService.parseDocument).toHaveBeenCalledWith(
         exec.agent?.session,
-        expect.objectContaining({ file_path: '/single.pdf', file_paths: ['/single.pdf'] }),
+        { file_path: '/single.pdf' },
         exec.signal,
         undefined,
       )
@@ -552,7 +482,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const exec = createMockExec(true)
       for (const tool of registeredTools) {
         for (const param of ['model', 'ocr', 'formula', 'table', 'language', 'artifacts', 'max_inline_images']) {
-          await expect(tool.execute({ file_paths: ['/doc.pdf'], [param]: 'test' }, exec))
+          await expect(tool.execute({ file_path: '/doc.pdf', [param]: 'test' }, exec))
             .rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
         }
       }
@@ -581,7 +511,6 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         exec.agent?.session,
         expect.objectContaining({
           file_path: '/paper.pdf',
-          file_paths: ['/paper.pdf'],
           pages: '1-3, 5',
           focus: 'table',
         }),
@@ -590,7 +519,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       )
     })
 
-    it('projects structured presentation metadata for single result and batch result', () => {
+    it('projects structured presentation metadata for single result', () => {
       const { ctx, registeredTools } = createMockContext()
       registerTools(ctx, () => ({} as MinerUService))
       const parseTool = registeredTools.find(t => t.name === 'read_pdf')!
@@ -602,6 +531,8 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         result_id: 'mr_test_1',
         files: [{ file_id: 'mf_1', name: 'paper.pdf', artifacts: [{ kind: 'markdown', path: '/p/out.md', bytes: 50 }] }],
         manifest_path: '/p/manifest.json',
+        content_status: 'complete',
+        output_limit_chars: 2000,
       }
       expect(parseTool.output.presentationMeta?.({}, singleResult)).toEqual({
         result_id: 'mr_test_1',
@@ -636,18 +567,6 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
           { level: 2, title: 'Background', line: 15 },
         ],
       })
-
-      const batchResult: BatchParseDocumentView = {
-        kind: 'batch',
-        state: 'completed',
-        results: [singleResult],
-      }
-      expect(parseTool.output.presentationMeta?.({}, batchResult)).toEqual({
-        kind: 'batch',
-        state: 'completed',
-        results_count: 1,
-        manifests: ['/p/manifest.json'],
-      })
     })
 
     it('rejects invalid poll timeouts before invoking the service', async () => {
@@ -658,7 +577,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const exec = createMockExec(true)
 
       for (const poll_timeout_ms of [-1, 0, 86_400_001, Number.MAX_SAFE_INTEGER, 1.5, NaN]) {
-        await expect(parseTool.execute({ file_paths: ['/doc.pdf'], poll_timeout_ms }, exec))
+        await expect(parseTool.execute({ file_path: '/doc.pdf', poll_timeout_ms }, exec))
           .rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
       }
       expect(mockService.parseDocument).not.toHaveBeenCalled()
@@ -706,43 +625,6 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         output_limit_chars: 2000,
       })
       expect(rendered[0]?.text).toContain('Artifact list truncated to output limit')
-    })
-
-    it('renders batch document results with mixed success and failure entries', () => {
-      const batchResult: BatchParseDocumentView = {
-        kind: 'batch',
-        state: 'partially-completed',
-        results: [
-          {
-            state: 'completed',
-            source: 'provider',
-            cache_hit: false,
-            result_id: 'mr_b1',
-            files: [{ file_id: 'mf_1', name: 'file1.pdf', artifacts: [{ kind: 'markdown', path: '/p1.md', bytes: 10 }] }],
-            markdown_content: '# P1',
-            content_status: 'complete',
-            manifest_path: '/m1.json',
-            output_limit_chars: 1000,
-          },
-          {
-            state: 'failed',
-            source: 'provider',
-            file_id: 'mf_2',
-            name: 'file2.pdf',
-            failure: failure('REMOTE_PARSE_FAILED', 'Extraction failed'),
-          },
-        ],
-      }
-      const rendered = renderParseDocument(batchResult)
-      expect(rendered[0]?.text).toContain('**MinerU Batch Result**')
-      expect(rendered[0]?.text).toContain('- State: partially-completed')
-      expect(rendered[0]?.text).toContain('- Results: 2')
-      expect(rendered[0]?.text).toContain('file1.pdf')
-      expect(rendered[0]?.text).toContain('# P1')
-      expect(rendered[0]?.text).toContain('Status: Content complete. Full document markdown delivered above.')
-      expect(rendered[0]?.text).toContain('/m1.json')
-      expect(rendered[0]?.text).toContain('file2.pdf')
-      expect(rendered[0]?.text).toContain('REMOTE_PARSE_FAILED')
     })
 
     it('renders truncation footer with markdown artifact path when content_status is partial', () => {
@@ -838,93 +720,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       expect(rendered[0]?.text).toContain('Manifest: /cache/doc/manifest.json')
     })
 
-    it('does not clamp batch text at 16,384 when output_limit_chars is larger', () => {
-      const longText1 = 'A'.repeat(20000)
-      const longText2 = 'B'.repeat(20000)
-      const batchResult: BatchParseDocumentView = {
-        kind: 'batch',
-        state: 'completed',
-        output_limit_chars: 100000,
-        content_status: 'complete',
-        results: [
-          {
-            state: 'completed',
-            source: 'provider',
-            cache_hit: false,
-            result_id: 'mr_1',
-            files: [{ file_id: 'mf_1', name: 'f1.pdf', artifacts: [] }],
-            markdown_content: longText1,
-            content_status: 'complete',
-            manifest_path: '/cache/f1/manifest.json',
-            output_limit_chars: 100000,
-          },
-          {
-            state: 'completed',
-            source: 'provider',
-            cache_hit: false,
-            result_id: 'mr_2',
-            files: [{ file_id: 'mf_2', name: 'f2.pdf', artifacts: [] }],
-            markdown_content: longText2,
-            content_status: 'complete',
-            manifest_path: '/cache/f2/manifest.json',
-            output_limit_chars: 100000,
-          },
-        ],
-      }
-      const rendered = renderParseDocument(batchResult)
-      expect(rendered[0]?.text.length).toBeGreaterThan(40000)
-      expect(rendered[0]?.text).not.toContain('[Output truncated to limit]')
-      expect(rendered[0]?.text).toContain(longText1)
-      expect(rendered[0]?.text).toContain(longText2)
-    })
 
-    it('preserves all batch documents and failure items without silently eating them', () => {
-      const batchResult: BatchParseDocumentView = {
-        kind: 'batch',
-        state: 'partially-completed',
-        output_limit_chars: 50000,
-        content_status: 'partial',
-        results: [
-          {
-            state: 'completed',
-            source: 'provider',
-            cache_hit: false,
-            result_id: 'mr_1',
-            files: [{ file_id: 'mf_1', name: 'doc1.pdf', artifacts: [] }],
-            markdown_content: '# Doc 1 Content',
-            content_status: 'complete',
-            manifest_path: '/cache/doc1/manifest.json',
-            output_limit_chars: 50000,
-          },
-          {
-            state: 'failed',
-            source: 'provider',
-            file_id: 'mf_2',
-            name: 'doc2.pdf',
-            failure: failure('CORRUPT_FILE', 'File is corrupted and unreadable'),
-          },
-          {
-            state: 'completed',
-            source: 'provider',
-            cache_hit: false,
-            result_id: 'mr_3',
-            files: [{ file_id: 'mf_3', name: 'doc3.pdf', artifacts: [] }],
-            markdown_content: '# Doc 3 Content',
-            content_status: 'complete',
-            manifest_path: '/cache/doc3/manifest.json',
-            output_limit_chars: 50000,
-          },
-        ],
-      }
-      const rendered = renderParseDocument(batchResult)
-      const text = rendered[0]?.text ?? ''
-      expect(text).toContain('doc1.pdf')
-      expect(text).toContain('# Doc 1 Content')
-      expect(text).toContain('doc2.pdf')
-      expect(text).toContain('[CORRUPT_FILE] File is corrupted and unreadable')
-      expect(text).toContain('doc3.pdf')
-      expect(text).toContain('# Doc 3 Content')
-    })
     it('renders inlined image ContentBlocks alongside text block', () => {
       const resultData: ResultView = {
         state: 'completed',

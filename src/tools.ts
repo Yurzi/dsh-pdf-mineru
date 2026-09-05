@@ -12,7 +12,6 @@ import { normalizeFocusSelection, normalizePageSelection } from './domain/reques
 import type { MinerUResultManifest } from './domain/result.js'
 import type { StorageAccessGate } from './storage/access-gate.js'
 import type {
-  BatchParseDocumentView,
   FailedParseView,
   ImageCandidateView,
   InlinedImageView,
@@ -139,30 +138,12 @@ const failedParseViewSchema: ObjectValueSchemaSpec = {
   additionalProperties: false,
 }
 
-const batchViewSchema: ObjectValueSchemaSpec = {
-  type: 'object',
-  properties: {
-    kind: { type: 'string', enum: ['batch'] },
-    state: { type: 'string', enum: ['completed', 'partially-completed', 'failed'] },
-    results: { type: 'array', items: { oneOf: [resultViewSchema, failedParseViewSchema] } },
-    output_limit_chars: { type: 'integer' },
-    content_status: { type: 'string', enum: ['complete', 'partial', 'not_requested'] },
-    results_omitted: { type: 'boolean' },
-  },
-  additionalProperties: false,
-}
-
-const parseOutputSchema: ValueSchemaSpec = { oneOf: [resultViewSchema, batchViewSchema] }
+const parseOutputSchema: ValueSchemaSpec = resultViewSchema
 
 const asyncParseParameters: ParameterSchemaSpec = {
   file_path: {
     type: 'string',
     description: 'Path of the local PDF document to parse.',
-  },
-  file_paths: {
-    type: 'array',
-    items: { type: 'string' },
-    description: 'Paths of local PDF documents to parse (for batch operations).',
   },
 }
 
@@ -170,11 +151,6 @@ const readPdfParameters: ParameterSchemaSpec = {
   file_path: {
     type: 'string',
     description: 'Path of the local PDF document to read.',
-  },
-  file_paths: {
-    type: 'array',
-    items: { type: 'string' },
-    description: 'Paths of local PDF documents to read (for batch operations).',
   },
   pages: {
     oneOf: [
@@ -240,22 +216,11 @@ function assertNoRemovedParameters(args: Record<string, unknown>): void {
   }
 }
 
-function extractFilePaths(args: Record<string, unknown>): string[] {
-  const paths: string[] = []
-  if (typeof args.file_path === 'string' && args.file_path.trim() !== '') {
-    paths.push(args.file_path.trim())
+function extractFilePath(args: Record<string, unknown>): string {
+  if (typeof args.file_path !== 'string' || args.file_path.trim() === '') {
+    throw new MinerUError(failure('INVALID_REQUEST', 'Local document path (file_path) is required'))
   }
-  if (Array.isArray(args.file_paths)) {
-    for (const p of args.file_paths) {
-      if (typeof p === 'string' && p.trim() !== '' && !paths.includes(p.trim())) {
-        paths.push(p.trim())
-      }
-    }
-  }
-  if (paths.length === 0) {
-    throw new MinerUError(failure('INVALID_REQUEST', 'Exactly one local document path is required'))
-  }
-  return paths
+  return args.file_path.trim()
 }
 
 export function parseAsyncInput(args: unknown): { readonly input: ParseRequestInput } {
@@ -264,12 +229,10 @@ export function parseAsyncInput(args: unknown): { readonly input: ParseRequestIn
   }
   const obj = args as Record<string, unknown>
   assertNoRemovedParameters(obj)
-  const filePaths = extractFilePaths(obj)
-  const hasSinglePath = typeof obj.file_path === 'string' && obj.file_path.trim() !== ''
+  const filePath = extractFilePath(obj)
   return {
     input: {
-      file_paths: filePaths,
-      ...(hasSinglePath ? { file_path: obj.file_path as string } : {}),
+      file_path: filePath,
     },
   }
 }
@@ -286,7 +249,7 @@ export function parseReadInput(args: unknown): ParsedToolInput {
   }
   const obj = args as Record<string, unknown>
   assertNoRemovedParameters(obj)
-  const filePaths = extractFilePaths(obj)
+  const filePath = extractFilePath(obj)
   const pollTimeoutMs = parsePollTimeout(obj.poll_timeout_ms)
 
   let inline_images: boolean | undefined
@@ -317,11 +280,9 @@ export function parseReadInput(args: unknown): ParsedToolInput {
     }
   }
 
-  const hasSinglePath = typeof obj.file_path === 'string' && obj.file_path.trim() !== ''
   return {
     input: {
-      file_paths: filePaths,
-      ...(hasSinglePath ? { file_path: obj.file_path as string } : {}),
+      file_path: filePath,
       ...(pages !== undefined ? { pages } : {}),
       ...(focus !== undefined ? { focus } : {}),
       ...(inline_images !== undefined ? { inline_images } : {}),
@@ -348,28 +309,17 @@ export function renderResult(value: ResultView): ContentBlock[] {
 }
 
 export function renderParseDocument(value: ParseDocumentView): ContentBlock[] {
-  if (!('kind' in value)) return renderResult(value)
-  const limit = ('output_limit_chars' in value && typeof value.output_limit_chars === 'number' && Number.isSafeInteger(value.output_limit_chars) && value.output_limit_chars > 0)
-    ? value.output_limit_chars
-    : DEFAULT_RENDER_LIMIT
-  const textBlock: ContentBlock = { type: 'text', text: clampRenderText(formatParseDocumentProse(value), limit) }
-  const imageBlocks: ContentBlock[] = value.results
-    .filter((r): r is ResultView => r.state === 'completed')
-    .flatMap(r => (r.inlined_images ?? []).flatMap(img => img.attachmentRef ? [{ type: 'image' as const, attachment: img.attachmentRef }] : []))
-  return [textBlock, ...imageBlocks]
+  return renderResult(value)
 }
 
 function backgroundLabel(input: ParseRequestInput): string {
-  const count = Array.isArray(input.file_paths) ? input.file_paths.length : (input.file_path ? 1 : 0)
-  return 'Parse ' + String(count) + ' PDF document' + (count === 1 ? '' : 's') + ' with MinerU'
+  const name = input.file_path ? basename(input.file_path) : 'document'
+  return 'Parse ' + name + ' with MinerU'
 }
 
 function nativeSuccessOutcome(value: ParseDocumentView): JobOutcome {
   const output = formatParseSummaryProse(value)
-  if ('kind' in value && value.state === 'failed') {
-    return { status: 'failed', detail: 'batch-failed', output }
-  }
-  return { status: 'completed', detail: 'kind' in value ? value.state : 'completed', output }
+  return { status: 'completed', detail: 'completed', output }
 }
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif'])
@@ -487,19 +437,7 @@ async function processInlineImages(
   attachments: AttachmentStore,
   signal?: AbortSignal,
 ): Promise<ParseDocumentView> {
-  if (!('kind' in view)) {
-    return await inlineImagesForSingleResult(view, attachments, signal)
-  }
-  const updatedResults: Array<ResultView | FailedParseView> = []
-  for (const res of view.results) {
-    if (res.state === 'completed') {
-      const updated = await inlineImagesForSingleResult(res, attachments, signal)
-      updatedResults.push(updated)
-    } else {
-      updatedResults.push(res)
-    }
-  }
-  return { ...view, results: updatedResults }
+  return await inlineImagesForSingleResult(view, attachments, signal)
 }
 
 async function checkCallingModelSupportsImage(exec: ToolRunContext, ctx: Context): Promise<boolean> {
@@ -590,16 +528,7 @@ export function registerTools(ctx: Context, getService: () => MinerUService, acc
       schema: parseOutputSchema,
       render: (_args: unknown, value: unknown) => renderParseDocument(value as ParseDocumentView),
       presentationMeta: (_args: unknown, value: unknown): JsonValue => {
-        const doc = value as ParseDocumentView
-        if ('kind' in doc && doc.kind === 'batch') {
-          return {
-            kind: 'batch',
-            state: doc.state,
-            results_count: doc.results.length,
-            manifests: doc.results.flatMap(r => r.state === 'completed' ? [r.manifest_path] : []),
-          }
-        }
-        const single = doc as ResultView
+        const single = value as ResultView
         return {
           result_id: single.result_id,
           source: single.source,

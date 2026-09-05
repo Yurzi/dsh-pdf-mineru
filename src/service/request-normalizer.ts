@@ -18,7 +18,7 @@ import {
 } from '../domain/request.js'
 
 const REQUEST_FIELDS = new Set([
-  'file_path', 'file_paths', 'pages', 'focus', 'model', 'ocr', 'language', 'formula', 'table', 'artifacts',
+  'file_path', 'pages', 'focus', 'model', 'ocr', 'language', 'formula', 'table', 'artifacts',
   'inline_images', 'poll_timeout_ms',
 ])
 
@@ -30,7 +30,6 @@ const SUPPORTED_EXTENSIONS = new Set([
 export interface RequestNormalizerOptions {
   readonly defaults: ParseDefaults
   readonly cwd?: string
-  readonly maxFiles?: number
   readonly maxFileBytes?: number
 }
 
@@ -71,21 +70,11 @@ export function normalizePages(input: unknown): string {
   }
 }
 
-function resolvePaths(input: ParseRequestInput, maxFiles: number): readonly string[] {
-  const paths: string[] = []
-  if (typeof input.file_path === 'string' && input.file_path.trim() !== '') {
-    paths.push(input.file_path.trim())
+function resolvePath(input: ParseRequestInput): string {
+  if (typeof input.file_path !== 'string' || input.file_path.trim() === '') {
+    throw new MinerUError(failure('INVALID_REQUEST', 'Exactly one local document path is required'))
   }
-  if (Array.isArray(input.file_paths)) {
-    for (const path of input.file_paths) {
-      if (typeof path === 'string' && path.trim() !== '' && !paths.includes(path.trim())) {
-        paths.push(path.trim())
-      }
-    }
-  }
-  if (paths.length === 0) throw new MinerUError(failure('INVALID_REQUEST', 'Exactly one local document path is required'))
-  if (paths.length > maxFiles) throw new MinerUError(failure('INVALID_REQUEST', `At most ${String(maxFiles)} file(s) may be submitted`))
-  return paths
+  return input.file_path.trim()
 }
 
 function resolveArtifacts(input: ParseRequestInput): readonly ArtifactKind[] {
@@ -164,7 +153,7 @@ export class RequestNormalizer {
         throw new MinerUError(failure('INVALID_REQUEST', `Parse request contains unsupported property ${key}`))
       }
     }
-    const paths = resolvePaths(input, this.options.maxFiles ?? 1)
+    const path = resolvePath(input)
     const language = input.language ?? this.options.defaults.language
     if (language.trim() === '') throw new MinerUError(failure('INVALID_REQUEST', 'Language cannot be empty'))
     const model = input.model ?? this.options.defaults.model
@@ -175,22 +164,16 @@ export class RequestNormalizer {
     const formula = input.formula ?? this.options.defaults.formula
     const table = input.table ?? this.options.defaults.table
     const pages = input.pages === undefined ? undefined : normalizePages(input.pages)
-    const unhashedSources = await Promise.all(paths.map(path => prepareSource(
+    const unhashedSource = await prepareSource(
       path, this.options.cwd, this.options.maxFileBytes, signal,
-    )))
-    // File IDs must remain stable when the same source moves within an overlapping
-    // batch. The ordinal is therefore per content hash rather than request index.
-    const occurrences = new Map<string, number>()
-    const sources = unhashedSources.map(source => {
-      const occurrence = occurrences.get(source.sha256) ?? 0
-      occurrences.set(source.sha256, occurrence + 1)
-      return { ...source, fileId: createFileId(source.sha256, occurrence) }
-    })
+    )
+    const fileId = createFileId(unhashedSource.sha256, 0)
+    const source: PreparedSourceFile = { ...unhashedSource, fileId }
     return {
-      sources,
+      sources: [source],
       request: {
         schemaVersion: CANONICAL_PARSE_REQUEST_SCHEMA_VERSION,
-        files: sources.map(({ fileId, name, bytes, sha256 }) => ({ fileId, name, bytes, sha256 })),
+        files: [{ fileId, name: source.name, bytes: source.bytes, sha256: source.sha256 }],
         semantics: { model, ocr, parseMethod, language, formula, table, ...(pages === undefined ? {} : { pages }) },
         requiredArtifacts: resolveArtifacts(input),
       },

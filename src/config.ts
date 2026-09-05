@@ -50,7 +50,6 @@ export interface OutputConfig {
 }
 
 export interface SecurityLimits {
-  readonly maxFilesPerRequest: number
   readonly maxFileBytes: number
   readonly maxApiResponseBytes: number
   readonly maxZipDownloadBytes: number
@@ -114,7 +113,6 @@ export function defaultMinerUConfig(): MinerUConfig {
     retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 10000 },
     output: { maxInlineChars: 200000 },
     limits: {
-      maxFilesPerRequest: 1,
       maxFileBytes: 200 * 1024 * 1024,
       maxApiResponseBytes: 8 * 1024 * 1024,
       maxZipDownloadBytes: 512 * 1024 * 1024,
@@ -265,7 +263,6 @@ function parseCanonical(input: Record<string, unknown>, fallback: MinerUConfig):
       maxInlineChars: boundedPositive(output.maxInlineChars, fallback.output.maxInlineChars, 'output.maxInlineChars', 1024, 1_000_000),
     },
     limits: {
-      maxFilesPerRequest: positive(limits.maxFilesPerRequest, fallback.limits.maxFilesPerRequest, 'limits.maxFilesPerRequest'),
       maxFileBytes: positive(limits.maxFileBytes, fallback.limits.maxFileBytes, 'limits.maxFileBytes'),
       maxApiResponseBytes: positive(limits.maxApiResponseBytes, fallback.limits.maxApiResponseBytes, 'limits.maxApiResponseBytes'),
       maxZipDownloadBytes: positive(limits.maxZipDownloadBytes, fallback.limits.maxZipDownloadBytes, 'limits.maxZipDownloadBytes'),

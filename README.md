@@ -113,14 +113,13 @@ Agent 会自动根据文档长度和指令意图，智能选择同步返回或�
   - `complete`：本次请求所选页面的提取 Markdown 已完整提供，可直接用于回答，无需重复读取正文文件。
   - `partial`：提取正文存在但因输出预算截断，提供可读取的完整正文文件路径 (`markdown_path`) 及续读起始行号 (`read_offset_line`)，明确区分正文文件与结果清单 (`manifest_path`)。
   - `not_requested`：本次请求未包含 `markdown` 产物。
-- `output.maxInlineChars`：单次响应（含批量）的整次字符预算（默认 200,000 字符），批量解析采用支持剩余额度回收的确定性均分策略，优先保障元信息、失败状态与正文展示。
+- `output.maxInlineChars`：单次响应的整次字符预算（默认 200,000 字符），优先保障元信息与正文展示。
 
 ### 常用解析参数（均可通过自然语言告知 Agent）
 
 | 参数 | 类型 | 适用工具 | 作用说明 |
 | --- | --- | --- | --- |
-| `file_path` | `string` | 全部 | 单个本地文件绝对路径（推荐） |
-| `file_paths` | `string[]` | 全部 | 待解析/读取的本地文件绝对路径列表（用于批量操作） |
+| `file_path` | `string` | 全部 | 待解析/读取的本地文件路径（必填） |
 | `pages` | `number` / `string` / `number[]` | `read_pdf` | 1-based 页码选择，支持单页（如 `3`）、数组（如 `[1, 2, 5]`）或范围字符串（如 `"1-3, 5"`） |
 | `focus` | `string` / `string[]` | `read_pdf` | 关注内容类型：`all`（默认全部）、`text`（正文代码公式）、`table`（表格与表题）、`image`（图表与图题） |
 | `inline_images` | `boolean` | `read_pdf` | 是否直接内联多模态图表（模型路由支持图片时默认开启） |
@@ -218,9 +217,8 @@ storage:
   storageRoot: /absolute/path/to/dsh/cache/pdf-mineru  # 默认在 $DSH_HOME/cache/pdf-mineru
   cacheEnabled: true
 output:
-  maxInlineChars: 200000  # 单次响应最大内联字符预算（UTF-16 字符），统一约束单文件与批量结果
+  maxInlineChars: 200000  # 单次响应最大内联字符预算（UTF-16 字符）
 limits:
-  maxFilesPerRequest: 1
   maxFileBytes: 209715200  # 200 MB
 ```
 

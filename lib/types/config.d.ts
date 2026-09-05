@@ -40,7 +40,6 @@ export interface OutputConfig {
     readonly maxInlineChars: number;
 }
 export interface SecurityLimits {
-    readonly maxFilesPerRequest: number;
     readonly maxFileBytes: number;
     readonly maxApiResponseBytes: number;
     readonly maxZipDownloadBytes: number;

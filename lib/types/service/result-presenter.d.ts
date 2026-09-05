@@ -69,15 +69,7 @@ export interface FailedParseView {
     readonly name: string;
     readonly failure: MinerUFailure;
 }
-export interface BatchParseDocumentView {
-    readonly kind: 'batch';
-    readonly state: 'completed' | 'partially-completed' | 'failed';
-    readonly results: readonly (ResultView | FailedParseView)[];
-    readonly output_limit_chars: number;
-    readonly content_status?: ContentStatus;
-    readonly results_omitted?: boolean;
-}
-export type ParseDocumentView = ResultView | BatchParseDocumentView;
+export type ParseDocumentView = ResultView;
 export interface ContentListBlock {
     readonly type?: string;
     readonly page_idx?: number;

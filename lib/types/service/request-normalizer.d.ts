@@ -2,7 +2,6 @@ import { type ParseDefaults, type ParseRequestInput, type PreparedParseRequest, 
 export interface RequestNormalizerOptions {
     readonly defaults: ParseDefaults;
     readonly cwd?: string;
-    readonly maxFiles?: number;
     readonly maxFileBytes?: number;
 }
 export declare function normalizePages(input: unknown): string;

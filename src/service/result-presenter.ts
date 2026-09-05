@@ -83,16 +83,7 @@ export interface FailedParseView {
   readonly failure: MinerUFailure
 }
 
-export interface BatchParseDocumentView {
-  readonly kind: 'batch'
-  readonly state: 'completed' | 'partially-completed' | 'failed'
-  readonly results: readonly (ResultView | FailedParseView)[]
-  readonly output_limit_chars: number
-  readonly content_status?: ContentStatus
-  readonly results_omitted?: boolean
-}
-
-export type ParseDocumentView = ResultView | BatchParseDocumentView
+export type ParseDocumentView = ResultView
 
 export interface ContentListBlock {
   readonly type?: string
@@ -517,13 +508,7 @@ export function formatResultProse(value: ResultView): string {
 }
 
 export function formatParseDocumentProse(value: ParseDocumentView): string {
-  if (!('kind' in value)) return formatResultProse(value)
-  const sections = value.results.map(result =>
-    result.state === 'completed'
-      ? formatResultProse(result)
-      : '**' + result.name + '**: [' + result.failure.code + '] ' + result.failure.message
-  )
-  return '**MinerU Batch Result**\n- State: ' + value.state + '\n- Results: ' + String(value.results.length) + '\n\n' + sections.join('\n\n')
+  return formatResultProse(value)
 }
 
 export function formatSingleSummaryProse(value: ResultView): string {
@@ -573,21 +558,5 @@ export function formatSingleSummaryProse(value: ResultView): string {
 }
 
 export function formatParseSummaryProse(value: ParseDocumentView): string {
-  if ('kind' in value && value.kind === 'batch') {
-    const lines = [
-      '**MinerU Batch Parse Summary**',
-      `- State: ${value.state}`,
-      `- Documents: ${String(value.results.length)}`,
-      '',
-    ]
-    for (const result of value.results) {
-      if (result.state === 'completed') {
-        lines.push(formatSingleSummaryProse(result))
-      } else {
-        lines.push(`**${result.name}**: [${result.failure.code}] ${result.failure.message}`)
-      }
-    }
-    return lines.join('\n\n')
-  }
-  return formatSingleSummaryProse(value as ResultView)
+  return formatSingleSummaryProse(value)
 }

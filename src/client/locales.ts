@@ -48,7 +48,6 @@ export type MineruKey =
   | 'field.retryBaseDelayMs'
   | 'field.retryMaxDelayMs'
   | 'field.maxInlineChars'
-  | 'field.maxFilesPerRequest'
   | 'field.maxFileBytes'
   | 'field.maxApiResponseBytes'
   | 'field.maxZipDownloadBytes'
@@ -174,7 +173,6 @@ export const en: Record<MineruKey, string> = {
 
   'field.maxInlineChars': 'Max Inline Markdown Chars',
 
-  'field.maxFilesPerRequest': 'Max Files Per Request',
   'field.maxFileBytes': 'Max File Bytes',
   'field.maxApiResponseBytes': 'Max API Response Bytes',
   'field.maxZipDownloadBytes': 'Max ZIP Download Bytes',
@@ -301,7 +299,6 @@ export const zh: Record<MineruKey, string> = {
 
   'field.maxInlineChars': 'Markdown 内联字符上限',
 
-  'field.maxFilesPerRequest': '单次请求最大文件数',
   'field.maxFileBytes': '单个源文件大小上限 (bytes)',
   'field.maxApiResponseBytes': 'API 响应体大小上限 (bytes)',
   'field.maxZipDownloadBytes': 'ZIP 下载包大小上限 (bytes)',
