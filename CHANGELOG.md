@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.0.10
+
+### Fixed
+
+- Guarded `shouldInline` in `read_pdf` to only activate when `focus` includes the image modality, preventing inline image emission for non-image focus modes (`toc`, `text`, `table`).
+- Prevented `inlineImagesForSingleResult` from falling back to full document scanning when `ordered_images` for candidate pages is empty, adding comprehensive regression tests for per-page image isolation.
+
 ## 0.0.9
 
 ### Added
@@ -10,8 +17,6 @@
 ### Fixed
 
 - Omitted undeclared internal `attachmentRef` property from `inlined_images` tool output items to strictly conform to `readPdfResultSchema` (`additionalProperties: false`), reconstructing `ImageAttachmentRef` within `renderResult`.
-- Guarded `shouldInline` in `read_pdf` to only activate when `focus` includes the image modality, preventing inline image emission for non-image focus modes (`toc`, `text`, `table`).
-- Prevented `inlineImagesForSingleResult` from falling back to full document scanning when `ordered_images` for candidate pages is empty.
 
 ## 0.0.8
 

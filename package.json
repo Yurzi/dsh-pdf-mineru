@@ -1,6 +1,6 @@
 {
   "name": "dsh-pdf-mineru",
-  "version": "0.0.9",
+  "version": "0.0.10",
   "description": "Provider-independent DSH document parsing powered by MinerU, with native background jobs, immutable results, and safe request coalescing.",
   "keywords": ["dsh-plugin"],
   "license": "MIT",
