@@ -162,10 +162,10 @@ const readPdfParameters: ParameterSchemaSpec = {
   },
   focus: {
     oneOf: [
-      { type: 'string', enum: ['all', 'text', 'table', 'image'], description: 'Focus content type' },
-      { type: 'array', items: { type: 'string', enum: ['all', 'text', 'table', 'image'] }, description: 'Focus content types' },
+      { type: 'string', enum: ['all', 'text', 'table', 'image', 'toc'], description: 'Focus content type' },
+      { type: 'array', items: { type: 'string', enum: ['all', 'text', 'table', 'image', 'toc'] }, description: 'Focus content types' },
     ],
-    description: 'Content types to extract: "all" (default), "text" (paragraphs, headers, code, formulas), "table" (tables and captions), or "image" (charts, figures, and captions). Accepts a single kind or an array.',
+    description: 'Content types to extract: "all" (default), "text" (paragraphs, headers, code, formulas), "table" (tables and captions), "image" (charts, figures, and captions), or "toc" (document outline / table of contents). Accepts a single kind or an array.',
   },
   inline_images: {
     type: 'boolean',

@@ -29,6 +29,7 @@ import {
   safeStringSlice,
   allocateReclaimedShares,
   extractMarkdownHeadings,
+  formatTocMarkdown,
   type DocumentHeading,
 } from '../src/service/mineru-service.js'
 import { renderResult, renderParseDocument } from '../src/tools.js'
@@ -779,5 +780,144 @@ describe('MinerUService direct parsing', () => {
     expect(text).toContain('  - Chapter 2: Methods (line 5)')
     expect(text).toContain('    - Section 2.1: Details (line 7)')
     expect(text).toContain('Note: To read specific sections, call read_pdf with pages="X-Y" or use the read tool starting from the given line offset.')
+  })
+
+  describe('formatTocMarkdown', () => {
+    it('formats empty headings with or without page range note', () => {
+      expect(formatTocMarkdown([])).toBe('*(No headings detected in document outline)*')
+      expect(formatTocMarkdown(undefined)).toBe('*(No headings detected in document outline)*')
+      expect(formatTocMarkdown([], { pageRange: '3-5' })).toBe('*(No headings found in pages: 3-5)*')
+    })
+
+    it('formats headings with level indentation and page or line numbers', () => {
+      const headings: DocumentHeading[] = [
+        { level: 1, title: 'Introduction', line: 1, page: 1 },
+        { level: 2, title: 'Background', line: 5, page: 2 },
+        { level: 3, title: 'Details', line: 12 },
+      ]
+      const md = formatTocMarkdown(headings)
+      expect(md).toBe([
+        '# Document Outline',
+        '',
+        '- Introduction (Page 1)',
+        '  - Background (Page 2)',
+        '    - Details (line 12)',
+      ].join('\n'))
+    })
+  })
+
+  describe('focus: toc behavior in parseDocument', () => {
+    it('returns outline-only content when focus is toc on content_list source', async () => {
+      const h = await harness()
+      h.provider.complete = true
+      const contentList = [
+        { type: 'title', text: 'Overview', text_level: 1, page_idx: 0 },
+        { type: 'text', text: 'Some long paragraph text that should not appear in toc-only view.', page_idx: 0 },
+        { type: 'text', text: 'Section 1', text_level: 2, page_idx: 1 },
+        { type: 'image', path: 'images/fig1.png', page_idx: 1 },
+        { type: 'text', text: 'Section 2', text_level: 2, page_idx: 2 },
+      ]
+      h.provider.extraArtifactsByFileName.set('input.pdf', [
+        { kind: 'content-list', content: JSON.stringify(contentList) },
+        { kind: 'images', content: 'fake-png-content' },
+      ])
+      h.provider.markdown = '# Overview\nSome text\n## Section 1\n## Section 2'
+
+      const parsed = asResult(await h.service.parseDocument(
+        session('session-focus-toc'),
+        { file_path: h.file, focus: 'toc' },
+        new AbortController().signal,
+        null,
+      ))
+
+      expect(parsed.state).toBe('completed')
+      expect(parsed.content_status).toBe('complete')
+      expect(parsed.markdown_content).toContain('# Document Outline')
+      expect(parsed.markdown_content).toContain('- Overview (Page 1)')
+      expect(parsed.markdown_content).toContain('  - Section 1 (Page 2)')
+      expect(parsed.markdown_content).toContain('  - Section 2 (Page 3)')
+      expect(parsed.markdown_content).not.toContain('Some long paragraph text')
+      expect(parsed.ordered_images).toEqual([])
+      expect(parsed.toc).toEqual([
+        { level: 1, title: 'Overview', line: 1, page: 1 },
+        { level: 2, title: 'Section 1', line: 2, page: 2 },
+        { level: 2, title: 'Section 2', line: 3, page: 3 },
+      ])
+
+      const rendered = renderResult(parsed)
+      const renderedText = rendered[0]?.text ?? ''
+      expect(renderedText).toContain('# Document Outline')
+      expect(renderedText).toContain('- Overview (Page 1)')
+      expect(renderedText).not.toContain('Some long paragraph text')
+    })
+
+    it('filters outline by pages when both pages and focus: toc are specified', async () => {
+      const h = await harness()
+      h.provider.complete = true
+      const contentList = [
+        { type: 'title', text: 'Chapter 1', text_level: 1, page_idx: 0 },
+        { type: 'text', text: 'Section 1.1', text_level: 2, page_idx: 1 },
+        { type: 'title', text: 'Chapter 2', text_level: 1, page_idx: 2 },
+      ]
+      h.provider.extraArtifactsByFileName.set('input.pdf', [
+        { kind: 'content-list', content: JSON.stringify(contentList) },
+      ])
+
+      const parsed = asResult(await h.service.parseDocument(
+        session('session-focus-toc-pages'),
+        { file_path: h.file, pages: '2', focus: 'toc' },
+        new AbortController().signal,
+        null,
+      ))
+
+      expect(parsed.markdown_content).toContain('# Document Outline')
+      expect(parsed.markdown_content).toContain('  - Section 1.1 (Page 2)')
+      expect(parsed.markdown_content).not.toContain('Chapter 1 (Page 1)')
+      expect(parsed.markdown_content).not.toContain('Chapter 2 (Page 3)')
+      expect(parsed.toc).toEqual([
+        { level: 2, title: 'Section 1.1', line: 2, page: 2 },
+      ])
+    })
+
+    it('combines outline and text when multiple focus items are given', async () => {
+      const h = await harness()
+      h.provider.complete = true
+      const contentList = [
+        { type: 'title', text: 'Chapter 1', text_level: 1, page_idx: 0 },
+        { type: 'text', text: 'Content of chapter 1.', page_idx: 0 },
+      ]
+      h.provider.extraArtifactsByFileName.set('input.pdf', [
+        { kind: 'content-list', content: JSON.stringify(contentList) },
+      ])
+
+      const parsed = asResult(await h.service.parseDocument(
+        session('session-focus-multi'),
+        { file_path: h.file, focus: ['toc', 'text'] },
+        new AbortController().signal,
+        null,
+      ))
+
+      expect(parsed.markdown_content).toContain('# Document Outline')
+      expect(parsed.markdown_content).toContain('- Chapter 1 (Page 1)')
+      expect(parsed.markdown_content).toContain('Content of chapter 1.')
+    })
+
+    it('extracts outline in markdown fallback mode when focus is toc', async () => {
+      const h = await harness()
+      h.provider.complete = true
+      h.provider.markdown = '# Fallback Title\nSome body text\n## Sub Heading\nMore body'
+
+      const parsed = asResult(await h.service.parseDocument(
+        session('session-focus-fallback'),
+        { file_path: h.file, focus: 'toc' },
+        new AbortController().signal,
+        null,
+      ))
+
+      expect(parsed.markdown_content).toContain('# Document Outline')
+      expect(parsed.markdown_content).toContain('- Fallback Title (line 1)')
+      expect(parsed.markdown_content).toContain('  - Sub Heading (line 3)')
+      expect(parsed.markdown_content).not.toContain('Some body text')
+    })
   })
 })

@@ -136,6 +136,26 @@ export function getRasterMediaType(ext: string): 'image/jpeg' | 'image/webp' | '
   }
 }
 
+export function formatTocMarkdown(
+  headings: readonly DocumentHeading[] | undefined,
+  options?: { pageRange?: string },
+): string {
+  if (!headings || headings.length === 0) {
+    return options?.pageRange
+      ? `*(No headings found in pages: ${options.pageRange})*`
+      : '*(No headings detected in document outline)*'
+  }
+  const lines: string[] = ['# Document Outline', '']
+  for (const heading of headings) {
+    const indent = '  '.repeat(Math.max(0, heading.level - 1))
+    const location = heading.page !== undefined
+      ? ` (Page ${String(heading.page)})`
+      : ` (line ${String(heading.line)})`
+    lines.push(`${indent}- ${heading.title}${location}`)
+  }
+  return lines.join('\n')
+}
+
 export function computeDocumentSummary(
   contentList: readonly ContentListBlock[],
   fallbackFullText?: string,
@@ -485,7 +505,8 @@ export function formatResultProse(value: ResultView): string {
     lines.push('', 'Document Outline:')
     for (const heading of value.toc) {
       const indent = '  '.repeat(Math.max(0, heading.level - 1))
-      lines.push(`${indent}- ${heading.title} (line ${String(heading.line)})`)
+      const location = heading.page !== undefined ? ` (Page ${String(heading.page)})` : ` (line ${String(heading.line)})`
+      lines.push(`${indent}- ${heading.title}${location}`)
     }
     lines.push('', 'Note: To read specific sections, call read_pdf with pages="X-Y" or use the read tool starting from the given line offset.')
   }
@@ -551,6 +572,7 @@ export function formatSingleSummaryProse(value: ResultView): string {
     `- Read specific pages: \`read_pdf({ file_path: "${fileName}", pages: "1-3" })\``,
     `- Focus on tables: \`read_pdf({ file_path: "${fileName}", focus: "table" })\``,
     `- Focus on figures/images: \`read_pdf({ file_path: "${fileName}", focus: "image" })\``,
+    `- Inspect outline / TOC: \`read_pdf({ file_path: "${fileName}", focus: "toc" })\``,
     `- Read complete text: \`read_pdf({ file_path: "${fileName}" })\``,
   )
 

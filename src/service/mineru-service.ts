@@ -40,6 +40,7 @@ import {
   formatParseDocumentProse,
   formatParseSummaryProse,
   formatResultProse,
+  formatTocMarkdown,
   readMarkdownFile,
   truncateAtCleanBoundary,
 } from './result-presenter.js'
@@ -470,6 +471,29 @@ export class MinerUService {
       orderedImages = fallback.orderedImages
       docSummary = fallback.summary
       toc = fallback.summary.toc
+    }
+
+    if (focusSet.has('toc')) {
+      const filteredToc = (pagesSet !== undefined && toc !== undefined)
+        ? toc.filter(h => h.page !== undefined ? pagesSet.has(h.page) : true)
+        : toc
+      const pagesLabel = typeof data.inputPages === 'string'
+        ? data.inputPages
+        : (Array.isArray(data.inputPages)
+          ? data.inputPages.join(',')
+          : (data.inputPages !== undefined ? String(data.inputPages) : undefined))
+      const tocMd = formatTocMarkdown(filteredToc, { pageRange: pagesLabel })
+      const isTocOnly = !focusSet.has('all') && !focusSet.has('text') && !focusSet.has('table') && !focusSet.has('image')
+
+      if (isTocOnly) {
+        fullSourceText = tocMd
+        orderedImages = []
+      } else {
+        fullSourceText = fullSourceText.trim().length > 0
+          ? `${tocMd}\n\n---\n\n${fullSourceText}`
+          : tocMd
+      }
+      toc = filteredToc
     }
 
     const skeleton: ResultView = {

@@ -16,7 +16,7 @@ export type ArtifactKind = typeof ARTIFACT_KINDS[number]
 export type MinerUModel = 'pipeline' | 'vlm'
 export type ParseMethod = 'auto' | 'txt' | 'ocr'
 
-export const FOCUS_KINDS = ['all', 'text', 'table', 'image'] as const
+export const FOCUS_KINDS = ['all', 'text', 'table', 'image', 'toc'] as const
 export type FocusKind = typeof FOCUS_KINDS[number]
 
 export type PageSelection = number | string | readonly (number | string)[]
@@ -157,21 +157,26 @@ export function normalizePageSelection(input: unknown): Set<number> | undefined 
   throw new TypeError(`Invalid page selection: ${String(input)}`)
 }
 
+function parseFocusToken(item: unknown): FocusKind {
+  if (typeof item !== 'string') throw new TypeError(`Invalid focus option: ${String(item)}`)
+  let trimmed = item.trim().toLowerCase()
+  if (trimmed === 'outline') trimmed = 'toc'
+  if (!FOCUS_KINDS.includes(trimmed as FocusKind)) {
+    throw new TypeError(`Invalid focus option: ${String(item)}`)
+  }
+  return trimmed as FocusKind
+}
+
 export function normalizeFocusSelection(input: unknown): Set<FocusKind> {
   if (input === undefined || input === null) return new Set(['all'])
   if (typeof input === 'string') {
-    const trimmed = input.trim().toLowerCase() as FocusKind
-    if (!FOCUS_KINDS.includes(trimmed)) throw new TypeError(`Invalid focus option: ${String(input)}`)
-    return new Set([trimmed])
+    return new Set([parseFocusToken(input)])
   }
   if (Array.isArray(input)) {
     if (input.length === 0) return new Set(['all'])
     const set = new Set<FocusKind>()
     for (const item of input) {
-      if (typeof item !== 'string') throw new TypeError(`Invalid focus option: ${String(item)}`)
-      const trimmed = item.trim().toLowerCase() as FocusKind
-      if (!FOCUS_KINDS.includes(trimmed)) throw new TypeError(`Invalid focus option: ${String(item)}`)
-      set.add(trimmed)
+      set.add(parseFocusToken(item))
     }
     return set
   }

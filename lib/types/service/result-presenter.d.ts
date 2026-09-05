@@ -93,6 +93,9 @@ export interface ContentListBlock {
 export declare function getBlockCategory(type?: string): 'text' | 'table' | 'image';
 export declare function formatCaption(caption: unknown): string;
 export declare function getRasterMediaType(ext: string): 'image/jpeg' | 'image/webp' | 'image/gif' | 'image/png';
+export declare function formatTocMarkdown(headings: readonly DocumentHeading[] | undefined, options?: {
+    pageRange?: string;
+}): string;
 export declare function computeDocumentSummary(contentList: readonly ContentListBlock[], fallbackFullText?: string): DocumentSummary;
 export declare function extractBlocksMarkdown(contentList: readonly ContentListBlock[], pagesSet: ReadonlySet<number> | undefined, focusSet: ReadonlySet<FocusKind>, imageArtifacts: readonly ArtifactView[]): {
     text: string;

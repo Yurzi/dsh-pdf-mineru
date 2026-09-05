@@ -81,7 +81,12 @@ describe('request normalization', () => {
   it('normalizes focus selection for single and array formats', () => {
     expect(normalizeFocusSelection('table')).toEqual(new Set(['table']))
     expect(normalizeFocusSelection(['text', 'image'])).toEqual(new Set(['text', 'image']))
+    expect(normalizeFocusSelection('toc')).toEqual(new Set(['toc']))
+    expect(normalizeFocusSelection('outline')).toEqual(new Set(['toc']))
+    expect(normalizeFocusSelection(['text', 'toc'])).toEqual(new Set(['text', 'toc']))
+    expect(normalizeFocusSelection(['text', 'outline'])).toEqual(new Set(['text', 'toc']))
     expect(normalizeFocusSelection(undefined)).toEqual(new Set(['all']))
+    expect(() => normalizeFocusSelection('invalid')).toThrowError('Invalid focus option: invalid')
   })
 
   it('rejects every removed request alias at the service boundary', async () => {

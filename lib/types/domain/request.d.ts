@@ -6,7 +6,7 @@ export declare const ARTIFACT_KINDS: readonly ["markdown", "layout", "model-outp
 export type ArtifactKind = typeof ARTIFACT_KINDS[number];
 export type MinerUModel = 'pipeline' | 'vlm';
 export type ParseMethod = 'auto' | 'txt' | 'ocr';
-export declare const FOCUS_KINDS: readonly ["all", "text", "table", "image"];
+export declare const FOCUS_KINDS: readonly ["all", "text", "table", "image", "toc"];
 export type FocusKind = typeof FOCUS_KINDS[number];
 export type PageSelection = number | string | readonly (number | string)[];
 export interface ParseSemantics {

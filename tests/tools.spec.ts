@@ -522,6 +522,17 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         exec.signal,
         undefined,
       )
+
+      await readTool.execute({ file_path: '/paper.pdf', focus: 'toc' }, exec)
+      expect(mockService.parseDocument).toHaveBeenCalledWith(
+        exec.agent?.session,
+        expect.objectContaining({
+          file_path: '/paper.pdf',
+          focus: 'toc',
+        }),
+        exec.signal,
+        undefined,
+      )
     })
 
     it('projects structured presentation metadata for single result', () => {
