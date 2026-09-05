@@ -84,3 +84,42 @@ MINERU_API_KEY=<token> pnpm run smoke:official-v4 -- /absolute/path/sample.pdf
 ```
 
 Tests must remain mock/fixture based by default and cover failure, cancellation, retry exhaustion, Retry-After, unsafe POST non-retry, security, concurrency, persistence, maintenance fail-closed behavior, confirmations, and render/output limits. All ESM relative imports include `.js`. Every object in a tool schema declares `additionalProperties`.
+
+## Release Workflow and Notes Template
+
+### Release Steps
+
+1. **Version Bump**: Update `"version"` in `package.json`.
+2. **Update CHANGELOG.md**: Add `## X.Y.Z` section following Keep a Changelog categories (`### Added`, `### Changed`, `### Fixed`, `### Removed`).
+3. **Verification**: Run `pnpm run build && pnpm run typecheck && pnpm test && git diff --check && pnpm run verify:gui`.
+4. **Commit & Tag**:
+   ```sh
+   git add package.json CHANGELOG.md
+   git commit -m "release: vX.Y.Z"
+   git tag -a vX.Y.Z -m "vX.Y.Z"
+   git push origin main
+   git push origin vX.Y.Z
+   ```
+5. **Create GitHub Release via gh CLI**:
+   ```sh
+   gh release create vX.Y.Z --title "vX.Y.Z" --notes-file <file>
+   ```
+
+### GitHub Release Notes Template
+
+Omit the `# [Version]` title header from the body as GitHub renders the release title automatically. Each entry must annotate its commit link. Omit sections (`## Added`, `## Fixed`, `## Changed`) if there are no corresponding items for that release.
+
+```markdown
+[Overview paragraph summarizing the release]
+
+## Added
+- [Feature description] ([short_sha](https://github.com/Yurzi/dsh-pdf-mineru/commit/full_sha))
+
+## Fixed
+- [Bug fix description] ([short_sha](https://github.com/Yurzi/dsh-pdf-mineru/commit/full_sha))
+
+## Changed
+- [Change description] ([short_sha](https://github.com/Yurzi/dsh-pdf-mineru/commit/full_sha))
+
+Full Changelog: https://github.com/Yurzi/dsh-pdf-mineru/compare/v[Previous]...v[Current]
+```
