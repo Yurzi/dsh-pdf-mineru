@@ -2,7 +2,7 @@
 
 ## Architecture
 
-The plugin exposes two model tools (`read_pdf` and `async_read_pdf`) over one versioned MinerU domain. Keep this dependency direction:
+The plugin exposes two model tools (`read_pdf` and `async_parse_pdf`) over one versioned MinerU domain. Keep this dependency direction:
 
 ```text
 tools -> DSH JobRegistry (async ownership, cancellation, completion)
@@ -31,7 +31,7 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 ## Session and concurrency rules
 
 - Every tool requires `exec.agent.session`; pass the exact live Agent as the native DSH background job owner.
-- `async_read_pdf` registers `kind: mineru` with `ctx.jobs.start`; generic `job_output`, `job_list`, and `job_kill` own async control.
+- `async_parse_pdf` registers `kind: mineru` with `ctx.jobs.start`; generic `job_output`, `job_list`, and `job_kill` own async control.
 - `read_pdf` returns results directly and never creates a plugin Job.
 - SharedOperation owns the producer AbortController. Waiter cancellation, including native `job_kill`, only stops that invocation's wait.
 - Native job hooks omit `readOutput`, settle with a non-rejecting final-output Promise, and never expose provider refs.
@@ -59,7 +59,7 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 - `src/providers/safe-zip.ts`: bounded ZIP scanner/extractor.
 - `src/storage/*`: validated paths, process lock, ResultRepository, staging sink, and privileged maintenance service.
 - `src/service/mineru-service.ts`: direct-result use-case orchestration and same-process operation coalescing.
-- `src/tools.ts`: two defineTool schemas (`read_pdf` and `async_read_pdf`), native DSH job adaptation, and pure renderers.
+- `src/tools.ts`: two defineTool schemas (`read_pdf` and `async_parse_pdf`), native DSH job adaptation, and pure renderers.
 - `src/rpc.ts`, `src/client/*`: loopback config/maintenance RPC and Provider-aware settings page.
 - `src/observability.ts`: typed, non-throwing structured diagnostic events.
 - `scripts/smoke-official-v4.mjs`: explicit live smoke through the built plugin tool chain.

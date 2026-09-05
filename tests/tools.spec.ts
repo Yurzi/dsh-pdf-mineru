@@ -134,7 +134,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
     expect(registeredTools).toHaveLength(2)
     const names = registeredTools.map(t => t.name)
     expect(names).toEqual([
-      'async_read_pdf',
+      'async_parse_pdf',
       'read_pdf',
     ])
     expect(typeof dispose).toBe('function')
@@ -172,11 +172,11 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
     }
   })
 
-  describe('async_read_pdf (Native DSH Background Job)', () => {
+  describe('async_parse_pdf (Native DSH Background Job)', () => {
     it('rejects when native DSH background jobs are unavailable', async () => {
       const { ctx, registeredTools } = createMockContext(undefined)
       registerTools(ctx, () => ({} as MinerUService))
-      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
+      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
       const exec = createMockExec(true)
 
       await expect(submitTool.execute({ file_paths: ['/doc.pdf'] }, exec)).rejects.toMatchObject({
@@ -188,7 +188,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const { registry } = createMockJobRegistry()
       const { ctx, registeredTools } = createMockContext(registry)
       registerTools(ctx, () => ({} as MinerUService))
-      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
+      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
 
       const controller = new AbortController()
       controller.abort()
@@ -205,18 +205,11 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         parseDocument: vi.fn(),
       } as unknown as MinerUService
       registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
+      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
 
       const exec = createMockExec(true)
       const inputArgs = {
         file_paths: ['/data/one.pdf', '/data/two.pdf'],
-        model: 'vlm' as const,
-        ocr: true,
-        language: 'en',
-        formula: true,
-        table: true,
-        pages: '1-10',
-        artifacts: ['markdown' as const, 'images' as const],
       }
 
       const result = await submitTool.execute(inputArgs, exec)
@@ -226,7 +219,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
 
       const captured = specs[0]!
       expect(captured.kind).toBe('mineru')
-      expect(captured.label).toBe('Read 2 PDF documents with MinerU')
+      expect(captured.label).toBe('Parse 2 PDF documents with MinerU')
       expect(captured.owner).toBe(exec.agent)
       expect(typeof captured.run).toBe('function')
 
@@ -234,7 +227,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       expect(rendered[0]?.text).toBe('Started native MinerU background job mineru-1.')
     })
 
-    it('resolves done hook with completed outcome and direct markdown content on success', async () => {
+    it('resolves done hook with completed outcome and document summary on success', async () => {
       const { registry, specs } = createMockJobRegistry()
       const { ctx, registeredTools } = createMockContext(registry)
 
@@ -254,13 +247,18 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         content_status: 'complete',
         manifest_path: '/cache/sample/manifest.json',
         output_limit_chars: 2000,
+        summary: {
+          page_count: 5,
+          table_count: 2,
+          image_count: 3,
+        },
       }
 
       const mockService = {
         parseDocument: vi.fn(async () => completedResult),
       } as unknown as MinerUService
       registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
+      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
 
       const exec = createMockExec(true)
       const inputArgs = { file_paths: ['/sample.pdf'] }
@@ -277,10 +275,9 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       )
       expect(outcome.status).toBe('completed')
       expect(outcome.detail).toBe('completed')
-      expect(outcome.output).toContain('Background Parsed Content')
-      expect(outcome.output).toContain('# Document: sample.pdf')
-      expect(outcome.output).toContain('Status: Content complete. Full document markdown delivered above.')
-      expect(outcome.output).toContain('/cache/sample/manifest.json')
+      expect(outcome.output).toContain('MinerU Document Parse Summary')
+      expect(outcome.output).toContain('sample.pdf')
+      expect(outcome.output).toContain('read_pdf')
     })
 
     it('resolves done hook with batch detail when batch parse settles', async () => {
@@ -316,7 +313,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         parseDocument: vi.fn(async () => batchResult),
       } as unknown as MinerUService
       registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
+      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
 
       const exec = createMockExec(true)
       await submitTool.execute({ file_paths: ['/good.pdf', '/bad.pdf'] }, exec)
@@ -326,7 +323,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
 
       expect(outcome.status).toBe('completed')
       expect(outcome.detail).toBe('partially-completed')
-      expect(outcome.output).toContain('**MinerU Batch Result**')
+      expect(outcome.output).toContain('**MinerU Batch Parse Summary**')
       expect(outcome.output).toContain('bad.pdf')
       expect(outcome.output).toContain('REMOTE_PARSE_FAILED')
     })
@@ -344,7 +341,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       }
       const mockService = { parseDocument: vi.fn(async () => failedBatch) } as unknown as MinerUService
       registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
+      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
 
       await submitTool.execute({ file_paths: ['/bad.pdf'] }, createMockExec(true))
       const outcome = await specs[0]!.run().done
@@ -368,7 +365,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         }),
       } as unknown as MinerUService
       registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
+      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
 
       const exec = createMockExec(true)
       await submitTool.execute({ file_paths: ['/hang.pdf'] }, exec)
@@ -393,7 +390,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         }),
       } as unknown as MinerUService
       const dispose = registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
+      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
 
       await submitTool.execute({ file_paths: ['/hang.pdf'] }, createMockExec(true))
       const hooks = specs[0]!.run()
@@ -412,7 +409,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         }),
       } as unknown as MinerUService
       registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
+      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
 
       const exec = createMockExec(true)
       await submitTool.execute({ file_paths: ['/giant.pdf'] }, exec)
@@ -428,7 +425,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
     it('projects structured presentation metadata for submitted jobs', () => {
       const { ctx, registeredTools } = createMockContext()
       registerTools(ctx, () => ({} as MinerUService))
-      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
+      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
 
       expect(submitTool.output.presentationMeta?.({}, { job_id: 'mineru-1', state: 'running' })).toEqual({
         job_id: 'mineru-1',
@@ -457,7 +454,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       } as unknown as MinerUService
 
       registerTools(ctx, () => mockService, accessGate)
-      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
+      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
 
       const exec = createMockExec(true)
       await submitTool.execute({ file_paths: ['/doc.pdf'] }, exec)
@@ -524,6 +521,73 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       expect(parseTool.description).toContain('When content_status is complete')
       expect(parseTool.description).toContain('markdown_content')
       expect(parseTool.description).toContain('When content_status is partial')
+      expect(parseTool.description).not.toContain('If pre-parsed by async_parse_pdf, reads instantly from local cache.')
+      expect(parseTool.description).not.toContain('reads instantly from local cache')
+    })
+
+    it('accepts single file_path parameter on both tools and normalizes appropriately', async () => {
+      const { registry } = createMockJobRegistry()
+      const { ctx, registeredTools } = createMockContext(registry)
+      const mockService = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'cache' as const, cache_hit: true, result_id: 'mr_1', files: [], content_status: 'complete' as const, manifest_path: '/p/m.json', output_limit_chars: 1000 })) } as unknown as MinerUService
+      registerTools(ctx, () => mockService)
+      const asyncTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
+      const readTool = registeredTools.find(t => t.name === 'read_pdf')!
+      const exec = createMockExec(true)
+
+      const asyncRes = await asyncTool.execute({ file_path: '/single.pdf' }, exec)
+      expect(asyncRes).toMatchObject({ state: 'running' })
+
+      await readTool.execute({ file_path: '/single.pdf' }, exec)
+      expect(mockService.parseDocument).toHaveBeenCalledWith(
+        exec.agent?.session,
+        expect.objectContaining({ file_path: '/single.pdf', file_paths: ['/single.pdf'] }),
+        exec.signal,
+        undefined,
+      )
+    })
+
+    it('rejects removed technical parameters (model, ocr, formula, table, language, artifacts, max_inline_images)', async () => {
+      const { ctx, registeredTools } = createMockContext()
+      registerTools(ctx, () => ({} as MinerUService))
+      const exec = createMockExec(true)
+      for (const tool of registeredTools) {
+        for (const param of ['model', 'ocr', 'formula', 'table', 'language', 'artifacts', 'max_inline_images']) {
+          await expect(tool.execute({ file_paths: ['/doc.pdf'], [param]: 'test' }, exec))
+            .rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
+        }
+      }
+    })
+
+    it('passes pages and focus options to mineru service in read_pdf', async () => {
+      const { ctx, registeredTools } = createMockContext()
+      const mockService = {
+        parseDocument: vi.fn(async () => ({
+          state: 'completed' as const,
+          source: 'cache' as const,
+          cache_hit: true,
+          result_id: 'mr_1',
+          files: [],
+          content_status: 'complete' as const,
+          manifest_path: '/cache/m.json',
+          output_limit_chars: 1000,
+        })),
+      } as unknown as MinerUService
+      registerTools(ctx, () => mockService)
+      const readTool = registeredTools.find(t => t.name === 'read_pdf')!
+      const exec = createMockExec(true)
+
+      await readTool.execute({ file_path: '/paper.pdf', pages: '1-3, 5', focus: 'table' }, exec)
+      expect(mockService.parseDocument).toHaveBeenCalledWith(
+        exec.agent?.session,
+        expect.objectContaining({
+          file_path: '/paper.pdf',
+          file_paths: ['/paper.pdf'],
+          pages: '1-3, 5',
+          focus: 'table',
+        }),
+        exec.signal,
+        undefined,
+      )
     })
 
     it('projects structured presentation metadata for single result and batch result', () => {

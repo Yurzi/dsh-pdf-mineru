@@ -165,8 +165,8 @@ async function main() {
     const tool = definitions.find(definition => definition?.name === 'read_pdf')
     if (tool === undefined || typeof tool.execute !== 'function') throw new Error('read_pdf was not registered')
     const args = {
-      file_paths: [pdfPath], model: options.model, ocr: options.ocr, language: options.language,
-      artifacts: ['markdown'], poll_timeout_ms: options.timeoutMs,
+      file_path: pdfPath,
+      poll_timeout_ms: options.timeoutMs,
     }
     const session = { header: { id: `smoke-${randomUUID()}`, cwd: process.cwd() } }
     const result = await tool.execute(args, {

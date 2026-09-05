@@ -551,15 +551,15 @@ Provider 应保留官方 code/msg/trace_id 或自托管 HTTP 状态作为诊断�
 
 ## 15. 工具接口
 
-模型面暴露两个解析工具（`read_pdf` 与 `async_read_pdf`）；异步控制统一复用 DSH 通用 job 工具，不再维护插件专用 status/result 工具。连通性探测作为内部 loopback RPC 端点（`mineru/probe`）供 Web 设置界面使用，不占用模型工具面。
+模型面暴露两个解析工具（`read_pdf` 与 `async_parse_pdf`）；异步控制统一复用 DSH 通用 job 工具，不再维护插件专用 status/result 工具。连通性探测作为内部 loopback RPC 端点（`mineru/probe`）供 Web 设置界面使用，不占用模型工具面。
 
 ### 15.1 read_pdf
 
-同步执行直接结果管线，成功直接交付提取的正文 Markdown（`markdown_content`）、多模态内联视觉图表、正文完整性状态（`content_status`：`complete` | `partial` | `not_requested`）与产物清单，不创建插件 Job。pollTimeout 仅停止当前 waiter；再次提交相同请求可重新加入仍在运行的 SharedOperation。
+同步执行直接结果读取管线。支持通过 `pages`（指定页码，如 `"1-3, 5"` 或 `3`）与 `focus`（关注点，如 `'all' | 'text' | 'table' | 'image'`）进行精准内容切片提取。成功直接交付提取的正文 Markdown（`markdown_content`）、按文档自然阅读顺序排列并关联正文标注的多模态内联图片、正文完整性状态（`content_status`：`complete` | `partial` | `not_requested`）与产物清单，不创建插件 Job。pollTimeout 仅停止当前 waiter；若文档已在缓存中则毫秒级秒开。
 
-### 15.2 async_read_pdf
+### 15.2 async_parse_pdf
 
-输入 file_paths 和统一解析参数，通过 ctx.jobs.start 立即返回原生 job_id 和 running 状态，注册为 DSH 原生后台任务（`mineru-N`）。最终任务完成由 job_output 读取排版正文与完整性指引；取消由 job_kill 处理。工具不返回上游 status_url、result_url、batch_id 或预签名地址。
+专职负责后台 PDF 全量异步解析落盘。输入 `file_path` 或 `file_paths`，通过 ctx.jobs.start 立即返回原生 job_id 和 running 状态，注册为 DSH 原生后台任务（`mineru-N`）。解析完成时向本地持久化缓存全量写入所有产物，并通过 job_output 交付文档结构化摘要（总页数、大纲目录、表格数、图片数等元信息）与后续调用 `read_pdf` 进行按需切片读取的指引。取消由 job_kill 处理。工具不返回上游 status_url、result_url、batch_id 或预签名地址。
 
 ### 15.3 模型输出限制与纯文本规范
 
@@ -667,7 +667,7 @@ Prepared request 和 SharedOperation 在创建时固定 providerConfigId 与 com
 插件只接受 Provider-based canonical config 和当前工具参数，不对旧接口做静默转换。
 
 1. flat `baseURL/apiKeyEnv/defaultBackend` 配置会被配置解析器拒绝。
-2. MinerU 工具只接受 `file_paths/model/ocr/language/formula/table/pages/artifacts`，后台控制使用 DSH 通用 job 工具。
+2. 模型工具只暴露 `read_pdf` 与 `async_parse_pdf`，参数专注于文档定位与用户阅读需求（`file_path`、`file_paths`、`pages`、`focus`、`inline_images`），彻底与 `model`、`ocr`、`formula`、`table`、`language`、`artifacts`、`max_inline_images` 等底层专有参数解耦；后台控制使用 DSH 通用 job 工具。
 3. Self-hosted v2 的 `task_id/backend/parse_method/start_page_id/end_page_id` 仅存在于 Provider 私有协议适配中。
 4. 旧 `/tmp/mineru-*` 文件不迁移到全局缓存，因为缺少可靠 CacheKey 与 manifest。
 

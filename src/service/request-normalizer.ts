@@ -8,6 +8,7 @@ import {
   CANONICAL_PARSE_REQUEST_SCHEMA_VERSION,
   normalizeArtifactKinds,
   normalizePageRanges,
+  normalizePageSelection,
   type ArtifactKind,
   type ParseDefaults,
   type ParseMethod,
@@ -17,7 +18,8 @@ import {
 } from '../domain/request.js'
 
 const REQUEST_FIELDS = new Set([
-  'file_paths', 'model', 'ocr', 'language', 'formula', 'table', 'pages', 'artifacts',
+  'file_path', 'file_paths', 'pages', 'focus', 'model', 'ocr', 'language', 'formula', 'table', 'artifacts',
+  'inline_images', 'poll_timeout_ms',
 ])
 
 const SUPPORTED_EXTENSIONS = new Set([
@@ -32,9 +34,35 @@ export interface RequestNormalizerOptions {
   readonly maxFileBytes?: number
 }
 
-export function normalizePages(input: string): string {
+export function normalizePages(input: unknown): string {
   try {
-    return normalizePageRanges(input)
+    if (typeof input === 'string') {
+      return normalizePageRanges(input)
+    }
+    if (typeof input === 'number') {
+      if (!Number.isSafeInteger(input) || input < 1 || input > 99999) throw new TypeError(`Invalid page number: ${String(input)}`)
+      return String(input)
+    }
+    if (Array.isArray(input)) {
+      const selected = normalizePageSelection(input)
+      if (!selected || selected.size === 0) throw new TypeError('Page selection cannot be empty')
+      const sorted = [...selected].sort((a, b) => a - b)
+      const ranges: string[] = []
+      let start = sorted[0]!
+      let end = start
+      for (let i = 1; i < sorted.length; i++) {
+        if (sorted[i] === end + 1) {
+          end = sorted[i]!
+        } else {
+          ranges.push(start === end ? String(start) : `${String(start)}-${String(end)}`)
+          start = sorted[i]!
+          end = start
+        }
+      }
+      ranges.push(start === end ? String(start) : `${String(start)}-${String(end)}`)
+      return ranges.join(',')
+    }
+    throw new TypeError('Invalid page selection')
   } catch (error) {
     throw new MinerUError(failure(
       'INVALID_REQUEST',
@@ -44,23 +72,32 @@ export function normalizePages(input: string): string {
 }
 
 function resolvePaths(input: ParseRequestInput, maxFiles: number): readonly string[] {
-  const paths = input.file_paths ?? []
+  const paths: string[] = []
+  if (typeof input.file_path === 'string' && input.file_path.trim() !== '') {
+    paths.push(input.file_path.trim())
+  }
+  if (Array.isArray(input.file_paths)) {
+    for (const path of input.file_paths) {
+      if (typeof path === 'string' && path.trim() !== '' && !paths.includes(path.trim())) {
+        paths.push(path.trim())
+      }
+    }
+  }
   if (paths.length === 0) throw new MinerUError(failure('INVALID_REQUEST', 'Exactly one local document path is required'))
   if (paths.length > maxFiles) throw new MinerUError(failure('INVALID_REQUEST', `At most ${String(maxFiles)} file(s) may be submitted`))
-  if (paths.some(path => typeof path !== 'string' || path.trim() === '')) {
-    throw new MinerUError(failure('INVALID_REQUEST', 'File paths must be non-empty strings'))
-  }
   return paths
 }
 
-function resolveArtifacts(input: ParseRequestInput, defaults: ParseDefaults): readonly ArtifactKind[] {
-  const artifacts = [...(input.artifacts ?? defaults.artifacts)]
-  for (const artifact of artifacts) {
-    if (!(ARTIFACT_KINDS as readonly string[]).includes(artifact)) {
-      throw new MinerUError(failure('INVALID_REQUEST', `Unknown artifact kind: ${String(artifact)}`))
+function resolveArtifacts(input: ParseRequestInput): readonly ArtifactKind[] {
+  if (input.artifacts !== undefined) {
+    for (const artifact of input.artifacts) {
+      if (!(ARTIFACT_KINDS as readonly string[]).includes(artifact)) {
+        throw new MinerUError(failure('INVALID_REQUEST', `Unknown artifact kind: ${String(artifact)}`))
+      }
     }
+    return normalizeArtifactKinds(input.artifacts)
   }
-  return normalizeArtifactKinds(artifacts)
+  return ARTIFACT_KINDS
 }
 
 async function prepareSource(
@@ -155,7 +192,7 @@ export class RequestNormalizer {
         schemaVersion: CANONICAL_PARSE_REQUEST_SCHEMA_VERSION,
         files: sources.map(({ fileId, name, bytes, sha256 }) => ({ fileId, name, bytes, sha256 })),
         semantics: { model, ocr, parseMethod, language, formula, table, ...(pages === undefined ? {} : { pages }) },
-        requiredArtifacts: resolveArtifacts(input, this.options.defaults),
+        requiredArtifacts: resolveArtifacts(input),
       },
     }
   }

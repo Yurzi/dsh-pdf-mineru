@@ -6,6 +6,9 @@ export declare const ARTIFACT_KINDS: readonly ["markdown", "layout", "model-outp
 export type ArtifactKind = typeof ARTIFACT_KINDS[number];
 export type MinerUModel = 'pipeline' | 'vlm';
 export type ParseMethod = 'auto' | 'txt' | 'ocr';
+export declare const FOCUS_KINDS: readonly ["all", "text", "table", "image"];
+export type FocusKind = typeof FOCUS_KINDS[number];
+export type PageSelection = number | string | readonly (number | string)[];
 export interface ParseSemantics {
     readonly model: MinerUModel;
     readonly ocr: boolean;
@@ -43,14 +46,18 @@ export interface PreparedParseRequest {
     readonly sources: readonly PreparedSourceFile[];
 }
 export interface ParseRequestInput {
+    readonly file_path?: string;
     readonly file_paths?: readonly string[];
     readonly model?: MinerUModel;
     readonly ocr?: boolean;
     readonly language?: string;
     readonly formula?: boolean;
     readonly table?: boolean;
-    readonly pages?: string;
+    readonly pages?: PageSelection;
+    readonly focus?: FocusKind | readonly FocusKind[];
     readonly artifacts?: readonly ArtifactKind[];
+    readonly inline_images?: boolean;
+    readonly poll_timeout_ms?: number;
 }
 export interface ParseDefaults {
     readonly model: MinerUModel;
@@ -59,7 +66,8 @@ export interface ParseDefaults {
     readonly language: string;
     readonly formula: boolean;
     readonly table: boolean;
-    readonly artifacts: readonly ArtifactKind[];
 }
 export declare function normalizePageRanges(input: string): string;
+export declare function normalizePageSelection(input: unknown): Set<number> | undefined;
+export declare function normalizeFocusSelection(input: unknown): Set<FocusKind>;
 export declare function normalizeArtifactKinds(kinds: readonly ArtifactKind[]): readonly ArtifactKind[];

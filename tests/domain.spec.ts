@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { asCacheKey, asSessionId, createFileId } from '../src/domain/ids.js'
 import { MinerUError, sanitizeDiagnostic } from '../src/domain/errors.js'
-import { CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, type CanonicalParseRequest, type ParseDefaults, type ParseRequestInput } from '../src/domain/request.js'
+import { CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, normalizeFocusSelection, normalizePageSelection, type CanonicalParseRequest, type ParseDefaults, type ParseRequestInput } from '../src/domain/request.js'
 import { computeCacheKey } from '../src/service/cache-key.js'
 import { RequestNormalizer, assertSourcesUnchanged, normalizePages } from '../src/service/request-normalizer.js'
 
@@ -20,7 +20,6 @@ const defaults: ParseDefaults = {
   language: 'ch',
   formula: true,
   table: true,
-  artifacts: ['markdown'],
 }
 
 async function fixture(name = 'document.pdf', contents = '%PDF-1.4 fixture'): Promise<{ root: string; path: string }> {
@@ -45,7 +44,7 @@ describe('request normalization', () => {
     expect(prepared.request.semantics).toEqual({
       model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true,
     })
-    expect(prepared.request.requiredArtifacts).toEqual(['markdown'])
+    expect(prepared.request.requiredArtifacts).toEqual(['markdown', 'layout', 'model-output', 'content-list', 'images'])
     expect(prepared.sources[0]?.path).toBe(path)
     expect(JSON.stringify(prepared.request)).not.toContain(root)
   })
@@ -64,11 +63,32 @@ describe('request normalization', () => {
   })
 
 
+  it('accepts single file_path and normalizes to canonical request file', async () => {
+    const { path } = await fixture()
+    const normalizer = new RequestNormalizer({ defaults })
+    const prepared = await normalizer.normalize({ file_path: path }, new AbortController().signal)
+    expect(prepared.request.files).toHaveLength(1)
+    expect(prepared.sources[0]?.path).toBe(path)
+  })
+
+  it('normalizes page selection for various input formats', () => {
+    expect(normalizePageSelection(3)).toEqual(new Set([3]))
+    expect(normalizePageSelection([1, 2, 5])).toEqual(new Set([1, 2, 5]))
+    expect(normalizePageSelection('1-3, 5')).toEqual(new Set([1, 2, 3, 5]))
+    expect(normalizePageSelection(undefined)).toBeUndefined()
+  })
+
+  it('normalizes focus selection for single and array formats', () => {
+    expect(normalizeFocusSelection('table')).toEqual(new Set(['table']))
+    expect(normalizeFocusSelection(['text', 'image'])).toEqual(new Set(['text', 'image']))
+    expect(normalizeFocusSelection(undefined)).toEqual(new Set(['all']))
+  })
+
   it('rejects every removed request alias at the service boundary', async () => {
     const { path } = await fixture()
     const normalizer = new RequestNormalizer({ defaults })
     const aliases: Record<string, unknown> = {
-      file_path: path, backend: 'pipeline', parse_method: 'ocr', lang_list: ['en'],
+      backend: 'pipeline', parse_method: 'ocr', lang_list: ['en'],
       formula_enable: true, table_enable: true, return_middle_json: true,
       return_model_output: true, return_content_list: true, return_images: true,
       start_page_id: 0, end_page_id: 1,

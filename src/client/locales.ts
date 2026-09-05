@@ -37,7 +37,6 @@ export type MineruKey =
   | 'field.defaultLang'
   | 'field.defaultFormula'
   | 'field.defaultTable'
-  | 'field.defaultArtifacts'
   | 'field.storageRoot'
   | 'field.cacheEnabled'
   | 'field.stagingTtlMs'
@@ -159,7 +158,6 @@ export const en: Record<MineruKey, string> = {
   'field.defaultLang': 'Default Language',
   'field.defaultFormula': 'Enable Formula Extraction',
   'field.defaultTable': 'Enable Table Extraction',
-  'field.defaultArtifacts': 'Default Required Artifacts',
 
   'field.storageRoot': 'Storage Root Directory',
   'field.cacheEnabled': 'Enable Global Cache',
@@ -287,7 +285,6 @@ export const zh: Record<MineruKey, string> = {
   'field.defaultLang': '默认语言',
   'field.defaultFormula': '开启公式解析',
   'field.defaultTable': '开启表格解析',
-  'field.defaultArtifacts': '默认必要产物',
 
   'field.storageRoot': '持久存储根目录',
   'field.cacheEnabled': '启用全局内容寻址缓存',

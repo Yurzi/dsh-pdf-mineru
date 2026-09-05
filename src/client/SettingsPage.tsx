@@ -3,7 +3,7 @@ import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots
 import type { ClientConnectionRpc, RpcResult } from '@deepseek-ai/dsh-client-connection/client'
 import { defaultProviderConfig, type MinerUConfig, type OfficialV4Config, type ProviderConfig, type SelfHostedV2Config } from '../config.js'
 import { asProviderConfigId } from '../domain/ids.js'
-import type { ArtifactKind, MinerUModel, ParseMethod } from '../domain/request.js'
+import type { MinerUModel, ParseMethod } from '../domain/request.js'
 import type { ProbeView } from '../service/mineru-service.js'
 import type { MineruKey } from './locales.js'
 import { StorageOperations } from './StorageOperations.js'
@@ -39,8 +39,6 @@ interface CredentialState {
   readonly view?: CredentialView
   readonly error?: string
 }
-
-const ALL_ARTIFACT_KINDS: readonly ArtifactKind[] = ['markdown', 'layout', 'model-output', 'content-list', 'images']
 
 const PROVIDER_TYPES = ['self-hosted-v2', 'official-v4'] as const
 
@@ -296,18 +294,6 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
   const credentialPlaceholder = credentialView?.configured === true
     ? t('credential.placeholderStored')
     : t('credential.placeholderEmpty')
-
-  const toggleArtifact = (kind: ArtifactKind): void => {
-    const current = draft.defaults.artifacts
-    let next: ArtifactKind[]
-    if (current.includes(kind)) {
-      if (kind === 'markdown') return // markdown is mandatory
-      next = current.filter(k => k !== kind)
-    } else {
-      next = [...current, kind]
-    }
-    setDraft(prev => (prev === null ? prev : updateConfigSection(prev, 'defaults', { artifacts: next })))
-  }
 
   const toggleOfficialModel = (model: MinerUModel): void => {
     if (activeProvider.type !== 'official-v4') return
@@ -635,22 +621,6 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
           </label>
         </div>
 
-        <div className={css.field}>
-          <span className={css.fieldLabel}>{t('field.defaultArtifacts')}</span>
-          <div className={css.checkboxGroup}>
-            {ALL_ARTIFACT_KINDS.map(kind => (
-              <label key={kind} className={css.checkboxOption}>
-                <input
-                  type="checkbox"
-                  checked={draft.defaults.artifacts.includes(kind)}
-                  disabled={kind === 'markdown'}
-                  onChange={() => toggleArtifact(kind)}
-                />
-                <span>{t(`artifact.${kind}` as MineruKey)}</span>
-              </label>
-            ))}
-          </div>
-        </div>
       </div>
 
       {/* 3. Storage & Cache */}

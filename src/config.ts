@@ -1,7 +1,7 @@
 import { homedir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
 import { asProviderConfigId, type ProviderConfigId } from './domain/ids.js'
-import type { ArtifactKind, MinerUModel, ParseDefaults } from './domain/request.js'
+import type { MinerUModel, ParseDefaults } from './domain/request.js'
 
 export interface SelfHostedV2Config {
   readonly id: ProviderConfigId
@@ -108,7 +108,7 @@ export function defaultMinerUConfig(): MinerUConfig {
     schemaVersion: 1,
     activeProvider: selfHosted.id,
     providers: [selfHosted, official],
-    defaults: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true, artifacts: ['markdown'] },
+    defaults: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true },
     storage: { storageRoot: join(dshHome(), 'cache', 'pdf-mineru'), cacheEnabled: true, retainSources: false, stagingTtlMs: 24 * 60 * 60 * 1000 },
     polling: { pollIntervalMs: 2000, pollTimeoutMs: 600000, requestTimeoutMs: 60000, operationTimeoutMs: 60 * 60 * 1000 },
     retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 10000 },
@@ -177,15 +177,6 @@ function models(value: unknown, fallback: readonly MinerUModel[]): readonly Mine
   return [...new Set(input as MinerUModel[])]
 }
 
-function artifacts(value: unknown, fallback: readonly ArtifactKind[]): readonly ArtifactKind[] {
-  const input = value === undefined ? fallback : value
-  const allowed = new Set<ArtifactKind>(['markdown', 'layout', 'model-output', 'content-list', 'images'])
-  if (!Array.isArray(input) || input.some(item => typeof item !== 'string' || !allowed.has(item as ArtifactKind))) {
-    throw new TypeError('defaults.artifacts contains an unsupported artifact')
-  }
-  return [...new Set<ArtifactKind>(['markdown', ...(input as ArtifactKind[])])]
-}
-
 function parseProvider(value: unknown): ProviderConfig {
   const input = record(value, 'provider')
   const id = asProviderConfigId(text(input.id, '', 'provider.id'))
@@ -252,7 +243,6 @@ function parseCanonical(input: Record<string, unknown>, fallback: MinerUConfig):
       language: text(defaults.language, fallback.defaults.language, 'defaults.language'),
       formula: booleanValue(defaults.formula, fallback.defaults.formula, 'defaults.formula'),
       table: booleanValue(defaults.table, fallback.defaults.table, 'defaults.table'),
-      artifacts: artifacts(defaults.artifacts, fallback.defaults.artifacts),
     },
     storage: {
       storageRoot: isAbsolute(storageRoot) ? resolve(storageRoot) : resolve(storageRoot),

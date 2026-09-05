@@ -49,7 +49,6 @@ export const Config = z.object({
     language: z.string(),
     formula: z.boolean(),
     table: z.boolean(),
-    artifacts: z.array(z.union(['markdown', 'layout', 'model-output', 'content-list', 'images'])),
   }),
   storage: z.object({
     storageRoot: z.string(),

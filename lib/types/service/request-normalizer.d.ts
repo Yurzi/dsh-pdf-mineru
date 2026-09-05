@@ -5,7 +5,7 @@ export interface RequestNormalizerOptions {
     readonly maxFiles?: number;
     readonly maxFileBytes?: number;
 }
-export declare function normalizePages(input: string): string;
+export declare function normalizePages(input: unknown): string;
 export declare function assertSourcesUnchanged(sources: readonly PreparedSourceFile[], signal: AbortSignal): Promise<void>;
 export declare class RequestNormalizer {
     private readonly options;

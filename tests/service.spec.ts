@@ -162,6 +162,24 @@ class MockProvider implements MinerUProvider {
           artifacts.push(art)
         }
       }
+      for (const kind of _request.requiredArtifacts) {
+        if (!artifacts.some(a => a.kind === kind)) {
+          if (kind === 'content-list') {
+            const art = await sink.writeArtifact(file.fileId, kind, '[]', { mediaType: 'application/json' })
+            artifacts.push(art)
+          } else if (kind === 'layout') {
+            const art = await sink.writeArtifact(file.fileId, kind, '{"pdf_info":[]}', { mediaType: 'application/json' })
+            artifacts.push(art)
+          } else if (kind === 'model-output') {
+            const art = await sink.writeArtifact(file.fileId, kind, '{}', { mediaType: 'application/json' })
+            artifacts.push(art)
+          } else if (kind === 'images') {
+            const png1x1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64')
+            const art = await sink.writeArtifact(file.fileId, kind, png1x1, { mediaType: 'image/png' })
+            artifacts.push(art)
+          }
+        }
+      }
       files.push({ fileId: file.fileId, name: file.name, artifacts })
     }
     return { files }

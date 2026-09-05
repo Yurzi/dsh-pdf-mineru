@@ -7,12 +7,14 @@ import type { JobOutcome, JobRegistry } from '@deepseek-ai/dsh-jobs'
 import type { AttachmentStore, ImageMediaType } from '@deepseek-ai/dsh-attachment'
 import type { ContentBlock, JsonValue, ObjectValueSchemaSpec, ParameterSchemaSpec, ToolRunContext, ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
 import { MinerUError, failure, toMinerUFailure } from './domain/errors.js'
-import type { ParseRequestInput } from './domain/request.js'
+import type { FocusKind, PageSelection, ParseRequestInput } from './domain/request.js'
+import { normalizeFocusSelection, normalizePageSelection } from './domain/request.js'
 import type { MinerUResultManifest } from './domain/result.js'
 import type { StorageAccessGate } from './storage/access-gate.js'
 import type {
   BatchParseDocumentView,
   FailedParseView,
+  ImageCandidateView,
   InlinedImageView,
   MinerUService,
   ParseDocumentView,
@@ -20,7 +22,9 @@ import type {
 } from './service/mineru-service.js'
 import {
   formatParseDocumentProse,
+  formatParseSummaryProse,
   formatResultProse,
+  getRasterMediaType,
 } from './service/mineru-service.js'
 
 declare module '@deepseek-ai/dsh-jobs' {
@@ -58,12 +62,38 @@ const inlinedImageViewSchema: ObjectValueSchemaSpec = {
   additionalProperties: false,
 }
 
+const imageCandidateViewSchema: ObjectValueSchemaSpec = {
+  type: 'object',
+  properties: {
+    path: { type: 'string' },
+    name: { type: 'string' },
+    page: { type: 'integer' },
+    caption: { type: 'string' },
+    media_type: { type: 'string' },
+    bytes: { type: 'integer' },
+  },
+  additionalProperties: false,
+}
+
 const documentHeadingSchema: ObjectValueSchemaSpec = {
   type: 'object',
   properties: {
     level: { type: 'integer' },
     title: { type: 'string' },
     line: { type: 'integer' },
+    page: { type: 'integer' },
+  },
+  additionalProperties: false,
+}
+
+const documentSummarySchema: ObjectValueSchemaSpec = {
+  type: 'object',
+  properties: {
+    page_count: { type: 'integer' },
+    table_count: { type: 'integer' },
+    image_count: { type: 'integer' },
+    equation_count: { type: 'integer' },
+    toc: { type: 'array', items: documentHeadingSchema },
   },
   additionalProperties: false,
 }
@@ -92,6 +122,8 @@ const resultViewSchema: ObjectValueSchemaSpec = {
     manifest_path: { type: 'string' },
     output_limit_chars: { type: 'integer' },
     inlined_images: { type: 'array', items: inlinedImageViewSchema },
+    ordered_images: { type: 'array', items: imageCandidateViewSchema },
+    summary: documentSummarySchema,
     toc: { type: 'array', items: documentHeadingSchema },
   },
   additionalProperties: false,
@@ -122,18 +154,50 @@ const batchViewSchema: ObjectValueSchemaSpec = {
 
 const parseOutputSchema: ValueSchemaSpec = { oneOf: [resultViewSchema, batchViewSchema] }
 
-const parseParameters: ParameterSchemaSpec = {
-  file_paths: { type: 'array', items: { type: 'string' }, description: 'Paths of local documents to parse.' },
-  model: { type: 'string', enum: ['pipeline', 'vlm'], description: 'Parsing model: pipeline or vlm.' },
-  ocr: { type: 'boolean', description: 'Force OCR on all pages.' },
-  language: { type: 'string', description: 'Language hint code.' },
-  formula: { type: 'boolean', description: 'Enable mathematical formula recognition.' },
-  table: { type: 'boolean', description: 'Enable table structure recognition.' },
-  pages: { type: 'string', description: '1-based page range string.' },
-  artifacts: {
+const asyncParseParameters: ParameterSchemaSpec = {
+  file_path: {
+    type: 'string',
+    description: 'Path of the local PDF document to parse.',
+  },
+  file_paths: {
     type: 'array',
-    items: { type: 'string', enum: ['markdown', 'layout', 'model-output', 'content-list', 'images'] },
-    description: 'Artifacts to extract and retain. Default: markdown.',
+    items: { type: 'string' },
+    description: 'Paths of local PDF documents to parse (for batch operations).',
+  },
+}
+
+const readPdfParameters: ParameterSchemaSpec = {
+  file_path: {
+    type: 'string',
+    description: 'Path of the local PDF document to read.',
+  },
+  file_paths: {
+    type: 'array',
+    items: { type: 'string' },
+    description: 'Paths of local PDF documents to read (for batch operations).',
+  },
+  pages: {
+    oneOf: [
+      { type: 'integer', description: 'Single 1-based page number, e.g. 3' },
+      { type: 'string', description: 'Page range string, e.g. "1-3, 5"' },
+      { type: 'array', items: { type: 'integer' }, description: 'Array of page numbers, e.g. [1, 2, 5]' },
+    ],
+    description: '1-based page numbers to extract. Accepts a single page number (e.g. 3), an array of page numbers (e.g. [1, 2, 5]), or a range string (e.g. "1-3, 5").',
+  },
+  focus: {
+    oneOf: [
+      { type: 'string', enum: ['all', 'text', 'table', 'image'], description: 'Focus content type' },
+      { type: 'array', items: { type: 'string', enum: ['all', 'text', 'table', 'image'] }, description: 'Focus content types' },
+    ],
+    description: 'Content types to extract: "all" (default), "text" (paragraphs, headers, code, formulas), "table" (tables and captions), or "image" (charts, figures, and captions). Accepts a single kind or an array.',
+  },
+  inline_images: {
+    type: 'boolean',
+    description: 'Whether to inline visual figures directly as multimodal image blocks. Defaults to true when calling model route supports images.',
+  },
+  poll_timeout_ms: {
+    type: 'integer',
+    description: 'Maximum synchronous wait in milliseconds. A timeout leaves the shared producer running; retry the same request to rejoin it.',
   },
 }
 
@@ -164,51 +228,111 @@ function requireAgent(exec: ToolRunContext): NonNullable<ToolRunContext['agent']
   return agent
 }
 
+const REMOVED_TOOL_PARAMETERS = new Set([
+  'model', 'ocr', 'formula', 'table', 'language', 'artifacts', 'max_inline_images',
+])
+
+function assertNoRemovedParameters(args: Record<string, unknown>): void {
+  for (const key of Object.keys(args)) {
+    if (REMOVED_TOOL_PARAMETERS.has(key)) {
+      throw new MinerUError(failure('INVALID_REQUEST', `Unsupported parameter: ${key}. Technical parameters (model, ocr, formula, table, language, artifacts, max_inline_images) have been removed from tool arguments.`))
+    }
+  }
+}
+
+function extractFilePaths(args: Record<string, unknown>): string[] {
+  const paths: string[] = []
+  if (typeof args.file_path === 'string' && args.file_path.trim() !== '') {
+    paths.push(args.file_path.trim())
+  }
+  if (Array.isArray(args.file_paths)) {
+    for (const p of args.file_paths) {
+      if (typeof p === 'string' && p.trim() !== '' && !paths.includes(p.trim())) {
+        paths.push(p.trim())
+      }
+    }
+  }
+  if (paths.length === 0) {
+    throw new MinerUError(failure('INVALID_REQUEST', 'Exactly one local document path is required'))
+  }
+  return paths
+}
+
+export function parseAsyncInput(args: unknown): { readonly input: ParseRequestInput } {
+  if (typeof args !== 'object' || args === null || Array.isArray(args)) {
+    throw new MinerUError(failure('INVALID_REQUEST', 'Tool arguments must be an object'))
+  }
+  const obj = args as Record<string, unknown>
+  assertNoRemovedParameters(obj)
+  const filePaths = extractFilePaths(obj)
+  const hasSinglePath = typeof obj.file_path === 'string' && obj.file_path.trim() !== ''
+  return {
+    input: {
+      file_paths: filePaths,
+      ...(hasSinglePath ? { file_path: obj.file_path as string } : {}),
+    },
+  }
+}
+
 export interface ParsedToolInput {
   readonly input: ParseRequestInput
   readonly pollTimeoutMs?: number
   readonly inline_images?: boolean
-  readonly max_inline_images?: number
 }
 
-function parseInput(args: unknown): ParsedToolInput {
+export function parseReadInput(args: unknown): ParsedToolInput {
   if (typeof args !== 'object' || args === null || Array.isArray(args)) {
     throw new MinerUError(failure('INVALID_REQUEST', 'Tool arguments must be an object'))
   }
-  const {
-    poll_timeout_ms: rawPollTimeout,
-    inline_images: rawInlineImages,
-    max_inline_images: rawMaxInlineImages,
-    ...input
-  } = args as ParseRequestInput & {
-    poll_timeout_ms?: unknown
-    inline_images?: unknown
-    max_inline_images?: unknown
-  }
-  const pollTimeoutMs = parsePollTimeout(rawPollTimeout)
+  const obj = args as Record<string, unknown>
+  assertNoRemovedParameters(obj)
+  const filePaths = extractFilePaths(obj)
+  const pollTimeoutMs = parsePollTimeout(obj.poll_timeout_ms)
 
   let inline_images: boolean | undefined
-  if (rawInlineImages !== undefined) {
-    if (typeof rawInlineImages !== 'boolean') {
+  if (obj.inline_images !== undefined) {
+    if (typeof obj.inline_images !== 'boolean') {
       throw new MinerUError(failure('INVALID_REQUEST', 'inline_images must be a boolean'))
     }
-    inline_images = rawInlineImages
+    inline_images = obj.inline_images
   }
 
-  let max_inline_images: number | undefined
-  if (rawMaxInlineImages !== undefined) {
-    if (!Number.isSafeInteger(rawMaxInlineImages) || (rawMaxInlineImages as number) <= 0) {
-      throw new MinerUError(failure('INVALID_REQUEST', 'max_inline_images must be a positive integer'))
+  let pages: PageSelection | undefined
+  if (obj.pages !== undefined) {
+    try {
+      normalizePageSelection(obj.pages)
+      pages = obj.pages as PageSelection
+    } catch (error) {
+      throw new MinerUError(failure('INVALID_REQUEST', error instanceof Error ? error.message : 'Invalid page range'), { cause: error })
     }
-    max_inline_images = rawMaxInlineImages as number
   }
 
-  return {
-    input,
-    ...(pollTimeoutMs === undefined ? {} : { pollTimeoutMs }),
-    ...(inline_images === undefined ? {} : { inline_images }),
-    ...(max_inline_images === undefined ? {} : { max_inline_images }),
+  let focus: FocusKind | readonly FocusKind[] | undefined
+  if (obj.focus !== undefined) {
+    try {
+      normalizeFocusSelection(obj.focus)
+      focus = obj.focus as FocusKind | readonly FocusKind[]
+    } catch (error) {
+      throw new MinerUError(failure('INVALID_REQUEST', error instanceof Error ? error.message : 'Invalid focus'), { cause: error })
+    }
   }
+
+  const hasSinglePath = typeof obj.file_path === 'string' && obj.file_path.trim() !== ''
+  return {
+    input: {
+      file_paths: filePaths,
+      ...(hasSinglePath ? { file_path: obj.file_path as string } : {}),
+      ...(pages !== undefined ? { pages } : {}),
+      ...(focus !== undefined ? { focus } : {}),
+      ...(inline_images !== undefined ? { inline_images } : {}),
+    },
+    ...(pollTimeoutMs !== undefined ? { pollTimeoutMs } : {}),
+    ...(inline_images !== undefined ? { inline_images } : {}),
+  }
+}
+
+export function parseInput(args: unknown): ParsedToolInput {
+  return parseReadInput(args)
 }
 
 export function renderResult(value: ResultView): ContentBlock[] {
@@ -236,13 +360,12 @@ export function renderParseDocument(value: ParseDocumentView): ContentBlock[] {
 }
 
 function backgroundLabel(input: ParseRequestInput): string {
-  const count = Array.isArray(input.file_paths) ? input.file_paths.length : 0
-  return 'Read ' + String(count) + ' PDF document' + (count === 1 ? '' : 's') + ' with MinerU'
+  const count = Array.isArray(input.file_paths) ? input.file_paths.length : (input.file_path ? 1 : 0)
+  return 'Parse ' + String(count) + ' PDF document' + (count === 1 ? '' : 's') + ' with MinerU'
 }
 
 function nativeSuccessOutcome(value: ParseDocumentView): JobOutcome {
-  const firstBlock = renderParseDocument(value)[0]
-  const output = (firstBlock && 'text' in firstBlock) ? firstBlock.text : JSON.stringify(value)
+  const output = formatParseSummaryProse(value)
   if ('kind' in value && value.state === 'failed') {
     return { status: 'failed', detail: 'batch-failed', output }
   }
@@ -250,21 +373,6 @@ function nativeSuccessOutcome(value: ParseDocumentView): JobOutcome {
 }
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif'])
-const MIN_FIGURE_BYTES = 5 * 1024 // 5KB
-
-function getRasterMediaType(ext: string): ImageMediaType {
-  switch (ext.toLowerCase()) {
-    case '.jpg':
-    case '.jpeg':
-      return 'image/jpeg'
-    case '.webp':
-      return 'image/webp'
-    case '.gif':
-      return 'image/gif'
-    default:
-      return 'image/png'
-  }
-}
 
 interface ImageCandidate {
   readonly path: string
@@ -329,22 +437,23 @@ async function collectImageCandidates(view: ResultView): Promise<ImageCandidate[
 async function inlineImagesForSingleResult(
   view: ResultView,
   attachments: AttachmentStore,
-  maxInline: number,
   signal?: AbortSignal,
 ): Promise<ResultView> {
-  const candidates = await collectImageCandidates(view)
+  let candidates: ImageCandidate[] = []
+  if (view.ordered_images && view.ordered_images.length > 0) {
+    candidates = view.ordered_images.map(img => ({
+      path: img.path,
+      bytes: img.bytes,
+      name: img.name,
+      mediaType: img.media_type as ImageMediaType,
+    }))
+  } else {
+    candidates = await collectImageCandidates(view)
+  }
   if (candidates.length === 0) return view
 
-  candidates.sort((a, b) => b.bytes - a.bytes)
-
-  const hasLarger = candidates.some(c => c.bytes >= MIN_FIGURE_BYTES)
-  const filtered = hasLarger ? candidates.filter(c => c.bytes >= MIN_FIGURE_BYTES) : candidates
-
-  const limit = Math.max(1, Math.min(10, maxInline))
-  const selected = filtered.slice(0, limit)
-
   const inlined: InlinedImageView[] = []
-  for (const item of selected) {
+  for (const item of candidates) {
     signal?.throwIfAborted()
     try {
       const imageBytes = await readFile(item.path)
@@ -376,20 +485,15 @@ async function inlineImagesForSingleResult(
 async function processInlineImages(
   view: ParseDocumentView,
   attachments: AttachmentStore,
-  maxInline?: number,
   signal?: AbortSignal,
 ): Promise<ParseDocumentView> {
-  const totalMax = Math.max(1, Math.min(10, (typeof maxInline === 'number' && Number.isSafeInteger(maxInline)) ? maxInline : 3))
   if (!('kind' in view)) {
-    return await inlineImagesForSingleResult(view, attachments, totalMax, signal)
+    return await inlineImagesForSingleResult(view, attachments, signal)
   }
-  let remaining = totalMax
   const updatedResults: Array<ResultView | FailedParseView> = []
   for (const res of view.results) {
-    if (res.state === 'completed' && remaining > 0) {
-      const updated = await inlineImagesForSingleResult(res, attachments, remaining, signal)
-      const count = updated.inlined_images?.length ?? 0
-      remaining -= count
+    if (res.state === 'completed') {
+      const updated = await inlineImagesForSingleResult(res, attachments, signal)
       updatedResults.push(updated)
     } else {
       updatedResults.push(res)
@@ -422,9 +526,9 @@ export function registerTools(ctx: Context, getService: () => MinerUService, acc
   }
 
   disposers.push(ctx.tools.register(defineTool({
-    name: 'async_read_pdf',
-    description: 'Submit PDF document parsing as a native background job. Returns job_id immediately. Use job_output to retrieve results or job_kill to cancel.',
-    parameters: parseParameters,
+    name: 'async_parse_pdf',
+    description: 'Submit PDF document parsing as a native background job. Fully parses the PDF to local cache and returns a structured summary (pages, outline, tables, images) upon completion. Use read_pdf to read specific content or pages on demand.',
+    parameters: asyncParseParameters,
     output: {
       schema: {
         type: 'object',
@@ -447,7 +551,7 @@ export function registerTools(ctx: Context, getService: () => MinerUService, acc
     execute: async (args: unknown, exec: ToolRunContext) => {
       const agent = requireAgent(exec)
       exec.signal.throwIfAborted()
-      const { input } = parseInput(args)
+      const { input } = parseAsyncInput(args)
       const jobs = ctx.get('jobs') as JobRegistry | undefined
       if (jobs === undefined) {
         throw new MinerUError(failure('PROVIDER_UNAVAILABLE', 'Native DSH background jobs are unavailable; load the jobs registry and job tools'))
@@ -480,22 +584,8 @@ export function registerTools(ctx: Context, getService: () => MinerUService, acc
 
   disposers.push(ctx.tools.register(defineTool({
     name: 'read_pdf',
-    description: 'Parse PDF documents and return extracted Markdown text and figures directly. When content_status is complete, full Markdown is provided in markdown_content. When content_status is partial, Markdown is truncated by output limits; use the returned markdown_path and read_offset_line to read the remainder.',
-    parameters: {
-      ...parseParameters,
-      inline_images: {
-        type: 'boolean',
-        description: 'Whether to inline key visual figures directly as multimodal image blocks. Defaults to true when calling model route supports images.',
-      },
-      max_inline_images: {
-        type: 'integer',
-        description: 'Maximum number of key images to inline directly (default 3, max 10).',
-      },
-      poll_timeout_ms: {
-        type: 'integer',
-        description: 'Maximum synchronous wait in milliseconds. A timeout leaves the shared producer running; retry the same request to rejoin it.',
-      },
-    },
+    description: 'Read and extract structured content from PDF documents synchronously. Supports page selection (pages) and content focus (focus). When content_status is complete, full Markdown is provided in markdown_content. When content_status is partial, Markdown is truncated by output limits; use the returned markdown_path and read_offset_line to read the remainder.',
+    parameters: readPdfParameters,
     output: {
       schema: parseOutputSchema,
       render: (_args: unknown, value: unknown) => renderParseDocument(value as ParseDocumentView),
@@ -530,11 +620,38 @@ export function registerTools(ctx: Context, getService: () => MinerUService, acc
               ...(img.bytes !== undefined ? { bytes: img.bytes } : {}),
             })),
           } : {}),
+          ...(single.ordered_images !== undefined ? {
+            ordered_images: single.ordered_images.map(img => ({
+              path: img.path,
+              name: img.name,
+              media_type: img.media_type,
+              bytes: img.bytes,
+              ...(img.page !== undefined ? { page: img.page } : {}),
+              ...(img.caption !== undefined ? { caption: img.caption } : {}),
+            })),
+          } : {}),
+          ...(single.summary !== undefined ? {
+            summary: {
+              ...(single.summary.page_count !== undefined ? { page_count: single.summary.page_count } : {}),
+              ...(single.summary.table_count !== undefined ? { table_count: single.summary.table_count } : {}),
+              ...(single.summary.image_count !== undefined ? { image_count: single.summary.image_count } : {}),
+              ...(single.summary.equation_count !== undefined ? { equation_count: single.summary.equation_count } : {}),
+              ...(single.summary.toc !== undefined ? {
+                toc: single.summary.toc.map(item => ({
+                  level: item.level,
+                  title: item.title,
+                  line: item.line,
+                  ...(item.page !== undefined ? { page: item.page } : {}),
+                })),
+              } : {}),
+            },
+          } : {}),
           ...(single.toc !== undefined ? {
             toc: single.toc.map(item => ({
               level: item.level,
               title: item.title,
               line: item.line,
+              ...(item.page !== undefined ? { page: item.page } : {}),
             })),
           } : {}),
         }
@@ -543,19 +660,14 @@ export function registerTools(ctx: Context, getService: () => MinerUService, acc
     isConcurrencySafe: () => true,
     execute: async (args: unknown, exec: ToolRunContext) => {
       const agent = requireAgent(exec)
-      const { input, pollTimeoutMs, inline_images, max_inline_images } = parseInput(args)
+      const { input, pollTimeoutMs, inline_images } = parseReadInput(args)
       const supportsImage = await checkCallingModelSupportsImage(exec, ctx)
       const attachments = ctx.get('attachments') as AttachmentStore | undefined
       const shouldInline = inline_images !== false && supportsImage && attachments !== undefined
 
-      const effectiveArtifacts = input.artifacts
-        ? (shouldInline && !input.artifacts.includes('images') ? [...input.artifacts, 'images' as const] : input.artifacts)
-        : (shouldInline ? ['markdown' as const, 'images' as const] : undefined)
-      const effectiveInput = effectiveArtifacts ? { ...input, artifacts: effectiveArtifacts } : input
-
-      const rawResult = await withStorageAccess(() => getService().parseDocument(agent.session, effectiveInput, exec.signal, pollTimeoutMs))
+      const rawResult = await withStorageAccess(() => getService().parseDocument(agent.session, input, exec.signal, pollTimeoutMs))
       if (shouldInline && attachments) {
-        return await processInlineImages(rawResult, attachments, max_inline_images, exec.signal)
+        return await processInlineImages(rawResult, attachments, exec.signal)
       }
       return rawResult
     },

@@ -4,7 +4,11 @@
 
 ### Changed
 
-- Standardized model tool surface to two dedicated tools: `read_pdf` (synchronous reading with multimodal visual figure inlining) and `async_read_pdf` (native DSH background job). Removed `mineru_health` tool from the model-facing surface while preserving the internal loopback RPC `mineru/probe` for Web settings connectivity tests.
+- Refactored model tool surface to decoupled, specialized tools: `read_pdf` (synchronous reading with page slicing via `pages`, content focus filtering via `focus`, and reading-order multimodal figure inlining) and `async_parse_pdf` (native background parsing with document structure summary).
+- Completely decoupled proprietary MinerU parameters (`model`, `ocr`, `formula`, `table`, `language`, `artifacts`, `max_inline_images`) from tool arguments; always request all artifacts from providers for permanent local caching.
+- Enhanced `pages` parsing to flexibly accept single numbers, number arrays, and range strings; added `focus` filtering based on cached `content_list.json` with graceful fallback to Markdown.
+- Strictly ordered inline images by natural document reading order, linked to page selection, and eliminated rigid image quotas.
+- Supported both `file_path` and `file_paths` with internal normalization.
 - Re-architected model output and tool descriptions to strict Plain Text English with zero emoji, eliminating hallucinated guidance references to deprecated fields (`is_truncated`).
 - Decoupled document presentation, outline (TOC) extraction, character budget allocation, and prose formatting from `MinerUService` into `src/service/result-presenter.ts`.
 - Consolidated shared HTTP request pipelines, timeout management, error body diagnostics, and retry policies into `src/providers/http-client.ts`, eliminating duplicate logic across official and self-hosted providers.
