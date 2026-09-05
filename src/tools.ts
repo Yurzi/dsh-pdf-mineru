@@ -4,7 +4,7 @@ import { basename, dirname, extname, resolve } from 'node:path'
 import type { Context } from 'cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { JobOutcome, JobRegistry } from '@deepseek-ai/dsh-jobs'
-import type { AttachmentStore, ImageMediaType } from '@deepseek-ai/dsh-attachment'
+import type { AttachmentStore, ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
 import type { ContentBlock, JsonValue, ObjectValueSchemaSpec, ParameterSchemaSpec, ToolRunContext, ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
 import { MinerUError, failure, toMinerUFailure } from './domain/errors.js'
 import type { FocusKind, PageSelection, ParseRequestInput } from './domain/request.js'
@@ -302,9 +302,17 @@ export function renderResult(value: ResultView): ContentBlock[] {
     : DEFAULT_RENDER_LIMIT
   const textBlock: ContentBlock = { type: 'text', text: clampRenderText(formatResultProse(value), limit) }
   const inlined = value.inlined_images ?? []
-  const imageBlocks: ContentBlock[] = inlined.flatMap(img =>
-    img.attachmentRef ? [{ type: 'image' as const, attachment: img.attachmentRef }] : []
-  )
+  const imageBlocks: ContentBlock[] = inlined.flatMap(img => {
+    const attachment: ImageAttachmentRef = img.attachmentRef ?? {
+      attachmentId: img.attachment_id as any,
+      mediaType: img.media_type as ImageMediaType,
+      bytes: img.bytes ?? 0,
+      width: img.width ?? 0,
+      height: img.height ?? 0,
+      ...(img.name !== undefined ? { name: img.name } : {}),
+    }
+    return [{ type: 'image' as const, attachment }]
+  })
   return [textBlock, ...imageBlocks]
 }
 
@@ -419,7 +427,6 @@ async function inlineImagesForSingleResult(
         ...(ref.width !== undefined ? { width: ref.width } : {}),
         ...(ref.height !== undefined ? { height: ref.height } : {}),
         ...(ref.bytes !== undefined ? { bytes: ref.bytes } : {}),
-        attachmentRef: ref,
       })
     } catch {
       // Skip individual failure gracefully

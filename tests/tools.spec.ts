@@ -1,8 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 
-vi.mock('@deepseek-ai/dsh-tools', () => ({
-  defineTool: <T>(options: T): T => options,
-}))
+vi.mock('@deepseek-ai/dsh-tools', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@deepseek-ai/dsh-tools')>()
+  return {
+    ...actual,
+    defineTool: <T>(options: T): T => options,
+  }
+})
 
 import {
   registerTools,
@@ -16,6 +20,7 @@ import type {
   ToolRunContext,
   ValueSchemaSpec,
 } from '@deepseek-ai/dsh-tools'
+import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import type {
   FailedParseView,
   MinerUService,
@@ -760,6 +765,85 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         type: 'image',
         attachment: resultData.inlined_images![0]!.attachmentRef,
       })
+    })
+
+    it('reconstructs ImageAttachmentRef from InlinedImageView when attachmentRef property is omitted', () => {
+      const resultData: ResultView = {
+        state: 'completed',
+        source: 'provider',
+        cache_hit: false,
+        result_id: 'mr_with_img_no_ref',
+        files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
+        markdown_content: '# Visual Doc',
+        content_status: 'complete',
+        manifest_path: '/cache/doc/manifest.json',
+        output_limit_chars: 2000,
+        inlined_images: [
+          {
+            attachment_id: 'att_reconstructed',
+            name: 'figure2.jpg',
+            media_type: 'image/jpeg',
+            width: 640,
+            height: 480,
+            bytes: 65432,
+          },
+        ],
+      }
+      const rendered = renderResult(resultData)
+      expect(rendered).toHaveLength(2)
+      expect(rendered[1]).toEqual({
+        type: 'image',
+        attachment: {
+          attachmentId: 'att_reconstructed',
+          mediaType: 'image/jpeg',
+          bytes: 65432,
+          width: 640,
+          height: 480,
+          name: 'figure2.jpg',
+        },
+      })
+    })
+
+    it('validates tool output with inlined_images against read_pdf schema without violations', () => {
+      const { ctx, registeredTools } = createMockContext()
+      registerTools(ctx, () => ({} as MinerUService))
+      const readTool = registeredTools.find(t => t.name === 'read_pdf')!
+
+      const validResult: ResultView = {
+        state: 'completed',
+        source: 'provider',
+        cache_hit: false,
+        result_id: 'mr_schema_test',
+        files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
+        markdown_content: '# Test',
+        content_status: 'complete',
+        manifest_path: '/cache/doc/manifest.json',
+        output_limit_chars: 2000,
+        inlined_images: [
+          {
+            attachment_id: 'att_123',
+            name: 'fig.png',
+            media_type: 'image/png',
+            width: 100,
+            height: 100,
+            bytes: 500,
+          },
+        ],
+      }
+      const violations = validateJsonSchemaValue(readTool.output.schema, validResult, 'value')
+      expect(violations).toEqual([])
+
+      const invalidResultWithAttachmentRef = {
+        ...validResult,
+        inlined_images: [
+          {
+            ...validResult.inlined_images![0],
+            attachmentRef: { some: 'ref' },
+          },
+        ],
+      }
+      const invalidViolations = validateJsonSchemaValue(readTool.output.schema, invalidResultWithAttachmentRef, 'value')
+      expect(invalidViolations).toContain('"value.inlined_images[0].attachmentRef" is not a declared property (additionalProperties: false)')
     })
 
     it('renders document outline and guidance hint in prose when content_status is partial and toc has entries', () => {
