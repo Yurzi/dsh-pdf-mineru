@@ -1,6 +1,5 @@
-import { createHash } from 'node:crypto'
-import { createReadStream } from 'node:fs'
 import { stat } from 'node:fs/promises'
+import { computeFileSha256 } from '../utils/crypto.js'
 import { basename, extname, resolve } from 'node:path'
 import { createFileId } from '../domain/ids.js'
 import { MinerUError, failure } from '../domain/errors.js'
@@ -64,24 +63,6 @@ function resolveArtifacts(input: ParseRequestInput, defaults: ParseDefaults): re
   return normalizeArtifactKinds(artifacts)
 }
 
-async function hashFile(path: string, signal: AbortSignal): Promise<string> {
-  const hash = createHash('sha256')
-  const stream = createReadStream(path)
-  const onAbort = (): void => { stream.destroy(new DOMException('Aborted', 'AbortError')) }
-  signal.addEventListener('abort', onAbort, { once: true })
-  try {
-    signal.throwIfAborted()
-    for await (const chunk of stream) {
-      signal.throwIfAborted()
-      hash.update(chunk as Buffer)
-    }
-    return hash.digest('hex')
-  } finally {
-    signal.removeEventListener('abort', onAbort)
-    stream.destroy()
-  }
-}
-
 async function prepareSource(
   rawPath: string,
   cwd: string | undefined,
@@ -102,7 +83,7 @@ async function prepareSource(
   if (maxFileBytes !== undefined && before.size > maxFileBytes) {
     throw new MinerUError(failure('FILE_TOO_LARGE', `${basename(path)} exceeds the configured file-size limit`))
   }
-  const sha256 = await hashFile(path, signal)
+  const sha256 = await computeFileSha256(path, signal)
   const after = await stat(path)
   if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.dev !== after.dev || before.ino !== after.ino) {
     throw new MinerUError(failure('INVALID_REQUEST', `${basename(path)} changed while it was being hashed`, true))

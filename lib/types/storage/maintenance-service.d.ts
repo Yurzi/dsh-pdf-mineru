@@ -1,16 +1,15 @@
 /**
- * storage-maintenance.ts - Bounded, path-safe maintenance inventory for MinerU storage.
+ * storage-maintenance.ts — Streamlined, path-safe maintenance inventory for MinerU storage.
  *
- * This module is intentionally privileged and storage-local. It never accepts an
- * arbitrary filesystem path, never follows symlink entries, and only exposes
- * bounded summary data for the loopback RPC and settings UI.
+ * Privileged and storage-local. Never follows symlink entries, strictly stays
+ * within storageRoot, and exposes summary data for the loopback RPC and settings UI.
  */
 import { type CacheKey, type MinerUResultId } from '../domain/ids.js';
-import type { ResultRepository } from './result-repository.js';
 import type { SharedOperationRegistry } from '../service/shared-operations.js';
-import type { ProcessLock } from './process-lock.js';
 import { StorageAccessGate } from './access-gate.js';
 import type { StoragePaths } from './paths.js';
+import type { ProcessLock } from './process-lock.js';
+import type { ResultRepository } from './result-repository.js';
 export type StorageMaintenanceArea = 'published-results' | 'staging' | 'quarantine';
 export type StorageMaintenanceDiagnosticCode = 'unexpected-entry' | 'symlink-skipped' | 'unreadable-entry' | 'corrupt-result' | 'missing-result' | 'unsafe-result' | 'quarantine-failed';
 export interface StorageMaintenanceDiagnostic {
@@ -19,11 +18,6 @@ export interface StorageMaintenanceDiagnostic {
     readonly code: StorageMaintenanceDiagnosticCode;
     readonly message: string;
 }
-/**
- * Byte usage is the sum of regular files reached without crossing a symlink.
- * logicalEntryCount is a safe layout-shaped record/directory count, not a
- * declaration that every persisted record has passed schema validation.
- */
 export interface StorageAreaStatistics {
     readonly byteUsage: number;
     readonly byteUsageSaturated: boolean;
@@ -130,10 +124,6 @@ export interface GcCandidate {
     readonly byteUsage: number;
     readonly byteUsageSaturated: boolean;
 }
-/**
- * This operation never deletes data. It reports only fully validated published
- * result directories that are eligible under the current retention policy.
- */
 export interface GcDryRunReport {
     readonly generatedAt: number;
     readonly dryRun: true;
@@ -177,6 +167,8 @@ export interface CacheClearReport {
     readonly scan: ScanMetadata;
     readonly diagnostics: readonly StorageMaintenanceDiagnostic[];
 }
+export declare function cacheClearConfirmationToken(cacheKeys: readonly CacheKey[]): string;
+export declare const confirmationToken: typeof cacheClearConfirmationToken;
 /** Storage maintenance is loopback-only and blocks destructive work while parse operations are active. */
 export declare class StorageMaintenanceService {
     readonly paths: StoragePaths;
@@ -185,6 +177,7 @@ export declare class StorageMaintenanceService {
     readonly lock: ProcessLock;
     readonly accessGate: StorageAccessGate;
     constructor(paths: StoragePaths, results: ResultRepository, operations: SharedOperationRegistry, lock: ProcessLock, accessGate?: StorageAccessGate);
+    static confirmationToken(cacheKeys: readonly CacheKey[]): string;
     getStatistics(signal?: AbortSignal): Promise<StorageStatistics>;
     scanIntegrity(options?: IntegrityScanOptions): Promise<CacheIntegrityScanReport>;
     private scanIntegrityInternal;
@@ -195,7 +188,6 @@ export declare class StorageMaintenanceService {
     private clearCacheInternal;
     gcDryRun(options?: GcDryRunOptions): Promise<GcDryRunReport>;
     private acquireDestructiveAccess;
-    private assertLockHeld;
     private countPublishedResultDirectories;
     private countDirectDirectories;
     private visitPublishedResults;

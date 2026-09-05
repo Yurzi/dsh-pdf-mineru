@@ -2,9 +2,16 @@
 
 ## Unreleased
 
-### Fixed
+### Changed
 
-- Recover stale Windows `.process.lock` files safely after abnormal DSH exits using named pipe serialization and fail-closed PID liveness verification.
+- Standardized model tool surface to two dedicated tools: `read_pdf` (synchronous reading with multimodal visual figure inlining) and `async_read_pdf` (native DSH background job). Removed `mineru_health` tool from the model-facing surface while preserving the internal loopback RPC `mineru/probe` for Web settings connectivity tests.
+- Re-architected model output and tool descriptions to strict Plain Text English with zero emoji, eliminating hallucinated guidance references to deprecated fields (`is_truncated`).
+- Decoupled document presentation, outline (TOC) extraction, character budget allocation, and prose formatting from `MinerUService` into `src/service/result-presenter.ts`.
+- Consolidated shared HTTP request pipelines, timeout management, error body diagnostics, and retry policies into `src/providers/http-client.ts`, eliminating duplicate logic across official and self-hosted providers.
+- Upgraded `self-hosted-v2` multipart streaming to Node 22 native `FormData` and `openAsBlob`, removing third-party `form-data` package dependency.
+- Replaced hand-rolled streaming JSON parser in `safe-zip` with standard V8 `JSON.parse`, and standardized delay timers across all modules using `node:timers/promises`.
+- Eliminated self-inflicted read-only (`0o400`/`0o500`) permission cycles in `result-repository`, streamlining cache cleanup and quarantine deletions.
+- Modernized single-process storage lock (`ProcessLock`) to use atomic file creation (`flag: 'wx'`) with cross-platform dead PID reclamation, retiring abstract Unix sockets and Windows named pipes.
 
 ## 0.0.7
 

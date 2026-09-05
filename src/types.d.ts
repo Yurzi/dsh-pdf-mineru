@@ -18,7 +18,9 @@ declare module '*.css' {
 declare module '@deepseek-ai/dsh-tools' {
   export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue }
 
-  export type ContentBlock = { type: 'text'; text: string }
+  export type ContentBlock =
+    | { type: 'text'; text: string }
+    | { type: 'image'; attachment: import('@deepseek-ai/dsh-attachment').ImageAttachmentRef }
 
   export interface ValueSchemaAnnotations {
     description?: string

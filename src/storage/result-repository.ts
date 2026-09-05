@@ -1,6 +1,6 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { createReadStream } from 'node:fs'
-import { chmod, lstat, mkdir, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { TextDecoder } from 'node:util'
 import {
@@ -18,9 +18,11 @@ import type { ArtifactKind, CanonicalParseRequest, CanonicalSourceFile } from '.
 import type { ArtifactRef, MinerUResultManifest, ResultProducer } from '../domain/result.js'
 import { parseMinerUResultManifest } from '../domain/schemas.js'
 import { canonicalJson, computeCacheKey } from '../service/cache-key.js'
+import { computeFileSha256 } from '../utils/crypto.js'
 import type { ArtifactInput, ArtifactSink, ArtifactWriteOptions, TemporaryArtifact } from '../providers/provider.js'
 import { StagingArtifactSink } from './artifact-sink.js'
 import type { StoragePaths } from './paths.js'
+import type { ProcessLock } from './process-lock.js'
 
 const DEFAULT_MAX_JSON_VALIDATION_BYTES = 64 * 1024 * 1024
 const DEFAULT_MAX_MANIFEST_BYTES = 16 * 1024 * 1024
@@ -134,47 +136,6 @@ async function assertRegularFileWithin(rootDir: string, filePath: string): Promi
     } else if (!details.isDirectory()) {
       throw new TypeError('Artifact parent is not a regular directory')
     }
-  }
-}
-
-async function setReadOnlyRecursive(dirPath: string): Promise<void> {
-  try {
-    const root = await lstat(dirPath)
-    if (root.isSymbolicLink() || !root.isDirectory()) return
-    const items = await readdir(dirPath, { withFileTypes: true })
-    for (const item of items) {
-      if (item.isSymbolicLink()) continue
-      const full = join(dirPath, item.name)
-      const details = await lstat(full)
-      if (details.isSymbolicLink()) continue
-      if (details.isDirectory()) {
-        await setReadOnlyRecursive(full)
-        await chmod(full, 0o555).catch(() => undefined)
-      } else if (details.isFile()) {
-        await chmod(full, 0o400).catch(() => undefined)
-      }
-    }
-    await chmod(dirPath, 0o500).catch(() => undefined)
-  } catch {
-    // Read-only permissions are a secondary guard; content addressing is authoritative.
-  }
-}
-
-async function sha256File(path: string, signal?: AbortSignal): Promise<string> {
-  const digest = createHash('sha256')
-  const stream = createReadStream(path)
-  const onAbort = (): void => { stream.destroy(signal?.reason instanceof Error ? signal.reason : new DOMException('Aborted', 'AbortError')) }
-  signal?.addEventListener('abort', onAbort, { once: true })
-  try {
-    signal?.throwIfAborted()
-    for await (const chunk of stream) {
-      signal?.throwIfAborted()
-      digest.update(chunk as Buffer)
-    }
-    return digest.digest('hex')
-  } finally {
-    signal?.removeEventListener('abort', onAbort)
-    stream.destroy()
   }
 }
 
@@ -293,7 +254,11 @@ export class ResultRepository {
   private readonly maxManifestBytes: number
   private readonly maxArtifactBytes: number | undefined
 
-  constructor(public readonly paths: StoragePaths, options: ResultRepositoryOptions = {}) {
+  constructor(
+    public readonly paths: StoragePaths,
+    options: ResultRepositoryOptions = {},
+    public readonly lock?: ProcessLock,
+  ) {
     this.maxJsonValidationBytes = options.maxJsonValidationBytes ?? DEFAULT_MAX_JSON_VALIDATION_BYTES
     this.maxManifestBytes = options.maxManifestBytes ?? DEFAULT_MAX_MANIFEST_BYTES
     if (!Number.isSafeInteger(this.maxManifestBytes) || this.maxManifestBytes <= 0) {
@@ -342,7 +307,7 @@ export class ResultRepository {
     await assertRegularFileWithin(rootDir, path)
     const details = await lstat(path)
     if (details.size !== artifact.bytes) throw new TypeError(`Artifact ${artifact.relativePath} size mismatch`)
-    if (await sha256File(path, signal) !== artifact.sha256) throw new TypeError(`Artifact ${artifact.relativePath} SHA-256 mismatch`)
+    if (await computeFileSha256(path, signal) !== artifact.sha256) throw new TypeError(`Artifact ${artifact.relativePath} SHA-256 mismatch`)
     if (artifact.kind === 'markdown') await validateUtf8(path, signal)
     if (artifact.kind === 'layout' || artifact.kind === 'model-output' || artifact.kind === 'content-list') {
       if (artifact.bytes > this.maxJsonValidationBytes) {
@@ -446,7 +411,6 @@ export class ResultRepository {
 
     const targetDir = this.paths.resultDir(validated.cacheKey)
     await mkdir(dirname(targetDir), { recursive: true, mode: 0o700 })
-    await chmod(dirname(targetDir), 0o700)
 
     const resolveExisting = async (): Promise<MinerUResultManifest | undefined> => {
       const existing = await this.get(validated.cacheKey, undefined, signal)
@@ -459,29 +423,41 @@ export class ResultRepository {
       return existing
     }
 
-    const before = await resolveExisting()
-    if (before !== undefined) return { resultId: before.id, cacheKey: before.cacheKey, manifest: before }
-
-    for (let attempt = 0; attempt < 2; attempt++) {
-      signal?.throwIfAborted()
-      try {
-        // Staging and results share one configured root; EXDEV is a configuration/filesystem error.
-        await rename(tx.stagingDir, targetDir)
-        await setReadOnlyRecursive(targetDir)
-        return { resultId: validated.id, cacheKey: validated.cacheKey, manifest: validated }
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code
-        if (code === 'EEXIST' || code === 'ENOTEMPTY') {
-          const raced = await resolveExisting()
-          if (raced !== undefined) return { resultId: raced.id, cacheKey: raced.cacheKey, manifest: raced }
-          continue
-        }
-        await this.quarantine(tx.stagingDir, 'commit_failed').catch(() => undefined)
-        throw error
+    const doCommit = async () => {
+      const before = await resolveExisting()
+      if (before !== undefined) {
+        await tx.abort().catch(() => undefined)
+        return { resultId: before.id, cacheKey: before.cacheKey, manifest: before }
       }
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        signal?.throwIfAborted()
+        try {
+          // Staging and results share one configured root; EXDEV is a configuration/filesystem error.
+          await rename(tx.stagingDir, targetDir)
+          return { resultId: validated.id, cacheKey: validated.cacheKey, manifest: validated }
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code
+          if (code === 'EEXIST' || code === 'ENOTEMPTY') {
+            const raced = await resolveExisting()
+            if (raced !== undefined) {
+              await tx.abort().catch(() => undefined)
+              return { resultId: raced.id, cacheKey: raced.cacheKey, manifest: raced }
+            }
+            continue
+          }
+          await this.quarantine(tx.stagingDir, 'commit_failed').catch(() => undefined)
+          throw error
+        }
+      }
+      await this.quarantine(tx.stagingDir, 'commit_race').catch(() => undefined)
+      throw new MinerUError(failure('CACHE_CONFLICT', `Could not atomically publish cache key ${validated.cacheKey}`))
     }
-    await this.quarantine(tx.stagingDir, 'commit_race').catch(() => undefined)
-    throw new MinerUError(failure('CACHE_CONFLICT', `Could not atomically publish cache key ${validated.cacheKey}`))
+
+    if (this.lock !== undefined) {
+      return await this.lock.withLock(doCommit, signal)
+    }
+    return await doCommit()
   }
 
   /**
@@ -576,30 +552,34 @@ export class ResultRepository {
   }
 
   async quarantine(sourcePath: string, reason = 'quarantine'): Promise<string> {
-    const safeSourcePath = assertQuarantineSourcePath(this.paths, sourcePath)
-    const id = `${String(Date.now())}_${reason}_${randomUUID().slice(0, 8)}`
-    const destination = this.paths.quarantineDir(id)
-    try {
-      const source = await lstat(safeSourcePath)
-      if (source.isSymbolicLink() || !source.isDirectory()) {
-        throw new TypeError('Only regular directories can be quarantined')
+    const doQuarantine = async () => {
+      const safeSourcePath = assertQuarantineSourcePath(this.paths, sourcePath)
+      const id = `${String(Date.now())}_${reason}_${randomUUID().slice(0, 8)}`
+      const destination = this.paths.quarantineDir(id)
+      try {
+        const source = await lstat(safeSourcePath)
+        if (source.isSymbolicLink() || !source.isDirectory()) {
+          throw new TypeError('Only regular directories can be quarantined')
+        }
+      } catch (error) {
+        if (errnoCode(error) === 'ENOENT') return destination
+        throw new MinerUError(failure('CACHE_CORRUPT', 'Failed to isolate corrupt MinerU data safely'))
       }
-    } catch (error) {
-      if (errnoCode(error) === 'ENOENT') return destination
-      throw new MinerUError(failure('CACHE_CORRUPT', 'Failed to isolate corrupt MinerU data safely'))
+
+      await mkdir(this.paths.quarantineDir(), { recursive: true })
+      try {
+        await rename(safeSourcePath, destination)
+        return destination
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return destination
+        throw new MinerUError(failure('CACHE_CORRUPT', 'Failed to isolate corrupt MinerU data'))
+      }
     }
 
-    await mkdir(this.paths.quarantineDir(), { recursive: true })
-    // The source was lstat-verified as a regular directory above. Published
-    // roots are read-only, so restore owner traversal before atomic rename.
-    await chmod(safeSourcePath, 0o755).catch(() => undefined)
-    try {
-      await rename(safeSourcePath, destination)
-      return destination
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return destination
-      throw new MinerUError(failure('CACHE_CORRUPT', 'Failed to isolate corrupt MinerU data'))
+    if (this.lock !== undefined) {
+      return await this.lock.withLock(doQuarantine)
     }
+    return await doQuarantine()
   }
 
   async cleanupStaging(

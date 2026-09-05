@@ -1,45 +1,39 @@
-# Windows storage-lock recovery
+# Storage lock and crash recovery
 
-This fix resolves the Windows `STORAGE_LOCKED` startup failure after an abnormal
-DSH exit. Exclusive creation of `.process.lock` on non-Linux systems causes even a dead
-process's file to block subsequent starts indefinitely.
+This architecture ensures fail-closed single-process `storageRoot` isolation across all supported platforms (Linux, Windows, macOS). Exclusive creation of `.process.lock` prevents multiple concurrent DSH processes from mutating the same storageRoot.
 
-## Recovery rules
+## Design & Recovery Rules
 
-On Windows, the plugin acquires a named pipe derived from the canonical,
-case-normalized storage path before touching ownership metadata. Windows
-releases this endpoint when its process exits. The file protocol is also
-retained so that an active, older plugin cannot be bypassed.
+The lock uses atomic file creation (`writeFile` with `flag: 'wx'`) at `storageRoot/.process.lock`, containing JSON metadata:
 
-An existing file is reclaimed only when all of these checks succeed:
+```json
+{
+  "pid": 12345,
+  "ownerToken": "owner_abcdef...",
+  "createdAt": 1700000000000,
+  "hostname": "my-host"
+}
+```
 
-- It is a regular file, not a symbolic link or directory.
-- Its metadata is valid and belongs to this host.
-- Probing its PID returns `ESRCH` (the process is absent).
-- Its file identity and contents have not changed during the check.
+### Contention and Recovery
 
-Live PIDs (including possible PID reuse), `EPERM`, foreign hosts, corrupt files,
-and other ambiguous states remain locked. Never delete a lock merely because
-it is old. Stop and inspect its owner if automatic recovery refuses it.
+When an acquisition attempt encounters `EEXIST`:
 
-The new owner publishes a fully written temporary record with an exclusive
-hard link. This avoids partial lock metadata on abrupt termination and preserves
-compatibility with legacy `wx` file acquisition. A crash before publication may
-leave a uniquely named `.process.lock.owner_*.tmp` file, but it never blocks
-startup. Windows storage must be local and support hard links (e.g. NTFS).
-This is not a distributed lock for shared storage across machines.
+1. It reads and parses the existing lock payload.
+2. If the lock was already acquired by this process and matches this instance's `ownerToken`, acquisition succeeds idempotently.
+3. If the lock was created by another host, acquisition fails immediately with `STORAGE_LOCKED`.
+4. It probes whether the recorded owner PID is still running using `process.kill(existing.pid, 0)`:
+   - If `ESRCH` is returned, the owner process has exited. The stale lock file is safely unlinked, and acquisition is re-attempted.
+   - If the PID is still alive, or if probing encounters `EPERM` or any ambiguous state, it fails closed with `STORAGE_LOCKED`.
 
-Normal release removes only this instance's metadata while still holding the
-pipe, then releases the pipe. Recovery does not touch `results`, `staging`,
-configuration, credentials, or other processes.
+### Safe Release
 
-Linux retains its abstract-socket authority. Other non-Windows platforms retain
-their existing conservative file-lock behavior.
+Normal release verifies that the lock file exists, is currently held, and that the recorded `ownerToken` and `pid` match this instance before unlinking. This prevents accidentally removing a successor process's valid lock.
 
 ## Validation
 
 ```sh
 pnpm install
 pnpm run typecheck
-pnpm exec vitest run tests/process-lock-windows.spec.ts tests/storage.spec.ts -t ProcessLock
+pnpm exec vitest run tests/storage.spec.ts -t ProcessLock
 ```

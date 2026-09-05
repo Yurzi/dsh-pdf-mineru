@@ -139,17 +139,12 @@ src/
     manifest.ts
   service/
     mineru-service.ts
+    result-presenter.ts
     request-normalizer.ts
+    batch-coordinator.ts
     cache-key.ts
     shared-operations.ts
-  tools/
-    common.ts
-    probe.ts
-    submit.ts
-    status.ts
-    result.ts
-    parse.ts
-    index.ts
+  tools.ts
   client/
     SettingsPage.tsx
     ...
@@ -505,7 +500,7 @@ SharedOperationRegistry 以 CacheKey 和 Provider authority 为键。缓存未�
 
 - requestTimeoutMs：单次 API、上传或下载的 inactivity/overall timeout。
 - pollIntervalMs：状态轮询间隔。
-- pollTimeoutMs：mineru_parse_document 的总等待时间，不改变异步任务本身。
+- pollTimeoutMs：read_pdf 的总等待时间，不改变异步任务本身。
 - operationTimeoutMs：可选共享 producer 总时限。
 
 同步 waiter 超时不应将 SharedOperation 或仍在远端执行的任务标为 failed；重试相同请求可重新加入。
@@ -556,23 +551,19 @@ Provider 应保留官方 code/msg/trace_id 或自托管 HTTP 状态作为诊断�
 
 ## 15. 工具接口
 
-模型面保留三个工具；异步控制统一复用 DSH 通用 job 工具，不再维护插件专用 status/result 工具。
+模型面暴露两个解析工具（`read_pdf` 与 `async_read_pdf`）；异步控制统一复用 DSH 通用 job 工具，不再维护插件专用 status/result 工具。连通性探测作为内部 loopback RPC 端点（`mineru/probe`）供 Web 设置界面使用，不占用模型工具面。
 
-### 15.1 mineru_health
+### 15.1 read_pdf
 
-执行当前 Provider 的 probe。返回 provider、available、authentication、protocol_version、server_version 和可选能力摘要。不得假设所有 Provider 有队列或健康端点。
+同步执行直接结果管线，成功直接交付提取的正文 Markdown（`markdown_content`）、多模态内联视觉图表、正文完整性状态（`content_status`：`complete` | `partial` | `not_requested`）与产物清单，不创建插件 Job。pollTimeout 仅停止当前 waiter；再次提交相同请求可重新加入仍在运行的 SharedOperation。
 
-### 15.2 mineru_submit_parse_job
+### 15.2 async_read_pdf
 
-输入 file_paths 和统一解析参数，通过 ctx.jobs.start 立即返回原生 job_id 和 running。任务完成文本由 job_output 读取；取消由 job_kill 处理。工具不返回上游 status_url、result_url、batch_id 或预签名地址。
+输入 file_paths 和统一解析参数，通过 ctx.jobs.start 立即返回原生 job_id 和 running 状态，注册为 DSH 原生后台任务（`mineru-N`）。最终任务完成由 job_output 读取排版正文与完整性指引；取消由 job_kill 处理。工具不返回上游 status_url、result_url、batch_id 或预签名地址。
 
-### 15.3 mineru_parse_document
+### 15.3 模型输出限制与纯文本规范
 
-同步执行直接结果管线，成功返回 result_id、cache_hit、artifact paths、Markdown preview 和 manifest_path，不创建插件 Job。pollTimeout 仅停止当前 waiter；再次提交相同请求可重新加入仍在运行的 SharedOperation。
-
-### 15.4 模型输出限制
-
-Markdown preview 的完整包装和正文必须共同受 maxInlineMarkdownChars 或字节限制约束。JSON、图片和完整 Markdown只以路径和小型元数据返回。工具 execute 返回规范 JSON，render 继续作为纯投影。
+Markdown 输出受 maxInlineChars（字符预算）约束。当正文因预算截断时，`content_status` 标记为 `partial`，并提供 `markdown_path` 及续读起始行号 `read_offset_line`。所有模型端展示文案与状态指示均采用标准纯文本英文（Plain Text English），杜绝 Emoji 装饰符号与双语混杂，确保跨模型的一致指令遵循能力。
 
 ## 16. 配置、RPC 与设置页
 
@@ -704,7 +695,7 @@ Prepared request 和 SharedOperation 在创建时固定 providerConfigId 与 com
 
 ### 20.3 同步等待超时
 
-1. mineru_parse_document 已取得 SharedOperation waiter。
+1. read_pdf 已取得 SharedOperation waiter。
 2. pollTimeout 到期，当前工具抛出可重试 POLL_TIMEOUT。
 3. 远端任务和共享 producer 不因单个等待超时而失效。
 4. 模型可重新提交相同请求加入现有 operation，或改用原生后台任务。

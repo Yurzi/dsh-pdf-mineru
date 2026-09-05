@@ -85,35 +85,28 @@ Agent 会自动根据文档长度和指令意图，智能选择同步返回或�
 
 ### 场景 1：常规论文 / 报告解析
 > **你**：“帮我解析 `/workspace/paper.pdf`，提取正文、数学公式和表格，整理成 Markdown 格式。”
-> **Agent**：调用 `mineru_parse_document`，直接返回排版好的 Markdown 文本与产物清单。
+> **Agent**：调用 `read_pdf`，直接返回排版好的 Markdown 文本与关键内联图表。
 
 ### 场景 2：超长文档后台异步解析（推荐）
 > **你**：“请在后台解析这本 120 页的技术研报 `/data/annual-report.pdf`，解析完成后告诉我。”
-> **Agent**：提交 `mineru_submit_parse_job` 并返回任务 ID（如 `mineru-1`），随后可在后台静默运行，完成后自动读取结果并向您汇报。
+> **Agent**：提交 `async_read_pdf` 并返回任务 ID（如 `mineru-1`），随后可在后台静默运行，完成后自动读取结果并向您汇报。
 
 ### 场景 3：指定页码与扫描件 OCR
 > **你**：“解析 `/data/scanned_doc.pdf` 的第 1 到 5 页，这个是扫描件，请开启强制 OCR 模式。”
 > **Agent**：传入 `pages: "1-5"` 与 `ocr: true` 进行精准定向识别。
 
-### 场景 4：检查服务状态
-> **你**：“检查一下当前 MinerU 服务的连接状态和剩余队列。”
-> **Agent**：调用 `mineru_health`，回报服务连通性、鉴权状态与排队情况。
-
----
-
 ## ⚙️ 模型工具与参数参考
 
-插件为 Agent 注册了三项核心工具：
+插件为 Agent 注册了两项核心文档解析工具：
 
 | 工具名称 | 适用场景 | 说明 |
 | --- | --- | --- |
-| `mineru_parse_document` | 短篇文档 / 同步等待 | 同步解析文档，直接交付提取的正文 Markdown、正文完整性状态 (`content_status`)、产物清单与存储路径 |
-| `mineru_submit_parse_job` | 长篇文档 / 批量解析 | 注册为 DSH 原生后台任务（`mineru-N`），最终输出交付排版正文与完整性指引，不阻塞当前对话 |
-| `mineru_health` | 状态诊断 | 检查 MinerU 服务连通性、鉴权有效性及协议版本 |
+| `read_pdf` | 短篇文档 / 同步直读 | 同步读取 PDF，直接交付提取的正文 Markdown、多模态关键图表、正文完整性状态 (`content_status`) 与产物清单 |
+| `async_read_pdf` | 长篇文档 / 批量解析 | 注册为 DSH 原生后台任务（`mineru-N`），最终输出交付排版正文与完整性指引，不阻塞当前对话 |
 
 ### 核心交付字段与正文状态说明
 
-调用 `mineru_parse_document` 或后台任务 `mineru_submit_parse_job` 完成后，交付结果包含可靠的正文与完整性判定：
+调用 `read_pdf` 或后台任务 `async_read_pdf` 完成后，交付结果包含可靠的正文与完整性判定：
 
 - `markdown_content`：提取的正文 Markdown 文本。
 - `content_status`：正文交付状态：
@@ -141,14 +134,12 @@ Agent 会自动根据文档长度和指令意图，智能选择同步返回或�
 
 ```mermaid
 flowchart LR
-    Agent[DSH Agent] --> Health[mineru_health]
-    Agent --> Sync[mineru_parse_document]
-    Agent --> Async[mineru_submit_parse_job]
+    Agent[DSH Agent] --> Sync[read_pdf]
+    Agent --> Async[async_read_pdf]
 
     Async --> Jobs[DSH JobRegistry]
     Jobs --> Service[MinerUService]
     Sync --> Service
-    Health --> Providers[ProviderRegistry]
 
     Service --> Cache{Result cache}
     Cache -->|hit| Result[Immutable result]
@@ -162,7 +153,7 @@ flowchart LR
     Publish --> Result
 ```
 
-- **统一工具分发**：Agent 发起的同步请求（`mineru_parse_document`）直接返回结果，异步长任务（`mineru_submit_parse_job`）交由 DSH 原生 JobRegistry 调度。
+- **统一工具分发**：Agent 发起的同步请求（`read_pdf`）直接返回结果，异步长任务（`async_read_pdf`）交由 DSH 原生 JobRegistry 调度。
 - **智能缓存命中**：每次解析计算文件 SHA-256 与参数指纹，若命中缓存则秒级返回不可变产物。
 - **并发请求合并**：同进程内的并发重复请求由 `SharedOperationRegistry` 合并，避免重复向上游提交。
 - **双 Provider 适配**：上游适配自建 FastAPI v2 或官方云 v4，解析产物经校验后原子发布。

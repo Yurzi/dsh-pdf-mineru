@@ -12,6 +12,7 @@ export * from './domain/errors.js';
 export * from './providers/provider.js';
 export * from './providers/self-hosted-v2.js';
 export * from './providers/official-v4.js';
+export * from './providers/http-client.js';
 export * from './service/mineru-service.js';
 export * from './observability.js';
 export * from './storage/maintenance-service.js';

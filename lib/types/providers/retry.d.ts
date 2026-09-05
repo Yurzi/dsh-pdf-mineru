@@ -45,8 +45,7 @@ export declare function isRetryableHttpStatus(status: number): boolean;
  */
 export declare function isRetryableError(err: unknown, signal?: AbortSignal): boolean;
 /**
- * Abort-aware delay utility.
- * Cleans up its timer listener immediately when aborted or resolved.
+ * Abort-aware delay utility using node:timers/promises.
  */
 export declare function defaultSleep(ms: number, signal: AbortSignal): Promise<void>;
 /**

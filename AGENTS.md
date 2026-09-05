@@ -2,7 +2,7 @@
 
 ## Architecture
 
-The plugin exposes three model tools over one versioned MinerU domain. Keep this dependency direction:
+The plugin exposes two model tools (`read_pdf` and `async_read_pdf`) over one versioned MinerU domain. Keep this dependency direction:
 
 ```text
 tools -> DSH JobRegistry (async ownership, cancellation, completion)
@@ -31,8 +31,8 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 ## Session and concurrency rules
 
 - Every tool requires `exec.agent.session`; pass the exact live Agent as the native DSH background job owner.
-- `mineru_submit_parse_job` registers `kind: mineru` with `ctx.jobs.start`; generic `job_output`, `job_list`, and `job_kill` own async control.
-- `mineru_parse_document` returns results directly and never creates a plugin Job.
+- `async_read_pdf` registers `kind: mineru` with `ctx.jobs.start`; generic `job_output`, `job_list`, and `job_kill` own async control.
+- `read_pdf` returns results directly and never creates a plugin Job.
 - SharedOperation owns the producer AbortController. Waiter cancellation, including native `job_kill`, only stops that invocation's wait.
 - Native job hooks omit `readOutput`, settle with a non-rejecting final-output Promise, and never expose provider refs.
 
@@ -43,11 +43,11 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 - Official presigned PUT has an explicitly empty headers object. CDN requests have no auth headers.
 - Hash source files as streams and re-stat them immediately before upload.
 - ZIP extraction uses yauzl lazy entries, validates metadata first, then streams each entry through staging limits. Do not reintroduce whole-archive or whole-entry accumulation.
-- storageRoot is single-process; acquire ProcessLock before registering tools.
+- storageRoot mutations use scoped ProcessLock; plugins register tools without lifetime lock holding.
 - Result publication is staging validation followed by same-filesystem atomic rename. EXDEV is an error, not a copy fallback.
 - Retry only idempotent GET and official PUT with a fresh source stream. Never auto-retry official batch-allocation POST or self-hosted multipart POST.
 - Retry diagnostics contain only typed operation/status/count fields, never error messages, URLs, headers, bodies, credentials, or local paths.
-- Storage maintenance requires the held ProcessLock, never follows symlinks, defaults to read-only/dry-run, and blocks destructive work while SharedOperations or storage readers are active.
+- Destructive storage maintenance acquires scoped ProcessLock, never follows symlinks, defaults to read-only/dry-run, and blocks destructive work while SharedOperations or storage readers are active.
 - Destructive maintenance stays loopback-only and requires explicit confirmation. Never expose maintenance as a model tool.
 
 ## Main files
@@ -59,7 +59,7 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 - `src/providers/safe-zip.ts`: bounded ZIP scanner/extractor.
 - `src/storage/*`: validated paths, process lock, ResultRepository, staging sink, and privileged maintenance service.
 - `src/service/mineru-service.ts`: direct-result use-case orchestration and same-process operation coalescing.
-- `src/tools.ts`: three defineTool schemas, native DSH job adaptation, and pure renderers.
+- `src/tools.ts`: two defineTool schemas (`read_pdf` and `async_read_pdf`), native DSH job adaptation, and pure renderers.
 - `src/rpc.ts`, `src/client/*`: loopback config/maintenance RPC and Provider-aware settings page.
 - `src/observability.ts`: typed, non-throwing structured diagnostic events.
 - `scripts/smoke-official-v4.mjs`: explicit live smoke through the built plugin tool chain.

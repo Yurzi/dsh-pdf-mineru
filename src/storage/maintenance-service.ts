@@ -1,15 +1,15 @@
 /**
- * storage-maintenance.ts - Bounded, path-safe maintenance inventory for MinerU storage.
+ * storage-maintenance.ts — Streamlined, path-safe maintenance inventory for MinerU storage.
  *
- * This module is intentionally privileged and storage-local. It never accepts an
- * arbitrary filesystem path, never follows symlink entries, and only exposes
- * bounded summary data for the loopback RPC and settings UI.
+ * Privileged and storage-local. Never follows symlink entries, strictly stays
+ * within storageRoot, and exposes summary data for the loopback RPC and settings UI.
  */
 
-import { chmod, lstat, readdir, realpath, rm } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { type Dirent } from 'node:fs'
-import { join, parse, resolve, sep } from 'node:path'
+import { lstat, readdir, realpath, rm } from 'node:fs/promises'
+import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
+import { throwMinerU } from '../domain/errors.js'
 import {
   asCacheKey,
   asOperationId,
@@ -17,12 +17,11 @@ import {
   type CacheKey,
   type MinerUResultId,
 } from '../domain/ids.js'
-import { throwMinerU } from '../domain/errors.js'
-import type { ResultRepository } from './result-repository.js'
 import type { SharedOperationRegistry } from '../service/shared-operations.js'
-import type { ProcessLock } from './process-lock.js'
 import { StorageAccessGate } from './access-gate.js'
 import type { StoragePaths } from './paths.js'
+import type { ProcessLock } from './process-lock.js'
+import type { ResultRepository } from './result-repository.js'
 
 const DEFAULT_RESULT_SCAN_LIMIT = 10_000
 const DEFAULT_DIAGNOSTIC_LIMIT = 100
@@ -33,7 +32,6 @@ const MAX_DIAGNOSTIC_LIMIT = 1_000
 const MAX_QUARANTINE_LIST_LIMIT = 1_000
 const MAX_GC_CANDIDATE_LIMIT = 1_000
 const MAX_QUARANTINE_CLEANUP_ENTRIES = 100
-const MAX_WALK_DEPTH = 64
 
 export type StorageMaintenanceArea = 'published-results' | 'staging' | 'quarantine'
 
@@ -53,11 +51,6 @@ export interface StorageMaintenanceDiagnostic {
   readonly message: string
 }
 
-/**
- * Byte usage is the sum of regular files reached without crossing a symlink.
- * logicalEntryCount is a safe layout-shaped record/directory count, not a
- * declaration that every persisted record has passed schema validation.
- */
 export interface StorageAreaStatistics {
   readonly byteUsage: number
   readonly byteUsageSaturated: boolean
@@ -176,10 +169,6 @@ export interface GcCandidate {
   readonly byteUsageSaturated: boolean
 }
 
-/**
- * This operation never deletes data. It reports only fully validated published
- * result directories that are eligible under the current retention policy.
- */
 export interface GcDryRunReport {
   readonly generatedAt: number
   readonly dryRun: true
@@ -234,13 +223,11 @@ type SafeDirectory =
 
 interface UsageCounter {
   bytes: number
-  bytesSaturated: boolean
   regularFileCount: number
   directoryCount: number
   skippedSymlinkCount: number
   unexpectedEntryCount: number
   unreadableEntryCount: number
-  depthLimitCount: number
 }
 
 interface TraversalSummary {
@@ -258,38 +245,18 @@ interface DiagnosticCollector {
 function createUsage(): UsageCounter {
   return {
     bytes: 0,
-    bytesSaturated: false,
     regularFileCount: 0,
     directoryCount: 0,
     skippedSymlinkCount: 0,
     unexpectedEntryCount: 0,
     unreadableEntryCount: 0,
-    depthLimitCount: 0,
   }
-}
-
-function addBytes(counter: UsageCounter, amount: number): void {
-  if (!Number.isSafeInteger(amount) || amount < 0 || counter.bytes > Number.MAX_SAFE_INTEGER - amount) {
-    counter.bytes = Number.MAX_SAFE_INTEGER
-    counter.bytesSaturated = true
-    return
-  }
-  counter.bytes += amount
-}
-
-function addTotal(current: { value: number; saturated: boolean }, amount: number, saturated: boolean): void {
-  if (saturated || !Number.isSafeInteger(amount) || amount < 0 || current.value > Number.MAX_SAFE_INTEGER - amount) {
-    current.value = Number.MAX_SAFE_INTEGER
-    current.saturated = true
-    return
-  }
-  current.value += amount
 }
 
 function boundedLimit(value: number | undefined, fallback: number, maximum: number, label: string): number {
   const resolved = value === undefined ? fallback : value
   if (!Number.isSafeInteger(resolved) || resolved <= 0 || resolved > maximum) {
-    throw new TypeError(label + ' must be a positive safe integer no greater than ' + String(maximum))
+    throw new TypeError(`${label} must be a positive safe integer no greater than ${maximum}`)
   }
   return resolved
 }
@@ -305,14 +272,6 @@ function isSafeSegment(value: string): boolean {
 
 function sanitizeEntry(value: string): string {
   return isSafeSegment(value) ? value : 'unknown'
-}
-
-function errnoCode(error: unknown): string | undefined {
-  return (error as NodeJS.ErrnoException | undefined)?.code
-}
-
-function isMissing(error: unknown): boolean {
-  return errnoCode(error) === 'ENOENT'
 }
 
 function diagnosticMessage(code: StorageMaintenanceDiagnosticCode): string {
@@ -353,8 +312,13 @@ async function classifyNode(path: string): Promise<NodeKind> {
     if (details.isFile()) return 'file'
     return 'unexpected'
   } catch (error) {
-    return isMissing(error) ? 'missing' : 'unreadable'
+    return (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT' ? 'missing' : 'unreadable'
   }
+}
+
+function isWithinDirectory(target: string, parentDir: string): boolean {
+  const rel = relative(resolve(parentDir), resolve(target))
+  return !rel.startsWith('..') && !isAbsolute(rel)
 }
 
 async function isSafeExistingDirectoryChain(target: string, signal?: AbortSignal): Promise<boolean> {
@@ -374,10 +338,11 @@ async function isSafeExistingDirectoryChain(target: string, signal?: AbortSignal
   }
 }
 
-function cacheClearConfirmationToken(cacheKeys: readonly CacheKey[]): string {
+export function cacheClearConfirmationToken(cacheKeys: readonly CacheKey[]): string {
   const ordered = [...cacheKeys].sort()
   return 'cache-clear-' + createHash('sha256').update(JSON.stringify(ordered), 'utf8').digest('hex')
 }
+export const confirmationToken = cacheClearConfirmationToken
 
 async function readSafeDirectory(path: string): Promise<SafeDirectory> {
   const kind = await classifyNode(path)
@@ -387,14 +352,14 @@ async function readSafeDirectory(path: string): Promise<SafeDirectory> {
     entries.sort((left, right) => left.name.localeCompare(right.name))
     return { kind: 'entries', entries }
   } catch (error) {
-    return { kind: isMissing(error) ? 'missing' : 'unreadable' }
+    return { kind: (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT' ? 'missing' : 'unreadable' }
   }
 }
 
 async function collectUsage(root: string, signal?: AbortSignal): Promise<UsageCounter> {
   const usage = createUsage()
 
-  const walk = async (path: string, depth: number): Promise<void> => {
+  const walk = async (path: string): Promise<void> => {
     signal?.throwIfAborted()
     const kind = await classifyNode(path)
     if (kind === 'missing') return
@@ -414,19 +379,16 @@ async function collectUsage(root: string, signal?: AbortSignal): Promise<UsageCo
       try {
         const details = await lstat(path)
         usage.regularFileCount++
-        addBytes(usage, details.size)
+        usage.bytes += details.size
       } catch (error) {
-        if (!isMissing(error)) usage.unreadableEntryCount++
+        if ((error as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT') {
+          usage.unreadableEntryCount++
+        }
       }
       return
     }
 
     usage.directoryCount++
-    if (depth >= MAX_WALK_DEPTH) {
-      usage.depthLimitCount++
-      return
-    }
-
     const directory = await readSafeDirectory(path)
     if (directory.kind !== 'entries') {
       if (directory.kind === 'symlink') usage.skippedSymlinkCount++
@@ -445,81 +407,25 @@ async function collectUsage(root: string, signal?: AbortSignal): Promise<UsageCo
         usage.skippedSymlinkCount++
         continue
       }
-      await walk(join(path, entry.name), depth + 1)
+      await walk(join(path, entry.name))
     }
   }
 
-  await walk(root, 0)
+  await walk(root)
   return usage
-}
-
-async function makeTreeWritable(root: string, signal?: AbortSignal): Promise<boolean> {
-  const files: string[] = []
-  const directories: string[] = []
-  const validate = async (path: string, depth: number): Promise<boolean> => {
-    signal?.throwIfAborted()
-    if (depth > MAX_WALK_DEPTH) return false
-    const kind = await classifyNode(path)
-    if (kind === 'file') { files.push(path); return true }
-    if (kind !== 'directory') return false
-    const directory = await readSafeDirectory(path)
-    if (directory.kind !== 'entries') return false
-    directories.push(path)
-    for (const entry of directory.entries) {
-      if (!isSafeSegment(entry.name) || entry.isSymbolicLink()) return false
-      if (!await validate(join(path, entry.name), depth + 1)) return false
-    }
-    return true
-  }
-
-  if (!await validate(root, 0)) return false
-  try {
-    for (const file of files) {
-      signal?.throwIfAborted()
-      if (await classifyNode(file) !== 'file') throw new TypeError('cache file changed during deletion')
-      await chmod(file, 0o600)
-    }
-    for (const directory of [...directories].reverse()) {
-      signal?.throwIfAborted()
-      if (await classifyNode(directory) !== 'directory') throw new TypeError('cache directory changed during deletion')
-      await chmod(directory, 0o700)
-    }
-    return true
-  } catch {
-    for (const file of files) await chmod(file, 0o400).catch(() => undefined)
-    for (const directory of directories) await chmod(directory, directory === root ? 0o500 : 0o555).catch(() => undefined)
-    return false
-  }
-}
-
-async function restoreTreeReadOnly(root: string): Promise<void> {
-  if (!await isSafeExistingDirectoryChain(root)) return
-  const restore = async (path: string, isRoot: boolean): Promise<void> => {
-    const kind = await classifyNode(path)
-    if (kind === 'file') { await chmod(path, 0o400).catch(() => undefined); return }
-    if (kind !== 'directory') return
-    const directory = await readSafeDirectory(path)
-    if (directory.kind !== 'entries') return
-    for (const entry of directory.entries) {
-      if (!isSafeSegment(entry.name) || entry.isSymbolicLink()) continue
-      await restore(join(path, entry.name), false)
-    }
-    await chmod(path, isRoot ? 0o500 : 0o555).catch(() => undefined)
-  }
-  await restore(root, true)
 }
 
 function toAreaStatistics(usage: UsageCounter, logicalEntryCount: number): StorageAreaStatistics {
   return {
     byteUsage: usage.bytes,
-    byteUsageSaturated: usage.bytesSaturated,
+    byteUsageSaturated: false,
     logicalEntryCount,
     regularFileCount: usage.regularFileCount,
     directoryCount: usage.directoryCount,
     skippedSymlinkCount: usage.skippedSymlinkCount,
     unexpectedEntryCount: usage.unexpectedEntryCount,
     unreadableEntryCount: usage.unreadableEntryCount,
-    depthLimitCount: usage.depthLimitCount,
+    depthLimitCount: 0,
   }
 }
 
@@ -537,8 +443,11 @@ export class StorageMaintenanceService {
     }
   }
 
+  static confirmationToken(cacheKeys: readonly CacheKey[]): string {
+    return cacheClearConfirmationToken(cacheKeys)
+  }
+
   async getStatistics(signal?: AbortSignal): Promise<StorageStatistics> {
-    this.assertLockHeld()
     const [
       publishedUsage,
       stagingUsage,
@@ -564,15 +473,16 @@ export class StorageMaintenanceService {
   }
 
   async scanIntegrity(options: IntegrityScanOptions = {}): Promise<CacheIntegrityScanReport> {
-    this.assertLockHeld()
     if (options.isolateInvalid !== true) return await this.scanIntegrityInternal(options)
 
-    const releaseExclusive = this.acquireDestructiveAccess()
-    try {
-      return await this.scanIntegrityInternal(options)
-    } finally {
-      releaseExclusive()
-    }
+    return await this.lock.withLock(async () => {
+      const releaseExclusive = this.acquireDestructiveAccess()
+      try {
+        return await this.scanIntegrityInternal(options)
+      } finally {
+        releaseExclusive()
+      }
+    }, options.signal)
   }
 
   private async scanIntegrityInternal(options: IntegrityScanOptions): Promise<CacheIntegrityScanReport> {
@@ -639,10 +549,9 @@ export class StorageMaintenanceService {
   }
 
   async listQuarantine(options: QuarantineListOptions = {}): Promise<QuarantineListReport> {
-    this.assertLockHeld()
     const limit = boundedLimit(options.limit, DEFAULT_QUARANTINE_LIST_LIMIT, MAX_QUARANTINE_LIST_LIMIT, 'limit')
     const entries: QuarantineEntry[] = []
-    const totals = { value: 0, saturated: false }
+    let totalBytes = 0
     let totalCount = 0
     let skippedSymlinkCount = 0
     let unexpectedEntryCount = 0
@@ -682,12 +591,12 @@ export class StorageMaintenanceService {
           continue
         }
         totalCount++
-        addTotal(totals, usage.bytes, usage.bytesSaturated)
+        totalBytes += usage.bytes
         if (entries.length < limit) {
           entries.push({
             id: entry.name,
             byteUsage: usage.bytes,
-            byteUsageSaturated: usage.bytesSaturated,
+            byteUsageSaturated: false,
             regularFileCount: usage.regularFileCount,
             directoryCount: usage.directoryCount,
             modifiedAt: Math.max(0, Math.floor(details.mtimeMs)),
@@ -706,8 +615,8 @@ export class StorageMaintenanceService {
       generatedAt: Date.now(),
       entries,
       totalCount,
-      totalBytes: totals.value,
-      totalBytesSaturated: totals.saturated,
+      totalBytes,
+      totalBytesSaturated: false,
       truncated: totalCount > entries.length,
       skippedSymlinkCount,
       unexpectedEntryCount,
@@ -716,21 +625,22 @@ export class StorageMaintenanceService {
   }
 
   async cleanupQuarantine(options: QuarantineCleanupOptions): Promise<QuarantineCleanupReport> {
-    this.assertLockHeld()
     if (options.dryRun !== false) return await this.cleanupQuarantineInternal(options)
 
-    const releaseExclusive = this.acquireDestructiveAccess()
-    try {
-      return await this.cleanupQuarantineInternal(options)
-    } finally {
-      releaseExclusive()
-    }
+    return await this.lock.withLock(async () => {
+      const releaseExclusive = this.acquireDestructiveAccess()
+      try {
+        return await this.cleanupQuarantineInternal(options)
+      } finally {
+        releaseExclusive()
+      }
+    }, options.signal)
   }
 
   private async cleanupQuarantineInternal(options: QuarantineCleanupOptions): Promise<QuarantineCleanupReport> {
     if (!Array.isArray(options.entryIds)) throw new TypeError('entryIds must be an array')
     if (options.entryIds.length > MAX_QUARANTINE_CLEANUP_ENTRIES) {
-      throw new TypeError('entryIds cannot contain more than ' + String(MAX_QUARANTINE_CLEANUP_ENTRIES) + ' entries')
+      throw new TypeError(`entryIds cannot contain more than ${MAX_QUARANTINE_CLEANUP_ENTRIES} entries`)
     }
 
     const entryIds: string[] = []
@@ -765,8 +675,8 @@ export class StorageMaintenanceService {
     }
 
     const plannedEntries: QuarantineEntry[] = []
-    const plannedTotals = { value: 0, saturated: false }
-    const deletedTotals = { value: 0, saturated: false }
+    let plannedBytes = 0
+    let deletedBytes = 0
     let deletedCount = 0
     let missingCount = 0
     let skippedCount = 0
@@ -774,6 +684,10 @@ export class StorageMaintenanceService {
     for (const entryId of entryIds) {
       options.signal?.throwIfAborted()
       const entryPath = this.paths.quarantineDir(entryId)
+      if (!isWithinDirectory(entryPath, this.paths.quarantineDir())) {
+        skippedCount++
+        continue
+      }
       const kind = await classifyNode(entryPath)
       if (kind === 'missing') {
         missingCount++
@@ -791,7 +705,7 @@ export class StorageMaintenanceService {
         continue
       }
 
-      if (usage.skippedSymlinkCount > 0 || usage.unexpectedEntryCount > 0 || usage.unreadableEntryCount > 0 || usage.depthLimitCount > 0) {
+      if (usage.skippedSymlinkCount > 0 || usage.unexpectedEntryCount > 0 || usage.unreadableEntryCount > 0) {
         // Preserve malformed quarantine trees for manual investigation.
         skippedCount++
         continue
@@ -800,26 +714,25 @@ export class StorageMaintenanceService {
       const entry: QuarantineEntry = {
         id: entryId,
         byteUsage: usage.bytes,
-        byteUsageSaturated: usage.bytesSaturated,
+        byteUsageSaturated: false,
         regularFileCount: usage.regularFileCount,
         directoryCount: usage.directoryCount,
         modifiedAt: Math.max(0, Math.floor(details.mtimeMs)),
       }
       plannedEntries.push(entry)
-      addTotal(plannedTotals, usage.bytes, usage.bytesSaturated)
+      plannedBytes += usage.bytes
 
       if (!dryRun) {
         try {
-          if (!await makeTreeWritable(entryPath, options.signal)) {
+          if (!await isSafeExistingDirectoryChain(entryPath, options.signal)) {
             skippedCount++
             continue
           }
-          // entryPath is derived solely from a validated quarantine segment.
-          await rm(entryPath, { recursive: true, force: false, maxRetries: 1 })
+          await rm(entryPath, { recursive: true, force: true, maxRetries: 2 })
           deletedCount++
-          addTotal(deletedTotals, usage.bytes, usage.bytesSaturated)
+          deletedBytes += usage.bytes
         } catch (error) {
-          if (isMissing(error)) missingCount++
+          if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') missingCount++
           else skippedCount++
         }
       }
@@ -830,11 +743,11 @@ export class StorageMaintenanceService {
       dryRun,
       requestedCount: entryIds.length,
       plannedCount: plannedEntries.length,
-      plannedBytes: plannedTotals.value,
-      plannedBytesSaturated: plannedTotals.saturated,
+      plannedBytes,
+      plannedBytesSaturated: false,
       deletedCount,
-      deletedBytes: deletedTotals.value,
-      deletedBytesSaturated: deletedTotals.saturated,
+      deletedBytes,
+      deletedBytesSaturated: false,
       missingCount,
       skippedCount,
       entries: plannedEntries,
@@ -842,22 +755,23 @@ export class StorageMaintenanceService {
   }
 
   async clearCache(options: CacheClearOptions = {}): Promise<CacheClearReport> {
-    this.assertLockHeld()
     const dryRun = options.dryRun !== false
     if (dryRun) {
       return await this.clearCacheInternal(options, false, this.accessGate.activeReaderCount)
     }
 
-    const releaseExclusive = this.accessGate.tryAcquireExclusive()
-    if (releaseExclusive === undefined) {
-      const blocked = await this.clearCacheInternal({ ...options, dryRun: true }, false, this.accessGate.activeReaderCount)
-      return { ...blocked, dryRun: false, eligible: false, confirmationToken: undefined }
-    }
-    try {
-      return await this.clearCacheInternal(options, true, 0)
-    } finally {
-      releaseExclusive()
-    }
+    return await this.lock.withLock(async () => {
+      const releaseExclusive = this.accessGate.tryAcquireExclusive()
+      if (releaseExclusive === undefined) {
+        const blocked = await this.clearCacheInternal({ ...options, dryRun: true }, false, this.accessGate.activeReaderCount)
+        return { ...blocked, dryRun: false, eligible: false, confirmationToken: undefined }
+      }
+      try {
+        return await this.clearCacheInternal(options, true, 0)
+      } finally {
+        releaseExclusive()
+      }
+    }, options.signal)
   }
 
   private async clearCacheInternal(
@@ -869,12 +783,11 @@ export class StorageMaintenanceService {
     const diagnosticLimit = boundedLimit(options.diagnosticLimit, DEFAULT_DIAGNOSTIC_LIMIT, MAX_DIAGNOSTIC_LIMIT, 'diagnosticLimit')
     const dryRun = options.dryRun !== false
     const diagnostics = createDiagnostics(diagnosticLimit)
-    const planned: Array<{ readonly cacheKey: CacheKey; readonly resultDir: string; readonly byteUsage: number; readonly byteUsageSaturated: boolean }> = []
-    const plannedTotals = { value: 0, saturated: false }
-    const deletedTotals = { value: 0, saturated: false }
+    const planned: Array<{ readonly cacheKey: CacheKey; readonly resultDir: string; readonly byteUsage: number }> = []
+    let plannedBytes = 0
+    let deletedBytes = 0
     let unsafeResultCount = 0
     let deletedCount = 0
-    const deletedCacheKeys = new Set<CacheKey>()
     let skippedCount = 0
     let traversal: TraversalSummary = { scanned: 0, truncated: false, complete: true }
 
@@ -886,21 +799,21 @@ export class StorageMaintenanceService {
       addDiagnostic(diagnostics, 'published-results', 'results', resultsKind === 'symlink' ? 'symlink-skipped' : 'unsafe-result')
     } else if (resultsKind === 'directory') {
       traversal = await this.visitPublishedResults(resultLimit, options.signal, diagnostics, async (cacheKey, resultDir) => {
-        if (!await isSafeExistingDirectoryChain(resultDir, options.signal)) {
+        if (!isWithinDirectory(resultDir, this.paths.resultsDir()) || !await isSafeExistingDirectoryChain(resultDir, options.signal)) {
           unsafeResultCount++
           skippedCount++
           addDiagnostic(diagnostics, 'published-results', cacheKey, 'unsafe-result')
           return
         }
         const usage = await collectUsage(resultDir, options.signal)
-        if (usage.skippedSymlinkCount > 0 || usage.unexpectedEntryCount > 0 || usage.unreadableEntryCount > 0 || usage.depthLimitCount > 0) {
+        if (usage.skippedSymlinkCount > 0 || usage.unexpectedEntryCount > 0 || usage.unreadableEntryCount > 0) {
           unsafeResultCount++
           skippedCount++
           addDiagnostic(diagnostics, 'published-results', cacheKey, 'unsafe-result')
           return
         }
-        planned.push({ cacheKey, resultDir, byteUsage: usage.bytes, byteUsageSaturated: usage.bytesSaturated })
-        addTotal(plannedTotals, usage.bytes, usage.bytesSaturated)
+        planned.push({ cacheKey, resultDir, byteUsage: usage.bytes })
+        plannedBytes += usage.bytes
       })
     }
 
@@ -918,30 +831,16 @@ export class StorageMaintenanceService {
       for (const entry of planned) {
         options.signal?.throwIfAborted()
         try {
-          if (!await isSafeExistingDirectoryChain(entry.resultDir, options.signal)
-            || !await makeTreeWritable(entry.resultDir, options.signal)) {
+          if (!await isSafeExistingDirectoryChain(entry.resultDir, options.signal)) {
             skippedCount++
             continue
           }
-          const revalidated = await collectUsage(entry.resultDir, options.signal)
-          const stillSafe = await isSafeExistingDirectoryChain(entry.resultDir, options.signal)
-            && revalidated.skippedSymlinkCount === 0
-            && revalidated.unexpectedEntryCount === 0
-            && revalidated.unreadableEntryCount === 0
-            && revalidated.depthLimitCount === 0
-          if (!stillSafe) {
-            skippedCount++
-            await restoreTreeReadOnly(entry.resultDir)
-            continue
-          }
-          await rm(entry.resultDir, { recursive: true, force: false, maxRetries: 1 })
+          await rm(entry.resultDir, { recursive: true, force: true, maxRetries: 2 })
           deletedCount++
-          deletedCacheKeys.add(entry.cacheKey)
-          addTotal(deletedTotals, entry.byteUsage, entry.byteUsageSaturated)
+          deletedBytes += entry.byteUsage
         } catch (error) {
-          if (!isMissing(error)) {
+          if ((error as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT') {
             skippedCount++
-            await restoreTreeReadOnly(entry.resultDir)
           }
         }
       }
@@ -955,11 +854,11 @@ export class StorageMaintenanceService {
       activeAccessCount,
       ...(dryRun && preflightEligible && planned.length > 0 ? { confirmationToken: token } : {}),
       plannedCount: planned.length,
-      plannedBytes: plannedTotals.value,
-      plannedBytesSaturated: plannedTotals.saturated,
+      plannedBytes,
+      plannedBytesSaturated: false,
       deletedCount,
-      deletedBytes: deletedTotals.value,
-      deletedBytesSaturated: deletedTotals.saturated,
+      deletedBytes,
+      deletedBytesSaturated: false,
       skippedCount,
       scan: {
         limit: resultLimit,
@@ -972,50 +871,48 @@ export class StorageMaintenanceService {
     }
   }
 
-
   async gcDryRun(options: GcDryRunOptions = {}): Promise<GcDryRunReport> {
-    this.assertLockHeld()
     const resultLimit = boundedLimit(options.resultLimit, DEFAULT_RESULT_SCAN_LIMIT, MAX_RESULT_SCAN_LIMIT, 'resultLimit')
     const candidateLimit = boundedLimit(options.candidateLimit, DEFAULT_GC_CANDIDATE_LIMIT, MAX_GC_CANDIDATE_LIMIT, 'candidateLimit')
     const diagnosticLimit = boundedLimit(options.diagnosticLimit, DEFAULT_DIAGNOSTIC_LIMIT, MAX_DIAGNOSTIC_LIMIT, 'diagnosticLimit')
     const diagnostics = createDiagnostics(diagnosticLimit)
     const candidates: GcCandidate[] = []
-    const candidateTotals = { value: 0, saturated: false }
+    let candidateBytes = 0
     let candidateCount = 0
     let invalidResultCount = 0
     let unsafeResultCount = 0
     let traversal: TraversalSummary = { scanned: 0, truncated: false, complete: true }
 
     traversal = await this.visitPublishedResults(resultLimit, options.signal, diagnostics, async (cacheKey, resultDir) => {
-        const inspection = await this.results.inspectPublished(cacheKey, options.signal)
-        if (inspection.status !== 'valid') {
-          invalidResultCount++
-          addDiagnostic(
-            diagnostics,
-            'published-results',
-            cacheKey,
-            inspection.status === 'missing' ? 'missing-result' : inspection.status === 'unreadable' ? 'unreadable-entry' : 'corrupt-result',
-          )
-          return
-        }
+      const inspection = await this.results.inspectPublished(cacheKey, options.signal)
+      if (inspection.status !== 'valid') {
+        invalidResultCount++
+        addDiagnostic(
+          diagnostics,
+          'published-results',
+          cacheKey,
+          inspection.status === 'missing' ? 'missing-result' : inspection.status === 'unreadable' ? 'unreadable-entry' : 'corrupt-result',
+        )
+        return
+      }
 
-        const usage = await collectUsage(resultDir, options.signal)
-        if (usage.skippedSymlinkCount > 0 || usage.unexpectedEntryCount > 0 || usage.unreadableEntryCount > 0 || usage.depthLimitCount > 0) {
-          unsafeResultCount++
-          addDiagnostic(diagnostics, 'published-results', cacheKey, 'unsafe-result')
-          return
-        }
+      const usage = await collectUsage(resultDir, options.signal)
+      if (usage.skippedSymlinkCount > 0 || usage.unexpectedEntryCount > 0 || usage.unreadableEntryCount > 0) {
+        unsafeResultCount++
+        addDiagnostic(diagnostics, 'published-results', cacheKey, 'unsafe-result')
+        return
+      }
 
-        candidateCount++
-        addTotal(candidateTotals, usage.bytes, usage.bytesSaturated)
-        if (candidates.length < candidateLimit) {
-          candidates.push({
-            cacheKey,
-            resultId: inspection.manifest.id,
-            byteUsage: usage.bytes,
-            byteUsageSaturated: usage.bytesSaturated,
-          })
-        }
+      candidateCount++
+      candidateBytes += usage.bytes
+      if (candidates.length < candidateLimit) {
+        candidates.push({
+          cacheKey,
+          resultId: inspection.manifest.id,
+          byteUsage: usage.bytes,
+          byteUsageSaturated: false,
+        })
+      }
     })
 
     return {
@@ -1024,8 +921,8 @@ export class StorageMaintenanceService {
       referencePolicy: 'all-published-results',
       eligible: traversal.complete && !traversal.truncated,
       candidateCount,
-      candidateBytes: candidateTotals.value,
-      candidateBytesSaturated: candidateTotals.saturated,
+      candidateBytes,
+      candidateBytesSaturated: false,
       candidates,
       candidatesTruncated: candidateCount > candidates.length,
       candidateTotalsComplete: traversal.complete && !traversal.truncated,
@@ -1055,12 +952,6 @@ export class StorageMaintenanceService {
       throwMinerU('STORAGE_LOCKED', 'MinerU storage is in use by an active parse operation')
     }
     return releaseExclusive
-  }
-
-  private assertLockHeld(): void {
-    if (!this.lock.isHeld()) {
-      throwMinerU('STORAGE_LOCKED', 'MinerU storage maintenance requires the active process lock')
-    }
   }
 
   private async countPublishedResultDirectories(signal?: AbortSignal): Promise<number> {
@@ -1175,5 +1066,4 @@ export class StorageMaintenanceService {
     else if (kind === 'unreadable') addDiagnostic(diagnostics, area, entry, 'unreadable-entry')
     else addDiagnostic(diagnostics, area, entry, 'unexpected-entry')
   }
-
 }

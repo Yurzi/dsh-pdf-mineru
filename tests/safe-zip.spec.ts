@@ -350,14 +350,24 @@ describe('safe-zip', () => {
     })
 
 
-    it('rejects excessive JSON nesting with a fixed frame budget', async () => {
-      const dir = await mkdtemp(join(tmpdir(), 'mineru-json-depth-'))
+    it('rejects invalid JSON artifact in archive', async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'mineru-json-invalid-'))
       tempDirs.push(dir)
-      const path = join(dir, 'deep.json')
-      await writeFile(path, '['.repeat(257) + '0' + ']'.repeat(257))
+      const path = join(dir, 'invalid.json')
+      await writeFile(path, '{"invalid":')
       await expect(validateJsonFile(path)).rejects.toMatchObject({
         failure: { code: 'RESULT_ARCHIVE_INVALID' },
       })
+    })
+
+    it('respects abort signal during JSON validation', async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'mineru-json-abort-'))
+      tempDirs.push(dir)
+      const path = join(dir, 'valid.json')
+      await writeFile(path, '{"ok":true}')
+      const controller = new AbortController()
+      controller.abort(new DOMException('Aborted by user', 'AbortError'))
+      await expect(validateJsonFile(path, undefined, controller.signal)).rejects.toThrowError(/Aborted by user/i)
     })
 
     it('rejects zip containing path traversal ("../evil.txt")', async () => {

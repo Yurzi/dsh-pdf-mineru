@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto'
 import { createReadStream } from 'node:fs'
-import { stat } from 'node:fs/promises'
 import { Readable } from 'node:stream'
+import { assertSourcesUnchanged } from '../service/request-normalizer.js'
+import { ProviderHttpClient } from './http-client.js'
 import { asProviderConfigId } from '../domain/ids.js'
 import {
   MinerUError,
@@ -179,12 +180,19 @@ export class OfficialV4Provider implements MinerUProvider {
   readonly capabilities: ProviderCapabilities
   private readonly parsedBaseUrl: URL
   private readonly retryOptions: ProviderRetryOptions
+  private readonly client: ProviderHttpClient
 
   constructor(config: OfficialV4Config, options?: ProviderOptions) {
     asProviderConfigId(config.id)
     this.config = config
     this.retryOptions = options?.retry ?? {}
     this.parsedBaseUrl = validateAndNormalizeOfficialBaseURL(config.baseURL)
+    this.client = new ProviderHttpClient({
+      baseURL: this.parsedBaseUrl,
+      provider: 'official-v4',
+      defaultRetry: this.retryOptions,
+      providerLabel: 'MinerU official API',
+    })
 
     const supportedModels = config.models.length > 0 ? config.models : (['pipeline', 'vlm'] as const)
 
@@ -275,23 +283,7 @@ export class OfficialV4Provider implements MinerUProvider {
     }
 
     // Pre-submission verification: ensure files exist and fingerprints match
-    for (const source of sources) {
-      context.signal.throwIfAborted()
-      let currentStat
-      try {
-        currentStat = await stat(source.path)
-      } catch (err) {
-        throw new MinerUError(failure('FILE_NOT_FOUND', `Source file missing before upload: ${source.name}`), { cause: err })
-      }
-      if (
-        currentStat.size !== source.fingerprint.size ||
-        currentStat.mtimeMs !== source.fingerprint.mtimeMs ||
-        currentStat.dev !== source.fingerprint.device ||
-        currentStat.ino !== source.fingerprint.inode
-      ) {
-        throw new MinerUError(failure('INVALID_REQUEST', `Source file ${source.name} changed before upload`, true))
-      }
-    }
+    await assertSourcesUnchanged(sources, context.signal)
 
     const submittedFiles: ProviderSubmittedFile[] = request.files.map(f => ({
       dataId: `data_${f.fileId}`,
@@ -584,131 +576,17 @@ export class OfficialV4Provider implements MinerUProvider {
       businessValidation?: 'strict' | 'probe'
     },
   ): Promise<T> {
-    const allowRetry = options?.retry ?? (method.toUpperCase() === 'GET')
-    const operation = options?.operation ?? (path.startsWith('/extract-results/batch/__dsh_probe__') ? 'probe' : 'api-json')
     const businessValidation = options?.businessValidation ?? 'strict'
-
-    const executeOnce = async (): Promise<T> => {
-      context.signal.throwIfAborted()
-
-      const url = `${this.parsedBaseUrl.origin}${this.parsedBaseUrl.pathname.replace(/\/+$/, '')}${path}`
-      const controller = new AbortController()
-      let timedOut = false
-      const timer = setTimeout(() => {
-        timedOut = true
-        controller.abort(new DOMException(`Request timed out after ${String(context.timeoutMs)}ms`, 'TimeoutError'))
-      }, context.timeoutMs)
-
-      const onParentAbort = () => {
-        controller.abort(context.signal.reason)
-      }
-      context.signal.addEventListener('abort', onParentAbort, { once: true })
-
-      try {
-        const requestHeaders: Record<string, string> = { ...headers }
-        if (context.credential && context.credential.trim() !== '') {
-          requestHeaders['authorization'] = `Bearer ${context.credential}`
-        }
-
-        let response: Response
-        try {
-          const requestInit: RequestInit = {
-            method,
-            headers: requestHeaders,
-            body: bodyText,
-            signal: controller.signal,
-            redirect: 'error',
-          }
-          response = await fetch(url, requestInit)
-        } catch (err: unknown) {
-          if (context.signal.aborted) {
-            throw new MinerUError(failure('CANCELLED', 'Operation was cancelled', true))
-          }
-          if (timedOut) {
-            const timeoutErr = new MinerUError(
-              failure('PROVIDER_UNAVAILABLE', `Request to MinerU official API timed out after ${String(context.timeoutMs)}ms`, true),
-            )
-            Object.assign(timeoutErr, { httpStatus: 408 })
-            throw timeoutErr
-          }
-          const message = err instanceof Error ? err.message : String(err)
-          throw new MinerUError(
-            failure('PROVIDER_UNAVAILABLE', `Failed to connect to MinerU official API: ${sanitizeDiagnostic(message)}`, true),
-            { cause: err },
-          )
-        }
-
-        const status = response.status
-        if (!acceptedStatuses.includes(status)) {
-          let errorBody = ''
-          try {
-            errorBody = await readBoundedResponseText(response, context.limits.maxApiResponseBytes, controller.signal)
-          } catch {
-            if (response.body) {
-              try { await response.body.cancel() } catch {}
-            }
-          }
-
-          let parsedError: string | undefined
-          try {
-            const parsed: unknown = JSON.parse(errorBody)
-            if (typeof parsed === 'object' && parsed !== null) {
-              const json = parsed as Record<string, unknown>
-              if (typeof json.msg === 'string') parsedError = json.msg
-              else if (typeof json.message === 'string') parsedError = json.message
-              else if (typeof json.detail === 'string') parsedError = json.detail
-            }
-          } catch {
-            parsedError = errorBody.slice(0, 500)
-          }
-
-          const diagnostic = parsedError
-            ? `: ${sanitizeDiagnostic(parsedError, [context.credential ?? ''])}`
-            : ''
-          const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'))
-          let err: MinerUError
-
-          if (status === 401 || status === 403) {
-            err = new MinerUError(failure('AUTHENTICATION_FAILED', `Official MinerU authentication failed (${String(status)})${diagnostic}`, false, { provider: 'official-v4' }))
-          } else if (status === 404) {
-            err = new MinerUError(failure('JOB_NOT_FOUND', `Official MinerU resource not found (${String(status)})${diagnostic}`, false, { provider: 'official-v4' }))
-          } else if (status === 413) {
-            err = new MinerUError(failure('FILE_TOO_LARGE', `File exceeds size limit (${String(status)})${diagnostic}`, false, { provider: 'official-v4' }))
-          } else if (status === 429) {
-            err = new MinerUError(failure('PROVIDER_RATE_LIMITED', `Official MinerU rate limit exceeded (${String(status)})${diagnostic}`, true, { provider: 'official-v4' }))
-          } else if (status === 408) {
-            err = new MinerUError(failure('PROVIDER_UNAVAILABLE', `Official MinerU request timeout (${String(status)})${diagnostic}`, true, { provider: 'official-v4' }))
-          } else if (status >= 500) {
-            err = new MinerUError(failure('PROVIDER_UNAVAILABLE', `Official MinerU server error (${String(status)})${diagnostic}`, true, { provider: 'official-v4' }))
-          } else {
-            err = new MinerUError(failure('REMOTE_PARSE_FAILED', `Official MinerU returned status ${String(status)}${diagnostic}`, false, { provider: 'official-v4' }))
-          }
-
-          Object.assign(err, { httpStatus: status, retryAfterMs })
-          throw err
-        }
-
-        const contentType = response.headers.get('content-type') ?? ''
-        if (!contentType.toLowerCase().includes('application/json')) {
-          if (response.body) {
-            try { await response.body.cancel() } catch {}
-          }
-          throw new MinerUError(failure('REMOTE_PARSE_FAILED', `Expected application/json response, got "${contentType}"`, false, { provider: 'official-v4' }))
-        }
-
-        const rawText = await readBoundedResponseText(response, context.limits.maxApiResponseBytes, controller.signal)
-        let parsed: T
-        try {
-          parsed = JSON.parse(rawText) as T
-        } catch (err) {
-          throw new MinerUError(
-            failure('REMOTE_PARSE_FAILED', `Failed to parse JSON response: ${sanitizeDiagnostic(err instanceof Error ? err.message : String(err))}`, false, { provider: 'official-v4' }),
-            { cause: err },
-          )
-        }
-        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-          throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Official MinerU response must be an object', false, { provider: 'official-v4' }))
-        }
+    return await this.client.requestJson<T>({
+      method,
+      path,
+      body: bodyText,
+      headers,
+      context,
+      acceptedStatuses,
+      operation: options?.operation,
+      retry: options?.retry,
+      validateResponse: (parsed, response) => {
         if (!('code' in parsed)) {
           throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Official MinerU response is missing its business code', false, { provider: 'official-v4' }))
         }
@@ -717,7 +595,7 @@ export class OfficialV4Provider implements MinerUProvider {
           const normalizedCode = String(envelope.code).toUpperCase()
           const probeSentinel = businessValidation === 'probe'
             && isMissingBatchProbeSentinel(envelope.code, envelope.msg)
-          if (probeSentinel) return parsed
+          if (probeSentinel) return parsed as T
           const businessError = officialBusinessFailure(
             envelope.code,
             sanitizeDiagnostic(envelope.msg || `Official API failed with code ${String(envelope.code)}`, [context.credential ?? '']),
@@ -731,23 +609,8 @@ export class OfficialV4Provider implements MinerUProvider {
           }
           throw businessError
         }
-        return parsed
-      } finally {
-        clearTimeout(timer)
-        context.signal.removeEventListener('abort', onParentAbort)
-      }
-    }
-
-    if (!allowRetry) {
-      return await executeOnce()
-    }
-
-    return await executeWithRetry({
-      provider: 'official-v4',
-      operation,
-      signal: context.signal,
-      retryOptions: mergeRetryOptions(this.retryOptions, context.retry),
-      fn: executeOnce,
+        return parsed as T
+      },
     })
   }
 
@@ -769,20 +632,7 @@ export class OfficialV4Provider implements MinerUProvider {
         context.signal.throwIfAborted()
 
         // Re-verify file stat right before streaming
-        let currentStat
-        try {
-          currentStat = await stat(source.path)
-        } catch (err) {
-          throw new MinerUError(failure('FILE_NOT_FOUND', `Source file missing during upload: ${source.name}`), { cause: err })
-        }
-        if (
-          currentStat.size !== source.fingerprint.size ||
-          currentStat.mtimeMs !== source.fingerprint.mtimeMs ||
-          currentStat.dev !== source.fingerprint.device ||
-          currentStat.ino !== source.fingerprint.inode
-        ) {
-          throw new MinerUError(failure('INVALID_REQUEST', `Source file ${source.name} modified during upload`, true))
-        }
+        await assertSourcesUnchanged([source], context.signal)
 
         const controller = new AbortController()
         let timedOut = false

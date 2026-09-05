@@ -3,6 +3,7 @@ import type { ArtifactKind, CanonicalParseRequest, CanonicalSourceFile } from '.
 import type { ArtifactRef, MinerUResultManifest, ResultProducer } from '../domain/result.js';
 import type { ArtifactInput, ArtifactSink, ArtifactWriteOptions, TemporaryArtifact } from '../providers/provider.js';
 import type { StoragePaths } from './paths.js';
+import type { ProcessLock } from './process-lock.js';
 type ResultInspectionStatus = 'valid' | 'missing' | 'corrupt' | 'unreadable';
 type ResultInspectionReason = 'absent' | 'missing-entry' | 'unsafe-entry' | 'manifest-invalid' | 'artifact-invalid' | 'io-error';
 /**
@@ -37,10 +38,11 @@ export interface ResultRepositoryOptions {
 }
 export declare class ResultRepository {
     readonly paths: StoragePaths;
+    readonly lock?: ProcessLock | undefined;
     private readonly maxJsonValidationBytes;
     private readonly maxManifestBytes;
     private readonly maxArtifactBytes;
-    constructor(paths: StoragePaths, options?: ResultRepositoryOptions);
+    constructor(paths: StoragePaths, options?: ResultRepositoryOptions, lock?: ProcessLock | undefined);
     beginTransaction(operationId: OperationId | string, request: CanonicalParseRequest, producer: ResultProducer, signal?: AbortSignal): ResultTransaction;
     private assertManifestConsistency;
     private verifyArtifact;

@@ -1,5 +1,5 @@
-import { open } from 'node:fs/promises'
-import { TextDecoder } from 'node:util'
+import { readFile } from 'node:fs/promises'
+import { setTimeout as delay } from 'node:timers/promises'
 import type { MinerUConfig, ProviderConfig } from '../config.js'
 import type { MinerUFailure, MinerUProviderId } from '../domain/errors.js'
 import { MinerUError, failure, toMinerUFailure } from '../domain/errors.js'
@@ -20,6 +20,27 @@ import { BatchCoordinator, type BatchParticipant } from './batch-coordinator.js'
 import { computeCacheKey } from './cache-key.js'
 import { RequestNormalizer, assertSourcesUnchanged } from './request-normalizer.js'
 import { SharedOperationRegistry, type SharedOperation, type SharedOutcome } from './shared-operations.js'
+import type {
+  ArtifactView,
+  BatchParseDocumentView,
+  ContentStatus,
+  DocumentHeading,
+  FailedParseView,
+  ParseDocumentView,
+  ResultFileView,
+  ResultView,
+  SubmissionSource,
+} from './result-presenter.js'
+import {
+  allocateReclaimedShares,
+  extractMarkdownHeadings,
+  formatParseDocumentProse,
+  formatResultProse,
+  readMarkdownFile,
+  truncateAtCleanBoundary,
+} from './result-presenter.js'
+
+export * from './result-presenter.js'
 
 export interface ServiceSession {
   readonly header: { readonly id: string; readonly cwd?: string }
@@ -28,56 +49,6 @@ export interface ServiceSession {
 const MAX_POLL_TIMEOUT_MS = 24 * 60 * 60 * 1000
 
 export type CredentialResolver = (reference: string, signal: AbortSignal) => Promise<string | undefined>
-export type SubmissionSource = 'cache' | 'shared-operation' | 'provider'
-
-export type ContentStatus = 'complete' | 'partial' | 'not_requested'
-
-export interface ArtifactView {
-  readonly kind: string
-  readonly path: string
-  readonly bytes: number
-}
-
-export interface ResultFileView {
-  readonly file_id: string
-  readonly name: string
-  readonly artifacts: readonly ArtifactView[]
-  readonly artifacts_truncated?: boolean
-  readonly markdown_path?: string
-}
-
-export interface ResultView {
-  readonly state: 'completed'
-  readonly source: SubmissionSource
-  readonly cache_hit: boolean
-  readonly result_id: string
-  readonly files: readonly ResultFileView[]
-  readonly markdown_content?: string
-  readonly content_status: ContentStatus
-  readonly markdown_path?: string
-  readonly read_offset_line?: number
-  readonly manifest_path: string
-  readonly output_limit_chars: number
-}
-
-export interface FailedParseView {
-  readonly state: 'failed'
-  readonly source: SubmissionSource
-  readonly file_id: string
-  readonly name: string
-  readonly failure: MinerUFailure
-}
-
-export interface BatchParseDocumentView {
-  readonly kind: 'batch'
-  readonly state: 'completed' | 'partially-completed' | 'failed'
-  readonly results: readonly (ResultView | FailedParseView)[]
-  readonly output_limit_chars: number
-  readonly content_status?: ContentStatus
-  readonly results_omitted?: boolean
-}
-
-export type ParseDocumentView = ResultView | BatchParseDocumentView
 
 export interface ProbeView {
   readonly available: boolean
@@ -114,24 +85,6 @@ interface PendingFileParse {
   created?: boolean
 }
 
-function delay(ms: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return Promise.reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
-  return new Promise((resolve, reject) => {
-    const finish = (): void => {
-      signal.removeEventListener('abort', onAbort)
-      resolve()
-    }
-    const timer = setTimeout(finish, ms)
-    const onAbort = (): void => {
-      clearTimeout(timer)
-      signal.removeEventListener('abort', onAbort)
-      reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
-    }
-    signal.addEventListener('abort', onAbort, { once: true })
-    timer.unref?.()
-  })
-}
-
 function singlePreparedRequest(prepared: PreparedParseRequest, index: number): PreparedParseRequest {
   const file = prepared.request.files[index]
   const source = prepared.sources[index]
@@ -142,157 +95,6 @@ function singlePreparedRequest(prepared: PreparedParseRequest, index: number): P
   }
 }
 
-export function safeStringSlice(str: string, maxLen: number): string {
-  if (str.length <= maxLen) return str
-  let end = maxLen
-  const code = str.charCodeAt(end - 1)
-  if (code >= 0xD800 && code <= 0xDBFF) {
-    end--
-  }
-  return str.slice(0, end)
-}
-
-export function truncateAtCleanBoundary(
-  fullText: string,
-  maxChars: number,
-): { text: string; truncated: boolean; resumeLine?: number } {
-  if (fullText.length <= maxChars) {
-    return { text: fullText, truncated: false }
-  }
-  if (maxChars <= 0) {
-    return { text: '', truncated: true, resumeLine: 1 }
-  }
-
-  const boundedSlice = safeStringSlice(fullText, maxChars)
-  const paragraphIndex = boundedSlice.lastIndexOf('\n\n')
-  const lineIndex = boundedSlice.lastIndexOf('\n')
-
-  let cutIndex = -1
-  if (paragraphIndex !== -1 && paragraphIndex >= Math.floor(maxChars * 0.7)) {
-    cutIndex = paragraphIndex + 2
-  } else if (lineIndex !== -1) {
-    cutIndex = lineIndex + 1
-  }
-
-  if (cutIndex > 0) {
-    const text = boundedSlice.slice(0, cutIndex)
-    let newlineCount = 0
-    for (let i = 0; i < text.length; i++) {
-      if (text.charCodeAt(i) === 10) newlineCount++
-    }
-    const resumeLine = newlineCount + 1
-    return { text, truncated: true, resumeLine }
-  }
-
-  const text = boundedSlice
-  return { text, truncated: true, resumeLine: 1 }
-}
-
-export function allocateReclaimedShares(lengths: readonly number[], totalBudget: number): number[] {
-  const result = new Array(lengths.length).fill(0)
-  const active = lengths.map((len, idx) => ({ idx, len }))
-  let remaining = totalBudget
-
-  while (active.length > 0) {
-    const share = Math.floor(remaining / active.length)
-    if (share <= 0) break
-    const fitIndex = active.findIndex(item => item.len <= share)
-    if (fitIndex !== -1) {
-      const item = active.splice(fitIndex, 1)[0]!
-      result[item.idx] = item.len
-      remaining -= item.len
-    } else {
-      for (const item of active) {
-        result[item.idx] = share
-      }
-      break
-    }
-  }
-  return result
-}
-
-export async function readMarkdownFile(
-  path: string,
-  totalBytes: number,
-  maxCharsToRead: number,
-): Promise<{ text: string; isCompleteFile: boolean }> {
-  if (totalBytes === 0) {
-    return { text: '', isCompleteFile: true }
-  }
-  const maxBytes = Math.min(totalBytes, Math.max(4096, (maxCharsToRead + 2048) * 4))
-  const handle = await open(path, 'r')
-  try {
-    const buffer = Buffer.alloc(maxBytes)
-    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0)
-    const text = new TextDecoder('utf-8').decode(buffer.subarray(0, bytesRead))
-    const isCompleteFile = bytesRead >= totalBytes
-    return { text, isCompleteFile }
-  } finally {
-    await handle.close()
-  }
-}
-
-export function findMarkdownArtifactPath(value: ResultView): string | undefined {
-  if (value.markdown_path !== undefined) return value.markdown_path
-  for (const file of value.files) {
-    if (file.markdown_path !== undefined) return file.markdown_path
-    const md = file.artifacts.find(artifact => artifact.kind === 'markdown')
-    if (md !== undefined) return md.path
-  }
-  return undefined
-}
-
-export function formatResultProse(value: ResultView): string {
-  const status: ContentStatus = value.content_status ?? (value.markdown_content !== undefined ? 'complete' : 'not_requested')
-  const lines = [
-    '**MinerU Parse Result** (Source: ' + value.source + ', Cache: ' + (value.cache_hit ? 'hit' : 'miss') + ')',
-  ]
-  const content = value.markdown_content
-  if (value.files.length > 0) {
-    for (let i = 0; i < value.files.length; i++) {
-      const file = value.files[i]!
-      lines.push('', '# Document: ' + file.name)
-      if (i === 0 && content !== undefined) {
-        lines.push('', content)
-      }
-      const secondary = file.artifacts.filter(artifact => artifact.kind !== 'markdown')
-      if (secondary.length > 0) {
-        lines.push('', 'Artifacts: ' + secondary.map(a => a.kind + ' (' + String(a.bytes) + ' bytes): ' + a.path).join(', '))
-      }
-      if (file.artifacts_truncated) {
-        lines.push('', '*(Artifact list truncated to output limit)*')
-      }
-    }
-  } else if (content !== undefined) {
-    lines.push('', content)
-  }
-
-  let footer: string
-  if (status === 'complete') {
-    footer = '\n---\n[✓ 本次所选页面的提取 Markdown 已完整提供，可直接用于回答。Complete document content delivered above. Artifact retained at: ' + value.manifest_path + ']'
-  } else if (status === 'partial') {
-    const mdPath = findMarkdownArtifactPath(value)
-    const resumeInfo = value.read_offset_line !== undefined ? ' (resume line: offset=' + String(value.read_offset_line) + ')' : ''
-    const mdGuidance = mdPath !== undefined
-      ? 'Full markdown artifact at: ' + mdPath + resumeInfo + '.'
-      : 'Full markdown artifact path unavailable.'
-    footer = '\n---\n[⚠ 正文未完整提供（受输出限制截断 / Content truncated to output limit）。' + mdGuidance + ' Result manifest: ' + value.manifest_path + ']'
-  } else {
-    footer = '\n---\n[ℹ 本次解析未请求提取 Markdown 正文 (Markdown text was not requested). Result manifest: ' + value.manifest_path + ']'
-  }
-  lines.push(footer)
-  return lines.join('\n')
-}
-
-export function formatParseDocumentProse(value: ParseDocumentView): string {
-  if (!('kind' in value)) return formatResultProse(value)
-  const sections = value.results.map(result =>
-    result.state === 'completed'
-      ? formatResultProse(result)
-      : '**' + result.name + '**: [' + result.failure.code + '] ' + result.failure.message
-  )
-  return '**MinerU Batch Result**\n- State: ' + value.state + '\n- Results: ' + String(value.results.length) + '\n\n' + sections.join('\n\n')
-}
 
 type RawParsedItem =
   | { readonly state: 'failed'; readonly failureView: FailedParseView }
@@ -591,7 +393,7 @@ export class MinerUService {
       if (snapshot.state === 'failed') return { state: 'failed', failure: submissionFailure }
 
       while (snapshot.state !== 'completed' && snapshot.state !== 'partially-completed') {
-        await delay(this.config().polling.pollIntervalMs, operation.controller.signal)
+        await delay(this.config().polling.pollIntervalMs, undefined, { signal: operation.controller.signal })
         snapshot = await resolved.provider.inspect(
           submission.ref,
           await this.callContext(resolved.config, operation.controller.signal, operation.id),
@@ -745,6 +547,8 @@ export class MinerUService {
     let content: string
     let readOffsetLine: number | undefined
     let artifactsTruncated = baseArtifactsTruncated
+    let fullText = raw.text
+    let toc: DocumentHeading[] | undefined
 
     if (raw.text.length <= textBudget && raw.isCompleteFile) {
       contentStatus = 'complete'
@@ -758,6 +562,14 @@ export class MinerUService {
       if (data.secondaryArtifacts.length > 0) {
         artifactsTruncated = true
       }
+      if (!raw.isCompleteFile && data.markdownPath) {
+        try {
+          fullText = await readFile(data.markdownPath, 'utf8')
+        } catch {
+          // fallback to raw.text
+        }
+      }
+      toc = extractMarkdownHeadings(fullText)
     }
 
     let finalArtifacts: ArtifactView[] = baseArtifacts
@@ -800,6 +612,7 @@ export class MinerUService {
       manifest_path: data.manifestPath,
       output_limit_chars: limit,
       markdown_content: content,
+      ...(contentStatus === 'partial' ? { toc } : {}),
     }
 
     while (JSON.stringify(view).length > limit || formatResultProse(view).length > limit) {
@@ -812,11 +625,19 @@ export class MinerUService {
         const excess = Math.max(JSON.stringify(view).length - limit, formatResultProse(view).length - limit, 10)
         const targetLen = Math.max(0, view.markdown_content.length - excess)
         const cut = truncateAtCleanBoundary(raw.text, targetLen)
+        const activeToc = view.toc ?? extractMarkdownHeadings(fullText)
         view = {
           ...view,
           content_status: 'partial',
           markdown_content: cut.text,
           read_offset_line: cut.resumeLine,
+          toc: activeToc,
+        }
+      } else if (view.toc && view.toc.length > 0) {
+        const nextToc = view.toc.slice(0, Math.max(0, Math.floor(view.toc.length / 2)))
+        view = {
+          ...view,
+          ...(nextToc.length > 0 ? { toc: nextToc } : { toc: undefined }),
         }
       } else {
         throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds configured model output limit'))
@@ -833,6 +654,7 @@ export class MinerUService {
     const completedItems = rawItems.filter((i): i is Extract<RawParsedItem, { state: 'completed' }> => i.state === 'completed')
 
     const fileTexts = new Map<string, { text: string; isCompleteFile: boolean }>()
+    const fullTexts = new Map<string, string>()
     for (const item of completedItems) {
       if (item.markdownRequested && item.markdownPath) {
         const raw = await readMarkdownFile(item.markdownPath, item.markdownBytes ?? 0, limit)
@@ -903,7 +725,7 @@ export class MinerUService {
     const lengths = mdItems.map(i => fileTexts.get(i.fileId)?.text.length ?? 0)
     const shares = allocateReclaimedShares(lengths, totalTextBudget)
 
-    const finalResults: Array<ResultView | FailedParseView> = rawItems.map(item => {
+    const finalResults: Array<ResultView | FailedParseView> = await Promise.all(rawItems.map(async item => {
       if (item.state === 'failed') return item.failureView
       if (!item.markdownRequested) {
         return {
@@ -937,11 +759,13 @@ export class MinerUService {
       let content: string
       let readOffsetLine: number | undefined
       let artifactsTruncated = baseArtifactsStripped
+      let toc: DocumentHeading[] | undefined
 
       if (raw.text.length <= share && raw.isCompleteFile) {
         contentStatus = 'complete'
         content = raw.text
         readOffsetLine = undefined
+        fullTexts.set(item.fileId, raw.text)
       } else {
         contentStatus = 'partial'
         const cut = truncateAtCleanBoundary(raw.text, share)
@@ -950,6 +774,16 @@ export class MinerUService {
         if (item.secondaryArtifacts.length > 0 || baseArtifactsStripped) {
           artifactsTruncated = true
         }
+        let full = raw.text
+        if (!raw.isCompleteFile && item.markdownPath) {
+          try {
+            full = await readFile(item.markdownPath, 'utf8')
+          } catch {
+            // fallback
+          }
+        }
+        fullTexts.set(item.fileId, full)
+        toc = extractMarkdownHeadings(full)
       }
 
       const fileArtifacts = baseArtifactsStripped ? [] : [markdownArtifact]
@@ -972,8 +806,9 @@ export class MinerUService {
         manifest_path: item.manifestPath,
         output_limit_chars: limit,
         markdown_content: content,
+        ...(contentStatus === 'partial' ? { toc } : {}),
       }
-    })
+    }))
 
     let batchContentStatus: ContentStatus
     const completedResults = finalResults.filter((r): r is ResultView => r.state === 'completed')
@@ -1020,11 +855,15 @@ export class MinerUService {
         const targetLen = Math.max(0, (target.markdown_content?.length ?? 0) - excess)
         const raw = fileTexts.get(target.files[0]?.file_id ?? '')?.text ?? target.markdown_content!
         const cut = truncateAtCleanBoundary(raw, targetLen)
+        const fileId = target.files[0]?.file_id ?? ''
+        const full = fullTexts.get(fileId) ?? raw
+        const activeToc = target.toc ?? extractMarkdownHeadings(full)
         const updatedTarget: ResultView = {
           ...target,
           content_status: 'partial',
           markdown_content: cut.text,
           read_offset_line: cut.resumeLine,
+          toc: activeToc,
         }
         batchView = {
           ...batchView,
@@ -1032,7 +871,22 @@ export class MinerUService {
           results: batchView.results.map(r => r === target ? updatedTarget : r),
         }
       } else {
-        throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds configured model output limit'))
+        const tocCandidates = batchView.results
+          .filter((r): r is ResultView => r.state === 'completed' && Boolean(r.toc && r.toc.length > 0))
+        if (tocCandidates.length > 0) {
+          const target = tocCandidates[0]!
+          const nextToc = target.toc!.slice(0, Math.max(0, Math.floor(target.toc!.length / 2)))
+          const updatedTarget: ResultView = {
+            ...target,
+            ...(nextToc.length > 0 ? { toc: nextToc } : { toc: undefined }),
+          }
+          batchView = {
+            ...batchView,
+            results: batchView.results.map(r => r === target ? updatedTarget : r),
+          }
+        } else {
+          throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds configured model output limit'))
+        }
       }
     }
 

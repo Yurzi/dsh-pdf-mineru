@@ -118,35 +118,33 @@ function cancellableContext(config: ReturnType<typeof defaultMinerUConfig>): Fak
 }
 
 describe('plugin composition lifecycle', () => {
-  it('cancels before lock acquisition resumes into an inactive Cordis fiber', async () => {
+  it('cancels before initialization resumes into an inactive Cordis fiber', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mineru-index-cancel-lock-'))
     roots.push(root)
     const base = defaultMinerUConfig()
     const config = { ...base, storage: { ...base.storage, storageRoot: join(root, 'store') } }
-    let releaseAcquire!: () => void
-    let acquireStarted!: () => void
-    const acquireGate = new Promise<void>(resolve => { releaseAcquire = resolve })
-    const acquireSeen = new Promise<void>(resolve => { acquireStarted = resolve })
-    const acquire = vi.spyOn(ProcessLock.prototype, 'acquire').mockImplementation(async function (signal) {
-      acquireStarted()
-      await acquireGate
+    let releaseCleanup!: () => void
+    let cleanupStarted!: () => void
+    const cleanupGate = new Promise<void>(resolve => { releaseCleanup = resolve })
+    const cleanupSeen = new Promise<void>(resolve => { cleanupStarted = resolve })
+    const cleanup = vi.spyOn(ResultRepository.prototype, 'cleanupStaging').mockImplementation(async function (_ttl, _active, signal) {
+      cleanupStarted()
+      await cleanupGate
       signal?.throwIfAborted()
+      return 0
     })
-    const release = vi.spyOn(ProcessLock.prototype, 'release').mockResolvedValue(undefined)
     const runtime = cancellableContext(config)
     const applying = (await import('../src/index.js')).apply(runtime.ctx, config)
-    await acquireSeen
+    await cleanupSeen
     await runtime.disposeContext()
-    releaseAcquire()
+    releaseCleanup()
 
     await expect(applying).resolves.toEqual(expect.any(Function))
     expect(runtime.definitions).toHaveLength(0)
-    expect(release).toHaveBeenCalled()
-    acquire.mockRestore()
-    release.mockRestore()
+    cleanup.mockRestore()
   })
 
-  it('cancels while staging cleanup is pending and releases the lock', async () => {
+  it('cancels while staging cleanup is pending and shuts down operations', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mineru-index-cancel-cleanup-'))
     roots.push(root)
     const base = defaultMinerUConfig()
@@ -161,7 +159,6 @@ describe('plugin composition lifecycle', () => {
       signal?.throwIfAborted()
       return 0
     })
-    const release = vi.spyOn(ProcessLock.prototype, 'release')
     const runtime = cancellableContext(config)
     const applying = (await import('../src/index.js')).apply(runtime.ctx, config)
     await cleanupSeen
@@ -170,12 +167,10 @@ describe('plugin composition lifecycle', () => {
 
     await expect(applying).resolves.toEqual(expect.any(Function))
     expect(runtime.definitions).toHaveLength(0)
-    expect(release).toHaveBeenCalled()
     cleanup.mockRestore()
-    release.mockRestore()
   })
 
-  it('registers three tools and loopback RPC only after acquiring storage lock', async () => {
+  it('registers two tools and loopback RPC upon startup', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mineru-index-'))
     roots.push(root)
     const base = defaultMinerUConfig()
@@ -184,9 +179,9 @@ describe('plugin composition lifecycle', () => {
     const { apply, name } = await import('../src/index.js')
     expect(name).toBe('dsh-pdf-mineru')
     const dispose = await apply(runtime.ctx, config)
-    expect(runtime.definitions).toHaveLength(3)
+    expect(runtime.definitions).toHaveLength(2)
     expect(runtime.rpc.authority).toBe('loopback')
-    expect(await stat(join(config.storage.storageRoot, '.process.lock'))).toBeDefined()
+    expect(await stat(config.storage.storageRoot)).toBeDefined()
     expect(runtime.effects.length).toBeGreaterThan(0)
 
     const otherRoot = join(root, 'other-store')
@@ -195,11 +190,9 @@ describe('plugin composition lifecycle', () => {
       'mineru/config.set', { config: changed }, new AbortController().signal,
     ) as { ok: boolean; error?: { code: string } }
     expect(response).toMatchObject({ ok: false })
-    await expect(stat(join(otherRoot, '.process.lock'))).rejects.toThrow()
 
     for (const eff of runtime.effects) await eff()
     await dispose()
-    await expect(stat(join(config.storage.storageRoot, '.process.lock'))).rejects.toThrow()
     expect(runtime.rpc.disposeCount).toBe(1)
   })
 
@@ -218,8 +211,8 @@ describe('plugin composition lifecycle', () => {
 
     expect(inject).toContain('settings')
     const dispose = await apply(runtime.ctx, entryConfig)
-    expect(await stat(join(storedConfig.storage.storageRoot, '.process.lock'))).toBeDefined()
-    await expect(stat(join(entryConfig.storage.storageRoot, '.process.lock'))).rejects.toThrow()
+    expect(await stat(storedConfig.storage.storageRoot)).toBeDefined()
+    await expect(stat(entryConfig.storage.storageRoot)).rejects.toThrow()
 
     const next = { ...storedConfig, output: { maxInlineChars: 234567 } }
     const response = await runtime.rpc.handler?.(
@@ -247,14 +240,19 @@ describe('plugin composition lifecycle', () => {
     })).toThrow()
   })
 
-  it('releases the process lock when initialization fails after lock acquisition', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'mineru-index-fail-'))
+  it('allows multiple concurrent plugin instances on the same storageRoot without throwing STORAGE_LOCKED', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mineru-concurrent-'))
     roots.push(root)
     const base = defaultMinerUConfig()
     const config = { ...base, storage: { ...base.storage, storageRoot: join(root, 'store') } }
-    const runtime = fakeContext(config, true)
+    const runtime1 = fakeContext(config)
+    const runtime2 = fakeContext(config)
     const { apply } = await import('../src/index.js')
-    await expect(apply(runtime.ctx, config)).rejects.toThrow(/simulated tool registration failure/)
-    await expect(stat(join(config.storage.storageRoot, '.process.lock'))).rejects.toThrow()
+    const dispose1 = await apply(runtime1.ctx, config)
+    const dispose2 = await apply(runtime2.ctx, config)
+    expect(runtime1.definitions).toHaveLength(2)
+    expect(runtime2.definitions).toHaveLength(2)
+    await dispose1()
+    await dispose2()
   })
 })

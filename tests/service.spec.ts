@@ -29,6 +29,8 @@ import {
   truncateAtCleanBoundary,
   safeStringSlice,
   allocateReclaimedShares,
+  extractMarkdownHeadings,
+  type DocumentHeading,
 } from '../src/service/mineru-service.js'
 import { renderResult, renderParseDocument } from '../src/tools.js'
 import { SharedOperationRegistry } from '../src/service/shared-operations.js'
@@ -585,9 +587,9 @@ describe('MinerUService direct parsing', () => {
     expect(parsed.markdown_content).toBeUndefined()
     expect(parsed.read_offset_line).toBeUndefined()
     const rendered = renderResult(parsed)[0]?.text ?? ''
-    expect(rendered).not.toContain('完整提供')
+    expect(rendered).not.toContain('Status: Content complete')
     expect(rendered).not.toContain('delivered above')
-    expect(rendered).toContain('本次解析未请求提取 Markdown 正文')
+    expect(rendered).toContain('Status: Markdown content was not requested')
   })
 
   it('fails if markdown was requested but provider did not produce it', async () => {
@@ -646,6 +648,100 @@ describe('MinerUService direct parsing', () => {
     expect(shares3).toEqual([100, 200, 300])
   })
 
+  describe('extractMarkdownHeadings', () => {
+    it('returns empty array for empty string or text without headings', () => {
+      expect(extractMarkdownHeadings('')).toEqual([])
+      expect(extractMarkdownHeadings('Just plain text\nAnother line\nNo hashes here')).toEqual([])
+    })
+
+    it('extracts levels 1 through 6 with 1-based line numbers and trimmed titles', () => {
+      const text = [
+        '# Main Title',
+        'Intro text',
+        '## Section 1 ',
+        'Paragraph',
+        '### Subsection 1.1',
+        '#### Heading 4',
+        '##### Heading 5',
+        '###### Heading 6',
+      ].join('\n')
+
+      const headings = extractMarkdownHeadings(text)
+      expect(headings).toEqual([
+        { level: 1, title: 'Main Title', line: 1 },
+        { level: 2, title: 'Section 1', line: 3 },
+        { level: 3, title: 'Subsection 1.1', line: 5 },
+        { level: 4, title: 'Heading 4', line: 6 },
+        { level: 5, title: 'Heading 5', line: 7 },
+        { level: 6, title: 'Heading 6', line: 8 },
+      ])
+    })
+
+    it('ignores invalid heading syntax and handles CRLF line endings', () => {
+      const text = [
+        '####### Seven Hashes (not a heading)',
+        '#NoSpaceAfterHash',
+        '### \t Tab after hash',
+        '###    ',
+        '# Valid Heading\r\n## Second Heading\r\n',
+      ].join('\r\n')
+
+      const headings = extractMarkdownHeadings(text)
+      expect(headings).toEqual([
+        { level: 3, title: 'Tab after hash', line: 3 },
+        { level: 1, title: 'Valid Heading', line: 5 },
+        { level: 2, title: 'Second Heading', line: 6 },
+      ])
+    })
+
+    it('retains all headings when count <= 25', () => {
+      const lines: string[] = []
+      for (let i = 1; i <= 25; i++) {
+        lines.push(`## Section ${i}`)
+      }
+      const headings = extractMarkdownHeadings(lines.join('\n'))
+      expect(headings).toHaveLength(25)
+      expect(headings[0]).toEqual({ level: 2, title: 'Section 1', line: 1 })
+      expect(headings[24]).toEqual({ level: 2, title: 'Section 25', line: 25 })
+    })
+
+    it('filters to high-level headings (levels 1-3, max 20) when headings > 25', () => {
+      const lines: string[] = []
+      // 10 H1, 10 H2, 10 H4 -> total 30
+      for (let i = 1; i <= 10; i++) lines.push(`# Title ${i}`)
+      for (let i = 1; i <= 10; i++) lines.push(`## Subtitle ${i}`)
+      for (let i = 1; i <= 10; i++) lines.push(`#### LowLevel ${i}`)
+
+      const headings = extractMarkdownHeadings(lines.join('\n'))
+      expect(headings).toHaveLength(20)
+      expect(headings.every(h => h.level <= 3)).toBe(true)
+      expect(headings[0]!.title).toBe('Title 1')
+      expect(headings[19]!.title).toBe('Subtitle 10')
+    })
+
+    it('caps high-level headings to max 20 when there are > 20 high-level headings', () => {
+      const lines: string[] = []
+      // 30 H1 headings
+      for (let i = 1; i <= 30; i++) lines.push(`# Title ${i}`)
+
+      const headings = extractMarkdownHeadings(lines.join('\n'))
+      expect(headings).toHaveLength(20)
+      expect(headings[0]!.title).toBe('Title 1')
+      expect(headings[19]!.title).toBe('Title 20')
+    })
+
+    it('falls back to first 20 headings when all > 25 headings are low-level', () => {
+      const lines: string[] = []
+      // 30 H4 headings
+      for (let i = 1; i <= 30; i++) lines.push(`#### LowLevel ${i}`)
+
+      const headings = extractMarkdownHeadings(lines.join('\n'))
+      expect(headings).toHaveLength(20)
+      expect(headings[0]!.title).toBe('LowLevel 1')
+      expect(headings[19]!.title).toBe('LowLevel 20')
+    })
+  })
+
   it('applies fair share reclamation in multi-file batch so short file is complete and long file gets remainder', async () => {
     const h = await harness()
     h.provider.complete = true
@@ -681,8 +777,8 @@ describe('MinerUService direct parsing', () => {
     expect(rendered[0]?.text.length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
     expect(rendered[0]?.text).toContain('input.pdf')
     expect(rendered[0]?.text).toContain('input-two.pdf')
-    expect(rendered[0]?.text).toContain('本次所选页面的提取 Markdown 已完整提供')
-    expect(rendered[0]?.text).toContain('正文未完整提供（受输出限制截断 / Content truncated to output limit）')
+    expect(rendered[0]?.text).toContain('Status: Content complete. Full document markdown delivered above.')
+    expect(rendered[0]?.text).toContain('Status: Content partial (truncated to output limit)')
   })
 
   it('preserves failure info and visible text when batch has mixed success and failure under tight budget', async () => {
@@ -781,8 +877,49 @@ describe('MinerUService direct parsing', () => {
     expect(text.length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
     expect(text).not.toContain('[Output truncated to limit]')
     expect(text).toContain('Full markdown artifact at:')
-    expect(text).toContain('Result manifest:')
+    expect(text).toContain('Manifest:')
     expect(text).toContain('resume line: offset=')
     expect(parsed.content_status).toBe('partial')
+  })
+
+  it('computes and populates toc on partial content when document has headings', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    const mdWithHeadings = [
+      '# Document Title',
+      'Introduction paragraph.',
+      '## Chapter 1: Foundations',
+      'Paragraph 1. '.repeat(100),
+      '## Chapter 2: Methods',
+      'Paragraph 2. '.repeat(100),
+      '### Section 2.1: Details',
+      'Paragraph 3. '.repeat(100),
+    ].join('\n')
+    h.provider.markdown = mdWithHeadings
+
+    const parsed = asResult(await h.service.parseDocument(
+      session('session-toc-partial'),
+      { file_paths: [h.file] },
+      new AbortController().signal,
+      null,
+    ))
+
+    expect(parsed.state).toBe('completed')
+    expect(parsed.content_status).toBe('partial')
+    expect(parsed.toc).toBeDefined()
+    expect(parsed.toc!.length).toBeGreaterThanOrEqual(4)
+    expect(parsed.toc![0]).toEqual({ level: 1, title: 'Document Title', line: 1 })
+    expect(parsed.toc![1]).toEqual({ level: 2, title: 'Chapter 1: Foundations', line: 3 })
+    expect(parsed.toc![2]).toEqual({ level: 2, title: 'Chapter 2: Methods', line: 5 })
+    expect(parsed.toc![3]).toEqual({ level: 3, title: 'Section 2.1: Details', line: 7 })
+
+    const rendered = renderResult(parsed)
+    const text = rendered[0]?.text ?? ''
+    expect(text).toContain('Document Outline:')
+    expect(text).toContain('- Document Title (line 1)')
+    expect(text).toContain('  - Chapter 1: Foundations (line 3)')
+    expect(text).toContain('  - Chapter 2: Methods (line 5)')
+    expect(text).toContain('    - Section 2.1: Details (line 7)')
+    expect(text).toContain('Note: To read specific sections, call read_pdf with pages="X-Y" or use the read tool starting from the given line offset.')
   })
 })

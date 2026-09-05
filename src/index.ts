@@ -4,6 +4,7 @@ import { migrateConfig, type MinerUConfig, type ProviderConfig } from './config.
 import { ProviderRegistry } from './providers/registry.js'
 import { MinerUService } from './service/mineru-service.js'
 import { SharedOperationRegistry } from './service/shared-operations.js'
+import { mkdir } from 'node:fs/promises'
 import { StoragePaths } from './storage/paths.js'
 import { ProcessLock } from './storage/process-lock.js'
 import { StorageAccessGate } from './storage/access-gate.js'
@@ -154,7 +155,7 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
   const lock = new ProcessLock(paths)
 
   try {
-    await lock.acquire(startup.signal)
+    await mkdir(paths.root, { recursive: true, mode: 0o700 })
     startup.signal.throwIfAborted()
     const operationRegistry = new SharedOperationRegistry()
     operations = operationRegistry
@@ -162,7 +163,7 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
     const results = new ResultRepository(paths, {
       maxArtifactBytes: persistedConfig.limits.maxZipEntryBytes,
       maxJsonValidationBytes: Math.min(persistedConfig.limits.maxZipEntryBytes, 64 * 1024 * 1024),
-    })
+    }, lock)
     await results.cleanupStaging(
       persistedConfig.storage.stagingTtlMs, operationRegistry.activeOperationIds(), startup.signal,
     )
@@ -207,7 +208,7 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
       disposing ??= (async () => {
         await toolDisposer?.()
         await operationRegistry.shutdown()
-        await lock.release()
+        if (lock.isHeld()) await lock.release()
       })()
       return disposing
     }
@@ -216,7 +217,7 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
   } catch (error) {
     await toolDisposer?.()
     if (operations !== undefined) await operations.shutdown()
-    await lock.release()
+    if (lock.isHeld()) await lock.release()
     if (startup.signal.aborted || isInactiveContextError(error)) return async () => undefined
     throw error
   }
@@ -230,6 +231,7 @@ export * from './domain/errors.js'
 export * from './providers/provider.js'
 export * from './providers/self-hosted-v2.js'
 export * from './providers/official-v4.js'
+export * from './providers/http-client.js'
 export * from './service/mineru-service.js'
 export * from './observability.js'
 export * from './storage/maintenance-service.js'

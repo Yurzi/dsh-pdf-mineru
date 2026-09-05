@@ -39,7 +39,7 @@
     "verify:gui": "node scripts/verify-current-gui.mjs",
     "smoke:official-v4": "node scripts/smoke-official-v4.mjs"
   },
-  "dependencies": { "form-data": "^4.0.6", "yauzl": "^3.4.0" },
+  "dependencies": { "yauzl": "^3.4.0" },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1 || ^4.0.2",
     "@deepseek-ai/dsh-api-remotes": "^0.1.2-rc.1",

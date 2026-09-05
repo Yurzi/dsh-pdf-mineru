@@ -6,7 +6,6 @@ vi.mock('@deepseek-ai/dsh-tools', () => ({
 
 import {
   registerTools,
-  renderHealth,
   renderResult,
   renderParseDocument,
 } from '../src/tools.js'
@@ -22,7 +21,6 @@ import type {
   FailedParseView,
   MinerUService,
   ParseDocumentView,
-  ProbeView,
   ResultView,
 } from '../src/service/mineru-service.js'
 import { failure, MinerUError } from '../src/domain/errors.js'
@@ -127,18 +125,17 @@ function assertAllObjectSchemasClosed(schema: ValueSchemaSpec, path = 'root'): v
   }
 }
 
-describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () => {
-  it('registers exactly 3 model-facing tools with disposer', async () => {
+describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
+  it('registers exactly 2 model-facing tools with disposer', async () => {
     const { ctx, registeredTools } = createMockContext()
     const mockService = {} as MinerUService
     const dispose = registerTools(ctx, () => mockService)
 
-    expect(registeredTools).toHaveLength(3)
+    expect(registeredTools).toHaveLength(2)
     const names = registeredTools.map(t => t.name)
     expect(names).toEqual([
-      'mineru_health',
-      'mineru_submit_parse_job',
-      'mineru_parse_document',
+      'async_read_pdf',
+      'read_pdf',
     ])
     expect(typeof dispose).toBe('function')
     await dispose()
@@ -163,7 +160,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
     }
   })
 
-  it('rejects execute on all 3 tools when agent session is missing', async () => {
+  it('rejects execute on all 2 tools when agent session is missing', async () => {
     const { ctx, registeredTools } = createMockContext()
     registerTools(ctx, () => ({} as MinerUService))
     const unauthenticatedExec = createMockExec(false)
@@ -175,82 +172,11 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
     }
   })
 
-  describe('mineru_health', () => {
-    it('executes probe via service and passes signal', async () => {
-      const probeResult: ProbeView = {
-        available: true,
-        provider: 'official-v4',
-        authentication: 'valid',
-        protocol_version: 'v4',
-        server_version: '4.1.0',
-        queue: { queued: 2, processing: 1, completed: 10, failed: 0, max_concurrent: 5 },
-        diagnostics: 'All systems operational',
-      }
-      const mockService = {
-        probe: vi.fn(async () => probeResult),
-      } as unknown as MinerUService
-
-      const { ctx, registeredTools } = createMockContext()
-      registerTools(ctx, () => mockService)
-      const healthTool = registeredTools.find(t => t.name === 'mineru_health')!
-
-      const controller = new AbortController()
-      const exec = createMockExec(true, controller.signal)
-      const result = await healthTool.execute({}, exec)
-
-      expect(mockService.probe).toHaveBeenCalledWith(controller.signal)
-      expect(result).toEqual(probeResult)
-
-      const rendered = healthTool.output.render({}, result)
-      expect(rendered).toHaveLength(1)
-      expect(rendered[0]?.text).toContain('Available')
-      expect(rendered[0]?.text).toContain('official-v4')
-      expect(rendered[0]?.text).toContain('queued=2')
-      expect(rendered[0]?.text).toContain('All systems operational')
-    })
-
-    it('renders minimal health view cleanly when optional fields are omitted', () => {
-      const minimalProbe: ProbeView = {
-        available: false,
-        provider: 'self-hosted-v2',
-        authentication: 'not-configured',
-        protocol_version: 'v2',
-      }
-      const rendered = renderHealth(minimalProbe)
-      expect(rendered[0]?.text).toContain('Unavailable')
-      expect(rendered[0]?.text).toContain('self-hosted-v2')
-      expect(rendered[0]?.text).toContain('not-configured')
-      expect(rendered[0]?.text).not.toContain('Server Version')
-      expect(rendered[0]?.text).not.toContain('Queue:')
-    })
-
-    it('projects structured presentation metadata', () => {
-      const { ctx, registeredTools } = createMockContext()
-      registerTools(ctx, () => ({} as MinerUService))
-      const healthTool = registeredTools.find(t => t.name === 'mineru_health')!
-
-      const probeResult: ProbeView = {
-        available: true,
-        provider: 'official-v4',
-        authentication: 'valid',
-        protocol_version: 'v4',
-        server_version: '4.1.0',
-      }
-      expect(healthTool.output.presentationMeta?.({}, probeResult)).toEqual({
-        available: true,
-        provider: 'official-v4',
-        authentication: 'valid',
-        protocol_version: 'v4',
-        server_version: '4.1.0',
-      })
-    })
-  })
-
-  describe('mineru_submit_parse_job (Native DSH Background Job)', () => {
+  describe('async_read_pdf (Native DSH Background Job)', () => {
     it('rejects when native DSH background jobs are unavailable', async () => {
       const { ctx, registeredTools } = createMockContext(undefined)
       registerTools(ctx, () => ({} as MinerUService))
-      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
       const exec = createMockExec(true)
 
       await expect(submitTool.execute({ file_paths: ['/doc.pdf'] }, exec)).rejects.toMatchObject({
@@ -262,7 +188,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
       const { registry } = createMockJobRegistry()
       const { ctx, registeredTools } = createMockContext(registry)
       registerTools(ctx, () => ({} as MinerUService))
-      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
 
       const controller = new AbortController()
       controller.abort()
@@ -279,7 +205,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
         parseDocument: vi.fn(),
       } as unknown as MinerUService
       registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
 
       const exec = createMockExec(true)
       const inputArgs = {
@@ -300,7 +226,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
 
       const captured = specs[0]!
       expect(captured.kind).toBe('mineru')
-      expect(captured.label).toBe('Parse 2 documents with MinerU')
+      expect(captured.label).toBe('Read 2 PDF documents with MinerU')
       expect(captured.owner).toBe(exec.agent)
       expect(typeof captured.run).toBe('function')
 
@@ -334,7 +260,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
         parseDocument: vi.fn(async () => completedResult),
       } as unknown as MinerUService
       registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
 
       const exec = createMockExec(true)
       const inputArgs = { file_paths: ['/sample.pdf'] }
@@ -353,7 +279,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
       expect(outcome.detail).toBe('completed')
       expect(outcome.output).toContain('Background Parsed Content')
       expect(outcome.output).toContain('# Document: sample.pdf')
-      expect(outcome.output).toContain('本次所选页面的提取 Markdown 已完整提供，可直接用于回答')
+      expect(outcome.output).toContain('Status: Content complete. Full document markdown delivered above.')
       expect(outcome.output).toContain('/cache/sample/manifest.json')
     })
 
@@ -390,7 +316,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
         parseDocument: vi.fn(async () => batchResult),
       } as unknown as MinerUService
       registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
 
       const exec = createMockExec(true)
       await submitTool.execute({ file_paths: ['/good.pdf', '/bad.pdf'] }, exec)
@@ -418,7 +344,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
       }
       const mockService = { parseDocument: vi.fn(async () => failedBatch) } as unknown as MinerUService
       registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
 
       await submitTool.execute({ file_paths: ['/bad.pdf'] }, createMockExec(true))
       const outcome = await specs[0]!.run().done
@@ -442,7 +368,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
         }),
       } as unknown as MinerUService
       registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
 
       const exec = createMockExec(true)
       await submitTool.execute({ file_paths: ['/hang.pdf'] }, exec)
@@ -467,7 +393,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
         }),
       } as unknown as MinerUService
       const dispose = registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
 
       await submitTool.execute({ file_paths: ['/hang.pdf'] }, createMockExec(true))
       const hooks = specs[0]!.run()
@@ -486,7 +412,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
         }),
       } as unknown as MinerUService
       registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
 
       const exec = createMockExec(true)
       await submitTool.execute({ file_paths: ['/giant.pdf'] }, exec)
@@ -502,7 +428,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
     it('projects structured presentation metadata for submitted jobs', () => {
       const { ctx, registeredTools } = createMockContext()
       registerTools(ctx, () => ({} as MinerUService))
-      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
 
       expect(submitTool.output.presentationMeta?.({}, { job_id: 'mineru-1', state: 'running' })).toEqual({
         job_id: 'mineru-1',
@@ -531,7 +457,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
       } as unknown as MinerUService
 
       registerTools(ctx, () => mockService, accessGate)
-      const submitTool = registeredTools.find(t => t.name === 'mineru_submit_parse_job')!
+      const submitTool = registeredTools.find(t => t.name === 'async_read_pdf')!
 
       const exec = createMockExec(true)
       await submitTool.execute({ file_paths: ['/doc.pdf'] }, exec)
@@ -544,7 +470,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
     })
   })
 
-  describe('mineru_parse_document (Direct Result, No Plugin Job)', () => {
+  describe('read_pdf (Direct Result, No Plugin Job)', () => {
     it('executes synchronous direct parseDocument and returns direct result', async () => {
       const completedResult: ResultView = {
         state: 'completed',
@@ -569,7 +495,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
 
       const { ctx, registeredTools } = createMockContext()
       registerTools(ctx, () => mockService)
-      const parseTool = registeredTools.find(t => t.name === 'mineru_parse_document')!
+      const parseTool = registeredTools.find(t => t.name === 'read_pdf')!
 
       const exec = createMockExec(true)
       const args = { file_paths: ['/sync.pdf'], poll_timeout_ms: 30000 }
@@ -587,23 +513,23 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
       expect(rendered[0]?.text).toContain('Synchronous Direct Result')
       expect(rendered[0]?.text).toContain('# Document: sync.pdf')
       expect(rendered[0]?.text).toContain('**MinerU Parse Result** (Source: provider, Cache: miss)')
-      expect(rendered[0]?.text).toContain('本次所选页面的提取 Markdown 已完整提供，可直接用于回答')
+      expect(rendered[0]?.text).toContain('Status: Content complete. Full document markdown delivered above.')
       expect(rendered[0]?.text).toContain('/cache/sync/manifest.json')
     })
 
     it('documents direct content inlining and positive usage guidance', () => {
       const { ctx, registeredTools } = createMockContext()
       registerTools(ctx, () => ({} as MinerUService))
-      const parseTool = registeredTools.find(t => t.name === 'mineru_parse_document')!
-      expect(parseTool.description).toContain("When 'content_status' is 'complete'")
-      expect(parseTool.description).toContain("markdown_content")
-      expect(parseTool.description).toContain("Only read the Markdown file path if content is partial")
+      const parseTool = registeredTools.find(t => t.name === 'read_pdf')!
+      expect(parseTool.description).toContain('When content_status is complete')
+      expect(parseTool.description).toContain('markdown_content')
+      expect(parseTool.description).toContain('When content_status is partial')
     })
 
     it('projects structured presentation metadata for single result and batch result', () => {
       const { ctx, registeredTools } = createMockContext()
       registerTools(ctx, () => ({} as MinerUService))
-      const parseTool = registeredTools.find(t => t.name === 'mineru_parse_document')!
+      const parseTool = registeredTools.find(t => t.name === 'read_pdf')!
 
       const singleResult: ResultView = {
         state: 'completed',
@@ -619,6 +545,32 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
         cache_hit: true,
         manifest_path: '/p/manifest.json',
         files: [{ file_id: 'mf_1', name: 'paper.pdf', artifacts: [{ kind: 'markdown', path: '/p/out.md', bytes: 50 }] }],
+      })
+
+      const singleWithToc: ResultView = {
+        state: 'completed',
+        source: 'provider',
+        cache_hit: false,
+        result_id: 'mr_test_toc',
+        files: [{ file_id: 'mf_1', name: 'paper.pdf', artifacts: [] }],
+        manifest_path: '/p/manifest.json',
+        content_status: 'partial',
+        output_limit_chars: 2000,
+        toc: [
+          { level: 1, title: 'Introduction', line: 1 },
+          { level: 2, title: 'Background', line: 15 },
+        ],
+      }
+      expect(parseTool.output.presentationMeta?.({}, singleWithToc)).toEqual({
+        result_id: 'mr_test_toc',
+        source: 'provider',
+        cache_hit: false,
+        manifest_path: '/p/manifest.json',
+        files: [{ file_id: 'mf_1', name: 'paper.pdf', artifacts: [] }],
+        toc: [
+          { level: 1, title: 'Introduction', line: 1 },
+          { level: 2, title: 'Background', line: 15 },
+        ],
       })
 
       const batchResult: BatchParseDocumentView = {
@@ -638,7 +590,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
       const mockService = { parseDocument: vi.fn() } as unknown as MinerUService
       const { ctx, registeredTools } = createMockContext()
       registerTools(ctx, () => mockService)
-      const parseTool = registeredTools.find(t => t.name === 'mineru_parse_document')!
+      const parseTool = registeredTools.find(t => t.name === 'read_pdf')!
       const exec = createMockExec(true)
 
       for (const poll_timeout_ms of [-1, 0, 86_400_001, Number.MAX_SAFE_INTEGER, 1.5, NaN]) {
@@ -652,7 +604,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
       const mockService = { parseDocument: vi.fn() } as unknown as MinerUService
       const { ctx, registeredTools } = createMockContext()
       registerTools(ctx, () => mockService)
-      const parseTool = registeredTools.find(t => t.name === 'mineru_parse_document')!
+      const parseTool = registeredTools.find(t => t.name === 'read_pdf')!
       const exec = createMockExec(true)
 
       for (const invalid of [null, undefined, 'bad', 123, []]) {
@@ -723,7 +675,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
       expect(rendered[0]?.text).toContain('- Results: 2')
       expect(rendered[0]?.text).toContain('file1.pdf')
       expect(rendered[0]?.text).toContain('# P1')
-      expect(rendered[0]?.text).toContain('本次所选页面的提取 Markdown 已完整提供，可直接用于回答')
+      expect(rendered[0]?.text).toContain('Status: Content complete. Full document markdown delivered above.')
       expect(rendered[0]?.text).toContain('/m1.json')
       expect(rendered[0]?.text).toContain('file2.pdf')
       expect(rendered[0]?.text).toContain('REMOTE_PARSE_FAILED')
@@ -742,9 +694,9 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
         output_limit_chars: 2000,
       }
       const rendered = renderResult(resultData)
-      expect(rendered[0]?.text).toContain('正文未完整提供（受输出限制截断 / Content truncated to output limit）')
+      expect(rendered[0]?.text).toContain('Status: Content partial (truncated to output limit)')
       expect(rendered[0]?.text).toContain('Full markdown artifact at: /cache/doc/full.md')
-      expect(rendered[0]?.text).toContain('Result manifest: /cache/doc/manifest.json')
+      expect(rendered[0]?.text).toContain('Manifest: /cache/doc/manifest.json')
     })
 
     it('renders secondary artifacts compactly when present', () => {
@@ -769,7 +721,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
       }
       const rendered = renderResult(resultData)
       expect(rendered[0]?.text).toContain('Artifacts: layout (200 bytes): /cache/doc/layout.json, images (800 bytes): /cache/doc/images')
-      expect(rendered[0]?.text).toContain('本次所选页面的提取 Markdown 已完整提供，可直接用于回答')
+      expect(rendered[0]?.text).toContain('Status: Content complete. Full document markdown delivered above.')
       expect(rendered[0]?.text).toContain('/cache/doc/manifest.json')
     })
     it('renders clean message when markdown was not requested and does NOT claim complete delivery', () => {
@@ -791,10 +743,10 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
         output_limit_chars: 2000,
       }
       const rendered = renderResult(resultData)
-      expect(rendered[0]?.text).not.toContain('完整提供')
+      expect(rendered[0]?.text).not.toContain('Content complete')
       expect(rendered[0]?.text).not.toContain('Complete document content delivered')
-      expect(rendered[0]?.text).toContain('本次解析未请求提取 Markdown 正文')
-      expect(rendered[0]?.text).toContain('Result manifest: /cache/scan/manifest.json')
+      expect(rendered[0]?.text).toContain('Status: Markdown content was not requested')
+      expect(rendered[0]?.text).toContain('Manifest: /cache/scan/manifest.json')
       expect(rendered[0]?.text).toContain('Artifacts: layout (300 bytes): /cache/scan/layout.json, images (1200 bytes): /cache/scan/images')
     })
 
@@ -817,9 +769,9 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
         output_limit_chars: 2000,
       }
       const rendered = renderResult(resultData)
-      expect(rendered[0]?.text).toContain('正文未完整提供（受输出限制截断 / Content truncated to output limit）')
+      expect(rendered[0]?.text).toContain('Status: Content partial (truncated to output limit)')
       expect(rendered[0]?.text).toContain('Full markdown artifact at: /cache/doc/full.md (resume line: offset=42).')
-      expect(rendered[0]?.text).toContain('Result manifest: /cache/doc/manifest.json')
+      expect(rendered[0]?.text).toContain('Manifest: /cache/doc/manifest.json')
     })
 
     it('does not clamp batch text at 16,384 when output_limit_chars is larger', () => {
@@ -908,6 +860,132 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
       expect(text).toContain('[CORRUPT_FILE] File is corrupted and unreadable')
       expect(text).toContain('doc3.pdf')
       expect(text).toContain('# Doc 3 Content')
+    })
+    it('renders inlined image ContentBlocks alongside text block', () => {
+      const resultData: ResultView = {
+        state: 'completed',
+        source: 'provider',
+        cache_hit: false,
+        result_id: 'mr_with_img',
+        files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
+        markdown_content: '# Visual Doc',
+        content_status: 'complete',
+        manifest_path: '/cache/doc/manifest.json',
+        output_limit_chars: 2000,
+        inlined_images: [
+          {
+            attachment_id: 'att_123',
+            name: 'figure1.png',
+            media_type: 'image/png',
+            width: 800,
+            height: 600,
+            bytes: 12345,
+            attachmentRef: {
+              attachmentId: 'att_123' as any,
+              mediaType: 'image/png',
+              bytes: 12345,
+              width: 800,
+              height: 600,
+              name: 'figure1.png',
+            },
+          },
+        ],
+      }
+      const rendered = renderResult(resultData)
+      expect(rendered).toHaveLength(2)
+      expect(rendered[0]).toMatchObject({ type: 'text' })
+      expect((rendered[0] as any).text).toContain('Inlined Visual Figures')
+      expect((rendered[0] as any).text).toContain('Attached Image #1: figure1.png (800x600)')
+      expect(rendered[1]).toEqual({
+        type: 'image',
+        attachment: resultData.inlined_images![0]!.attachmentRef,
+      })
+    })
+
+    it('renders document outline and guidance hint in prose when content_status is partial and toc has entries', () => {
+      const resultData: ResultView = {
+        state: 'completed',
+        source: 'provider',
+        cache_hit: false,
+        result_id: 'mr_toc',
+        files: [{
+          file_id: 'mf_1',
+          name: 'paper.pdf',
+          artifacts: [{ kind: 'markdown', path: '/cache/paper/full.md', bytes: 15000 }],
+        }],
+        markdown_content: '# Introduction\nThis is the beginning...',
+        content_status: 'partial',
+        markdown_path: '/cache/paper/full.md',
+        read_offset_line: 25,
+        manifest_path: '/cache/paper/manifest.json',
+        output_limit_chars: 2000,
+        toc: [
+          { level: 1, title: 'Introduction', line: 1 },
+          { level: 2, title: 'Prior Work', line: 15 },
+          { level: 2, title: 'Methodology', line: 45 },
+          { level: 3, title: 'Dataset Collection', line: 70 },
+          { level: 1, title: 'Experiments', line: 120 },
+        ],
+      }
+      const rendered = renderResult(resultData)
+      const text = rendered[0]?.text ?? ''
+      expect(text).toContain('Document Outline:')
+      expect(text).toContain('- Introduction (line 1)')
+      expect(text).toContain('  - Prior Work (line 15)')
+      expect(text).toContain('  - Methodology (line 45)')
+      expect(text).toContain('    - Dataset Collection (line 70)')
+      expect(text).toContain('- Experiments (line 120)')
+      expect(text).toContain('Note: To read specific sections, call read_pdf with pages="X-Y" or use the read tool starting from the given line offset.')
+      expect(text).toContain('Status: Content partial (truncated to output limit)')
+    })
+
+    it('does not render document outline when content_status is partial but toc is empty', () => {
+      const resultData: ResultView = {
+        state: 'completed',
+        source: 'provider',
+        cache_hit: false,
+        result_id: 'mr_no_toc',
+        files: [{
+          file_id: 'mf_1',
+          name: 'doc.pdf',
+          artifacts: [{ kind: 'markdown', path: '/cache/doc/full.md', bytes: 5000 }],
+        }],
+        markdown_content: 'Some plain text...',
+        content_status: 'partial',
+        markdown_path: '/cache/doc/full.md',
+        read_offset_line: 10,
+        manifest_path: '/cache/doc/manifest.json',
+        output_limit_chars: 2000,
+        toc: [],
+      }
+      const rendered = renderResult(resultData)
+      const text = rendered[0]?.text ?? ''
+      expect(text).not.toContain('Document Outline')
+      expect(text).not.toContain('Note: To read specific sections')
+      expect(text).toContain('Status: Content partial (truncated to output limit)')
+    })
+
+    it('does not render document outline when content_status is complete even if toc is present', () => {
+      const resultData: ResultView = {
+        state: 'completed',
+        source: 'provider',
+        cache_hit: false,
+        result_id: 'mr_complete_toc',
+        files: [{
+          file_id: 'mf_1',
+          name: 'doc.pdf',
+          artifacts: [{ kind: 'markdown', path: '/cache/doc/full.md', bytes: 500 }],
+        }],
+        markdown_content: '# Heading 1\nContent',
+        content_status: 'complete',
+        manifest_path: '/cache/doc/manifest.json',
+        output_limit_chars: 2000,
+        toc: [{ level: 1, title: 'Heading 1', line: 1 }],
+      }
+      const rendered = renderResult(resultData)
+      const text = rendered[0]?.text ?? ''
+      expect(text).not.toContain('Document Outline')
+      expect(text).toContain('Status: Content complete. Full document markdown delivered above.')
     })
   })
 })

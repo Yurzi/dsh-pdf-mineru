@@ -162,15 +162,15 @@ async function main() {
       },
     })
     dispose = await plugin.apply(createContext(definitions), config)
-    const tool = definitions.find(definition => definition?.name === 'mineru_parse_document')
-    if (tool === undefined || typeof tool.execute !== 'function') throw new Error('mineru_parse_document was not registered')
+    const tool = definitions.find(definition => definition?.name === 'read_pdf')
+    if (tool === undefined || typeof tool.execute !== 'function') throw new Error('read_pdf was not registered')
     const args = {
       file_paths: [pdfPath], model: options.model, ocr: options.ocr, language: options.language,
       artifacts: ['markdown'], poll_timeout_ms: options.timeoutMs,
     }
     const session = { header: { id: `smoke-${randomUUID()}`, cwd: process.cwd() } }
     const result = await tool.execute(args, {
-      signal: controller.signal, callId: randomUUID(), name: 'mineru_parse_document', arguments: args,
+      signal: controller.signal, callId: randomUUID(), name: 'read_pdf', arguments: args,
       agent: { id: 'official-v4-smoke', session },
     })
     console.log(JSON.stringify(summarize(result), null, 2))

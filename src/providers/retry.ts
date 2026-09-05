@@ -1,3 +1,4 @@
+import { setTimeout } from 'node:timers/promises'
 import type { MinerUProviderId } from '../domain/errors.js'
 import { MinerUError, failure } from '../domain/errors.js'
 
@@ -145,25 +146,16 @@ export function isRetryableError(err: unknown, signal?: AbortSignal): boolean {
 }
 
 /**
- * Abort-aware delay utility.
- * Cleans up its timer listener immediately when aborted or resolved.
+ * Abort-aware delay utility using node:timers/promises.
  */
 export async function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
   if (ms <= 0) return
-  signal.throwIfAborted()
-  return new Promise<void>((resolve, reject) => {
-    let timer: NodeJS.Timeout | undefined
-    const onAbort = () => {
-      if (timer !== undefined) clearTimeout(timer)
-      signal.removeEventListener('abort', onAbort)
-      reject(signal.reason instanceof Error ? signal.reason : new DOMException('Aborted', 'AbortError'))
-    }
-    timer = setTimeout(() => {
-      signal.removeEventListener('abort', onAbort)
-      resolve()
-    }, ms)
-    signal.addEventListener('abort', onAbort, { once: true })
-  })
+  try {
+    await setTimeout(ms, undefined, { signal })
+  } catch (error) {
+    if (signal.aborted && signal.reason) throw signal.reason
+    throw error
+  }
 }
 
 /**

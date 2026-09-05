@@ -51,6 +51,7 @@ export declare class SelfHostedV2Provider implements MinerUProvider {
     readonly capabilities: ProviderCapabilities;
     private readonly parsedBaseUrl;
     private readonly retryOptions;
+    private readonly client;
     constructor(config: SelfHostedV2ProviderConfig, options?: ProviderOptions);
     compatibilityKey(request: CanonicalParseRequest, context: ProviderCompatibilityContext): Promise<string>;
     probe(context: ProviderCallContext): Promise<ProviderProbeResult>;

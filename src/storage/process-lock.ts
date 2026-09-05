@@ -2,15 +2,12 @@
  * process-lock.ts — Fail-closed single-process storageRoot lock.
  *
  * Prevents multiple concurrent DSH processes from mutating the same storageRoot.
- * Linux uses an abstract Unix socket. Windows uses a named pipe to serialize
- * metadata acquisition/recovery; both IPC endpoints disappear on process death.
- * Windows also honors the file lock used by older plugin versions: only a
- * valid same-host record with a definitively dead PID may be reclaimed.
+ * Uses a cross-platform atomic file lock on this.lockFilePath with dead PID reclamation.
  */
 
-import { createHash, randomUUID } from 'node:crypto'
-import { createServer, type Server } from 'node:net'
-import { chmod, link, lstat, mkdir, readFile, realpath, unlink, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { chmod, mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { hostname } from 'node:os'
 import { throwMinerU } from '../domain/errors.js'
 import type { StoragePaths } from './paths.js'
@@ -22,35 +19,37 @@ export interface ProcessLockPayload {
   readonly hostname: string
 }
 
-function parseLockPayload(raw: string): ProcessLockPayload {
-  const value: unknown = JSON.parse(raw)
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new TypeError('lock payload is not an object')
-  const record = value as Record<string, unknown>
-  if (!Number.isSafeInteger(record.pid) || (record.pid as number) <= 0
-    || typeof record.ownerToken !== 'string' || record.ownerToken.length === 0
-    || !Number.isSafeInteger(record.createdAt) || (record.createdAt as number) < 0
-    || typeof record.hostname !== 'string' || record.hostname.length === 0) {
-    throw new TypeError('lock payload is invalid')
-  }
-  return {
-    pid: record.pid as number,
-    ownerToken: record.ownerToken,
-    createdAt: record.createdAt as number,
-    hostname: record.hostname,
+function parseLockPayload(raw: string): ProcessLockPayload | null {
+  try {
+    const value: unknown = JSON.parse(raw)
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+    const record = value as Record<string, unknown>
+    if (
+      !Number.isSafeInteger(record.pid) || (record.pid as number) <= 0
+      || typeof record.ownerToken !== 'string' || record.ownerToken.length === 0
+      || !Number.isSafeInteger(record.createdAt) || (record.createdAt as number) < 0
+      || typeof record.hostname !== 'string' || record.hostname.length === 0
+    ) {
+      return null
+    }
+    return {
+      pid: record.pid as number,
+      ownerToken: record.ownerToken,
+      createdAt: record.createdAt as number,
+      hostname: record.hostname,
+    }
+  } catch {
+    return null
   }
 }
 
 export class ProcessLock {
   private readonly lockFilePath: string
-  private readonly socketName: string
   private readonly ownerToken: string
-  private server: Server | undefined
   private acquired = false
 
   constructor(public readonly paths: StoragePaths) {
     this.lockFilePath = paths.processLockFile()
-    const rootHash = createHash('sha256').update(paths.root).digest('hex').slice(0, 32)
-    this.socketName = `\0dsh-pdf-mineru-${rootHash}`
     this.ownerToken = `owner_${randomUUID().replace(/-/g, '')}`
   }
 
@@ -58,153 +57,126 @@ export class ProcessLock {
     return this.acquired
   }
 
+  /**
+   * Executes a critical section with exclusive scoped lock authority,
+   * acquiring the lock on entry and automatically releasing it on exit.
+   */
+  async withLock<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const wasHeld = this.acquired
+    if (!wasHeld) {
+      await this.acquire(signal)
+    }
+    try {
+      return await operation()
+    } finally {
+      if (!wasHeld) {
+        await this.release()
+      }
+    }
+  }
+
   async acquire(signal?: AbortSignal): Promise<void> {
     if (this.acquired) return
     signal?.throwIfAborted()
 
     await mkdir(this.paths.root, { recursive: true, mode: 0o700 })
-    await chmod(this.paths.root, 0o700)
+    await chmod(this.paths.root, 0o700).catch(() => undefined)
     signal?.throwIfAborted()
+
     const payload: ProcessLockPayload = {
       pid: process.pid,
       ownerToken: this.ownerToken,
       createdAt: Date.now(),
       hostname: hostname(),
     }
+    const serialized = JSON.stringify(payload, null, 2)
 
-    if (process.platform !== 'linux' && process.platform !== 'win32') {
-      let createdMetadata = false
+    for (let attempt = 0; attempt < 3; attempt++) {
+      signal?.throwIfAborted()
       try {
-        await writeFile(this.lockFilePath, JSON.stringify(payload, null, 2), { flag: 'wx', mode: 0o600 })
-        createdMetadata = true
-        signal?.throwIfAborted()
+        await writeFile(this.lockFilePath, serialized, { flag: 'wx', mode: 0o600 })
+        await chmod(this.lockFilePath, 0o600).catch(() => undefined)
+        if (signal?.aborted) {
+          await unlink(this.lockFilePath).catch(() => undefined)
+          signal.throwIfAborted()
+        }
         this.acquired = true
         return
       } catch (error) {
-        if (createdMetadata) await unlink(this.lockFilePath).catch(() => undefined)
-        if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-          throwMinerU('STORAGE_LOCKED', 'MinerU storage is already locked by another process')
-        }
-        throw error
-      }
-    }
-
-    // Canonicalize Windows aliases/casing so one physical root has one gate.
-    // Keep the Linux endpoint unchanged for compatibility with running versions.
-    const socketName = process.platform === 'win32'
-      ? `\\\\.\\pipe\\dsh-pdf-mineru-${createHash('sha256').update((await realpath(this.paths.root)).toLowerCase()).digest('hex').slice(0, 32)}`
-      : this.socketName
-    const server = createServer(socket => socket.destroy())
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const onError = (error: Error): void => { server.removeListener('listening', onListening); reject(error) }
-        const onListening = (): void => { server.removeListener('error', onError); resolve() }
-        server.once('error', onError)
-        server.once('listening', onListening)
-        server.listen(socketName)
-      })
-      signal?.throwIfAborted()
-    } catch (error) {
-      await new Promise<void>(resolve => server.close(() => resolve()))
-      if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') {
-        throwMinerU('STORAGE_LOCKED', 'MinerU storage is already locked by another process')
-      }
-      throw error
-    }
-    server.unref()
-    this.server = server
-    try {
-      if (process.platform === 'win32') {
-        await this.acquireWindowsMetadata(payload, signal)
-      } else {
-        await writeFile(this.lockFilePath, JSON.stringify(payload, null, 2), { flag: 'w', mode: 0o600 })
-      }
-      await chmod(this.lockFilePath, 0o600)
-      signal?.throwIfAborted()
-      this.acquired = true
-    } catch (error) {
-      this.server = undefined
-      // Never remove a legacy/live owner's metadata when acquisition failed.
-      await this.removeOwnedMetadata()
-      await new Promise<void>(resolve => server.close(() => resolve()))
-      throw error
-    }
-  }
-
-  private async acquireWindowsMetadata(payload: ProcessLockPayload, signal?: AbortSignal): Promise<void> {
-    const temporary = `${this.lockFilePath}.${this.ownerToken}.tmp`
-    // Publish a complete record atomically without overwriting an existing lock.
-    // A crash before publication leaves only a harmless, uniquely named temp file.
-    await writeFile(temporary, JSON.stringify(payload, null, 2), { flag: 'wx', mode: 0o600 })
-    try {
-      for (let attempt = 0; attempt < 2; attempt++) {
         signal?.throwIfAborted()
-        try {
-          await link(temporary, this.lockFilePath)
-          return
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-          if (attempt !== 0) throwMinerU('STORAGE_LOCKED', 'MinerU storage lock changed during recovery; retry startup')
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+          throw error
         }
-        await this.reclaimDeadWindowsMetadata()
-      }
-    } finally {
-      await unlink(temporary).catch(() => undefined)
-    }
-  }
 
-  private async reclaimDeadWindowsMetadata(): Promise<void> {
-    try {
-      const before = await lstat(this.lockFilePath)
-      if (!before.isFile() || before.isSymbolicLink()) throw new Error('not a regular lock file')
-      const raw = await readFile(this.lockFilePath, 'utf8')
-      const existing = parseLockPayload(raw)
-      if (existing.hostname.toLowerCase() !== hostname().toLowerCase()) throw new Error('foreign lock owner')
-      try {
-        process.kill(existing.pid, 0)
-        throw new Error('lock owner is alive')
-      } catch (error) {
-        // EPERM, PID reuse, and all ambiguous states must remain fail-closed.
-        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
-      }
-      const after = await lstat(this.lockFilePath)
-      if (!after.isFile() || after.isSymbolicLink()
-        || before.dev !== after.dev || before.ino !== after.ino
-        || before.mtimeMs !== after.mtimeMs
-        || await readFile(this.lockFilePath, 'utf8') !== raw) throw new Error('lock changed')
-      // New versions are serialized by the pipe. A legacy contender can only
-      // win after this unlink, and the subsequent exclusive link will detect it.
-      await unlink(this.lockFilePath)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
-      throwMinerU('STORAGE_LOCKED', 'MinerU storage lock is active or cannot be safely recovered; verify its owner before manual recovery')
-    }
-  }
+        // Lock file exists — inspect payload
+        let raw: string
+        try {
+          raw = await readFile(this.lockFilePath, 'utf8')
+        } catch (readError) {
+          if ((readError as NodeJS.ErrnoException).code === 'ENOENT') {
+            // Lock was unlinked concurrently, retry acquire
+            continue
+          }
+          throwMinerU('STORAGE_LOCKED', 'MinerU storage lock could not be read')
+        }
 
-  private async removeOwnedMetadata(): Promise<void> {
-    try {
-      const existing = parseLockPayload(await readFile(this.lockFilePath, 'utf8'))
-      if (existing.ownerToken === this.ownerToken && existing.pid === process.pid) {
-        await unlink(this.lockFilePath)
+        const existing = parseLockPayload(raw)
+        if (!existing) {
+          throwMinerU('STORAGE_LOCKED', 'MinerU storage lock metadata is invalid or ambiguous')
+        }
+
+        if (existing.pid === process.pid && existing.ownerToken === this.ownerToken) {
+          this.acquired = true
+          return
+        }
+
+        if (existing.hostname.toLowerCase() !== hostname().toLowerCase()) {
+          throwMinerU('STORAGE_LOCKED', 'MinerU storage is locked by another host')
+        }
+
+        try {
+          process.kill(existing.pid, 0)
+          // Owner PID is alive: if attempts remain, wait briefly for short scoped operation to finish
+          if (attempt < 2) {
+            await sleep(25, undefined, { signal }).catch(() => undefined)
+            continue
+          }
+          throwMinerU('STORAGE_LOCKED', 'MinerU storage is already locked by an active process')
+        } catch (killError) {
+          if ((killError as any)?.failure?.code === 'STORAGE_LOCKED') {
+            throw killError
+          }
+          if ((killError as NodeJS.ErrnoException).code === 'ESRCH') {
+            // Owner is dead: safely unlink the stale lock file and retry acquire
+            try {
+              await unlink(this.lockFilePath)
+            } catch (unlinkError) {
+              if ((unlinkError as NodeJS.ErrnoException).code !== 'ENOENT') {
+                throwMinerU('STORAGE_LOCKED', 'MinerU stale storage lock could not be removed')
+              }
+            }
+            continue
+          }
+          // Owner is alive or ambiguous (EPERM, etc.)
+          throwMinerU('STORAGE_LOCKED', 'MinerU storage lock owner is active or cannot be safely verified')
+        }
       }
-    } catch {
-      // Ignore if already unlinked or inaccessible; never remove unknown data.
     }
+
+    throwMinerU('STORAGE_LOCKED', 'MinerU storage lock contention; retry startup')
   }
 
   async release(): Promise<void> {
     if (!this.acquired) return
     this.acquired = false
-    const server = this.server
-    this.server = undefined
-    // Remove metadata before relinquishing IPC authority. Otherwise a new owner
-    // could publish its record between our ownership check and unlink.
     try {
-      await this.removeOwnedMetadata()
-    } finally {
-      if (server !== undefined) {
-        await new Promise<void>(resolve => server.close(() => resolve()))
+      const raw = await readFile(this.lockFilePath, 'utf8')
+      const existing = parseLockPayload(raw)
+      if (existing && existing.ownerToken === this.ownerToken && existing.pid === process.pid) {
+        await unlink(this.lockFilePath).catch(() => undefined)
       }
+    } catch {
+      // Ignore errors on release
     }
   }
 }

@@ -15,7 +15,7 @@ import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -125,8 +125,10 @@ describe('ProcessLock', () => {
     await lock.acquire()
     expect(lock.isHeld()).toBe(true)
 
-    const lockData = JSON.parse(await readFile(paths.processLockFile(), 'utf8')) as { pid: number }
+    const lockData = JSON.parse(await readFile(paths.processLockFile(), 'utf8')) as { pid: number; hostname: string; ownerToken: string }
     expect(lockData.pid).toBe(process.pid)
+    expect(lockData.hostname).toBe(hostname())
+    expect(typeof lockData.ownerToken).toBe('string')
 
     // Idempotent acquire on same instance
     await lock.acquire()
@@ -139,7 +141,7 @@ describe('ProcessLock', () => {
     await expect(readFile(paths.processLockFile(), 'utf8')).rejects.toThrow()
   })
 
-  it('throws STORAGE_LOCKED while another socket owner is active', async () => {
+  it('throws STORAGE_LOCKED while another lock owner is active', async () => {
     const root = await createTempRoot()
     const paths = new StoragePaths(root)
     const owner = new ProcessLock(paths)
@@ -151,44 +153,83 @@ describe('ProcessLock', () => {
     await contender.release()
   })
 
-
-  it.runIf(process.platform === 'linux')('reacquires after a socket-owning process is killed without cleanup', async () => {
+  it('reacquires after dead pid is killed', async () => {
     const root = await createTempRoot()
     const paths = new StoragePaths(root)
-    const rootHash = createHash('sha256').update(paths.root).digest('hex').slice(0, 32)
-    const childCode = [
-      "const { createServer } = require('node:net')",
-      "const name = String.fromCharCode(0) + 'dsh-pdf-mineru-' + process.argv[1]",
-      "const server = createServer()",
-      "server.listen(name, () => process.stdout.write('ready'))",
-      "setInterval(() => {}, 1000)",
-    ].join(';')
-    const child = spawn(process.execPath, ['-e', childCode, rootHash], { stdio: ['ignore', 'pipe', 'inherit'] })
-    await once(child.stdout!, 'data')
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+    const deadPid = child.pid!
     child.kill('SIGKILL')
     await once(child, 'exit')
+
+    const stalePayload = {
+      pid: deadPid,
+      ownerToken: 'dead-owner-token',
+      createdAt: Date.now() - 5000,
+      hostname: hostname(),
+    }
+    await writeFile(paths.processLockFile(), JSON.stringify(stalePayload, null, 2))
 
     const lock = new ProcessLock(paths)
     await lock.acquire()
     expect(lock.isHeld()).toBe(true)
+    const activePayload = JSON.parse(await readFile(paths.processLockFile(), 'utf8')) as { pid: number }
+    expect(activePayload.pid).toBe(process.pid)
     await lock.release()
   })
 
-  it.runIf(process.platform === 'linux')('replaces stale metadata only after acquiring OS lock authority', async () => {
+  it('throws STORAGE_LOCKED while a live child process holds the lock and reacquires once killed', async () => {
     const root = await createTempRoot()
     const paths = new StoragePaths(root)
-    const staleValues = [
-      '{not-json',
-      JSON.stringify({ pid: 99999999, ownerToken: 'dead', createdAt: 0, hostname: 'old' }),
-    ]
-    for (const stale of staleValues) {
-      await writeFile(paths.processLockFile(), stale)
-      const lock = new ProcessLock(paths)
-      await lock.acquire()
-      const current = JSON.parse(await readFile(paths.processLockFile(), 'utf8')) as { pid: number }
-      expect(current.pid).toBe(process.pid)
-      await lock.release()
-    }
+    const lockFile = paths.processLockFile()
+
+    const childCode = [
+      "const { writeFileSync } = require('node:fs')",
+      "const { hostname } = require('node:os')",
+      "const payload = JSON.stringify({ pid: process.pid, ownerToken: 'child-token', createdAt: Date.now(), hostname: hostname() })",
+      "writeFileSync(process.argv[1], payload)",
+      "process.stdout.write('ready')",
+      "setInterval(() => {}, 1000)",
+    ].join(';')
+    const child = spawn(process.execPath, ['-e', childCode, lockFile], { stdio: ['ignore', 'pipe', 'inherit'] })
+    await once(child.stdout!, 'data')
+
+    const lock = new ProcessLock(paths)
+    await expect(lock.acquire()).rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
+
+    child.kill('SIGKILL')
+    await once(child, 'exit')
+
+    await lock.acquire()
+    expect(lock.isHeld()).toBe(true)
+    const activePayload = JSON.parse(await readFile(lockFile, 'utf8')) as { pid: number }
+    expect(activePayload.pid).toBe(process.pid)
+    await lock.release()
+  })
+
+  it('throws STORAGE_LOCKED and preserves lock file when metadata is corrupt or from another host', async () => {
+    const root = await createTempRoot()
+    const paths = new StoragePaths(root)
+    const foreign = JSON.stringify({ pid: 12345, ownerToken: 'tok', createdAt: Date.now(), hostname: 'other-machine' })
+    await writeFile(paths.processLockFile(), foreign)
+
+    const lock = new ProcessLock(paths)
+    await expect(lock.acquire()).rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
+    expect(await readFile(paths.processLockFile(), 'utf8')).toBe(foreign)
+
+    await writeFile(paths.processLockFile(), '{invalid-json')
+    await expect(lock.acquire()).rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
+  })
+
+  it('does not remove another owner metadata on release', async () => {
+    const root = await createTempRoot()
+    const paths = new StoragePaths(root)
+    const lock = new ProcessLock(paths)
+    await lock.acquire()
+
+    const replacement = JSON.stringify({ pid: process.pid, ownerToken: 'other-token', createdAt: Date.now(), hostname: hostname() })
+    await writeFile(paths.processLockFile(), replacement)
+    await lock.release()
+    expect(await readFile(paths.processLockFile(), 'utf8')).toBe(replacement)
   })
 })
 

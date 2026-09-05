@@ -236,13 +236,19 @@ describe('StorageMaintenanceService statistics and integrity', () => {
     await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
   })
 
-  it('requires the existing held process lock', async () => {
+  it('blocks destructive cache clear when process lock is held by another active process', async () => {
     const root = await createTempRoot()
     const paths = new StoragePaths(root)
     const results = new ResultRepository(paths)
-    const lock = new ProcessLock(paths)
-    const maintenance = new StorageMaintenanceService(paths, results, new SharedOperationRegistry(), lock)
-    await expect(maintenance.getStatistics()).rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
+    const activeLock = new ProcessLock(paths)
+    await activeLock.acquire()
+    try {
+      const contenderLock = new ProcessLock(paths)
+      const maintenance = new StorageMaintenanceService(paths, results, new SharedOperationRegistry(), contenderLock)
+      await expect(maintenance.clearCache({ dryRun: false })).rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
+    } finally {
+      await activeLock.release()
+    }
   })
 })
 

@@ -1,8 +1,5 @@
 import { createHash } from 'node:crypto'
-import { createReadStream } from 'node:fs'
-import { stat } from 'node:fs/promises'
-import { PassThrough, Readable } from 'node:stream'
-import FormData from 'form-data'
+import { openAsBlob } from 'node:fs'
 import {
   type MinerUFileId,
   type ProviderConfigId,
@@ -41,12 +38,10 @@ import {
   type ProviderRetryOptions,
   type ProviderSubmission,
   type ProviderSubmittedFile,
-  executeWithRetry,
-  mergeRetryOptions,
-  readBoundedResponseText,
-  parseRetryAfter,
   validateProviderCapabilities,
 } from './provider.js'
+import { assertSourcesUnchanged } from '../service/request-normalizer.js'
+import { ProviderHttpClient } from './http-client.js'
 
 export interface SelfHostedV2ProviderConfig {
   readonly id: ProviderConfigId
@@ -213,12 +208,19 @@ export class SelfHostedV2Provider implements MinerUProvider {
   readonly capabilities: ProviderCapabilities
   private readonly parsedBaseUrl: URL
   private readonly retryOptions: ProviderRetryOptions
+  private readonly client: ProviderHttpClient
 
   constructor(config: SelfHostedV2ProviderConfig, options?: ProviderOptions) {
     asProviderConfigId(config.id)
     this.config = config
     this.retryOptions = options?.retry ?? {}
     this.parsedBaseUrl = validateAndNormalizeBaseURL(config.baseURL, config.allowInsecureHttp)
+    this.client = new ProviderHttpClient({
+      baseURL: this.parsedBaseUrl,
+      provider: 'self-hosted-v2',
+      defaultRetry: this.retryOptions,
+      providerLabel: 'MinerU server',
+    })
 
     const supportedModels = (['pipeline', 'vlm'] as const).filter(
       m => typeof config.modelMap[m] === 'string' && config.modelMap[m].trim() !== '',
@@ -319,23 +321,7 @@ export class SelfHostedV2Provider implements MinerUProvider {
     }
 
     // Pre-submission verification: ensure files have not changed
-    for (const source of sources) {
-      context.signal.throwIfAborted()
-      let currentStat
-      try {
-        currentStat = await stat(source.path)
-      } catch (err) {
-        throw new MinerUError(failure('FILE_NOT_FOUND', `Source file missing before upload: ${source.name}`), { cause: err })
-      }
-      if (
-        currentStat.size !== source.fingerprint.size ||
-        currentStat.mtimeMs !== source.fingerprint.mtimeMs ||
-        currentStat.dev !== source.fingerprint.device ||
-        currentStat.ino !== source.fingerprint.inode
-      ) {
-        throw new MinerUError(failure('INVALID_REQUEST', `Source file ${source.name} changed before upload`, true))
-      }
-    }
+    await assertSourcesUnchanged(sources, context.signal)
 
     let pageInterval: { start: number; end: number } | undefined
     if (request.semantics.pages !== undefined) {
@@ -353,15 +339,9 @@ export class SelfHostedV2Provider implements MinerUProvider {
       pageInterval = intervals[0]
     }
     const form = new FormData()
-    const sourceStreams = sources.map(source => createReadStream(source.path))
-    const onAbort = (): void => {
-      for (const stream of sourceStreams) stream.destroy(new DOMException('Aborted', 'AbortError'))
-    }
-    context.signal.addEventListener('abort', onAbort, { once: true })
-    for (const [index, source] of sources.entries()) {
-      const stream = sourceStreams[index]
-      if (stream === undefined) throw new TypeError('source stream index mismatch')
-      form.append('files', stream, { filename: source.name, knownLength: source.bytes })
+    for (const source of sources) {
+      const blob = await openAsBlob(source.path)
+      form.append('files', blob, source.name)
     }
 
     form.append('backend', backend)
@@ -382,27 +362,15 @@ export class SelfHostedV2Provider implements MinerUProvider {
     form.append('return_content_list', String(requiredSet.has('content-list')))
     form.append('return_images', String(requiredSet.has('images')))
 
-    const formHeaders = form.getHeaders()
-    const pass = new PassThrough()
-    form.on('error', err => pass.destroy(err))
-    form.pipe(pass)
-
-    let data: SelfHostedTaskSubmitResponse
-    try {
-      data = await this.requestJson<SelfHostedTaskSubmitResponse>(
-        'POST',
-        '/tasks',
-        pass,
-        formHeaders,
-        context,
-        [200, 202],
-        { operation: 'submit', retry: false },
-      )
-    } finally {
-      context.signal.removeEventListener('abort', onAbort)
-      for (const stream of sourceStreams) stream.destroy()
-    }
-
+    const data = await this.requestJson<SelfHostedTaskSubmitResponse>(
+      'POST',
+      '/tasks',
+      form,
+      {},
+      context,
+      [200, 202],
+      { operation: 'submit', retry: false },
+    )
     if (!data || typeof data.task_id !== 'string' || data.task_id.trim() === '') {
       throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'MinerU server did not return a valid task_id'))
     }
@@ -628,160 +596,21 @@ export class SelfHostedV2Provider implements MinerUProvider {
   private async requestJson<T>(
     method: string,
     path: string,
-    bodyStream: PassThrough | undefined,
+    body: BodyInit | undefined,
     headers: Record<string, string>,
     context: ProviderCallContext,
     acceptedStatuses: readonly number[] = [200],
     options?: { operation?: ProviderRetryOperation; retry?: boolean },
   ): Promise<T> {
-    const allowRetry = options?.retry ?? (method.toUpperCase() === 'GET')
-    const operation = options?.operation ?? (path.startsWith('/health') ? 'probe' : 'api-json')
-
-    const executeOnce = async (): Promise<T> => {
-      context.signal.throwIfAborted()
-
-      const url = `${this.parsedBaseUrl.origin}${this.parsedBaseUrl.pathname.replace(/\/+$/, '')}${path}`
-      const controller = new AbortController()
-      let timedOut = false
-      const timer = setTimeout(() => {
-        timedOut = true
-        controller.abort(new DOMException(`Request timed out after ${context.timeoutMs}ms`, 'TimeoutError'))
-      }, context.timeoutMs)
-
-      const onParentAbort = () => {
-        controller.abort(context.signal.reason)
-      }
-      context.signal.addEventListener('abort', onParentAbort, { once: true })
-
-      try {
-        const requestHeaders: Record<string, string> = { ...headers }
-        if (context.credential && context.credential.trim() !== '') {
-          requestHeaders['authorization'] = `Bearer ${context.credential}`
-        }
-
-        let response: Response
-        try {
-          const body = bodyStream !== undefined
-            ? (Readable.toWeb(bodyStream) as unknown as BodyInit)
-            : undefined
-          const requestInit: RequestInit & { duplex?: 'half' } = {
-            method,
-            headers: requestHeaders,
-            body,
-            signal: controller.signal,
-            redirect: 'error',
-            ...(body !== undefined ? { duplex: 'half' } : {}),
-          }
-          response = await fetch(url, requestInit)
-        } catch (err: unknown) {
-          if (context.signal.aborted) {
-            throw new MinerUError(failure('CANCELLED', 'Operation was cancelled', true))
-          }
-          if (timedOut) {
-            const timeoutErr = new MinerUError(
-              failure('PROVIDER_UNAVAILABLE', `Request to MinerU server timed out after ${context.timeoutMs}ms`, true),
-            )
-            Object.assign(timeoutErr, { httpStatus: 408 })
-            throw timeoutErr
-          }
-          const message = err instanceof Error ? err.message : String(err)
-          throw new MinerUError(
-            failure('PROVIDER_UNAVAILABLE', `Failed to connect to MinerU server: ${sanitizeDiagnostic(message)}`, true),
-            { cause: err },
-          )
-        }
-
-        const status = response.status
-        if (!acceptedStatuses.includes(status)) {
-          let errorBody = ''
-          try {
-            errorBody = await readBoundedResponseText(response, context.limits.maxApiResponseBytes, controller.signal)
-          } catch {
-            if (response.body) {
-              try { await response.body.cancel() } catch {}
-            }
-          }
-
-          let parsedError: string | undefined
-          try {
-            const parsed: unknown = JSON.parse(errorBody)
-            if (typeof parsed === 'object' && parsed !== null) {
-              const json = parsed as Record<string, unknown>
-              if (typeof json.detail === 'string') parsedError = json.detail
-              else if (typeof json.message === 'string') parsedError = json.message
-              else if (typeof json.error === 'string') parsedError = json.error
-            }
-          } catch {
-            parsedError = errorBody.slice(0, 500)
-          }
-
-          const diagnostic = parsedError
-            ? `: ${sanitizeDiagnostic(parsedError, [context.credential ?? ''])}`
-            : ''
-          const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'))
-          let err: MinerUError
-
-          if (status === 401 || status === 403) {
-            err = new MinerUError(failure('AUTHENTICATION_FAILED', `Authentication failed (${status})${diagnostic}`, false, { provider: 'self-hosted-v2' }))
-          } else if (status === 404) {
-            err = new MinerUError(failure('JOB_NOT_FOUND', `Resource not found (${status})${diagnostic}`, false, { provider: 'self-hosted-v2' }))
-          } else if (status === 413) {
-            err = new MinerUError(failure('FILE_TOO_LARGE', `Uploaded file is too large (${status})${diagnostic}`, false, { provider: 'self-hosted-v2' }))
-          } else if (status === 429) {
-            err = new MinerUError(failure('PROVIDER_RATE_LIMITED', `Provider rate limit exceeded (${status})${diagnostic}`, true, { provider: 'self-hosted-v2' }))
-          } else if (status === 408) {
-            err = new MinerUError(failure('PROVIDER_UNAVAILABLE', `MinerU server request timeout (${status})${diagnostic}`, true, { provider: 'self-hosted-v2' }))
-          } else if (status >= 500) {
-            err = new MinerUError(failure('PROVIDER_UNAVAILABLE', `MinerU server error (${status})${diagnostic}`, true, { provider: 'self-hosted-v2' }))
-          } else {
-            err = new MinerUError(failure('REMOTE_PARSE_FAILED', `MinerU returned unexpected status ${status}${diagnostic}`, false, { provider: 'self-hosted-v2' }))
-          }
-
-          Object.assign(err, { httpStatus: status, retryAfterMs })
-          throw err
-        }
-
-        const contentType = response.headers.get('content-type') ?? ''
-        if (!contentType.toLowerCase().includes('application/json')) {
-          if (response.body) {
-            try { await response.body.cancel() } catch {}
-          }
-          throw new MinerUError(failure('REMOTE_PARSE_FAILED', `Expected application/json response, got ${contentType || 'unknown'}`))
-        }
-
-        const rawText = await readBoundedResponseText(response, context.limits.maxApiResponseBytes, controller.signal)
-        try {
-          const parsed: unknown = JSON.parse(rawText)
-          if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-            throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'MinerU response must be an object', false, { provider: 'self-hosted-v2' }))
-          }
-          return parsed as T
-        } catch (err) {
-          if (err instanceof MinerUError) throw err
-          throw new MinerUError(
-            failure('REMOTE_PARSE_FAILED', `Failed to parse JSON response: ${sanitizeDiagnostic(err instanceof Error ? err.message : String(err))}`),
-            { cause: err },
-          )
-        }
-      } finally {
-        clearTimeout(timer)
-        context.signal.removeEventListener('abort', onParentAbort)
-        if (bodyStream !== undefined && !bodyStream.destroyed) {
-          bodyStream.destroy()
-        }
-      }
-    }
-
-    if (!allowRetry) {
-      return await executeOnce()
-    }
-
-    return await executeWithRetry({
-      provider: 'self-hosted-v2',
-      operation,
-      signal: context.signal,
-      retryOptions: mergeRetryOptions(this.retryOptions, context.retry),
-      fn: executeOnce,
+    return await this.client.requestJson<T>({
+      method,
+      path,
+      body,
+      headers,
+      context,
+      acceptedStatuses,
+      operation: options?.operation,
+      retry: options?.retry,
     })
   }
 

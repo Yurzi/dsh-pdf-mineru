@@ -7,6 +7,7 @@ export declare class OfficialV4Provider implements MinerUProvider {
     readonly capabilities: ProviderCapabilities;
     private readonly parsedBaseUrl;
     private readonly retryOptions;
+    private readonly client;
     constructor(config: OfficialV4Config, options?: ProviderOptions);
     compatibilityKey(request: CanonicalParseRequest, context: ProviderCompatibilityContext): Promise<string>;
     probe(context: ProviderCallContext): Promise<ProviderProbeResult>;

@@ -1,3 +1,4 @@
+import { setTimeout as delay } from 'node:timers/promises'
 import { MinerUError, failure } from '../domain/errors.js'
 import type { CanonicalParseRequest, PreparedSourceFile } from '../domain/request.js'
 import type { ArtifactSink, ProviderCallContext, ProviderCollectedFile, ProviderJobSnapshot } from '../providers/provider.js'
@@ -28,21 +29,6 @@ function combineRequest(participants: readonly BatchParticipant[]): CanonicalPar
     throw new TypeError('Batch participants must each own exactly one request file')
   }
   return { ...first, files: participants.map(participant => participant.request.files[0]!) }
-}
-
-function delay(ms: number, signal: AbortSignal): Promise<void> {
-  signal.throwIfAborted()
-  return new Promise((resolve, reject) => {
-    const finish = (): void => { signal.removeEventListener('abort', abort); resolve() }
-    const timer = setTimeout(finish, ms)
-    const abort = (): void => {
-      clearTimeout(timer)
-      signal.removeEventListener('abort', abort)
-      reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
-    }
-    signal.addEventListener('abort', abort, { once: true })
-    ;(timer as NodeJS.Timeout).unref?.()
-  })
 }
 
 /** Runs one provider batch while each file keeps an independent cache operation. */
@@ -78,7 +64,7 @@ export class BatchCoordinator {
 
       let snapshot: ProviderJobSnapshot = submission
       while (snapshot.files.some(file => file.state !== 'completed' && file.state !== 'failed')) {
-        await delay(this.options.pollIntervalMs, this.controller.signal)
+        await delay(this.options.pollIntervalMs, undefined, { signal: this.controller.signal })
         snapshot = await this.options.resolved.provider.inspect(
           submission.ref,
           await this.options.createContext(this.controller.signal),
