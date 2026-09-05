@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.0.9
+
+### Added
+
+- Added `toc` option (with `outline` alias) to `focus` parameter in `read_pdf`, formatting and projecting document table of contents with hierarchical indentation and page indexing as Markdown.
+- Added comprehensive unit tests covering TOC markdown formatting, focus normalization, and outline-only content projection.
+
+### Fixed
+
+- Omitted undeclared internal `attachmentRef` property from `inlined_images` tool output items to strictly conform to `readPdfResultSchema` (`additionalProperties: false`), reconstructing `ImageAttachmentRef` within `renderResult`.
+
 ## 0.0.8
 
 ### Changed
