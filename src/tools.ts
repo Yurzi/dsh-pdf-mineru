@@ -398,7 +398,7 @@ async function inlineImagesForSingleResult(
   signal?: AbortSignal,
 ): Promise<ResultView> {
   let candidates: ImageCandidate[] = []
-  if (view.ordered_images && view.ordered_images.length > 0) {
+  if (view.ordered_images !== undefined) {
     candidates = view.ordered_images.map(img => ({
       path: img.path,
       bytes: img.bytes,
@@ -599,7 +599,9 @@ export function registerTools(ctx: Context, getService: () => MinerUService, acc
       const { input, pollTimeoutMs, inline_images } = parseReadInput(args)
       const supportsImage = await checkCallingModelSupportsImage(exec, ctx)
       const attachments = ctx.get('attachments') as AttachmentStore | undefined
-      const shouldInline = inline_images !== false && supportsImage && attachments !== undefined
+      const focusSet = normalizeFocusSelection(input.focus)
+      const focusIncludesImages = focusSet.has('all') || focusSet.has('image')
+      const shouldInline = inline_images !== false && focusIncludesImages && supportsImage && attachments !== undefined
 
       const rawResult = await withStorageAccess(() => getService().parseDocument(agent.session, input, exec.signal, pollTimeoutMs))
       if (shouldInline && attachments) {

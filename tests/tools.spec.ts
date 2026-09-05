@@ -1,3 +1,6 @@
+import { writeFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 
 vi.mock('@deepseek-ai/dsh-tools', async (importOriginal) => {
@@ -533,6 +536,147 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         exec.signal,
         undefined,
       )
+    })
+
+    it('does not inline images when focus does not include image modality', async () => {
+      const mockAttachments = {
+        saveImage: vi.fn(async () => ({
+          attachmentId: 'att_img_1',
+          mediaType: 'image/png',
+          name: 'fig1.png',
+          width: 100,
+          height: 100,
+          bytes: 50,
+        })),
+      }
+      const mockLlm = {
+        resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text', 'image'] })),
+      }
+      const registeredTools: DefineToolOptions[] = []
+      const ctx = {
+        tools: {
+          register: vi.fn((def: DefineToolOptions) => {
+            registeredTools.push(def)
+            return vi.fn()
+          }),
+          schemas: vi.fn(() => []),
+        },
+        get: vi.fn((name: string) => {
+          if (name === 'attachments') return mockAttachments
+          if (name === 'llm') return mockLlm
+          return undefined
+        }),
+        effect: vi.fn(),
+        on: vi.fn(),
+        inject: vi.fn(),
+        logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      } as unknown as Context
+
+      const mockService = {
+        parseDocument: vi.fn(async () => ({
+          state: 'completed' as const,
+          source: 'cache' as const,
+          cache_hit: true,
+          result_id: 'mr_1',
+          files: [{
+            file_id: 'mf_1',
+            name: 'doc.pdf',
+            artifacts: [{ kind: 'images', path: '/fake/img.png', bytes: 100 }],
+          }],
+          content_status: 'complete' as const,
+          manifest_path: '/cache/m.json',
+          output_limit_chars: 1000,
+          ordered_images: [],
+        })),
+      } as unknown as MinerUService
+
+      registerTools(ctx, () => mockService)
+      const readTool = registeredTools.find(t => t.name === 'read_pdf')!
+      const exec: ToolRunContext = {
+        callId: 'call_1',
+        name: 'read_pdf',
+        arguments: {},
+        signal: new AbortController().signal,
+        agent: {
+          id: 'agent_1',
+          options: { provider: 'test-p', model: 'test-m' },
+          session: {
+            id: 'sess_1',
+            header: { id: 'sess_1', cwd: '/work' },
+          },
+        } as any,
+      }
+
+      // 1. focus: 'toc' should NOT inline images
+      const tocRes = await readTool.execute({ file_path: '/paper.pdf', focus: 'toc' }, exec) as ResultView
+      expect(mockAttachments.saveImage).not.toHaveBeenCalled()
+      expect(tocRes.inlined_images).toBeUndefined()
+      expect(renderResult(tocRes)).toHaveLength(1)
+
+      // 2. focus: 'text' should NOT inline images
+      const textRes = await readTool.execute({ file_path: '/paper.pdf', focus: 'text' }, exec) as ResultView
+      expect(mockAttachments.saveImage).not.toHaveBeenCalled()
+      expect(textRes.inlined_images).toBeUndefined()
+
+      // 3. focus: 'table' should NOT inline images
+      const tableRes = await readTool.execute({ file_path: '/paper.pdf', focus: 'table' }, exec) as ResultView
+      expect(mockAttachments.saveImage).not.toHaveBeenCalled()
+      expect(tableRes.inlined_images).toBeUndefined()
+
+      // 4. focus: ['toc', 'text'] should NOT inline images
+      const multiRes = await readTool.execute({ file_path: '/paper.pdf', focus: ['toc', 'text'] }, exec) as ResultView
+      expect(mockAttachments.saveImage).not.toHaveBeenCalled()
+      expect(multiRes.inlined_images).toBeUndefined()
+
+      // 5. focus: 'all' when ordered_images is empty should NOT fallback to all document images
+      const allEmptyRes = await readTool.execute({ file_path: '/paper.pdf', focus: 'all' }, exec) as ResultView
+      expect(mockAttachments.saveImage).not.toHaveBeenCalled()
+      expect(allEmptyRes.inlined_images).toBeUndefined()
+
+      // 6. focus: 'image' when ordered_images has an image should inline it
+      const testImgPath = join(tmpdir(), 'test-inline-fig.png')
+      await writeFile(testImgPath, Buffer.from('fake-png-data'))
+      try {
+        const mockServiceWithImages = {
+          parseDocument: vi.fn(async () => ({
+            state: 'completed' as const,
+            source: 'cache' as const,
+            cache_hit: true,
+            result_id: 'mr_2',
+            files: [{
+              file_id: 'mf_1',
+              name: 'doc.pdf',
+              artifacts: [],
+            }],
+            content_status: 'complete' as const,
+            manifest_path: '/cache/m.json',
+            output_limit_chars: 1000,
+            ordered_images: [{
+              path: testImgPath,
+              name: 'test-inline-fig.png',
+              page: 1,
+              media_type: 'image/png',
+              bytes: 13,
+            }],
+          })),
+        } as unknown as MinerUService
+        const { ctx: ctx2, registeredTools: tools2 } = createMockContext()
+        ;(ctx2.get as any) = vi.fn((name: string) => {
+          if (name === 'attachments') return mockAttachments
+          if (name === 'llm') return mockLlm
+          return undefined
+        })
+        registerTools(ctx2, () => mockServiceWithImages)
+        const readTool2 = tools2.find(t => t.name === 'read_pdf')!
+
+        const imageRes = await readTool2.execute({ file_path: '/paper.pdf', focus: 'image' }, exec) as ResultView
+        expect(mockAttachments.saveImage).toHaveBeenCalledTimes(1)
+        expect(imageRes.inlined_images).toHaveLength(1)
+        expect(imageRes.inlined_images![0]?.name).toBe('fig1.png')
+        expect(renderResult(imageRes)).toHaveLength(2)
+      } finally {
+        await rm(testImgPath, { force: true })
+      }
     })
 
     it('projects structured presentation metadata for single result', () => {

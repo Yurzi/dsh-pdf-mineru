@@ -919,5 +919,45 @@ describe('MinerUService direct parsing', () => {
       expect(parsed.markdown_content).toContain('  - Sub Heading (line 3)')
       expect(parsed.markdown_content).not.toContain('Some body text')
     })
+
+    it('filters images by pages and only returns images located on the specified page', async () => {
+      const h = await harness()
+      h.provider.complete = true
+      const contentList = [
+        { type: 'text', text: 'Page 1 intro.', page_idx: 0 },
+        { type: 'image', path: 'images/page1.png', caption: 'Figure 1 on Page 1', page_idx: 0 },
+        { type: 'text', text: 'Page 2 content.', page_idx: 1 },
+        { type: 'image', path: 'images/page2.png', caption: 'Figure 2 on Page 2', page_idx: 1 },
+        { type: 'text', text: 'Page 3 content without images.', page_idx: 2 },
+      ]
+      h.provider.extraArtifactsByFileName.set('input.pdf', [
+        { kind: 'content-list', content: JSON.stringify(contentList) },
+        { kind: 'images', content: 'fake-png-data' },
+      ])
+
+      // 1. Reading page 2 only returns Figure 2 on Page 2
+      const page2Result = asResult(await h.service.parseDocument(
+        session('session-p2-img'),
+        { file_path: h.file, pages: '2' },
+        new AbortController().signal,
+        null,
+      ))
+      expect(page2Result.ordered_images).toHaveLength(1)
+      expect(page2Result.ordered_images![0]?.name).toBe('page2.png')
+      expect(page2Result.ordered_images![0]?.page).toBe(2)
+      expect(page2Result.ordered_images![0]?.caption).toBe('Figure 2 on Page 2')
+      expect(page2Result.markdown_content).toContain('Figure 2 on Page 2')
+      expect(page2Result.markdown_content).not.toContain('Figure 1 on Page 1')
+
+      // 2. Reading page 3 only returns zero images
+      const page3Result = asResult(await h.service.parseDocument(
+        session('session-p3-no-img'),
+        { file_path: h.file, pages: '3' },
+        new AbortController().signal,
+        null,
+      ))
+      expect(page3Result.ordered_images).toHaveLength(0)
+      expect(page3Result.markdown_content).not.toContain('Attached Image')
+    })
   })
 })
