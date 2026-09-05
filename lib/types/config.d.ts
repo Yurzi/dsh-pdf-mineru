@@ -36,6 +36,7 @@ export interface RetryConfig {
     readonly maxDelayMs: number;
 }
 export interface OutputConfig {
+    /** Maximum inline character budget (UTF-16 chars) for the entire parse output across single or batch files. */
     readonly maxInlineChars: number;
 }
 export interface SecurityLimits {

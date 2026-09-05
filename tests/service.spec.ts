@@ -26,7 +26,11 @@ import {
   type ParseDocumentView,
   type ResultView,
   type ServiceSession,
+  truncateAtCleanBoundary,
+  safeStringSlice,
+  allocateReclaimedShares,
 } from '../src/service/mineru-service.js'
+import { renderResult, renderParseDocument } from '../src/tools.js'
 import { SharedOperationRegistry } from '../src/service/shared-operations.js'
 import { ResultRepository } from '../src/storage/result-repository.js'
 import { StoragePaths } from '../src/storage/paths.js'
@@ -71,6 +75,9 @@ class MockProvider implements MinerUProvider {
   readonly failedNames = new Set<string>()
   readonly submittedRequests: CanonicalParseRequest[] = []
   markdown = '# parsed\n'
+  readonly markdownByFileName = new Map<string, string>()
+  readonly extraArtifactsByFileName = new Map<string, Array<{ kind: 'layout' | 'images' | 'model-output' | 'content-list'; content: string }>>()
+  omitMarkdown = false
   submitGate: Promise<void> = Promise.resolve()
   retryOptions?: ProviderRetryOptions
 
@@ -140,8 +147,20 @@ class MockProvider implements MinerUProvider {
         })
         continue
       }
-      const markdown = await sink.writeArtifact(file.fileId, 'markdown', this.markdown, { mediaType: 'text/markdown' })
-      files.push({ fileId: file.fileId, name: file.name, artifacts: [markdown] })
+      const artifacts: any[] = []
+      if (!this.omitMarkdown) {
+        const mdText = this.markdownByFileName.get(file.name) ?? this.markdown
+        const markdown = await sink.writeArtifact(file.fileId, 'markdown', mdText, { mediaType: 'text/markdown' })
+        artifacts.push(markdown)
+      }
+      const extras = this.extraArtifactsByFileName.get(file.name)
+      if (extras) {
+        for (const extra of extras) {
+          const art = await sink.writeArtifact(file.fileId, extra.kind, extra.content, { mediaType: 'application/json' })
+          artifacts.push(art)
+        }
+      }
+      files.push({ fileId: file.fileId, name: file.name, artifacts })
     }
     return { files }
   }
@@ -516,7 +535,254 @@ describe('MinerUService direct parsing', () => {
     ))
     expect(parsed.state).toBe('completed')
     expect(JSON.stringify(parsed).length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
-    expect(parsed.preview_truncated).toBe(true)
+    expect(parsed.content_status).toBe('partial')
+    expect(parsed.markdown_content).toBeDefined()
     expect('job_id' in parsed).toBe(false)
+  })
+
+  it('populates markdown_content and content_status correctly on complete document', async () => {
+    const h = await harness()
+    h.provider.markdown = '# Complete Document Content\nFull text delivered.'
+    h.provider.complete = true
+
+    const parsed = asResult(await h.service.parseDocument(
+      session('session-direct-content'), { file_paths: [h.file] }, new AbortController().signal, null,
+    ))
+    expect(parsed.state).toBe('completed')
+    expect(parsed.content_status).toBe('complete')
+    expect(parsed.markdown_content).toBe('# Complete Document Content\nFull text delivered.')
+    expect(parsed.read_offset_line).toBeUndefined()
+    expect('job_id' in parsed).toBe(false)
+  })
+
+  it('handles valid empty markdown file with complete status', async () => {
+    const h = await harness()
+    h.provider.markdown = ''
+    h.provider.complete = true
+
+    const parsed = asResult(await h.service.parseDocument(
+      session('session-empty-md'), { file_paths: [h.file] }, new AbortController().signal, null,
+    ))
+    expect(parsed.state).toBe('completed')
+    expect(parsed.content_status).toBe('complete')
+    expect(parsed.markdown_content).toBe('')
+    expect(parsed.read_offset_line).toBeUndefined()
+  })
+
+  it('handles request without markdown artifact and marks not_requested without claiming complete text', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    h.provider.extraArtifactsByFileName.set('input.pdf', [{ kind: 'layout', content: '{"pages":[]}' }])
+
+    const parsed = asResult(await h.service.parseDocument(
+      session('session-no-md'),
+      { file_paths: [h.file], artifacts: ['layout'] },
+      new AbortController().signal,
+      null,
+    ))
+    expect(parsed.state).toBe('completed')
+    expect(parsed.content_status).toBe('not_requested')
+    expect(parsed.markdown_content).toBeUndefined()
+    expect(parsed.read_offset_line).toBeUndefined()
+    const rendered = renderResult(parsed)[0]?.text ?? ''
+    expect(rendered).not.toContain('完整提供')
+    expect(rendered).not.toContain('delivered above')
+    expect(rendered).toContain('本次解析未请求提取 Markdown 正文')
+  })
+
+  it('fails if markdown was requested but provider did not produce it', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    h.provider.omitMarkdown = true
+    h.provider.extraArtifactsByFileName.set('input.pdf', [{ kind: 'layout', content: '{"pages":[]}' }])
+
+    await expect(h.service.parseDocument(
+      session('session-missing-md'),
+      { file_paths: [h.file], artifacts: ['markdown'] },
+      new AbortController().signal,
+      null,
+    )).rejects.toMatchObject({ failure: { code: 'PROVIDER_UNAVAILABLE' } })
+  })
+
+  it('truncates text cleanly at paragraph and newline boundaries without splitting surrogate pairs', () => {
+    const text = 'First line\nSecond line\nThird line'
+    const cut = truncateAtCleanBoundary(text, 22)
+    expect(cut.truncated).toBe(true)
+    expect(cut.text).toBe('First line\n')
+    expect(cut.resumeLine).toBe(2)
+
+    const paraText = 'Paragraph 1\n\nParagraph 2\n\nParagraph 3'
+    const paraCut = truncateAtCleanBoundary(paraText, 16)
+    expect(paraCut.truncated).toBe(true)
+    expect(paraCut.text).toBe('Paragraph 1\n\n')
+    expect(paraCut.resumeLine).toBe(3)
+
+    const lineCut = truncateAtCleanBoundary(paraText, 25)
+    expect(lineCut.truncated).toBe(true)
+    expect(lineCut.text).toBe('Paragraph 1\n\nParagraph 2\n')
+    expect(lineCut.resumeLine).toBe(4)
+
+    const chText = '第一段中文\n第二段中文内容更长一些\n第三段'
+    const chCut = truncateAtCleanBoundary(chText, 16)
+    expect(chCut.truncated).toBe(true)
+    expect(chCut.text).toBe('第一段中文\n')
+    expect(chCut.resumeLine).toBe(2)
+
+    const emojiText = 'A🚀B\nC🌟D'
+    const brokenSlice = emojiText.slice(0, 2)
+    expect(brokenSlice.length).toBe(2)
+    const safeSlice = safeStringSlice(emojiText, 2)
+    expect(safeSlice).toBe('A')
+  })
+
+  it('allocates reclaimed fair shares correctly', () => {
+    const shares1 = allocateReclaimedShares([100, 5000], 1000)
+    expect(shares1).toEqual([100, 900])
+
+    const shares2 = allocateReclaimedShares([50, 150, 2000, 3000], 800)
+    expect(shares2).toEqual([50, 150, 300, 300])
+
+    const shares3 = allocateReclaimedShares([100, 200, 300], 1000)
+    expect(shares3).toEqual([100, 200, 300])
+  })
+
+  it('applies fair share reclamation in multi-file batch so short file is complete and long file gets remainder', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    const shortText = '# Short Document\nThis is a short paragraph.\n'
+    const longText = Array.from({ length: 100 }, (_, i) => `Line ${i + 1}: ${'Lorem ipsum '.repeat(5)}`).join('\n')
+    h.provider.markdownByFileName.set('input.pdf', shortText)
+    h.provider.markdownByFileName.set('input-two.pdf', longText)
+
+    const parsed = asBatch(await h.service.parseDocument(
+      session('session-reclaim-batch'),
+      { file_paths: [h.file, h.fileTwo] },
+      new AbortController().signal,
+      null,
+    ))
+
+    expect(parsed.kind).toBe('batch')
+    expect(parsed.state).toBe('completed')
+    expect(parsed.content_status).toBe('partial')
+    expect(parsed.results).toHaveLength(2)
+
+    const shortRes = parsed.results.find(r => r.state === 'completed' && r.files[0]?.name === 'input.pdf') as ResultView
+    const longRes = parsed.results.find(r => r.state === 'completed' && r.files[0]?.name === 'input-two.pdf') as ResultView
+
+    expect(shortRes.content_status).toBe('complete')
+    expect(shortRes.markdown_content).toBe(shortText)
+
+    expect(longRes.content_status).toBe('partial')
+    expect(longRes.read_offset_line).toBeGreaterThan(1)
+    expect(longRes.markdown_path).toBeDefined()
+
+    expect(JSON.stringify(parsed).length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
+    const rendered = renderParseDocument(parsed)
+    expect(rendered[0]?.text.length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
+    expect(rendered[0]?.text).toContain('input.pdf')
+    expect(rendered[0]?.text).toContain('input-two.pdf')
+    expect(rendered[0]?.text).toContain('本次所选页面的提取 Markdown 已完整提供')
+    expect(rendered[0]?.text).toContain('正文未完整提供（受输出限制截断 / Content truncated to output limit）')
+  })
+
+  it('preserves failure info and visible text when batch has mixed success and failure under tight budget', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    h.provider.failedNames.add('input-two.pdf')
+    h.provider.markdownByFileName.set('input.pdf', '# Succeeded\n' + 'Content line.\n'.repeat(20))
+
+    const parsed = asBatch(await h.service.parseDocument(
+      session('session-mixed-fail'),
+      { file_paths: [h.file, h.fileTwo] },
+      new AbortController().signal,
+      null,
+    ))
+
+    expect(parsed.kind).toBe('batch')
+    expect(parsed.state).toBe('partially-completed')
+    expect(parsed.results).toHaveLength(2)
+
+    const failed = parsed.results.find(r => r.state === 'failed')!
+    expect(failed.name).toBe('input-two.pdf')
+    expect(failed.failure.code).toBe('REMOTE_PARSE_FAILED')
+
+    const success = parsed.results.find(r => r.state === 'completed' && r.files[0]?.name === 'input.pdf') as ResultView
+    expect(success.files[0]?.name).toBe('input.pdf')
+    expect(success.markdown_content).toBeDefined()
+
+    const rendered = renderParseDocument(parsed)
+    const text = rendered[0]?.text ?? ''
+    expect(text).toContain('input-two.pdf')
+    expect(text).toContain('REMOTE_PARSE_FAILED')
+    expect(text).toContain('input.pdf')
+    expect(text.length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
+  })
+
+  it('prioritizes text over secondary artifacts when budget is tight', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    h.provider.extraArtifactsByFileName.set('input.pdf', [
+      { kind: 'layout', content: JSON.stringify({ data: 'x'.repeat(1000) }) },
+      { kind: 'images', content: JSON.stringify({ data: 'y'.repeat(1000) }) },
+    ])
+    h.provider.markdown = '# Essential Text\n' + 'Important content.\n'.repeat(50)
+
+    const parsed = asResult(await h.service.parseDocument(
+      session('session-priority'),
+      { file_paths: [h.file] },
+      new AbortController().signal,
+      null,
+    ))
+
+    expect(parsed.state).toBe('completed')
+    expect(parsed.markdown_content).toBeDefined()
+    expect(parsed.markdown_content).toContain('Essential Text')
+    expect(parsed.files[0]?.artifacts_truncated).toBe(true)
+    expect(JSON.stringify(parsed).length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
+  })
+
+  it('throws RESULT_TOO_LARGE when metadata alone exceeds the configured limit', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    const tinyConfig: MinerUConfig = {
+      ...h.config,
+      output: { maxInlineChars: 50 },
+    }
+    const tinyService = new MinerUService({
+      getConfig: () => tinyConfig,
+      providers: new MockProviderRegistry(() => tinyConfig, h.provider),
+      results: h.results,
+      operations: h.operations,
+      resolveCredential: () => Promise.resolve(undefined),
+    })
+
+    await expect(tinyService.parseDocument(
+      session('session-tiny-limit'),
+      { file_paths: [h.file] },
+      new AbortController().signal,
+      null,
+    )).rejects.toMatchObject({ failure: { code: 'RESULT_TOO_LARGE' } })
+  })
+
+  it('verifies end-to-end service projection to render output consistency without silent slice', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    h.provider.markdown = '# Full Story\n' + 'Paragraph here.\n'.repeat(150)
+
+    const parsed = asResult(await h.service.parseDocument(
+      session('session-consistency'),
+      { file_paths: [h.file] },
+      new AbortController().signal,
+      null,
+    ))
+
+    const rendered = renderResult(parsed)
+    const text = rendered[0]?.text ?? ''
+    expect(text.length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
+    expect(text).not.toContain('[Output truncated to limit]')
+    expect(text).toContain('Full markdown artifact at:')
+    expect(text).toContain('Result manifest:')
+    expect(text).toContain('resume line: offset=')
+    expect(parsed.content_status).toBe('partial')
   })
 })

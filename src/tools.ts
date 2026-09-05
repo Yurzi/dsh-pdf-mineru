@@ -6,7 +6,18 @@ import type { ContentBlock, JsonValue, ObjectValueSchemaSpec, ParameterSchemaSpe
 import { MinerUError, failure, toMinerUFailure } from './domain/errors.js'
 import type { ParseRequestInput } from './domain/request.js'
 import type { StorageAccessGate } from './storage/access-gate.js'
-import type { BatchParseDocumentView, FailedParseView, MinerUService, ParseDocumentView, ProbeView, ResultView } from './service/mineru-service.js'
+import type {
+  BatchParseDocumentView,
+  FailedParseView,
+  MinerUService,
+  ParseDocumentView,
+  ProbeView,
+  ResultView,
+} from './service/mineru-service.js'
+import {
+  formatParseDocumentProse,
+  formatResultProse,
+} from './service/mineru-service.js'
 
 declare module '@deepseek-ai/dsh-jobs' {
   interface JobKindMap {
@@ -35,6 +46,7 @@ const resultFileViewSchema: ObjectValueSchemaSpec = {
   properties: {
     file_id: { type: 'string' }, name: { type: 'string' },
     artifacts: { type: 'array', items: artifactViewSchema }, artifacts_truncated: { type: 'boolean' },
+    markdown_path: { type: 'string' },
   },
   additionalProperties: false,
 }
@@ -45,8 +57,13 @@ const resultViewSchema: ObjectValueSchemaSpec = {
     state: { type: 'string', enum: ['completed'] },
     source: { type: 'string', enum: ['cache', 'shared-operation', 'provider'] },
     cache_hit: { type: 'boolean' }, result_id: { type: 'string' },
-    files: { type: 'array', items: resultFileViewSchema }, markdown_preview: { type: 'string' },
-    preview_truncated: { type: 'boolean' }, manifest_path: { type: 'string' }, output_limit_chars: { type: 'integer' },
+    files: { type: 'array', items: resultFileViewSchema },
+    markdown_content: { type: 'string' },
+    content_status: { type: 'string', enum: ['complete', 'partial', 'not_requested'] },
+    markdown_path: { type: 'string' },
+    read_offset_line: { type: 'integer' },
+    manifest_path: { type: 'string' },
+    output_limit_chars: { type: 'integer' },
   },
   additionalProperties: false,
 }
@@ -67,6 +84,9 @@ const batchViewSchema: ObjectValueSchemaSpec = {
     kind: { type: 'string', enum: ['batch'] },
     state: { type: 'string', enum: ['completed', 'partially-completed', 'failed'] },
     results: { type: 'array', items: { oneOf: [resultViewSchema, failedParseViewSchema] } },
+    output_limit_chars: { type: 'integer' },
+    content_status: { type: 'string', enum: ['complete', 'partial', 'not_requested'] },
+    results_omitted: { type: 'boolean' },
   },
   additionalProperties: false,
 }
@@ -88,7 +108,7 @@ const parseParameters: ParameterSchemaSpec = {
   },
 }
 
-const DEFAULT_RENDER_LIMIT = 16_384
+const DEFAULT_RENDER_LIMIT = 200_000
 const MAX_POLL_TIMEOUT_MS = 24 * 60 * 60 * 1000
 
 function clampRenderText(rendered: string, limit = DEFAULT_RENDER_LIMIT): string {
@@ -141,34 +161,17 @@ export function renderHealth(value: ProbeView): ContentBlock[] {
 }
 
 export function renderResult(value: ResultView): ContentBlock[] {
-  const lines = [
-    '**MinerU Parse Result**', '- Source: ' + value.source,
-    '- Cache Hit: ' + (value.cache_hit ? 'Yes' : 'No'), '- Result ID: ' + value.result_id,
-    '- Manifest: ' + value.manifest_path,
-  ]
-  if (value.files.length > 0) {
-    lines.push('\n### Artifact Files:')
-    for (const file of value.files) {
-      lines.push('- **' + file.name + '**:')
-      for (const artifact of file.artifacts) lines.push('  - ' + artifact.kind + ' (' + String(artifact.bytes) + ' bytes): ' + artifact.path)
-      if (file.artifacts_truncated) lines.push('  - *(Artifact list truncated to output limit)*')
-    }
-  }
-  if (value.markdown_preview !== undefined) {
-    lines.push('\n### Markdown Preview:', value.markdown_preview)
-    if (value.preview_truncated) lines.push('\n*(Preview truncated to output limit)*')
-  }
-  return [{ type: 'text', text: clampRenderText(lines.join('\n'), value.output_limit_chars) }]
-}
-
-function renderFailure(value: FailedParseView): string {
-  return '**' + value.name + '**: [' + value.failure.code + '] ' + value.failure.message
+  const limit = (typeof value.output_limit_chars === 'number' && Number.isSafeInteger(value.output_limit_chars) && value.output_limit_chars > 0)
+    ? value.output_limit_chars
+    : DEFAULT_RENDER_LIMIT
+  return [{ type: 'text', text: clampRenderText(formatResultProse(value), limit) }]
 }
 
 export function renderParseDocument(value: ParseDocumentView): ContentBlock[] {
-  if (!('kind' in value)) return renderResult(value)
-  const sections = value.results.map(result => result.state === 'completed' ? renderResult(result)[0]?.text ?? '' : renderFailure(result))
-  return [{ type: 'text', text: clampRenderText('**MinerU Batch Result**\n- State: ' + value.state + '\n- Results: ' + String(value.results.length) + '\n\n' + sections.join('\n\n')) }]
+  const limit = ('output_limit_chars' in value && typeof value.output_limit_chars === 'number' && Number.isSafeInteger(value.output_limit_chars) && value.output_limit_chars > 0)
+    ? value.output_limit_chars
+    : DEFAULT_RENDER_LIMIT
+  return [{ type: 'text', text: clampRenderText(formatParseDocumentProse(value), limit) }]
 }
 
 function backgroundLabel(input: ParseRequestInput): string {
@@ -290,7 +293,7 @@ export function registerTools(ctx: Context, getService: () => MinerUService, acc
 
   disposers.push(ctx.tools.register(defineTool({
     name: 'mineru_parse_document',
-    description: 'Parse documents and synchronously return immutable result manifests, previews, and artifact paths. This call does not create a plugin Job.',
+    description: "Parse documents and return extracted Markdown content directly. When 'content_status' is 'complete', the extracted Markdown for the selected pages is fully provided in 'markdown_content' and ready to use directly. Only read the Markdown file path if content is partial ('content_status' is 'partial') and you need the remaining unreturned content.",
     parameters: {
       ...parseParameters,
       poll_timeout_ms: {

@@ -308,7 +308,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
       expect(rendered[0]?.text).toBe('Started native MinerU background job mineru-1.')
     })
 
-    it('resolves done hook with completed outcome and formatted markdown preview on success', async () => {
+    it('resolves done hook with completed outcome and direct markdown content on success', async () => {
       const { registry, specs } = createMockJobRegistry()
       const { ctx, registeredTools } = createMockContext(registry)
 
@@ -324,8 +324,8 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
             artifacts: [{ kind: 'markdown', path: '/cache/sample/full.md', bytes: 512 }],
           },
         ],
-        markdown_preview: '# Background Parsed Content',
-        preview_truncated: false,
+        markdown_content: '# Background Parsed Content',
+        content_status: 'complete',
         manifest_path: '/cache/sample/manifest.json',
         output_limit_chars: 2000,
       }
@@ -352,7 +352,9 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
       expect(outcome.status).toBe('completed')
       expect(outcome.detail).toBe('completed')
       expect(outcome.output).toContain('Background Parsed Content')
-      expect(outcome.output).toContain('/cache/sample/full.md')
+      expect(outcome.output).toContain('# Document: sample.pdf')
+      expect(outcome.output).toContain('本次所选页面的提取 Markdown 已完整提供，可直接用于回答')
+      expect(outcome.output).toContain('/cache/sample/manifest.json')
     })
 
     it('resolves done hook with batch detail when batch parse settles', async () => {
@@ -369,8 +371,8 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
             cache_hit: true,
             result_id: 'mr_1',
             files: [{ file_id: 'mf_1', name: 'good.pdf', artifacts: [] }],
-            markdown_preview: '# Good',
-            preview_truncated: false,
+            markdown_content: '# Good',
+            content_status: 'complete',
             manifest_path: '/cache/good/manifest.json',
             output_limit_chars: 2000,
           },
@@ -520,7 +522,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
         cache_hit: true,
         result_id: 'mr_gate_1',
         files: [],
-        preview_truncated: false,
+        content_status: 'complete',
         manifest_path: '/cache/manifest.json',
         output_limit_chars: 1000,
       }
@@ -556,8 +558,8 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
             artifacts: [{ kind: 'markdown', path: '/cache/sync/full.md', bytes: 100 }],
           },
         ],
-        markdown_preview: '# Synchronous Direct Result',
-        preview_truncated: false,
+        markdown_content: '# Synchronous Direct Result',
+        content_status: 'complete',
         manifest_path: '/cache/sync/manifest.json',
         output_limit_chars: 2000,
       }
@@ -583,8 +585,19 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
 
       const rendered = parseTool.output.render(args, result)
       expect(rendered[0]?.text).toContain('Synchronous Direct Result')
-      expect(rendered[0]?.text).toContain('/cache/sync/full.md')
-      expect(rendered[0]?.text).toContain('Cache Hit: No')
+      expect(rendered[0]?.text).toContain('# Document: sync.pdf')
+      expect(rendered[0]?.text).toContain('**MinerU Parse Result** (Source: provider, Cache: miss)')
+      expect(rendered[0]?.text).toContain('本次所选页面的提取 Markdown 已完整提供，可直接用于回答')
+      expect(rendered[0]?.text).toContain('/cache/sync/manifest.json')
+    })
+
+    it('documents direct content inlining and positive usage guidance', () => {
+      const { ctx, registeredTools } = createMockContext()
+      registerTools(ctx, () => ({} as MinerUService))
+      const parseTool = registeredTools.find(t => t.name === 'mineru_parse_document')!
+      expect(parseTool.description).toContain("When 'content_status' is 'complete'")
+      expect(parseTool.description).toContain("markdown_content")
+      expect(parseTool.description).toContain("Only read the Markdown file path if content is partial")
     })
 
     it('projects structured presentation metadata for single result and batch result', () => {
@@ -655,8 +668,8 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
         cache_hit: true,
         result_id: 'mr_long_preview',
         files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
-        markdown_preview: 'A'.repeat(5000),
-        preview_truncated: true,
+        markdown_content: 'A'.repeat(5000),
+        content_status: 'partial',
         manifest_path: '/cache/doc/manifest.json',
         output_limit_chars: 150,
       }
@@ -672,7 +685,7 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
         cache_hit: false,
         result_id: 'mr_truncated_artifacts',
         files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [], artifacts_truncated: true }],
-        preview_truncated: false,
+        content_status: 'complete',
         manifest_path: '/cache/manifest.json',
         output_limit_chars: 2000,
       })
@@ -690,8 +703,8 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
             cache_hit: false,
             result_id: 'mr_b1',
             files: [{ file_id: 'mf_1', name: 'file1.pdf', artifacts: [{ kind: 'markdown', path: '/p1.md', bytes: 10 }] }],
-            markdown_preview: '# P1',
-            preview_truncated: false,
+            markdown_content: '# P1',
+            content_status: 'complete',
             manifest_path: '/m1.json',
             output_limit_chars: 1000,
           },
@@ -709,9 +722,192 @@ describe('MinerU Tool Layer (3-Tool Native Background & Direct Contract)', () =>
       expect(rendered[0]?.text).toContain('- State: partially-completed')
       expect(rendered[0]?.text).toContain('- Results: 2')
       expect(rendered[0]?.text).toContain('file1.pdf')
-      expect(rendered[0]?.text).toContain('/p1.md')
+      expect(rendered[0]?.text).toContain('# P1')
+      expect(rendered[0]?.text).toContain('本次所选页面的提取 Markdown 已完整提供，可直接用于回答')
+      expect(rendered[0]?.text).toContain('/m1.json')
       expect(rendered[0]?.text).toContain('file2.pdf')
       expect(rendered[0]?.text).toContain('REMOTE_PARSE_FAILED')
+    })
+
+    it('renders truncation footer with markdown artifact path when content_status is partial', () => {
+      const resultData: ResultView = {
+        state: 'completed',
+        source: 'provider',
+        cache_hit: false,
+        result_id: 'mr_trunc',
+        files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [{ kind: 'markdown', path: '/cache/doc/full.md', bytes: 5000 }] }],
+        markdown_content: '# Truncated Content',
+        content_status: 'partial',
+        manifest_path: '/cache/doc/manifest.json',
+        output_limit_chars: 2000,
+      }
+      const rendered = renderResult(resultData)
+      expect(rendered[0]?.text).toContain('正文未完整提供（受输出限制截断 / Content truncated to output limit）')
+      expect(rendered[0]?.text).toContain('Full markdown artifact at: /cache/doc/full.md')
+      expect(rendered[0]?.text).toContain('Result manifest: /cache/doc/manifest.json')
+    })
+
+    it('renders secondary artifacts compactly when present', () => {
+      const resultData: ResultView = {
+        state: 'completed',
+        source: 'provider',
+        cache_hit: false,
+        result_id: 'mr_secondary',
+        files: [{
+          file_id: 'mf_1',
+          name: 'doc.pdf',
+          artifacts: [
+            { kind: 'markdown', path: '/cache/doc/full.md', bytes: 500 },
+            { kind: 'layout', path: '/cache/doc/layout.json', bytes: 200 },
+            { kind: 'images', path: '/cache/doc/images', bytes: 800 },
+          ],
+        }],
+        markdown_content: '# Document with Secondary Artifacts',
+        content_status: 'complete',
+        manifest_path: '/cache/doc/manifest.json',
+        output_limit_chars: 2000,
+      }
+      const rendered = renderResult(resultData)
+      expect(rendered[0]?.text).toContain('Artifacts: layout (200 bytes): /cache/doc/layout.json, images (800 bytes): /cache/doc/images')
+      expect(rendered[0]?.text).toContain('本次所选页面的提取 Markdown 已完整提供，可直接用于回答')
+      expect(rendered[0]?.text).toContain('/cache/doc/manifest.json')
+    })
+    it('renders clean message when markdown was not requested and does NOT claim complete delivery', () => {
+      const resultData: ResultView = {
+        state: 'completed',
+        source: 'provider',
+        cache_hit: false,
+        result_id: 'mr_no_md',
+        files: [{
+          file_id: 'mf_1',
+          name: 'scan.pdf',
+          artifacts: [
+            { kind: 'layout', path: '/cache/scan/layout.json', bytes: 300 },
+            { kind: 'images', path: '/cache/scan/images', bytes: 1200 },
+          ],
+        }],
+        content_status: 'not_requested',
+        manifest_path: '/cache/scan/manifest.json',
+        output_limit_chars: 2000,
+      }
+      const rendered = renderResult(resultData)
+      expect(rendered[0]?.text).not.toContain('完整提供')
+      expect(rendered[0]?.text).not.toContain('Complete document content delivered')
+      expect(rendered[0]?.text).toContain('本次解析未请求提取 Markdown 正文')
+      expect(rendered[0]?.text).toContain('Result manifest: /cache/scan/manifest.json')
+      expect(rendered[0]?.text).toContain('Artifacts: layout (300 bytes): /cache/scan/layout.json, images (1200 bytes): /cache/scan/images')
+    })
+
+    it('renders resume offset line when content is partial and read_offset_line is present', () => {
+      const resultData: ResultView = {
+        state: 'completed',
+        source: 'provider',
+        cache_hit: false,
+        result_id: 'mr_resume',
+        files: [{
+          file_id: 'mf_1',
+          name: 'doc.pdf',
+          artifacts: [{ kind: 'markdown', path: '/cache/doc/full.md', bytes: 8000 }],
+        }],
+        markdown_content: '# First Part of Text\nLine 2',
+        content_status: 'partial',
+        markdown_path: '/cache/doc/full.md',
+        read_offset_line: 42,
+        manifest_path: '/cache/doc/manifest.json',
+        output_limit_chars: 2000,
+      }
+      const rendered = renderResult(resultData)
+      expect(rendered[0]?.text).toContain('正文未完整提供（受输出限制截断 / Content truncated to output limit）')
+      expect(rendered[0]?.text).toContain('Full markdown artifact at: /cache/doc/full.md (resume line: offset=42).')
+      expect(rendered[0]?.text).toContain('Result manifest: /cache/doc/manifest.json')
+    })
+
+    it('does not clamp batch text at 16,384 when output_limit_chars is larger', () => {
+      const longText1 = 'A'.repeat(20000)
+      const longText2 = 'B'.repeat(20000)
+      const batchResult: BatchParseDocumentView = {
+        kind: 'batch',
+        state: 'completed',
+        output_limit_chars: 100000,
+        content_status: 'complete',
+        results: [
+          {
+            state: 'completed',
+            source: 'provider',
+            cache_hit: false,
+            result_id: 'mr_1',
+            files: [{ file_id: 'mf_1', name: 'f1.pdf', artifacts: [] }],
+            markdown_content: longText1,
+            content_status: 'complete',
+            manifest_path: '/cache/f1/manifest.json',
+            output_limit_chars: 100000,
+          },
+          {
+            state: 'completed',
+            source: 'provider',
+            cache_hit: false,
+            result_id: 'mr_2',
+            files: [{ file_id: 'mf_2', name: 'f2.pdf', artifacts: [] }],
+            markdown_content: longText2,
+            content_status: 'complete',
+            manifest_path: '/cache/f2/manifest.json',
+            output_limit_chars: 100000,
+          },
+        ],
+      }
+      const rendered = renderParseDocument(batchResult)
+      expect(rendered[0]?.text.length).toBeGreaterThan(40000)
+      expect(rendered[0]?.text).not.toContain('[Output truncated to limit]')
+      expect(rendered[0]?.text).toContain(longText1)
+      expect(rendered[0]?.text).toContain(longText2)
+    })
+
+    it('preserves all batch documents and failure items without silently eating them', () => {
+      const batchResult: BatchParseDocumentView = {
+        kind: 'batch',
+        state: 'partially-completed',
+        output_limit_chars: 50000,
+        content_status: 'partial',
+        results: [
+          {
+            state: 'completed',
+            source: 'provider',
+            cache_hit: false,
+            result_id: 'mr_1',
+            files: [{ file_id: 'mf_1', name: 'doc1.pdf', artifacts: [] }],
+            markdown_content: '# Doc 1 Content',
+            content_status: 'complete',
+            manifest_path: '/cache/doc1/manifest.json',
+            output_limit_chars: 50000,
+          },
+          {
+            state: 'failed',
+            source: 'provider',
+            file_id: 'mf_2',
+            name: 'doc2.pdf',
+            failure: failure('CORRUPT_FILE', 'File is corrupted and unreadable'),
+          },
+          {
+            state: 'completed',
+            source: 'provider',
+            cache_hit: false,
+            result_id: 'mr_3',
+            files: [{ file_id: 'mf_3', name: 'doc3.pdf', artifacts: [] }],
+            markdown_content: '# Doc 3 Content',
+            content_status: 'complete',
+            manifest_path: '/cache/doc3/manifest.json',
+            output_limit_chars: 50000,
+          },
+        ],
+      }
+      const rendered = renderParseDocument(batchResult)
+      const text = rendered[0]?.text ?? ''
+      expect(text).toContain('doc1.pdf')
+      expect(text).toContain('# Doc 1 Content')
+      expect(text).toContain('doc2.pdf')
+      expect(text).toContain('[CORRUPT_FILE] File is corrupted and unreadable')
+      expect(text).toContain('doc3.pdf')
+      expect(text).toContain('# Doc 3 Content')
     })
   })
 })

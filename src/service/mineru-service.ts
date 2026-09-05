@@ -30,6 +30,8 @@ const MAX_POLL_TIMEOUT_MS = 24 * 60 * 60 * 1000
 export type CredentialResolver = (reference: string, signal: AbortSignal) => Promise<string | undefined>
 export type SubmissionSource = 'cache' | 'shared-operation' | 'provider'
 
+export type ContentStatus = 'complete' | 'partial' | 'not_requested'
+
 export interface ArtifactView {
   readonly kind: string
   readonly path: string
@@ -41,6 +43,7 @@ export interface ResultFileView {
   readonly name: string
   readonly artifacts: readonly ArtifactView[]
   readonly artifacts_truncated?: boolean
+  readonly markdown_path?: string
 }
 
 export interface ResultView {
@@ -49,8 +52,10 @@ export interface ResultView {
   readonly cache_hit: boolean
   readonly result_id: string
   readonly files: readonly ResultFileView[]
-  readonly markdown_preview?: string
-  readonly preview_truncated: boolean
+  readonly markdown_content?: string
+  readonly content_status: ContentStatus
+  readonly markdown_path?: string
+  readonly read_offset_line?: number
   readonly manifest_path: string
   readonly output_limit_chars: number
 }
@@ -67,6 +72,9 @@ export interface BatchParseDocumentView {
   readonly kind: 'batch'
   readonly state: 'completed' | 'partially-completed' | 'failed'
   readonly results: readonly (ResultView | FailedParseView)[]
+  readonly output_limit_chars: number
+  readonly content_status?: ContentStatus
+  readonly results_omitted?: boolean
 }
 
 export type ParseDocumentView = ResultView | BatchParseDocumentView
@@ -99,6 +107,7 @@ export interface MinerUServiceOptions {
 interface PendingFileParse {
   readonly prepared: PreparedParseRequest
   readonly cacheKey: CacheKey
+  readonly markdownRequested: boolean
   source: SubmissionSource
   resultId?: MinerUResultId
   operation?: SharedOperation
@@ -132,6 +141,173 @@ function singlePreparedRequest(prepared: PreparedParseRequest, index: number): P
     sources: [source],
   }
 }
+
+export function safeStringSlice(str: string, maxLen: number): string {
+  if (str.length <= maxLen) return str
+  let end = maxLen
+  const code = str.charCodeAt(end - 1)
+  if (code >= 0xD800 && code <= 0xDBFF) {
+    end--
+  }
+  return str.slice(0, end)
+}
+
+export function truncateAtCleanBoundary(
+  fullText: string,
+  maxChars: number,
+): { text: string; truncated: boolean; resumeLine?: number } {
+  if (fullText.length <= maxChars) {
+    return { text: fullText, truncated: false }
+  }
+  if (maxChars <= 0) {
+    return { text: '', truncated: true, resumeLine: 1 }
+  }
+
+  const boundedSlice = safeStringSlice(fullText, maxChars)
+  const paragraphIndex = boundedSlice.lastIndexOf('\n\n')
+  const lineIndex = boundedSlice.lastIndexOf('\n')
+
+  let cutIndex = -1
+  if (paragraphIndex !== -1 && paragraphIndex >= Math.floor(maxChars * 0.7)) {
+    cutIndex = paragraphIndex + 2
+  } else if (lineIndex !== -1) {
+    cutIndex = lineIndex + 1
+  }
+
+  if (cutIndex > 0) {
+    const text = boundedSlice.slice(0, cutIndex)
+    let newlineCount = 0
+    for (let i = 0; i < text.length; i++) {
+      if (text.charCodeAt(i) === 10) newlineCount++
+    }
+    const resumeLine = newlineCount + 1
+    return { text, truncated: true, resumeLine }
+  }
+
+  const text = boundedSlice
+  return { text, truncated: true, resumeLine: 1 }
+}
+
+export function allocateReclaimedShares(lengths: readonly number[], totalBudget: number): number[] {
+  const result = new Array(lengths.length).fill(0)
+  const active = lengths.map((len, idx) => ({ idx, len }))
+  let remaining = totalBudget
+
+  while (active.length > 0) {
+    const share = Math.floor(remaining / active.length)
+    if (share <= 0) break
+    const fitIndex = active.findIndex(item => item.len <= share)
+    if (fitIndex !== -1) {
+      const item = active.splice(fitIndex, 1)[0]!
+      result[item.idx] = item.len
+      remaining -= item.len
+    } else {
+      for (const item of active) {
+        result[item.idx] = share
+      }
+      break
+    }
+  }
+  return result
+}
+
+export async function readMarkdownFile(
+  path: string,
+  totalBytes: number,
+  maxCharsToRead: number,
+): Promise<{ text: string; isCompleteFile: boolean }> {
+  if (totalBytes === 0) {
+    return { text: '', isCompleteFile: true }
+  }
+  const maxBytes = Math.min(totalBytes, Math.max(4096, (maxCharsToRead + 2048) * 4))
+  const handle = await open(path, 'r')
+  try {
+    const buffer = Buffer.alloc(maxBytes)
+    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0)
+    const text = new TextDecoder('utf-8').decode(buffer.subarray(0, bytesRead))
+    const isCompleteFile = bytesRead >= totalBytes
+    return { text, isCompleteFile }
+  } finally {
+    await handle.close()
+  }
+}
+
+export function findMarkdownArtifactPath(value: ResultView): string | undefined {
+  if (value.markdown_path !== undefined) return value.markdown_path
+  for (const file of value.files) {
+    if (file.markdown_path !== undefined) return file.markdown_path
+    const md = file.artifacts.find(artifact => artifact.kind === 'markdown')
+    if (md !== undefined) return md.path
+  }
+  return undefined
+}
+
+export function formatResultProse(value: ResultView): string {
+  const status: ContentStatus = value.content_status ?? (value.markdown_content !== undefined ? 'complete' : 'not_requested')
+  const lines = [
+    '**MinerU Parse Result** (Source: ' + value.source + ', Cache: ' + (value.cache_hit ? 'hit' : 'miss') + ')',
+  ]
+  const content = value.markdown_content
+  if (value.files.length > 0) {
+    for (let i = 0; i < value.files.length; i++) {
+      const file = value.files[i]!
+      lines.push('', '# Document: ' + file.name)
+      if (i === 0 && content !== undefined) {
+        lines.push('', content)
+      }
+      const secondary = file.artifacts.filter(artifact => artifact.kind !== 'markdown')
+      if (secondary.length > 0) {
+        lines.push('', 'Artifacts: ' + secondary.map(a => a.kind + ' (' + String(a.bytes) + ' bytes): ' + a.path).join(', '))
+      }
+      if (file.artifacts_truncated) {
+        lines.push('', '*(Artifact list truncated to output limit)*')
+      }
+    }
+  } else if (content !== undefined) {
+    lines.push('', content)
+  }
+
+  let footer: string
+  if (status === 'complete') {
+    footer = '\n---\n[✓ 本次所选页面的提取 Markdown 已完整提供，可直接用于回答。Complete document content delivered above. Artifact retained at: ' + value.manifest_path + ']'
+  } else if (status === 'partial') {
+    const mdPath = findMarkdownArtifactPath(value)
+    const resumeInfo = value.read_offset_line !== undefined ? ' (resume line: offset=' + String(value.read_offset_line) + ')' : ''
+    const mdGuidance = mdPath !== undefined
+      ? 'Full markdown artifact at: ' + mdPath + resumeInfo + '.'
+      : 'Full markdown artifact path unavailable.'
+    footer = '\n---\n[⚠ 正文未完整提供（受输出限制截断 / Content truncated to output limit）。' + mdGuidance + ' Result manifest: ' + value.manifest_path + ']'
+  } else {
+    footer = '\n---\n[ℹ 本次解析未请求提取 Markdown 正文 (Markdown text was not requested). Result manifest: ' + value.manifest_path + ']'
+  }
+  lines.push(footer)
+  return lines.join('\n')
+}
+
+export function formatParseDocumentProse(value: ParseDocumentView): string {
+  if (!('kind' in value)) return formatResultProse(value)
+  const sections = value.results.map(result =>
+    result.state === 'completed'
+      ? formatResultProse(result)
+      : '**' + result.name + '**: [' + result.failure.code + '] ' + result.failure.message
+  )
+  return '**MinerU Batch Result**\n- State: ' + value.state + '\n- Results: ' + String(value.results.length) + '\n\n' + sections.join('\n\n')
+}
+
+type RawParsedItem =
+  | { readonly state: 'failed'; readonly failureView: FailedParseView }
+  | {
+      readonly state: 'completed'
+      readonly item: PendingFileParse
+      readonly manifest: MinerUResultManifest
+      readonly fileId: string
+      readonly fileName: string
+      readonly markdownRequested: boolean
+      readonly markdownPath?: string
+      readonly markdownBytes?: number
+      readonly manifestPath: string
+      readonly secondaryArtifacts: readonly ArtifactView[]
+    }
 
 export class MinerUService {
   constructor(private readonly options: MinerUServiceOptions) {}
@@ -232,6 +408,7 @@ export class MinerUService {
       configuredVersion: 'configuredVersion' in resolved.config ? resolved.config.configuredVersion : undefined,
     })
     const pending: PendingFileParse[] = []
+    const markdownRequested = input.artifacts === undefined || input.artifacts.includes('markdown')
 
     try {
       for (let index = 0; index < prepared.request.files.length; index++) {
@@ -242,7 +419,7 @@ export class MinerUService {
           ? await this.options.results.get(cacheKey, one.request.requiredArtifacts, signal)
           : undefined
         if (hit !== undefined) {
-          pending.push({ prepared: one, cacheKey, source: 'cache', resultId: hit.id })
+          pending.push({ prepared: one, cacheKey, markdownRequested, source: 'cache', resultId: hit.id })
           this.diagnostic({
             level: 'info', phase: 'cache-hit', provider: resolved.provider.id,
             bytes: file.bytes, cacheHit: true,
@@ -257,6 +434,7 @@ export class MinerUService {
         pending.push({
           prepared: one,
           cacheKey,
+          markdownRequested,
           source: reservation.created ? 'provider' : 'shared-operation',
           operation: reservation.operation,
           created: reservation.created,
@@ -473,90 +651,392 @@ export class MinerUService {
     }
   }
 
-  private async markdownPreview(path: string, bytes: number, maxChars: number): Promise<{ text: string; truncated: boolean }> {
-    const maxBytes = Math.min(bytes, Math.max(1024, maxChars * 4))
-    const handle = await open(path, 'r')
-    try {
-      const buffer = Buffer.alloc(maxBytes)
-      const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0)
-      const text = new TextDecoder('utf-8').decode(buffer.subarray(0, bytesRead))
-      return { text: text.slice(0, maxChars), truncated: bytesRead < bytes || text.length > maxChars }
-    } finally {
-      await handle.close()
-    }
-  }
+  private fitSingleCandidate(
+    candidate: ResultView,
+    secondaryArtifacts: readonly ArtifactView[],
+    limit: number,
+  ): ResultView {
+    let view = candidate
+    let overhead = Math.max(JSON.stringify(view).length, formatResultProse(view).length)
+    if (overhead <= limit) return view
 
-  private fitResult(view: ResultView, limit: number): ResultView {
-    type MutableFile = Omit<ResultFileView, 'artifacts' | 'artifacts_truncated'> & {
-      artifacts: ArtifactView[]
-      artifacts_truncated?: boolean
-    }
-    const { markdown_preview: initialPreview, files: _initialFiles, ...base } = view
-    let preview = initialPreview
-    let outputTrimmed = false
-    const files: MutableFile[] = view.files.map(file => ({ ...file, artifacts: [...file.artifacts] }))
-    const build = (): ResultView => ({
-      ...base,
-      preview_truncated: base.preview_truncated || outputTrimmed,
-      files,
-      ...(preview === undefined ? {} : { markdown_preview: preview }),
-    })
-    let candidate = build()
-    if (JSON.stringify(candidate).length <= limit) return candidate
-    if (preview !== undefined) {
-      const fullPreview = preview
-      let low = 0
-      let high = fullPreview.length
-      while (low < high) {
-        const middle = Math.ceil((low + high) / 2)
-        preview = fullPreview.slice(0, middle)
-        if (JSON.stringify(build()).length <= limit) low = middle
-        else high = middle - 1
-      }
-      preview = fullPreview.slice(0, low)
-      outputTrimmed = low < fullPreview.length
-      candidate = build()
-    }
-    while (JSON.stringify(candidate).length > limit && files.some(file => file.artifacts.length > 0)) {
-      const target = files.find(file => file.artifacts.length > 0)
-      if (target === undefined) break
-      target.artifacts = target.artifacts.slice(0, -1)
-      target.artifacts_truncated = true
-      candidate = build()
-    }
-    if (JSON.stringify(candidate).length > limit) {
+    const strippedFiles: ResultFileView[] = view.files.map(f => ({
+      ...f,
+      artifacts: [],
+      ...(secondaryArtifacts.length > 0 ? { artifacts_truncated: true } : {}),
+    }))
+    view = { ...view, files: strippedFiles }
+    overhead = Math.max(JSON.stringify(view).length, formatResultProse(view).length)
+    if (overhead > limit) {
       throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds configured model output limit'))
     }
-    return candidate
+    return view
   }
 
-  private async projectResult(item: PendingFileParse, manifest: MinerUResultManifest): Promise<ResultView> {
-    const limit = this.config().output.maxInlineChars
-    const document = manifest.files[0]!
-    const markdown = document.artifacts.find(artifact => artifact.kind === 'markdown')
-    const preview = markdown === undefined
-      ? undefined
-      : await this.markdownPreview(
-        this.options.results.resolveArtifactAbsolutePath(item.cacheKey, markdown.relativePath),
-        markdown.bytes,
-        limit,
-      )
-    const artifacts = document.artifacts.map((artifact: ArtifactRef): ArtifactView => ({
-      kind: artifact.kind,
-      path: this.options.results.resolveArtifactAbsolutePath(item.cacheKey, artifact.relativePath),
-      bytes: artifact.bytes,
-    }))
-    return this.fitResult({
+  private async projectSingle(
+    data: Extract<RawParsedItem, { state: 'completed' }>,
+    limit: number,
+  ): Promise<ResultView> {
+    if (!data.markdownRequested) {
+      const baseFiles: ResultFileView[] = [{
+        file_id: data.fileId,
+        name: data.fileName,
+        artifacts: [...data.secondaryArtifacts],
+      }]
+      const candidate: ResultView = {
+        state: 'completed',
+        source: data.item.source,
+        cache_hit: data.item.source === 'cache',
+        result_id: data.manifest.id,
+        files: baseFiles,
+        content_status: 'not_requested',
+        manifest_path: data.manifestPath,
+        output_limit_chars: limit,
+      }
+      return this.fitSingleCandidate(candidate, data.secondaryArtifacts, limit)
+    }
+
+    const raw = await readMarkdownFile(data.markdownPath!, data.markdownBytes ?? 0, limit)
+    const markdownArtifact: ArtifactView = {
+      kind: 'markdown',
+      path: data.markdownPath!,
+      bytes: data.markdownBytes ?? 0,
+    }
+
+    const skeleton: ResultView = {
       state: 'completed',
-      source: item.source,
-      cache_hit: item.source === 'cache',
-      result_id: manifest.id,
-      files: [{ file_id: document.fileId, name: item.prepared.request.files[0]?.name ?? document.name, artifacts }],
-      ...(preview === undefined ? {} : { markdown_preview: preview.text }),
-      preview_truncated: preview?.truncated ?? false,
-      manifest_path: this.options.results.manifestAbsolutePath(item.cacheKey),
+      source: data.item.source,
+      cache_hit: data.item.source === 'cache',
+      result_id: data.manifest.id,
+      files: [{
+        file_id: data.fileId,
+        name: data.fileName,
+        artifacts: [markdownArtifact],
+        markdown_path: data.markdownPath,
+      }],
+      content_status: 'complete',
+      markdown_path: data.markdownPath,
+      manifest_path: data.manifestPath,
       output_limit_chars: limit,
-    }, limit)
+      markdown_content: '',
+    }
+
+    let overhead = Math.max(JSON.stringify(skeleton).length, formatResultProse(skeleton).length)
+    let baseArtifacts: ArtifactView[] = [markdownArtifact]
+    let baseArtifactsTruncated = false
+
+    if (overhead > limit) {
+      const strippedSkeleton: ResultView = {
+        ...skeleton,
+        files: [{ file_id: data.fileId, name: data.fileName, artifacts: [], artifacts_truncated: true, markdown_path: data.markdownPath }],
+      }
+      overhead = Math.max(JSON.stringify(strippedSkeleton).length, formatResultProse(strippedSkeleton).length)
+      if (overhead > limit) {
+        throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds configured model output limit'))
+      }
+      baseArtifacts = []
+      baseArtifactsTruncated = true
+    }
+
+    const avail = Math.max(0, limit - overhead)
+    const textBudget = Math.floor(avail / 1.05)
+
+    let contentStatus: ContentStatus
+    let content: string
+    let readOffsetLine: number | undefined
+    let artifactsTruncated = baseArtifactsTruncated
+
+    if (raw.text.length <= textBudget && raw.isCompleteFile) {
+      contentStatus = 'complete'
+      content = raw.text
+      readOffsetLine = undefined
+    } else {
+      contentStatus = 'partial'
+      const cut = truncateAtCleanBoundary(raw.text, textBudget)
+      content = cut.text
+      readOffsetLine = cut.resumeLine
+      if (data.secondaryArtifacts.length > 0) {
+        artifactsTruncated = true
+      }
+    }
+
+    let finalArtifacts: ArtifactView[] = baseArtifacts
+    if (contentStatus === 'complete' && !baseArtifactsTruncated && data.secondaryArtifacts.length > 0) {
+      const withSecondary = [markdownArtifact, ...data.secondaryArtifacts]
+      const testView: ResultView = {
+        state: 'completed',
+        source: data.item.source,
+        cache_hit: data.item.source === 'cache',
+        result_id: data.manifest.id,
+        files: [{ file_id: data.fileId, name: data.fileName, artifacts: withSecondary, markdown_path: data.markdownPath }],
+        content_status: contentStatus,
+        markdown_path: data.markdownPath,
+        manifest_path: data.manifestPath,
+        output_limit_chars: limit,
+        markdown_content: content,
+      }
+      if (JSON.stringify(testView).length <= limit && formatResultProse(testView).length <= limit) {
+        finalArtifacts = withSecondary
+      } else {
+        artifactsTruncated = true
+      }
+    }
+
+    let view: ResultView = {
+      state: 'completed',
+      source: data.item.source,
+      cache_hit: data.item.source === 'cache',
+      result_id: data.manifest.id,
+      files: [{
+        file_id: data.fileId,
+        name: data.fileName,
+        artifacts: finalArtifacts,
+        ...(artifactsTruncated ? { artifacts_truncated: true } : {}),
+        markdown_path: data.markdownPath,
+      }],
+      content_status: contentStatus,
+      markdown_path: data.markdownPath,
+      ...(readOffsetLine !== undefined ? { read_offset_line: readOffsetLine } : {}),
+      manifest_path: data.manifestPath,
+      output_limit_chars: limit,
+      markdown_content: content,
+    }
+
+    while (JSON.stringify(view).length > limit || formatResultProse(view).length > limit) {
+      if (view.files[0]?.artifacts.length && view.files[0].artifacts.length > 0) {
+        view = {
+          ...view,
+          files: [{ ...view.files[0]!, artifacts: [], artifacts_truncated: true }],
+        }
+      } else if (view.markdown_content && view.markdown_content.length > 0) {
+        const excess = Math.max(JSON.stringify(view).length - limit, formatResultProse(view).length - limit, 10)
+        const targetLen = Math.max(0, view.markdown_content.length - excess)
+        const cut = truncateAtCleanBoundary(raw.text, targetLen)
+        view = {
+          ...view,
+          content_status: 'partial',
+          markdown_content: cut.text,
+          read_offset_line: cut.resumeLine,
+        }
+      } else {
+        throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds configured model output limit'))
+      }
+    }
+
+    return view
+  }
+
+  private async projectBatch(
+    rawItems: readonly RawParsedItem[],
+    limit: number,
+  ): Promise<BatchParseDocumentView> {
+    const completedItems = rawItems.filter((i): i is Extract<RawParsedItem, { state: 'completed' }> => i.state === 'completed')
+
+    const fileTexts = new Map<string, { text: string; isCompleteFile: boolean }>()
+    for (const item of completedItems) {
+      if (item.markdownRequested && item.markdownPath) {
+        const raw = await readMarkdownFile(item.markdownPath, item.markdownBytes ?? 0, limit)
+        fileTexts.set(item.fileId, raw)
+      }
+    }
+
+    const skeletonResults: Array<ResultView | FailedParseView> = rawItems.map(item => {
+      if (item.state === 'failed') return item.failureView
+      const markdownArtifact: ArtifactView | undefined = item.markdownPath ? {
+        kind: 'markdown',
+        path: item.markdownPath,
+        bytes: item.markdownBytes ?? 0,
+      } : undefined
+      return {
+        state: 'completed',
+        source: item.item.source,
+        cache_hit: item.item.source === 'cache',
+        result_id: item.manifest.id,
+        files: [{
+          file_id: item.fileId,
+          name: item.fileName,
+          artifacts: markdownArtifact ? [markdownArtifact] : [],
+          markdown_path: item.markdownPath,
+        }],
+        content_status: item.markdownRequested ? 'complete' : 'not_requested',
+        markdown_path: item.markdownPath,
+        manifest_path: item.manifestPath,
+        output_limit_chars: limit,
+        ...(item.markdownRequested ? { markdown_content: '' } : {}),
+      }
+    })
+
+    const completedCount = completedItems.length
+    const batchState: BatchParseDocumentView['state'] =
+      completedCount === rawItems.length ? 'completed' : completedCount === 0 ? 'failed' : 'partially-completed'
+
+    let batchSkeleton: BatchParseDocumentView = {
+      kind: 'batch',
+      state: batchState,
+      output_limit_chars: limit,
+      content_status: 'complete',
+      results: skeletonResults,
+    }
+
+    let overhead = Math.max(JSON.stringify(batchSkeleton).length, formatParseDocumentProse(batchSkeleton).length)
+    let baseArtifactsStripped = false
+    if (overhead > limit) {
+      const strippedResults = skeletonResults.map(r => {
+        if (r.state === 'failed') return r
+        return {
+          ...r,
+          files: r.files.map(f => ({ ...f, artifacts: [], artifacts_truncated: true })),
+        }
+      })
+      batchSkeleton = { ...batchSkeleton, results: strippedResults }
+      overhead = Math.max(JSON.stringify(batchSkeleton).length, formatParseDocumentProse(batchSkeleton).length)
+      if (overhead > limit) {
+        throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds configured model output limit'))
+      }
+      baseArtifactsStripped = true
+    }
+
+    const avail = Math.max(0, limit - overhead)
+    const totalTextBudget = Math.floor(avail / 1.05)
+
+    const mdItems = completedItems.filter(i => i.markdownRequested)
+    const lengths = mdItems.map(i => fileTexts.get(i.fileId)?.text.length ?? 0)
+    const shares = allocateReclaimedShares(lengths, totalTextBudget)
+
+    const finalResults: Array<ResultView | FailedParseView> = rawItems.map(item => {
+      if (item.state === 'failed') return item.failureView
+      if (!item.markdownRequested) {
+        return {
+          state: 'completed',
+          source: item.item.source,
+          cache_hit: item.item.source === 'cache',
+          result_id: item.manifest.id,
+          files: [{
+            file_id: item.fileId,
+            name: item.fileName,
+            artifacts: baseArtifactsStripped ? [] : [...item.secondaryArtifacts],
+            ...(baseArtifactsStripped && item.secondaryArtifacts.length > 0 ? { artifacts_truncated: true } : {}),
+            markdown_path: undefined,
+          }],
+          content_status: 'not_requested',
+          manifest_path: item.manifestPath,
+          output_limit_chars: limit,
+        }
+      }
+
+      const mdIndex = mdItems.indexOf(item)
+      const share = shares[mdIndex] ?? 0
+      const raw = fileTexts.get(item.fileId) ?? { text: '', isCompleteFile: true }
+      const markdownArtifact: ArtifactView = {
+        kind: 'markdown',
+        path: item.markdownPath!,
+        bytes: item.markdownBytes ?? 0,
+      }
+
+      let contentStatus: ContentStatus
+      let content: string
+      let readOffsetLine: number | undefined
+      let artifactsTruncated = baseArtifactsStripped
+
+      if (raw.text.length <= share && raw.isCompleteFile) {
+        contentStatus = 'complete'
+        content = raw.text
+        readOffsetLine = undefined
+      } else {
+        contentStatus = 'partial'
+        const cut = truncateAtCleanBoundary(raw.text, share)
+        content = cut.text
+        readOffsetLine = cut.resumeLine
+        if (item.secondaryArtifacts.length > 0 || baseArtifactsStripped) {
+          artifactsTruncated = true
+        }
+      }
+
+      const fileArtifacts = baseArtifactsStripped ? [] : [markdownArtifact]
+
+      return {
+        state: 'completed',
+        source: item.item.source,
+        cache_hit: item.item.source === 'cache',
+        result_id: item.manifest.id,
+        files: [{
+          file_id: item.fileId,
+          name: item.fileName,
+          artifacts: fileArtifacts,
+          ...(artifactsTruncated ? { artifacts_truncated: true } : {}),
+          markdown_path: item.markdownPath,
+        }],
+        content_status: contentStatus,
+        markdown_path: item.markdownPath,
+        ...(readOffsetLine !== undefined ? { read_offset_line: readOffsetLine } : {}),
+        manifest_path: item.manifestPath,
+        output_limit_chars: limit,
+        markdown_content: content,
+      }
+    })
+
+    let batchContentStatus: ContentStatus
+    const completedResults = finalResults.filter((r): r is ResultView => r.state === 'completed')
+    if (completedResults.length === 0 || completedResults.every(r => r.content_status === 'not_requested')) {
+      batchContentStatus = 'not_requested'
+    } else if (completedResults.some(r => r.content_status === 'partial')) {
+      batchContentStatus = 'partial'
+    } else {
+      batchContentStatus = 'complete'
+    }
+
+    let batchView: BatchParseDocumentView = {
+      kind: 'batch',
+      state: batchState,
+      output_limit_chars: limit,
+      content_status: batchContentStatus,
+      results: finalResults,
+    }
+
+    while (JSON.stringify(batchView).length > limit || formatParseDocumentProse(batchView).length > limit) {
+      // Prioritize text: strip artifacts from completed results FIRST before cutting text
+      let strippedAnyArtifacts = false
+      const strippedResults = batchView.results.map(r => {
+        if (r.state === 'completed' && r.files.some(f => f.artifacts.length > 0)) {
+          strippedAnyArtifacts = true
+          return {
+            ...r,
+            files: r.files.map(f => ({ ...f, artifacts: [], artifacts_truncated: true })),
+          }
+        }
+        return r
+      })
+      if (strippedAnyArtifacts) {
+        batchView = { ...batchView, results: strippedResults }
+        continue
+      }
+
+      const candidates = batchView.results
+        .filter((r): r is ResultView => r.state === 'completed' && Boolean(r.markdown_content && r.markdown_content.length > 0))
+      if (candidates.length > 0) {
+        candidates.sort((a, b) => (b.markdown_content?.length ?? 0) - (a.markdown_content?.length ?? 0))
+        const target = candidates[0]!
+        const excess = Math.max(JSON.stringify(batchView).length - limit, formatParseDocumentProse(batchView).length - limit, 10)
+        const targetLen = Math.max(0, (target.markdown_content?.length ?? 0) - excess)
+        const raw = fileTexts.get(target.files[0]?.file_id ?? '')?.text ?? target.markdown_content!
+        const cut = truncateAtCleanBoundary(raw, targetLen)
+        const updatedTarget: ResultView = {
+          ...target,
+          content_status: 'partial',
+          markdown_content: cut.text,
+          read_offset_line: cut.resumeLine,
+        }
+        batchView = {
+          ...batchView,
+          content_status: 'partial',
+          results: batchView.results.map(r => r === target ? updatedTarget : r),
+        }
+      } else {
+        throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds configured model output limit'))
+      }
+    }
+
+    return batchView
   }
 
   private createWaitSignal(signal: AbortSignal, pollTimeoutMs: number | null | undefined): {
@@ -614,17 +1094,24 @@ export class MinerUService {
       wait.dispose()
     }
 
-    const views = await Promise.all(outcomes.map(async (outcome, index): Promise<ResultView | FailedParseView> => {
+    const rawItems: RawParsedItem[] = []
+
+    for (let index = 0; index < outcomes.length; index++) {
+      const outcome = outcomes[index]!
       const item = pending[index]!
       const file = item.prepared.request.files[0]!
       if (outcome.state === 'failed' || outcome.resultId === undefined) {
-        return {
+        rawItems.push({
           state: 'failed',
-          source: item.source,
-          file_id: file.fileId,
-          name: file.name,
-          failure: outcome.failure ?? failure('REMOTE_PARSE_FAILED', 'Remote parse failed'),
-        }
+          failureView: {
+            state: 'failed',
+            source: item.source,
+            file_id: file.fileId,
+            name: file.name,
+            failure: outcome.failure ?? failure('REMOTE_PARSE_FAILED', 'Remote parse failed'),
+          },
+        })
+        continue
       }
       const manifest = await this.options.results.get(
         item.cacheKey,
@@ -632,27 +1119,68 @@ export class MinerUService {
         signal,
       )
       if (manifest === undefined || manifest.id !== outcome.resultId) {
-        return {
+        rawItems.push({
           state: 'failed',
-          source: item.source,
-          file_id: file.fileId,
-          name: file.name,
-          failure: failure('CACHE_EVICTED', 'Published MinerU result is missing or corrupt'),
-        }
+          failureView: {
+            state: 'failed',
+            source: item.source,
+            file_id: file.fileId,
+            name: file.name,
+            failure: failure('CACHE_EVICTED', 'Published MinerU result is missing or corrupt'),
+          },
+        })
+        continue
       }
-      return await this.projectResult(item, manifest)
-    }))
+      const document = manifest.files[0]!
+      const markdownRequested = item.markdownRequested
+      const markdownRef = document.artifacts.find(artifact => artifact.kind === 'markdown')
+      if (markdownRequested && markdownRef === undefined) {
+        rawItems.push({
+          state: 'failed',
+          failureView: {
+            state: 'failed',
+            source: item.source,
+            file_id: document.fileId,
+            name: item.prepared.request.files[0]?.name ?? document.name,
+            failure: failure('REMOTE_PARSE_FAILED', 'Extracted markdown artifact is missing from result'),
+          },
+        })
+        continue
+      }
 
-    if (views.length === 1) {
-      const view = views[0]!
-      if (view.state === 'failed') throw new MinerUError(view.failure)
-      return view
+      const markdownPath = markdownRef !== undefined
+        ? this.options.results.resolveArtifactAbsolutePath(item.cacheKey, markdownRef.relativePath)
+        : undefined
+      const manifestPath = this.options.results.manifestAbsolutePath(item.cacheKey)
+      const secondaryArtifacts = document.artifacts
+        .filter(a => a.kind !== 'markdown')
+        .map((a: ArtifactRef): ArtifactView => ({
+          kind: a.kind,
+          path: this.options.results.resolveArtifactAbsolutePath(item.cacheKey, a.relativePath),
+          bytes: a.bytes,
+        }))
+
+      rawItems.push({
+        state: 'completed',
+        item,
+        manifest,
+        fileId: document.fileId,
+        fileName: item.prepared.request.files[0]?.name ?? document.name,
+        markdownRequested,
+        markdownPath,
+        markdownBytes: markdownRef?.bytes,
+        manifestPath,
+        secondaryArtifacts,
+      })
     }
-    const completed = views.filter(view => view.state === 'completed').length
-    return {
-      kind: 'batch',
-      state: completed === views.length ? 'completed' : completed === 0 ? 'failed' : 'partially-completed',
-      results: views,
+
+    const limit = this.config().output.maxInlineChars
+    if (rawItems.length === 1) {
+      const first = rawItems[0]!
+      if (first.state === 'failed') throw new MinerUError(first.failureView.failure)
+      return await this.projectSingle(first, limit)
     }
+
+    return await this.projectBatch(rawItems, limit)
   }
 }

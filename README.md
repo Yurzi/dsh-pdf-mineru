@@ -107,9 +107,20 @@ Agent 会自动根据文档长度和指令意图，智能选择同步返回或�
 
 | 工具名称 | 适用场景 | 说明 |
 | --- | --- | --- |
-| `mineru_parse_document` | 短篇文档 / 同步等待 | 同步解析文档，直接返回 Markdown 预览、产物清单与存储路径 |
-| `mineru_submit_parse_job` | 长篇文档 / 批量解析 | 注册为 DSH 原生后台任务（`mineru-N`），不阻塞当前对话 |
+| `mineru_parse_document` | 短篇文档 / 同步等待 | 同步解析文档，直接交付提取的正文 Markdown、正文完整性状态 (`content_status`)、产物清单与存储路径 |
+| `mineru_submit_parse_job` | 长篇文档 / 批量解析 | 注册为 DSH 原生后台任务（`mineru-N`），最终输出交付排版正文与完整性指引，不阻塞当前对话 |
 | `mineru_health` | 状态诊断 | 检查 MinerU 服务连通性、鉴权有效性及协议版本 |
+
+### 核心交付字段与正文状态说明
+
+调用 `mineru_parse_document` 或后台任务 `mineru_submit_parse_job` 完成后，交付结果包含可靠的正文与完整性判定：
+
+- `markdown_content`：提取的正文 Markdown 文本。
+- `content_status`：正文交付状态：
+  - `complete`：本次请求所选页面的提取 Markdown 已完整提供，可直接用于回答，无需重复读取正文文件。
+  - `partial`：提取正文存在但因输出预算截断，提供可读取的完整正文文件路径 (`markdown_path`) 及续读起始行号 (`read_offset_line`)，明确区分正文文件与结果清单 (`manifest_path`)。
+  - `not_requested`：本次请求未包含 `markdown` 产物。
+- `output.maxInlineChars`：单次响应（含批量）的整次字符预算（默认 200,000 字符），批量解析采用支持剩余额度回收的确定性均分策略，优先保障元信息、失败状态与正文展示。
 
 ### 常用解析参数（均可通过自然语言告知 Agent）
 
@@ -219,6 +230,8 @@ defaults:
 storage:
   storageRoot: /absolute/path/to/dsh/cache/pdf-mineru  # 默认在 $DSH_HOME/cache/pdf-mineru
   cacheEnabled: true
+output:
+  maxInlineChars: 200000  # 单次响应最大内联字符预算（UTF-16 字符），统一约束单文件与批量结果
 limits:
   maxFilesPerRequest: 1
   maxFileBytes: 209715200  # 200 MB

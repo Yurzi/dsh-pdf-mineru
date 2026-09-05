@@ -302,7 +302,7 @@ export const zh: Record<MineruKey, string> = {
   'field.retryBaseDelayMs': '基础重试延迟 (ms)',
   'field.retryMaxDelayMs': '最大重试延迟 (ms)',
 
-  'field.maxInlineChars': 'Markdown 预览字符上限',
+  'field.maxInlineChars': 'Markdown 内联字符上限',
 
   'field.maxFilesPerRequest': '单次请求最大文件数',
   'field.maxFileBytes': '单个源文件大小上限 (bytes)',

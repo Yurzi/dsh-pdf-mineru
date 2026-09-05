@@ -99,8 +99,8 @@ function summarize(result) {
     source: result.source,
     result_id: result.result_id,
     cache_hit: result.cache_hit,
-    preview_chars: typeof result.markdown_preview === 'string' ? result.markdown_preview.length : 0,
-    preview_truncated: result.preview_truncated,
+    content_chars: typeof result.markdown_content === 'string' ? result.markdown_content.length : 0,
+    content_status: result.content_status,
     files: Array.isArray(result.files) ? result.files.map(file => ({
       name: file.name,
       artifacts: Array.isArray(file.artifacts)

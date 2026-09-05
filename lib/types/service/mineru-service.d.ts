@@ -13,6 +13,7 @@ export interface ServiceSession {
 }
 export type CredentialResolver = (reference: string, signal: AbortSignal) => Promise<string | undefined>;
 export type SubmissionSource = 'cache' | 'shared-operation' | 'provider';
+export type ContentStatus = 'complete' | 'partial' | 'not_requested';
 export interface ArtifactView {
     readonly kind: string;
     readonly path: string;
@@ -23,6 +24,7 @@ export interface ResultFileView {
     readonly name: string;
     readonly artifacts: readonly ArtifactView[];
     readonly artifacts_truncated?: boolean;
+    readonly markdown_path?: string;
 }
 export interface ResultView {
     readonly state: 'completed';
@@ -30,8 +32,10 @@ export interface ResultView {
     readonly cache_hit: boolean;
     readonly result_id: string;
     readonly files: readonly ResultFileView[];
-    readonly markdown_preview?: string;
-    readonly preview_truncated: boolean;
+    readonly markdown_content?: string;
+    readonly content_status: ContentStatus;
+    readonly markdown_path?: string;
+    readonly read_offset_line?: number;
     readonly manifest_path: string;
     readonly output_limit_chars: number;
 }
@@ -46,6 +50,9 @@ export interface BatchParseDocumentView {
     readonly kind: 'batch';
     readonly state: 'completed' | 'partially-completed' | 'failed';
     readonly results: readonly (ResultView | FailedParseView)[];
+    readonly output_limit_chars: number;
+    readonly content_status?: ContentStatus;
+    readonly results_omitted?: boolean;
 }
 export type ParseDocumentView = ResultView | BatchParseDocumentView;
 export interface ProbeView {
@@ -71,6 +78,20 @@ export interface MinerUServiceOptions {
     readonly resolveCredential: CredentialResolver;
     readonly diagnostics?: MinerUDiagnosticSink;
 }
+export declare function safeStringSlice(str: string, maxLen: number): string;
+export declare function truncateAtCleanBoundary(fullText: string, maxChars: number): {
+    text: string;
+    truncated: boolean;
+    resumeLine?: number;
+};
+export declare function allocateReclaimedShares(lengths: readonly number[], totalBudget: number): number[];
+export declare function readMarkdownFile(path: string, totalBytes: number, maxCharsToRead: number): Promise<{
+    text: string;
+    isCompleteFile: boolean;
+}>;
+export declare function findMarkdownArtifactPath(value: ResultView): string | undefined;
+export declare function formatResultProse(value: ResultView): string;
+export declare function formatParseDocumentProse(value: ParseDocumentView): string;
 export declare class MinerUService {
     private readonly options;
     constructor(options: MinerUServiceOptions);
@@ -81,9 +102,9 @@ export declare class MinerUService {
     private prepare;
     private startBatch;
     private runOperation;
-    private markdownPreview;
-    private fitResult;
-    private projectResult;
+    private fitSingleCandidate;
+    private projectSingle;
+    private projectBatch;
     private createWaitSignal;
     /** Parse directly to immutable results. No plugin Job is created for this call. */
     parseDocument(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal, pollTimeoutMs?: number | null): Promise<ParseDocumentView>;
