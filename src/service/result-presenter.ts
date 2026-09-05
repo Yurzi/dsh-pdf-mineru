@@ -73,6 +73,7 @@ export interface ResultView {
   readonly ordered_images?: readonly ImageCandidateView[]
   readonly summary?: DocumentSummary
   readonly toc?: readonly DocumentHeading[]
+  readonly pages?: string
 }
 
 export interface FailedParseView {
@@ -469,14 +470,13 @@ export function extractMarkdownHeadings(fullText: string): DocumentHeading[] {
 
 export function formatResultProse(value: ResultView): string {
   const status: ContentStatus = value.content_status ?? (value.markdown_content !== undefined ? 'complete' : 'not_requested')
-  const lines = [
-    '**MinerU Parse Result** (Source: ' + value.source + ', Cache: ' + (value.cache_hit ? 'hit' : 'miss') + ')',
-  ]
+  const lines: string[] = []
   const content = value.markdown_content
   if (value.files.length > 0) {
     for (let i = 0; i < value.files.length; i++) {
       const file = value.files[i]!
-      lines.push('', '# Document: ' + file.name)
+      if (lines.length > 0) lines.push('')
+      lines.push('# Document: ' + file.name)
       if (i === 0 && content !== undefined) {
         lines.push('', content)
       }
@@ -489,16 +489,7 @@ export function formatResultProse(value: ResultView): string {
       }
     }
   } else if (content !== undefined) {
-    lines.push('', content)
-  }
-
-  if (value.inlined_images && value.inlined_images.length > 0) {
-    lines.push('', '**Inlined Visual Figures**:')
-    for (let idx = 0; idx < value.inlined_images.length; idx++) {
-      const img = value.inlined_images[idx]!
-      const dim = (img.width !== undefined && img.height !== undefined) ? ` (${String(img.width)}x${String(img.height)})` : ''
-      lines.push(`- Attached Image #${String(idx + 1)}: ${img.name}${dim}`)
-    }
+    lines.push(content)
   }
 
   if (status === 'partial' && value.toc && value.toc.length > 0) {
@@ -511,20 +502,46 @@ export function formatResultProse(value: ResultView): string {
     lines.push('', 'Note: To read specific sections, call read_pdf with pages="X-Y" or use the read tool starting from the given line offset.')
   }
 
+  const totalPages = value.summary?.page_count
+  const pagesLabel = value.pages ?? (totalPages !== undefined ? (totalPages > 1 ? `1-${totalPages}` : '1') : undefined)
+  const pagesParts: string[] = []
+  if (pagesLabel !== undefined) pagesParts.push(`Pages: ${pagesLabel}`)
+  if (totalPages !== undefined) pagesParts.push(`Total Pages: ${String(totalPages)}`)
+  const pagesInfo = pagesParts.length > 0 ? pagesParts.join(', ') + '. ' : ''
+
   let footer: string
   if (status === 'complete') {
-    footer = '\n---\n[Status: Content complete. Full document markdown delivered above. Artifact path: ' + value.manifest_path + ']'
+    footer = '\n---\n[Status: Content complete. ' + pagesInfo + 'Full requested document markdown delivered above.]'
   } else if (status === 'partial') {
     const mdPath = findMarkdownArtifactPath(value)
     const resumeInfo = value.read_offset_line !== undefined ? ' (resume line: offset=' + String(value.read_offset_line) + ')' : ''
     const mdGuidance = mdPath !== undefined
       ? 'Full markdown artifact at: ' + mdPath + resumeInfo + '.'
       : 'Full markdown artifact path unavailable.'
-    footer = '\n---\n[Status: Content partial (truncated to output limit). ' + mdGuidance + ' Manifest: ' + value.manifest_path + ']'
+    footer = '\n---\n[Status: Content partial (truncated to output limit). ' + pagesInfo + mdGuidance + ']'
   } else {
-    footer = '\n---\n[Status: Markdown content was not requested. Manifest: ' + value.manifest_path + ']'
+    footer = '\n---\n[Status: Markdown content was not requested.' + (pagesParts.length > 0 ? ' ' + pagesParts.join(', ') + '.' : '') + ']'
   }
   lines.push(footer)
+
+  if (value.inlined_images && value.inlined_images.length > 0) {
+    lines.push('', '**Inlined Visual Figures**:')
+    for (let idx = 0; idx < value.inlined_images.length; idx++) {
+      const img = value.inlined_images[idx]!
+      const dim = (img.width !== undefined && img.height !== undefined) ? ` (${String(img.width)}x${String(img.height)})` : ''
+      lines.push(`- Attached Image #${String(idx + 1)}: ${img.name}${dim}`)
+    }
+  } else if (value.ordered_images && value.ordered_images.length > 0) {
+    for (let idx = 0; idx < value.ordered_images.length; idx++) {
+      const img = value.ordered_images[idx]!
+      const pageStr = img.page !== undefined ? `Page ${String(img.page)}` : ''
+      const capStr = img.caption ? `"${img.caption}"` : ''
+      const meta = [pageStr, capStr].filter(Boolean).join(', ')
+      const metaStr = meta ? ` (${meta})` : ''
+      lines.push(`[Attached Image #${String(idx + 1)}]${metaStr}: ${img.path}`)
+    }
+  }
+
   return lines.join('\n')
 }
 

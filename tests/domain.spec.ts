@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { asCacheKey, asSessionId, createFileId } from '../src/domain/ids.js'
 import { MinerUError, sanitizeDiagnostic } from '../src/domain/errors.js'
-import { CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, normalizeFocusSelection, normalizePageSelection, type CanonicalParseRequest, type ParseDefaults, type ParseRequestInput } from '../src/domain/request.js'
+import { CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, narrowPageSelection, normalizeFocusSelection, normalizePageSelection, type CanonicalParseRequest, type ParseDefaults, type ParseRequestInput } from '../src/domain/request.js'
 import { computeCacheKey } from '../src/service/cache-key.js'
 import { RequestNormalizer, assertSourcesUnchanged, normalizePages } from '../src/service/request-normalizer.js'
 
@@ -78,6 +78,21 @@ describe('request normalization', () => {
     expect(normalizePageSelection(undefined)).toBeUndefined()
   })
 
+  it('narrows page selection safely to legal document page bounds', () => {
+    expect(narrowPageSelection(undefined, 50)).toEqual({ pagesSet: undefined, pagesLabel: '1-50' })
+    expect(narrowPageSelection(undefined, 1)).toEqual({ pagesSet: undefined, pagesLabel: '1' })
+    expect(narrowPageSelection(new Set([3]), 50)).toEqual({ pagesSet: new Set([3]), pagesLabel: '3' })
+    expect(narrowPageSelection(new Set([1, 2, 3]), 50)).toEqual({ pagesSet: new Set([1, 2, 3]), pagesLabel: '1-3' })
+    expect(narrowPageSelection(new Set([48, 49, 50, 51, 52]), 50)).toEqual({
+      pagesSet: new Set([48, 49, 50]),
+      pagesLabel: '48-50',
+    })
+    expect(narrowPageSelection(new Set([99, 100]), 50)).toEqual({
+      pagesSet: new Set([50]),
+      pagesLabel: '50',
+    })
+  })
+
   it('normalizes focus selection for single and array formats', () => {
     expect(normalizeFocusSelection('table')).toEqual(new Set(['table']))
     expect(normalizeFocusSelection(['text', 'image'])).toEqual(new Set(['text', 'image']))
@@ -85,6 +100,9 @@ describe('request normalization', () => {
     expect(normalizeFocusSelection('outline')).toEqual(new Set(['toc']))
     expect(normalizeFocusSelection(['text', 'toc'])).toEqual(new Set(['text', 'toc']))
     expect(normalizeFocusSelection(['text', 'outline'])).toEqual(new Set(['text', 'toc']))
+    expect(normalizeFocusSelection('artifacts')).toEqual(new Set(['artifacts']))
+    expect(normalizeFocusSelection('artifact')).toEqual(new Set(['artifacts']))
+    expect(normalizeFocusSelection(['text', 'artifacts'])).toEqual(new Set(['text', 'artifacts']))
     expect(normalizeFocusSelection(undefined)).toEqual(new Set(['all']))
     expect(() => normalizeFocusSelection('invalid')).toThrowError('Invalid focus option: invalid')
   })

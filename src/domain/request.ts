@@ -16,7 +16,7 @@ export type ArtifactKind = typeof ARTIFACT_KINDS[number]
 export type MinerUModel = 'pipeline' | 'vlm'
 export type ParseMethod = 'auto' | 'txt' | 'ocr'
 
-export const FOCUS_KINDS = ['all', 'text', 'table', 'image', 'toc'] as const
+export const FOCUS_KINDS = ['all', 'text', 'table', 'image', 'toc', 'artifacts'] as const
 export type FocusKind = typeof FOCUS_KINDS[number]
 
 export type PageSelection = number | string | readonly (number | string)[]
@@ -117,6 +117,46 @@ export function normalizePageRanges(input: string): string {
   return merged.map(({ start, end }) => start === end ? String(start) : `${String(start)}-${String(end)}`).join(',')
 }
 
+export function narrowPageSelection(
+  requested: ReadonlySet<number> | undefined,
+  totalPages: number,
+): { pagesSet: Set<number> | undefined; pagesLabel: string } {
+  const maxBound = Math.max(1, totalPages)
+  if (requested === undefined) {
+    const pagesLabel = maxBound > 1 ? `1-${maxBound}` : '1'
+    return { pagesSet: undefined, pagesLabel }
+  }
+
+  const valid = new Set<number>()
+  for (const p of requested) {
+    if (p >= 1 && p <= maxBound) {
+      valid.add(p)
+    }
+  }
+
+  if (valid.size === 0) {
+    const minReq = Math.min(...requested)
+    if (minReq > maxBound) {
+      valid.add(maxBound)
+    } else {
+      valid.add(1)
+    }
+  }
+
+  const sorted = [...valid].sort((a, b) => a - b)
+  const intervals: Array<{ start: number; end: number }> = []
+  for (const p of sorted) {
+    const last = intervals.at(-1)
+    if (last !== undefined && p === last.end + 1) {
+      last.end = p
+    } else {
+      intervals.push({ start: p, end: p })
+    }
+  }
+  const pagesLabel = intervals.map(({ start, end }) => start === end ? String(start) : `${start}-${end}`).join(',')
+  return { pagesSet: valid, pagesLabel }
+}
+
 export function normalizePageSelection(input: unknown): Set<number> | undefined {
   if (input === undefined || input === null) return undefined
   if (typeof input === 'number') {
@@ -161,6 +201,7 @@ function parseFocusToken(item: unknown): FocusKind {
   if (typeof item !== 'string') throw new TypeError(`Invalid focus option: ${String(item)}`)
   let trimmed = item.trim().toLowerCase()
   if (trimmed === 'outline') trimmed = 'toc'
+  if (trimmed === 'artifact') trimmed = 'artifacts'
   if (!FOCUS_KINDS.includes(trimmed as FocusKind)) {
     throw new TypeError(`Invalid focus option: ${String(item)}`)
   }

@@ -61,6 +61,7 @@ export interface ResultView {
     readonly ordered_images?: readonly ImageCandidateView[];
     readonly summary?: DocumentSummary;
     readonly toc?: readonly DocumentHeading[];
+    readonly pages?: string;
 }
 export interface FailedParseView {
     readonly state: 'failed';

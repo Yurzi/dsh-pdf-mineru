@@ -673,6 +673,57 @@ describe('MinerUService direct parsing', () => {
 
 
 
+  it('omits secondary artifacts by default when focus does not include artifacts', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    h.provider.extraArtifactsByFileName.set('input.pdf', [
+      { kind: 'layout', content: JSON.stringify({ data: 'x'.repeat(100) }) },
+      { kind: 'images', content: JSON.stringify({ data: 'y'.repeat(100) }) },
+    ])
+    h.provider.markdown = '# Essential Text\nContent'
+
+    const parsed = asResult(await h.service.parseDocument(
+      session('session-default-no-artifacts'),
+      { file_path: h.file },
+      new AbortController().signal,
+      null,
+    ))
+
+    expect(parsed.state).toBe('completed')
+    expect(parsed.markdown_content).toContain('Essential Text')
+    expect(parsed.files[0]?.artifacts).toHaveLength(1)
+    expect(parsed.files[0]?.artifacts[0]?.kind).toBe('markdown')
+    expect(parsed.files[0]?.artifacts_truncated).toBeUndefined()
+    const rendered = renderResult(parsed)
+    expect(rendered[0]?.text).not.toContain('Artifacts:')
+  })
+
+  it('delivers secondary artifacts and marks not_requested when focus is artifacts only', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    h.provider.extraArtifactsByFileName.set('input.pdf', [
+      { kind: 'layout', content: JSON.stringify({ data: 'layout data' }) },
+      { kind: 'images', content: JSON.stringify({ data: 'image data' }) },
+    ])
+    h.provider.markdown = '# Essential Text\nContent'
+
+    const parsed = asResult(await h.service.parseDocument(
+      session('session-artifacts-only'),
+      { file_path: h.file, focus: 'artifacts' },
+      new AbortController().signal,
+      null,
+    ))
+
+    expect(parsed.state).toBe('completed')
+    expect(parsed.content_status).toBe('not_requested')
+    expect(parsed.markdown_content).toBeUndefined()
+    expect(parsed.files[0]?.artifacts.some(a => a.kind === 'layout')).toBe(true)
+    expect(parsed.files[0]?.artifacts.some(a => a.kind === 'images')).toBe(true)
+    const rendered = renderResult(parsed)
+    expect(rendered[0]?.text).toContain('Artifacts:')
+    expect(rendered[0]?.text).toContain('Status: Markdown content was not requested')
+  })
+
   it('prioritizes text over secondary artifacts when budget is tight', async () => {
     const h = await harness()
     h.provider.complete = true
@@ -684,7 +735,7 @@ describe('MinerUService direct parsing', () => {
 
     const parsed = asResult(await h.service.parseDocument(
       session('session-priority'),
-      { file_path: h.file },
+      { file_path: h.file, focus: ['text', 'artifacts'] },
       new AbortController().signal,
       null,
     ))
@@ -736,7 +787,7 @@ describe('MinerUService direct parsing', () => {
     expect(text.length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
     expect(text).not.toContain('[Output truncated to limit]')
     expect(text).toContain('Full markdown artifact at:')
-    expect(text).toContain('Manifest:')
+    expect(text).not.toContain('Manifest:')
     expect(text).toContain('resume line: offset=')
     expect(parsed.content_status).toBe('partial')
   })
@@ -958,6 +1009,60 @@ describe('MinerUService direct parsing', () => {
       ))
       expect(page3Result.ordered_images).toHaveLength(0)
       expect(page3Result.markdown_content).not.toContain('Attached Image')
+    })
+
+    it('narrows out-of-bounds pages safely and formats status line with page numbers', async () => {
+      const h = await harness()
+      h.provider.complete = true
+      const contentList = [
+        { type: 'text', text: 'Page 1 text content.', page_idx: 0 },
+        { type: 'text', text: 'Page 2 text content.', page_idx: 1 },
+        { type: 'text', text: 'Page 3 text content.', page_idx: 2 },
+        { type: 'image', path: 'images/fig3.png', caption: 'Chart 3', page_idx: 2 },
+      ]
+      h.provider.extraArtifactsByFileName.set('input.pdf', [
+        { kind: 'content-list', content: JSON.stringify(contentList) },
+        { kind: 'images', content: 'fake-png-data' },
+      ])
+
+      // 1. Calling pages: '50-60' on a 3-page document narrows to page 3
+      const oobResult = asResult(await h.service.parseDocument(
+        session('session-oob-pages'),
+        { file_path: h.file, pages: '50-60' },
+        new AbortController().signal,
+        null,
+      ))
+      expect(oobResult.pages).toBe('3')
+      expect(oobResult.markdown_content).toContain('Page 3 text content')
+      expect(oobResult.markdown_content).not.toContain('Page 1 text content')
+      const oobRendered = renderResult(oobResult)[0]?.text ?? ''
+      expect(oobRendered).toContain('Status: Content complete. Pages: 3, Total Pages: 3. Full requested document markdown delivered above.')
+      expect(oobRendered).toContain('[Attached Image #1] (Page 3, "Chart 3"):')
+
+      // 2. Calling pages: '1-2' on a 3-page document shows Pages: 1-2, Total Pages: 3
+      const inBoundsResult = asResult(await h.service.parseDocument(
+        session('session-in-bounds-pages'),
+        { file_path: h.file, pages: '1-2' },
+        new AbortController().signal,
+        null,
+      ))
+      expect(inBoundsResult.pages).toBe('1-2')
+      expect(inBoundsResult.markdown_content).toContain('Page 1 text content')
+      expect(inBoundsResult.markdown_content).toContain('Page 2 text content')
+      expect(inBoundsResult.markdown_content).not.toContain('Page 3 text content')
+      const inBoundsRendered = renderResult(inBoundsResult)[0]?.text ?? ''
+      expect(inBoundsRendered).toContain('Status: Content complete. Pages: 1-2, Total Pages: 3. Full requested document markdown delivered above.')
+
+      // 3. Calling without pages shows Pages: 1-3, Total Pages: 3
+      const allResult = asResult(await h.service.parseDocument(
+        session('session-all-pages'),
+        { file_path: h.file },
+        new AbortController().signal,
+        null,
+      ))
+      expect(allResult.pages).toBe('1-3')
+      const allRendered = renderResult(allResult)[0]?.text ?? ''
+      expect(allRendered).toContain('Status: Content complete. Pages: 1-3, Total Pages: 3. Full requested document markdown delivered above.')
     })
   })
 })

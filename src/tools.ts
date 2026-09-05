@@ -124,6 +124,7 @@ const resultViewSchema: ObjectValueSchemaSpec = {
     ordered_images: { type: 'array', items: imageCandidateViewSchema },
     summary: documentSummarySchema,
     toc: { type: 'array', items: documentHeadingSchema },
+    pages: { type: 'string' },
   },
   additionalProperties: false,
 }
@@ -162,10 +163,10 @@ const readPdfParameters: ParameterSchemaSpec = {
   },
   focus: {
     oneOf: [
-      { type: 'string', enum: ['all', 'text', 'table', 'image', 'toc'], description: 'Focus content type' },
-      { type: 'array', items: { type: 'string', enum: ['all', 'text', 'table', 'image', 'toc'] }, description: 'Focus content types' },
+      { type: 'string', enum: ['all', 'text', 'table', 'image', 'toc', 'artifacts'], description: 'Focus content type' },
+      { type: 'array', items: { type: 'string', enum: ['all', 'text', 'table', 'image', 'toc', 'artifacts'] }, description: 'Focus content types' },
     ],
-    description: 'Content types to extract: "all" (default), "text" (paragraphs, headers, code, formulas), "table" (tables and captions), "image" (charts, figures, and captions), or "toc" (document outline / table of contents). Accepts a single kind or an array.',
+    description: 'Content types to extract: "all" (default), "text" (paragraphs, headers, code, formulas), "table" (tables and captions), "image" (charts, figures, and captions), "toc" (document outline / table of contents), or "artifacts" (secondary artifact files like layout.json, model.json, and extracted images). Accepts a single kind or an array.',
   },
   inline_images: {
     type: 'boolean',
@@ -590,6 +591,7 @@ export function registerTools(ctx: Context, getService: () => MinerUService, acc
               ...(item.page !== undefined ? { page: item.page } : {}),
             })),
           } : {}),
+          ...(single.pages !== undefined ? { pages: single.pages } : {}),
         }
       },
     },

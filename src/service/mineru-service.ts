@@ -4,8 +4,8 @@ import type { MinerUConfig, ProviderConfig } from '../config.js'
 import type { MinerUFailure, MinerUProviderId } from '../domain/errors.js'
 import { MinerUError, failure, toMinerUFailure } from '../domain/errors.js'
 import type { CacheKey, MinerUResultId } from '../domain/ids.js'
-import type { FocusKind, PageSelection, ParseRequestInput, PreparedParseRequest } from '../domain/request.js'
-import { normalizeFocusSelection, normalizePageSelection } from '../domain/request.js'
+import type { ArtifactKind, FocusKind, PageSelection, ParseRequestInput, PreparedParseRequest } from '../domain/request.js'
+import { narrowPageSelection, normalizeFocusSelection, normalizePageSelection } from '../domain/request.js'
 import type { ArtifactRef, MinerUResultManifest } from '../domain/result.js'
 import type {
   ProviderCallContext,
@@ -86,6 +86,7 @@ interface PendingFileParse {
   readonly markdownRequested: boolean
   readonly inputPages?: PageSelection
   readonly inputFocus?: FocusKind | readonly FocusKind[]
+  readonly inputArtifacts?: readonly ArtifactKind[]
   source: SubmissionSource
   resultId?: MinerUResultId
   operation?: SharedOperation
@@ -107,6 +108,7 @@ type RawParsedItem =
       readonly secondaryArtifacts: readonly ArtifactView[]
       readonly inputPages?: PageSelection
       readonly inputFocus?: FocusKind | readonly FocusKind[]
+      readonly inputArtifacts?: readonly ArtifactKind[]
     }
 
 export class MinerUService {
@@ -224,6 +226,7 @@ export class MinerUService {
         markdownRequested,
         inputPages: input.pages,
         inputFocus: input.focus,
+        inputArtifacts: input.artifacts,
         source: 'cache',
         resultId: hit.id,
       }
@@ -245,6 +248,7 @@ export class MinerUService {
       markdownRequested,
       inputPages: input.pages,
       inputFocus: input.focus,
+      inputArtifacts: input.artifacts,
       source: reservation.created ? 'provider' : 'shared-operation',
       operation: reservation.operation,
       created: reservation.created,
@@ -442,18 +446,57 @@ export class MinerUService {
       }
     }
 
-    const pagesSet = normalizePageSelection(data.inputPages)
+    const rawPagesSet = normalizePageSelection(data.inputPages)
     const focusSet = normalizeFocusSelection(data.inputFocus)
-    const imageArtifacts = data.secondaryArtifacts.filter(a => a.kind === 'images')
+    const artifactsRequested = focusSet.has('artifacts') || (data.inputArtifacts !== undefined && data.inputArtifacts.some(k => k !== 'markdown'))
 
-    let fullSourceText = ''
-    let orderedImages: ImageCandidateView[] = []
     let docSummary: DocumentSummary | undefined
     let toc: readonly DocumentHeading[] | undefined
+    let pagesSet: Set<number> | undefined = rawPagesSet
+    let pagesLabel: string | undefined
 
     if (contentList && contentList.length > 0) {
       docSummary = computeDocumentSummary(contentList, raw.text)
       toc = docSummary.toc
+      const narrowed = narrowPageSelection(rawPagesSet, docSummary.page_count ?? 1)
+      pagesSet = narrowed.pagesSet
+      pagesLabel = narrowed.pagesLabel
+    } else {
+      docSummary = { page_count: 1, table_count: 0, image_count: 0, equation_count: 0 }
+      const narrowed = narrowPageSelection(rawPagesSet, docSummary.page_count ?? 1)
+      pagesSet = narrowed.pagesSet
+      pagesLabel = narrowed.pagesLabel
+    }
+
+    if (focusSet.size === 1 && focusSet.has('artifacts')) {
+      const baseFiles: ResultFileView[] = [{
+        file_id: data.fileId,
+        name: data.fileName,
+        artifacts: [markdownArtifact, ...data.secondaryArtifacts],
+        markdown_path: data.markdownPath,
+      }]
+      const candidate: ResultView = {
+        state: 'completed',
+        source: data.item.source,
+        cache_hit: data.item.source === 'cache',
+        result_id: data.manifest.id,
+        files: baseFiles,
+        content_status: 'not_requested',
+        markdown_path: data.markdownPath,
+        manifest_path: data.manifestPath,
+        output_limit_chars: limit,
+        ...(docSummary !== undefined ? { summary: docSummary } : {}),
+        pages: pagesLabel,
+      }
+      return this.fitSingleCandidate(candidate, data.secondaryArtifacts, limit)
+    }
+
+    const imageArtifacts = data.secondaryArtifacts.filter(a => a.kind === 'images')
+
+    let fullSourceText = ''
+    let orderedImages: ImageCandidateView[] = []
+
+    if (contentList && contentList.length > 0) {
       const extracted = extractBlocksMarkdown(contentList, pagesSet, focusSet, imageArtifacts)
       fullSourceText = extracted.text
       orderedImages = extracted.orderedImages
@@ -469,6 +512,9 @@ export class MinerUService {
       const fallback = fallbackExtractFromMarkdown(rawText, imageArtifacts)
       fullSourceText = fallback.text
       orderedImages = fallback.orderedImages
+      if (!focusSet.has('all') && !focusSet.has('image')) {
+        orderedImages = []
+      }
       docSummary = fallback.summary
       toc = fallback.summary.toc
     }
@@ -477,11 +523,6 @@ export class MinerUService {
       const filteredToc = (pagesSet !== undefined && toc !== undefined)
         ? toc.filter(h => h.page !== undefined ? pagesSet.has(h.page) : true)
         : toc
-      const pagesLabel = typeof data.inputPages === 'string'
-        ? data.inputPages
-        : (Array.isArray(data.inputPages)
-          ? data.inputPages.join(',')
-          : (data.inputPages !== undefined ? String(data.inputPages) : undefined))
       const tocMd = formatTocMarkdown(filteredToc, { pageRange: pagesLabel })
       const isTocOnly = !focusSet.has('all') && !focusSet.has('text') && !focusSet.has('table') && !focusSet.has('image')
 
@@ -515,6 +556,7 @@ export class MinerUService {
       ordered_images: orderedImages,
       summary: docSummary,
       toc,
+      pages: pagesLabel,
     }
 
     let overhead = Math.max(JSON.stringify(skeleton).length, formatResultProse(skeleton).length)
@@ -551,7 +593,7 @@ export class MinerUService {
       const cut = truncateAtCleanBoundary(fullSourceText, textBudget)
       content = cut.text
       readOffsetLine = cut.resumeLine
-      if (data.secondaryArtifacts.length > 0) {
+      if (artifactsRequested && data.secondaryArtifacts.length > 0) {
         artifactsTruncated = true
       }
       if (!toc || toc.length === 0) {
@@ -560,7 +602,7 @@ export class MinerUService {
     }
 
     let finalArtifacts: ArtifactView[] = baseArtifacts
-    if (contentStatus === 'complete' && !baseArtifactsTruncated && data.secondaryArtifacts.length > 0) {
+    if (artifactsRequested && contentStatus === 'complete' && !baseArtifactsTruncated && data.secondaryArtifacts.length > 0) {
       const withSecondary = [markdownArtifact, ...data.secondaryArtifacts]
       const testView: ResultView = {
         state: 'completed',
@@ -604,13 +646,14 @@ export class MinerUService {
       ordered_images: orderedImages,
       summary: docSummary,
       ...(contentStatus === 'partial' || contentStatus === 'complete' ? { toc } : {}),
+      pages: pagesLabel,
     }
 
     while (JSON.stringify(view).length > limit || formatResultProse(view).length > limit) {
       if (view.files[0]?.artifacts.length && view.files[0].artifacts.length > 0) {
         view = {
           ...view,
-          files: [{ ...view.files[0]!, artifacts: [], artifacts_truncated: true }],
+          files: [{ ...view.files[0]!, artifacts: [], ...(artifactsRequested ? { artifacts_truncated: true } : {}) }],
         }
       } else if (view.summary !== undefined || (view.ordered_images !== undefined && view.ordered_images.length > 0)) {
         view = {
@@ -746,6 +789,7 @@ export class MinerUService {
       secondaryArtifacts,
       inputPages: pending.inputPages,
       inputFocus: pending.inputFocus,
+      inputArtifacts: pending.inputArtifacts,
     }
 
     const limit = this.config().output.maxInlineChars

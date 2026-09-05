@@ -6,7 +6,7 @@ export declare const ARTIFACT_KINDS: readonly ["markdown", "layout", "model-outp
 export type ArtifactKind = typeof ARTIFACT_KINDS[number];
 export type MinerUModel = 'pipeline' | 'vlm';
 export type ParseMethod = 'auto' | 'txt' | 'ocr';
-export declare const FOCUS_KINDS: readonly ["all", "text", "table", "image", "toc"];
+export declare const FOCUS_KINDS: readonly ["all", "text", "table", "image", "toc", "artifacts"];
 export type FocusKind = typeof FOCUS_KINDS[number];
 export type PageSelection = number | string | readonly (number | string)[];
 export interface ParseSemantics {
@@ -67,6 +67,10 @@ export interface ParseDefaults {
     readonly table: boolean;
 }
 export declare function normalizePageRanges(input: string): string;
+export declare function narrowPageSelection(requested: ReadonlySet<number> | undefined, totalPages: number): {
+    pagesSet: Set<number> | undefined;
+    pagesLabel: string;
+};
 export declare function normalizePageSelection(input: unknown): Set<number> | undefined;
 export declare function normalizeFocusSelection(input: unknown): Set<FocusKind>;
 export declare function normalizeArtifactKinds(kinds: readonly ArtifactKind[]): readonly ArtifactKind[];
