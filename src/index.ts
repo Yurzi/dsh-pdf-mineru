@@ -1,10 +1,9 @@
 import z from '@deepseek-ai/schemastery'
 import type { Context } from 'cordis'
-import { migrateConfig, type MinerUConfig, type ProviderConfig } from './config.js'
+import { parseConfig, type MinerUConfig, type ProviderConfig } from './config.js'
 import { ProviderRegistry } from './providers/registry.js'
 import { MinerUService } from './service/mineru-service.js'
 import { SharedOperationRegistry } from './service/shared-operations.js'
-import { mkdir } from 'node:fs/promises'
 import { StoragePaths } from './storage/paths.js'
 import { ProcessLock } from './storage/process-lock.js'
 import { StorageAccessGate } from './storage/access-gate.js'
@@ -39,7 +38,7 @@ const ProviderSchema = z.union([
 ])
 
 export const Config = z.object({
-  schemaVersion: z.number(),
+  schemaVersion: z.const(1),
   activeProvider: z.string(),
   providers: z.array(ProviderSchema),
   defaults: z.object({
@@ -53,7 +52,7 @@ export const Config = z.object({
   storage: z.object({
     storageRoot: z.string(),
     cacheEnabled: z.boolean(),
-    retainSources: z.boolean(),
+    retainSources: z.const(false),
     stagingTtlMs: z.number(),
   }),
   polling: z.object({
@@ -110,12 +109,13 @@ function parseDraftProvider(value: unknown, current: MinerUConfig): ProviderConf
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new TypeError('provider draft must be an object')
   const id = (value as Record<string, unknown>).id
   if (typeof id !== 'string') throw new TypeError('provider draft id is required')
-  return migrateConfig({ ...current, activeProvider: id, providers: [value] }).providers[0]!
+  return parseConfig({ ...current, activeProvider: id, providers: [value] }).providers[0]!
 }
 
 export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<() => Promise<void>> {
-  let persistedConfig = migrateConfig(entryConfig)
+  let persistedConfig = parseConfig(entryConfig)
   let fixedStorageRoot: string | undefined
+  let fixedLimits: MinerUConfig['limits'] | undefined
   let toolDisposer: (() => Promise<void>) | undefined
   let operations: SharedOperationRegistry | undefined
   const startup = new AbortController()
@@ -125,9 +125,16 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
   ctx.effect(() => () => startup.abort(), 'dsh-pdf-mineru startup cancellation')
 
   const validateRuntimeConfig = (value: unknown): MinerUConfig => {
-    const next = migrateConfig(value)
+    const next = parseConfig(value)
     if (fixedStorageRoot !== undefined && next.storage.storageRoot !== fixedStorageRoot) {
       throw new TypeError('storage.storageRoot cannot change while the MinerU plugin is running')
+    }
+    if (fixedLimits !== undefined) {
+      for (const key of Object.keys(fixedLimits) as Array<keyof MinerUConfig['limits']>) {
+        if (next.limits[key] !== fixedLimits[key]) {
+          throw new TypeError(`limits.${key} requires a MinerU plugin restart`)
+        }
+      }
     }
     return next
   }
@@ -144,6 +151,7 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
   })
   persistedConfig = validateRuntimeConfig(settingsScope.get())
   fixedStorageRoot = persistedConfig.storage.storageRoot
+  fixedLimits = { ...persistedConfig.limits }
   ctx.effect(
     () => settingsScope.watch(next => { persistedConfig = validateRuntimeConfig(next) }),
     'dsh-pdf-mineru settings watch',
@@ -153,11 +161,11 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
   const lock = new ProcessLock(paths)
 
   try {
-    await mkdir(paths.root, { recursive: true, mode: 0o700 })
+    await lock.initialize(startup.signal)
     startup.signal.throwIfAborted()
     const operationRegistry = new SharedOperationRegistry()
     operations = operationRegistry
-    const accessGate = new StorageAccessGate()
+    const accessGate = new StorageAccessGate({ paths, lock })
     const results = new ResultRepository(paths, {
       maxArtifactBytes: persistedConfig.limits.maxZipEntryBytes,
       maxJsonValidationBytes: Math.min(persistedConfig.limits.maxZipEntryBytes, 64 * 1024 * 1024),
@@ -171,7 +179,7 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
     const providers = new ProviderRegistry(runtimeConfig)
     const diagnostics = createStructuredDiagnosticSink(ctx.logger)
     const service = new MinerUService({
-      getConfig: runtimeConfig, providers, results, operations: operationRegistry, diagnostics,
+      getConfig: runtimeConfig, providers, results, operations: operationRegistry, diagnostics, accessGate,
       resolveCredential: async (reference, signal) => {
         signal.throwIfAborted()
         const credentials = ctx.get('credentials') as CredentialService | undefined
@@ -206,7 +214,6 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
       disposing ??= (async () => {
         await toolDisposer?.()
         await operationRegistry.shutdown()
-        if (lock.isHeld()) await lock.release()
       })()
       return disposing
     }
@@ -215,7 +222,6 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
   } catch (error) {
     await toolDisposer?.()
     if (operations !== undefined) await operations.shutdown()
-    if (lock.isHeld()) await lock.release()
     if (startup.signal.aborted || isInactiveContextError(error)) return async () => undefined
     throw error
   }

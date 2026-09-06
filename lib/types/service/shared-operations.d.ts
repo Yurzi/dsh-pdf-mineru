@@ -25,7 +25,6 @@ export declare class SharedOperation {
 export declare class SharedOperationRegistry {
     private readonly operations;
     private disposed;
-    private readonly coordinatorDisposers;
     private readonly operationKeys;
     private readonly operationTimeouts;
     private readonly started;
@@ -40,7 +39,6 @@ export declare class SharedOperationRegistry {
         readonly operation: SharedOperation;
         readonly created: boolean;
     };
-    registerCoordinator(dispose: () => void): () => void;
     get(cacheKey: CacheKey, authority: ProviderConfigId): SharedOperation | undefined;
     activeOperationIds(): ReadonlySet<OperationId>;
     activeOperationCount(): number;

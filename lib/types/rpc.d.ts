@@ -9,7 +9,7 @@
  * Security:
  *   - Authority: strictly 'loopback'
  *   - Credential values and tokens are never returned or leaked in responses/errors.
- *   - Errors sanitized via sanitizeDiagnostic.
+ *   - Errors sanitized via sanitizeDiagnostic and mapped to allowlisted actionable error codes.
  */
 import type { Context } from 'cordis';
 import type { MinerUConfig } from './config.js';
@@ -32,4 +32,8 @@ export type RpcResult<T> = {
     };
 };
 export declare const RPC_CHANNEL = "/dsh-pdf-mineru-api";
+export declare function mapRpcError(err: unknown): {
+    code: string;
+    message: string;
+};
 export declare function registerRpc(ctx: Context, deps: MineruRpcDeps): () => void | Promise<void>;

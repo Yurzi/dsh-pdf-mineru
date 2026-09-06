@@ -18,7 +18,8 @@ vi.mock('react', () => ({
 import type { Context } from 'cordis'
 import { defaultMinerUConfig, type MinerUConfig, type OfficialV4Config, type SelfHostedV2Config } from '../src/config.js'
 import { asProviderConfigId } from '../src/domain/ids.js'
-import { registerRpc, RPC_CHANNEL, type MineruRpcDeps, type RpcResult } from '../src/rpc.js'
+import { failure, MinerUError } from '../src/domain/errors.js'
+import { mapRpcError, registerRpc, RPC_CHANNEL, type MineruRpcDeps, type RpcResult } from '../src/rpc.js'
 import type { ProbeView } from '../src/service/mineru-service.js'
 import {
   activateProvider,
@@ -367,6 +368,59 @@ describe('MinerU RPC (registerRpc)', () => {
     if (!res.ok) {
       expect(res.error.code).toBe('mineru/not-found')
     }
+  })
+
+  it('maps MinerUError to allowlisted safe actionable error codes', async () => {
+    const { ctx, getHandler } = createMockContext()
+    const deps: MineruRpcDeps = {
+      ...maintenanceDeps(),
+      getConfig: vi.fn(() => defaultMinerUConfig()),
+      setConfig: vi.fn(),
+      probe: vi.fn(async () => {
+        throw new MinerUError(failure('STORAGE_LOCKED', 'Storage directory is currently locked by another process'))
+      }),
+    }
+
+    registerRpc(ctx, deps)
+    const handler = getHandler()
+
+    const res = await handler('mineru/probe', {}, new AbortController().signal)
+    expect(res).toEqual({
+      ok: false,
+      error: {
+        code: 'mineru/storage-locked',
+        message: 'Storage directory is currently locked by another process',
+      },
+    })
+  })
+
+  it('verifies mapRpcError covers key MinerU error codes and sanitizes output', () => {
+    expect(mapRpcError(new MinerUError(failure('CREDENTIAL_MISSING', 'API key required')))).toEqual({
+      code: 'mineru/credential-missing',
+      message: 'API key required',
+    })
+    expect(mapRpcError(new MinerUError(failure('AUTHENTICATION_FAILED', 'Bearer token_secret_123 invalid')))).toEqual({
+      code: 'mineru/auth-failed',
+      message: 'Bearer [REDACTED] invalid',
+    })
+    expect(mapRpcError(new MinerUError(failure('PROVIDER_RATE_LIMITED', 'Rate limit exceeded')))).toEqual({
+      code: 'mineru/provider-rate-limited',
+      message: 'Rate limit exceeded',
+    })
+    expect(mapRpcError(new MinerUError(failure('STORAGE_LOCKED', 'Lock contention')))).toEqual({
+      code: 'mineru/storage-locked',
+      message: 'Lock contention',
+    })
+    expect(mapRpcError(new TypeError('bad argument'))).toEqual({
+      code: 'mineru/invalid-argument',
+      message: 'bad argument',
+    })
+    const abortErr = new Error('aborted')
+    abortErr.name = 'AbortError'
+    expect(mapRpcError(abortErr)).toEqual({
+      code: 'mineru/cancelled',
+      message: 'aborted',
+    })
   })
 })
 

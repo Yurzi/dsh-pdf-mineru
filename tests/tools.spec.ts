@@ -14,7 +14,6 @@ vi.mock('@deepseek-ai/dsh-tools', async (importOriginal) => {
 import {
   registerTools,
   renderResult,
-  renderParseDocument,
 } from '../src/tools.js'
 import type { Context } from 'cordis'
 import type {
@@ -279,6 +278,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         { file_path: '/sample.pdf' },
         expect.any(AbortSignal),
         null,
+        true,
       )
       expect(outcome.status).toBe('completed')
       expect(outcome.detail).toBe('completed')
@@ -696,6 +696,34 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       }
     })
 
+    it('reports failed and omitted figures while preserving stable numbering', async () => {
+      const paths = [1, 2, 3].map(index => join(tmpdir(), 'mineru-figure-' + String(index) + '.png'))
+      await Promise.all(paths.map(path => writeFile(path, Buffer.from('fake-png-data'))))
+      try {
+        const saveImage = vi.fn()
+          .mockResolvedValueOnce({ attachmentId: 'att_1', mediaType: 'image/png', name: 'one.png', bytes: 13 })
+          .mockRejectedValueOnce(new Error('save failed'))
+          .mockResolvedValueOnce({ attachmentId: 'att_3', mediaType: 'image/png', name: 'three.png', bytes: 25 * 1024 * 1024 })
+        const service = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'provider' as const, cache_hit: false, result_id: 'mr_figures', files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }], content_status: 'complete' as const, manifest_path: '/cache/m.json', output_limit_chars: 20_000, ordered_images: paths.map((path, index) => ({ path, name: 'figure-' + String(index + 1) + '.png', media_type: 'image/png', bytes: 13, page: index + 1 })) })) } as unknown as MinerUService
+        const { ctx, registeredTools } = createMockContext()
+        ;(ctx.get as any) = vi.fn((name: string) => name === 'attachments' ? { saveImage } : name === 'llm' ? { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text', 'image'] })) } : undefined)
+        registerTools(ctx, () => service)
+        const tool = registeredTools.find(value => value.name === 'read_pdf')!
+        const exec = createMockExec()
+        ;(exec.agent as any).options = { provider: 'test-p', model: 'test-m' }
+        const value = await tool.execute({ file_path: '/paper.pdf', focus: 'image' }, exec) as ResultView
+        expect(value.inlined_images).toHaveLength(1)
+        expect(value.inlined_images![0]?.figure).toBe(1)
+        expect(value.ordered_images?.map(image => image.status)).toEqual(['available', 'failed', 'omitted'])
+        const text = (renderResult(value)[0] as any).text as string
+        expect(text).toContain('Figure 2 (Page 2)')
+        expect(text).toContain('[failed]')
+        expect(text).toContain('[omitted]')
+      } finally {
+        await Promise.all(paths.map(path => rm(path, { force: true })))
+      }
+    })
+
     it('formats extracted image paths for non-multimodal models when images are requested', async () => {
       const exec = createMockExec(true)
       const mockLlmTextOnly = {
@@ -744,7 +772,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         const rendered = readTool.output.render({ file_path: '/paper.pdf', focus: 'image' }, res)
         expect(rendered).toHaveLength(1)
         expect(rendered[0]?.text).not.toContain('**Extracted Images**:')
-        expect(rendered[0]?.text).toContain(`[Attached Image #1] (Page 1, "Diagram"): ${testImgPath}`)
+        expect(rendered[0]?.text).toContain(`Figure 1 (Page 1, "Diagram"): ${testImgPath}`)
         expect(rendered[0]?.text).not.toContain('manifest.json')
       } finally {
         await rm(testImgPath, { force: true })
@@ -873,7 +901,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       }
       const rendered = renderResult(resultData)
       expect(rendered[0]?.text).toContain('Status: Content partial (truncated to output limit)')
-      expect(rendered[0]?.text).toContain('Full markdown artifact at: /cache/doc/full.md')
+      expect(rendered[0]?.text).not.toContain('read_offset_line')
       expect(rendered[0]?.text).not.toContain('Manifest:')
     })
 
@@ -942,13 +970,12 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         markdown_content: '# First Part of Text\nLine 2',
         content_status: 'partial',
         markdown_path: '/cache/doc/full.md',
-        read_offset_line: 42,
         manifest_path: '/cache/doc/manifest.json',
         output_limit_chars: 2000,
       }
       const rendered = renderResult(resultData)
       expect(rendered[0]?.text).toContain('Status: Content partial (truncated to output limit)')
-      expect(rendered[0]?.text).toContain('Full markdown artifact at: /cache/doc/full.md (resume line: offset=42).')
+      expect(rendered[0]?.text).toContain('Full markdown artifact available in local result storage.')
       expect(rendered[0]?.text).not.toContain('Manifest:')
     })
 
@@ -975,8 +1002,8 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const rendered = renderResult(resultData)
       expect(rendered).toHaveLength(1)
       expect(rendered[0]?.text).not.toContain('**Extracted Images**:')
-      expect(rendered[0]?.text).toContain('[Attached Image #1] (Page 2, "Chart"): /cache/doc/images/fig1.png')
-      expect(rendered[0]?.text).toContain('[Attached Image #2] (Page 3): /cache/doc/images/fig2.png')
+      expect(rendered[0]?.text).toContain('Figure 1 (Page 2, "Chart"): /cache/doc/images/fig1.png')
+      expect(rendered[0]?.text).toContain('Figure 2 (Page 3): /cache/doc/images/fig2.png')
     })
 
 
@@ -1014,7 +1041,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       expect(rendered).toHaveLength(2)
       expect(rendered[0]).toMatchObject({ type: 'text' })
       expect((rendered[0] as any).text).toContain('Inlined Visual Figures')
-      expect((rendered[0] as any).text).toContain('Attached Image #1: figure1.png (800x600)')
+      expect((rendered[0] as any).text).toContain('Figure 1: figure1.png (800x600)')
       expect(rendered[1]).toEqual({
         type: 'image',
         attachment: resultData.inlined_images![0]!.attachmentRef,
@@ -1100,6 +1127,16 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       expect(invalidViolations).toContain('"value.inlined_images[0].attachmentRef" is not a declared property (additionalProperties: false)')
     })
 
+    it('rejects an empty nested result file object', () => {
+      const { ctx, registeredTools } = createMockContext()
+      registerTools(ctx, () => ({} as MinerUService))
+      const readTool = registeredTools.find(t => t.name === 'read_pdf')!
+      const fileSchema = (readTool.output.schema as any).properties.files.items
+      expect(fileSchema.properties.file_id.required).toBe(true)
+      expect(fileSchema.properties.name.required).toBe(true)
+      expect(fileSchema.properties.artifacts.required).toBe(true)
+    })
+
     it('renders document outline and guidance hint in prose when content_status is partial and toc has entries', () => {
       const resultData: ResultView = {
         state: 'completed',
@@ -1114,7 +1151,6 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         markdown_content: '# Introduction\nThis is the beginning...',
         content_status: 'partial',
         markdown_path: '/cache/paper/full.md',
-        read_offset_line: 25,
         manifest_path: '/cache/paper/manifest.json',
         output_limit_chars: 2000,
         toc: [
@@ -1133,7 +1169,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       expect(text).toContain('  - Methodology (line 45)')
       expect(text).toContain('    - Dataset Collection (line 70)')
       expect(text).toContain('- Experiments (line 120)')
-      expect(text).toContain('Note: To read specific sections, call read_pdf with pages="X-Y" or use the read tool starting from the given line offset.')
+      expect(text).not.toContain('starting from the given line offset')
       expect(text).toContain('Status: Content partial (truncated to output limit)')
     })
 
@@ -1151,7 +1187,6 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         markdown_content: 'Some plain text...',
         content_status: 'partial',
         markdown_path: '/cache/doc/full.md',
-        read_offset_line: 10,
         manifest_path: '/cache/doc/manifest.json',
         output_limit_chars: 2000,
         toc: [],

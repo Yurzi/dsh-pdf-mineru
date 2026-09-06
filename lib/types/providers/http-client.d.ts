@@ -19,13 +19,6 @@ export interface JsonRequestOptions<T = unknown> {
     readonly retry?: boolean;
     readonly validateResponse?: (parsed: Record<string, unknown>, response: Response) => T | void;
 }
-export interface ExecuteJsonRequestOptions<T = unknown> extends JsonRequestOptions<T> {
-    readonly client?: ProviderHttpClient;
-    readonly baseURL?: URL | string;
-    readonly provider?: MinerUProviderId;
-    readonly defaultRetry?: ProviderRetryOptions;
-    readonly providerLabel?: string;
-}
 /**
  * Resolves a request path against a base URL, preserving pathname prefix if any.
  */
@@ -50,14 +43,5 @@ export declare class ProviderHttpClient {
     readonly defaultRetry: ProviderRetryOptions;
     readonly providerLabel: string;
     constructor(options: ProviderHttpClientOptions);
-    requestJson<T>(options: JsonRequestOptions<T>): Promise<T>;
-    requestJson<T>(method: string, path: string, body: BodyInit | undefined, headers: Record<string, string> | undefined, context: ProviderCallContext, acceptedStatuses?: readonly number[], options?: {
-        operation?: ProviderRetryOperation;
-        retry?: boolean;
-        validateResponse?: (parsed: Record<string, unknown>, response: Response) => T | void;
-    }): Promise<T>;
+    requestJson<T>(opts: JsonRequestOptions<T>): Promise<T>;
 }
-/**
- * Unified helper to execute a JSON HTTP request with timeout, auth, status error handling, and retry.
- */
-export declare function executeJsonRequest<T>(options: ExecuteJsonRequestOptions<T>): Promise<T>;

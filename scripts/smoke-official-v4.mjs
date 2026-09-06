@@ -140,7 +140,7 @@ async function main() {
     const plugin = await import('../lib/index.js')
     const providerId = 'mp_official_smoke'
     const base = plugin.defaultMinerUConfig()
-    const config = plugin.migrateConfig({
+    const config = plugin.parseConfig({
       ...base,
       activeProvider: providerId,
       providers: [{

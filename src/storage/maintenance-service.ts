@@ -7,8 +7,8 @@
 
 import { createHash } from 'node:crypto'
 import { type Dirent } from 'node:fs'
-import { lstat, readdir, realpath, rm } from 'node:fs/promises'
-import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
+import { lstat, opendir, realpath, rm } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 import { throwMinerU } from '../domain/errors.js'
 import {
   asCacheKey,
@@ -32,6 +32,9 @@ const MAX_DIAGNOSTIC_LIMIT = 1_000
 const MAX_QUARANTINE_LIST_LIMIT = 1_000
 const MAX_GC_CANDIDATE_LIMIT = 1_000
 const MAX_QUARANTINE_CLEANUP_ENTRIES = 100
+const MAX_STATS_ENTRIES = 50_000
+const MAX_STATS_DEPTH = 16
+const MAX_STATS_TIME_MS = 2_000
 
 export type StorageMaintenanceArea = 'published-results' | 'staging' | 'quarantine'
 
@@ -61,6 +64,8 @@ export interface StorageAreaStatistics {
   readonly unexpectedEntryCount: number
   readonly unreadableEntryCount: number
   readonly depthLimitCount: number
+  readonly truncated: boolean
+  readonly complete: boolean
 }
 
 export interface StorageStatistics {
@@ -219,7 +224,7 @@ type NodeKind = 'missing' | 'directory' | 'file' | 'symlink' | 'unexpected' | 'u
 
 type SafeDirectory =
   | { readonly kind: 'missing' | 'symlink' | 'unexpected' | 'unreadable' }
-  | { readonly kind: 'entries'; readonly entries: readonly Dirent[] }
+  | { readonly kind: 'entries'; readonly entries: readonly Dirent[]; readonly truncated: boolean }
 
 interface UsageCounter {
   bytes: number
@@ -228,6 +233,9 @@ interface UsageCounter {
   skippedSymlinkCount: number
   unexpectedEntryCount: number
   unreadableEntryCount: number
+  depthLimitCount: number
+  truncated: boolean
+  logicalEntryCount: number
 }
 
 interface TraversalSummary {
@@ -250,6 +258,9 @@ function createUsage(): UsageCounter {
     skippedSymlinkCount: 0,
     unexpectedEntryCount: 0,
     unreadableEntryCount: 0,
+    depthLimitCount: 0,
+    truncated: false,
+    logicalEntryCount: 0,
   }
 }
 
@@ -342,24 +353,69 @@ export function cacheClearConfirmationToken(cacheKeys: readonly CacheKey[]): str
   const ordered = [...cacheKeys].sort()
   return 'cache-clear-' + createHash('sha256').update(JSON.stringify(ordered), 'utf8').digest('hex')
 }
-export const confirmationToken = cacheClearConfirmationToken
 
-async function readSafeDirectory(path: string): Promise<SafeDirectory> {
+async function isSafeReadableRoot(path: string, signal?: AbortSignal): Promise<boolean> {
+  const absolute = resolve(path)
+  const filesystemRoot = parse(absolute).root
+  const segments = absolute.slice(filesystemRoot.length).split(sep).filter(Boolean)
+  let current = filesystemRoot
+  for (const segment of segments) {
+    signal?.throwIfAborted()
+    current = join(current, segment)
+    try {
+      const details = await lstat(current)
+      if (details.isSymbolicLink() || !details.isDirectory()) return false
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return true
+      return false
+    }
+  }
+  return true
+}
+
+async function readSafeDirectory(path: string, signal?: AbortSignal): Promise<SafeDirectory> {
+  if (!await isSafeReadableRoot(path, signal)) return { kind: 'unreadable' }
   const kind = await classifyNode(path)
   if (kind !== 'directory') return { kind: kind === 'file' ? 'unexpected' : kind }
   try {
-    const entries = await readdir(path, { withFileTypes: true })
+    const directory = await opendir(path)
+    const entries: Dirent[] = []
+    for await (const entry of directory) {
+      entries.push(entry)
+      if (entries.length > MAX_STATS_ENTRIES) break
+    }
     entries.sort((left, right) => left.name.localeCompare(right.name))
-    return { kind: 'entries', entries }
+    return { kind: 'entries', entries, truncated: entries.length > MAX_STATS_ENTRIES }
   } catch (error) {
     return { kind: (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT' ? 'missing' : 'unreadable' }
   }
 }
 
-async function collectUsage(root: string, signal?: AbortSignal): Promise<UsageCounter> {
+async function collectUsage(
+  root: string,
+  signal?: AbortSignal,
+  logicalDepth?: number,
+  validateLogical: (value: string, path: string) => unknown = value => assertSafePathSegment(value, 'storage entry'),
+): Promise<UsageCounter> {
   const usage = createUsage()
+  if (!await isSafeReadableRoot(root, signal)) {
+    usage.unreadableEntryCount++
+    return usage
+  }
+  const deadline = Date.now() + MAX_STATS_TIME_MS
+  let visited = 0
 
-  const walk = async (path: string): Promise<void> => {
+  const walk = async (path: string, depth = 0): Promise<void> => {
+    if (visited >= MAX_STATS_ENTRIES || Date.now() > deadline) {
+      usage.truncated = true
+      return
+    }
+    if (depth > MAX_STATS_DEPTH) {
+      usage.depthLimitCount++
+      usage.truncated = true
+      return
+    }
+    visited++
     signal?.throwIfAborted()
     const kind = await classifyNode(path)
     if (kind === 'missing') return
@@ -389,7 +445,10 @@ async function collectUsage(root: string, signal?: AbortSignal): Promise<UsageCo
     }
 
     usage.directoryCount++
-    const directory = await readSafeDirectory(path)
+    if (logicalDepth === depth) {
+      try { validateLogical(basename(path), path); usage.logicalEntryCount++ } catch { /* not a logical entry */ }
+    }
+    const directory = await readSafeDirectory(path, signal)
     if (directory.kind !== 'entries') {
       if (directory.kind === 'symlink') usage.skippedSymlinkCount++
       else if (directory.kind === 'unreadable') usage.unreadableEntryCount++
@@ -397,7 +456,8 @@ async function collectUsage(root: string, signal?: AbortSignal): Promise<UsageCo
       return
     }
 
-    for (const entry of directory.entries) {
+    if (directory.truncated) usage.truncated = true
+    for (const entry of directory.entries.slice(0, MAX_STATS_ENTRIES)) {
       signal?.throwIfAborted()
       if (!isSafeSegment(entry.name)) {
         usage.unexpectedEntryCount++
@@ -407,7 +467,7 @@ async function collectUsage(root: string, signal?: AbortSignal): Promise<UsageCo
         usage.skippedSymlinkCount++
         continue
       }
-      await walk(join(path, entry.name))
+      await walk(join(path, entry.name), depth + 1)
     }
   }
 
@@ -415,17 +475,23 @@ async function collectUsage(root: string, signal?: AbortSignal): Promise<UsageCo
   return usage
 }
 
-function toAreaStatistics(usage: UsageCounter, logicalEntryCount: number): StorageAreaStatistics {
+function toAreaStatistics(usage: UsageCounter): StorageAreaStatistics {
   return {
     byteUsage: usage.bytes,
     byteUsageSaturated: false,
-    logicalEntryCount,
+    logicalEntryCount: usage.logicalEntryCount,
     regularFileCount: usage.regularFileCount,
     directoryCount: usage.directoryCount,
     skippedSymlinkCount: usage.skippedSymlinkCount,
     unexpectedEntryCount: usage.unexpectedEntryCount,
     unreadableEntryCount: usage.unreadableEntryCount,
-    depthLimitCount: 0,
+    depthLimitCount: usage.depthLimitCount,
+    truncated: usage.truncated,
+    complete: !usage.truncated
+      && usage.depthLimitCount === 0
+      && usage.skippedSymlinkCount === 0
+      && usage.unexpectedEntryCount === 0
+      && usage.unreadableEntryCount === 0,
   }
 }
 
@@ -436,56 +502,45 @@ export class StorageMaintenanceService {
     public readonly results: ResultRepository,
     public readonly operations: SharedOperationRegistry,
     public readonly lock: ProcessLock,
-    public readonly accessGate: StorageAccessGate = new StorageAccessGate(),
+    public readonly accessGate: StorageAccessGate = new StorageAccessGate({ paths, lock }),
   ) {
     if (paths.root !== results.paths.root || paths.root !== lock.paths.root) {
       throw new TypeError('StorageMaintenanceService paths must match its ResultRepository and ProcessLock')
     }
   }
 
-  static confirmationToken(cacheKeys: readonly CacheKey[]): string {
-    return cacheClearConfirmationToken(cacheKeys)
-  }
-
   async getStatistics(signal?: AbortSignal): Promise<StorageStatistics> {
-    const [
-      publishedUsage,
-      stagingUsage,
-      quarantineUsage,
-      publishedCount,
-      stagingCount,
-      quarantineCount,
-    ] = await Promise.all([
-      collectUsage(this.paths.resultsDir(), signal),
-      collectUsage(this.paths.stagingDir(), signal),
-      collectUsage(this.paths.quarantineDir(), signal),
-      this.countPublishedResultDirectories(signal),
-      this.countDirectDirectories(this.paths.stagingDir(), value => asOperationId(value), signal),
-      this.countDirectDirectories(this.paths.quarantineDir(), value => assertSafePathSegment(value, 'quarantine entry'), signal),
+    const [publishedUsage, stagingUsage, quarantineUsage] = await Promise.all([
+      collectUsage(this.paths.resultsDir(), signal, 2, (value, path) => {
+        const key = asCacheKey(value)
+        if (basename(dirname(path)) !== key.slice(0, 2)) throw new TypeError('cache prefix mismatch')
+      }),
+      collectUsage(this.paths.stagingDir(), signal, 1, value => asOperationId(value)),
+      collectUsage(this.paths.quarantineDir(), signal, 1),
     ])
 
     return {
       generatedAt: Date.now(),
-      publishedResults: toAreaStatistics(publishedUsage, publishedCount),
-      staging: toAreaStatistics(stagingUsage, stagingCount),
-      quarantine: toAreaStatistics(quarantineUsage, quarantineCount),
+      publishedResults: toAreaStatistics(publishedUsage),
+      staging: toAreaStatistics(stagingUsage),
+      quarantine: toAreaStatistics(quarantineUsage),
     }
   }
 
   async scanIntegrity(options: IntegrityScanOptions = {}): Promise<CacheIntegrityScanReport> {
     if (options.isolateInvalid !== true) return await this.scanIntegrityInternal(options)
 
-    return await this.lock.withLock(async () => {
-      const releaseExclusive = this.acquireDestructiveAccess()
-      try {
-        return await this.scanIntegrityInternal(options)
-      } finally {
-        releaseExclusive()
-      }
+    this.assertNoLocalOperations()
+    return await this.accessGate.runMaintenance(async scope => {
+      this.assertNoLocalOperations()
+      return await this.scanIntegrityInternal(options, scope)
     }, options.signal)
   }
 
-  private async scanIntegrityInternal(options: IntegrityScanOptions): Promise<CacheIntegrityScanReport> {
+  private async scanIntegrityInternal(
+    options: IntegrityScanOptions,
+    scope?: import('./process-lock.js').ProcessLockScope,
+  ): Promise<CacheIntegrityScanReport> {
     const resultLimit = boundedLimit(options.resultLimit, DEFAULT_RESULT_SCAN_LIMIT, MAX_RESULT_SCAN_LIMIT, 'resultLimit')
     const diagnosticLimit = boundedLimit(options.diagnosticLimit, DEFAULT_DIAGNOSTIC_LIMIT, MAX_DIAGNOSTIC_LIMIT, 'diagnosticLimit')
     const isolateInvalid = options.isolateInvalid === true
@@ -520,7 +575,8 @@ export class StorageMaintenanceService {
 
       if (isolateInvalid && inspection.status !== 'unreadable') {
         try {
-          await this.results.quarantine(resultDir, 'maintenance_invalid')
+          if (scope === undefined) throw new TypeError('Integrity isolation requires maintenance scope')
+          await this.results.quarantineScoped(this.lock, scope, resultDir, 'maintenance_invalid')
           quarantinedCount++
         } catch {
           addDiagnostic(diagnostics, 'published-results', cacheKey, 'quarantine-failed')
@@ -617,7 +673,7 @@ export class StorageMaintenanceService {
       totalCount,
       totalBytes,
       totalBytesSaturated: false,
-      truncated: totalCount > entries.length,
+      truncated: (root.kind === 'entries' && root.truncated) || totalCount > entries.length,
       skippedSymlinkCount,
       unexpectedEntryCount,
       unreadableEntryCount,
@@ -627,13 +683,10 @@ export class StorageMaintenanceService {
   async cleanupQuarantine(options: QuarantineCleanupOptions): Promise<QuarantineCleanupReport> {
     if (options.dryRun !== false) return await this.cleanupQuarantineInternal(options)
 
-    return await this.lock.withLock(async () => {
-      const releaseExclusive = this.acquireDestructiveAccess()
-      try {
-        return await this.cleanupQuarantineInternal(options)
-      } finally {
-        releaseExclusive()
-      }
+    this.assertNoLocalOperations()
+    return await this.accessGate.runMaintenance(async () => {
+      this.assertNoLocalOperations()
+      return await this.cleanupQuarantineInternal(options)
     }, options.signal)
   }
 
@@ -705,7 +758,7 @@ export class StorageMaintenanceService {
         continue
       }
 
-      if (usage.skippedSymlinkCount > 0 || usage.unexpectedEntryCount > 0 || usage.unreadableEntryCount > 0) {
+      if (usage.truncated || usage.depthLimitCount > 0 || usage.skippedSymlinkCount > 0 || usage.unexpectedEntryCount > 0 || usage.unreadableEntryCount > 0) {
         // Preserve malformed quarantine trees for manual investigation.
         skippedCount++
         continue
@@ -760,17 +813,10 @@ export class StorageMaintenanceService {
       return await this.clearCacheInternal(options, false, this.accessGate.activeReaderCount)
     }
 
-    return await this.lock.withLock(async () => {
-      const releaseExclusive = this.accessGate.tryAcquireExclusive()
-      if (releaseExclusive === undefined) {
-        const blocked = await this.clearCacheInternal({ ...options, dryRun: true }, false, this.accessGate.activeReaderCount)
-        return { ...blocked, dryRun: false, eligible: false, confirmationToken: undefined }
-      }
-      try {
-        return await this.clearCacheInternal(options, true, 0)
-      } finally {
-        releaseExclusive()
-      }
+    this.assertNoLocalOperations()
+    return await this.accessGate.runMaintenance(async () => {
+      this.assertNoLocalOperations()
+      return await this.clearCacheInternal(options, true, 0)
     }, options.signal)
   }
 
@@ -806,7 +852,7 @@ export class StorageMaintenanceService {
           return
         }
         const usage = await collectUsage(resultDir, options.signal)
-        if (usage.skippedSymlinkCount > 0 || usage.unexpectedEntryCount > 0 || usage.unreadableEntryCount > 0) {
+        if (usage.truncated || usage.depthLimitCount > 0 || usage.skippedSymlinkCount > 0 || usage.unexpectedEntryCount > 0 || usage.unreadableEntryCount > 0) {
           unsafeResultCount++
           skippedCount++
           addDiagnostic(diagnostics, 'published-results', cacheKey, 'unsafe-result')
@@ -897,7 +943,7 @@ export class StorageMaintenanceService {
       }
 
       const usage = await collectUsage(resultDir, options.signal)
-      if (usage.skippedSymlinkCount > 0 || usage.unexpectedEntryCount > 0 || usage.unreadableEntryCount > 0) {
+      if (usage.truncated || usage.depthLimitCount > 0 || usage.skippedSymlinkCount > 0 || usage.unexpectedEntryCount > 0 || usage.unreadableEntryCount > 0) {
         unsafeResultCount++
         addDiagnostic(diagnostics, 'published-results', cacheKey, 'unsafe-result')
         return
@@ -939,45 +985,10 @@ export class StorageMaintenanceService {
     }
   }
 
-  private acquireDestructiveAccess(): () => void {
+  private assertNoLocalOperations(): void {
     if (this.operations.activeOperationCount() > 0) {
       throwMinerU('STORAGE_LOCKED', 'MinerU storage is in use by an active parse operation')
     }
-    const releaseExclusive = this.accessGate.tryAcquireExclusive()
-    if (releaseExclusive === undefined) {
-      throwMinerU('STORAGE_LOCKED', 'MinerU storage is in use by an active reader')
-    }
-    if (this.operations.activeOperationCount() > 0) {
-      releaseExclusive()
-      throwMinerU('STORAGE_LOCKED', 'MinerU storage is in use by an active parse operation')
-    }
-    return releaseExclusive
-  }
-
-  private async countPublishedResultDirectories(signal?: AbortSignal): Promise<number> {
-    const traversal = await this.visitPublishedResults(Number.MAX_SAFE_INTEGER, signal, undefined, async () => undefined)
-    return traversal.scanned
-  }
-
-  private async countDirectDirectories<T>(
-    root: string,
-    parser: (value: string) => T,
-    signal?: AbortSignal,
-  ): Promise<number> {
-    const directory = await readSafeDirectory(root)
-    if (directory.kind !== 'entries') return 0
-    let count = 0
-    for (const entry of directory.entries) {
-      signal?.throwIfAborted()
-      if (!isSafeSegment(entry.name) || entry.isSymbolicLink()) continue
-      try {
-        parser(entry.name)
-      } catch {
-        continue
-      }
-      if (await classifyNode(join(root, entry.name)) === 'directory') count++
-    }
-    return count
   }
 
   private async visitPublishedResults(
@@ -986,16 +997,22 @@ export class StorageMaintenanceService {
     diagnostics: DiagnosticCollector | undefined,
     visitor: (cacheKey: CacheKey, resultDir: string) => Promise<void>,
   ): Promise<TraversalSummary> {
-    const root = await readSafeDirectory(this.paths.resultsDir())
+    const root = await readSafeDirectory(this.paths.resultsDir(), signal)
     if (root.kind !== 'entries') {
       this.recordDirectoryIssue(diagnostics, 'published-results', 'results', root.kind)
       return { scanned: 0, truncated: false, complete: root.kind === 'missing' }
     }
 
     let scanned = 0
-    let complete = true
+    let inspected = 0
+    const deadline = Date.now() + MAX_STATS_TIME_MS
+    let complete = !root.truncated
+    let truncated = root.truncated
     for (const prefixEntry of root.entries) {
       signal?.throwIfAborted()
+      if (inspected++ >= MAX_STATS_ENTRIES || Date.now() > deadline) {
+        return { scanned, truncated: true, complete: false }
+      }
       if (!isSafeSegment(prefixEntry.name) || !/^[a-f0-9]{2}$/.test(prefixEntry.name)) {
         complete = false
         addDiagnostic(diagnostics, 'published-results', prefixEntry.name, 'unexpected-entry')
@@ -1007,15 +1024,19 @@ export class StorageMaintenanceService {
         continue
       }
       const prefixPath = join(this.paths.resultsDir(), prefixEntry.name)
-      const prefix = await readSafeDirectory(prefixPath)
+      const prefix = await readSafeDirectory(prefixPath, signal)
       if (prefix.kind !== 'entries') {
         complete = false
         this.recordDirectoryIssue(diagnostics, 'published-results', prefixEntry.name, prefix.kind)
         continue
       }
+      if (prefix.truncated) { complete = false; truncated = true }
 
       for (const resultEntry of prefix.entries) {
         signal?.throwIfAborted()
+        if (inspected++ >= MAX_STATS_ENTRIES || Date.now() > deadline) {
+          return { scanned, truncated: true, complete: false }
+        }
         if (scanned >= limit) return { scanned, truncated: true, complete: false }
         if (!isSafeSegment(resultEntry.name) || resultEntry.isSymbolicLink()) {
           complete = false
@@ -1052,7 +1073,7 @@ export class StorageMaintenanceService {
       }
     }
 
-    return { scanned, truncated: false, complete }
+    return { scanned, truncated, complete }
   }
 
   private recordDirectoryIssue(

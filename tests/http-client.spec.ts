@@ -5,7 +5,6 @@ import { MinerUError } from '../src/domain/errors.js'
 import type { ProviderCallContext } from '../src/providers/provider.js'
 import {
   ProviderHttpClient,
-  executeJsonRequest,
   resolveProviderUrl,
   extractErrorMessage,
   createHttpStatusError,
@@ -140,8 +139,10 @@ describe('ProviderHttpClient', () => {
       expect(receivedAuth).toBe('Bearer secret-token')
     })
 
-    it('rejects HTTP redirects with redirect: error', async () => {
+    it('rejects HTTP redirects without following the target', async () => {
+      const requestedPaths: string[] = []
       server = createServer((req, res) => {
+        requestedPaths.push(req.url ?? '')
         res.writeHead(302, { location: '/somewhere' })
         res.end()
       })
@@ -157,9 +158,10 @@ describe('ProviderHttpClient', () => {
         client.requestJson({
           method: 'GET',
           path: '/redirect',
-          context: makeContext(),
+          context: makeContext({ retry: { maxRetries: 0 } }),
         }),
       ).rejects.toThrow()
+      expect(requestedPaths).toEqual(['/redirect'])
     })
 
     it('enforces request timeout with HTTP 408 status', async () => {
@@ -178,7 +180,7 @@ describe('ProviderHttpClient', () => {
         client.requestJson({
           method: 'GET',
           path: '/hang',
-          context: makeContext({ timeoutMs: 100 }),
+          context: makeContext({ timeoutMs: 100, retry: { maxRetries: 0 } }),
         }),
       ).rejects.toMatchObject({
         failure: expect.objectContaining({ code: 'PROVIDER_UNAVAILABLE', retryable: true }),
@@ -187,11 +189,8 @@ describe('ProviderHttpClient', () => {
     })
 
     it('aborts immediately when context.signal is triggered', async () => {
-      server = createServer((_req, res) => {
-        setTimeout(() => {
-          res.writeHead(200, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ ok: true }))
-        }, 1000)
+      server = createServer((_req, _res) => {
+        // Wait for client cancellation; no timer outlives this test.
       })
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
@@ -280,27 +279,6 @@ describe('ProviderHttpClient', () => {
 
       expect(attempts).toBe(2)
       expect(result.data).toBe('success')
-    })
-  })
-
-  describe('executeJsonRequest helper', () => {
-    it('executes request directly using executeJsonRequest function', async () => {
-      server = createServer((_req, res) => {
-        res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ success: true }))
-      })
-      await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
-      const port = getPort(server!)
-
-      const result = await executeJsonRequest<{ success: boolean }>({
-        baseURL: `http://127.0.0.1:${port}`,
-        provider: 'self-hosted-v2',
-        method: 'GET',
-        path: '/helper',
-        context: makeContext(),
-      })
-
-      expect(result).toEqual({ success: true })
     })
   })
 })

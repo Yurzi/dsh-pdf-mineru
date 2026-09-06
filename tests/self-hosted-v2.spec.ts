@@ -5,7 +5,6 @@ import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { asProviderConfigId, createFileId, type MinerUFileId } from '../src/domain/ids.js'
-import { parseProviderJobRef } from '../src/domain/schemas.js'
 import { MinerUError } from '../src/domain/errors.js'
 import type {
   ArtifactInput,
@@ -486,8 +485,8 @@ describe('SelfHostedV2Provider', () => {
       expect(requestBody).toContain('%PDF-1.4 report content')
 
       // Verify ProviderSubmission structure
-      const validatedRef = parseProviderJobRef(submission.ref)
-      expect(validatedRef.provider).toBe('self-hosted-v2')
+      expect(submission.ref.provider).toBe('self-hosted-v2')
+      expect(Object.keys(submission.ref).sort()).toEqual(['files', 'provider', 'taskId'])
       if (submission.ref.provider === 'self-hosted-v2') {
         expect(submission.ref.taskId).toBe('task_abc_123')
         expect(submission.ref.files).toEqual([

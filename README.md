@@ -106,14 +106,17 @@ Agent 会自动根据文档长度和指令意图，智能选择同步返回或�
 
 ### 核心交付字段与正文状态说明
 
-调用 `read_pdf` 或后台任务 `async_parse_pdf` 完成后，交付结果包含可靠的正文与完整性判定：
+`read_pdf` 直接返回阅读结果。`async_parse_pdf` 立即返回原生 `job_id`，完成后通过 `job_output` 提供英文摘要文本，不返回相同的正文结构。阅读结果字段如下：
 
 - `markdown_content`：提取的正文 Markdown 文本。
 - `content_status`：正文交付状态：
-  - `complete`：本次请求所选页面的提取 Markdown 已完整提供，可直接用于回答，无需重复读取正文文件。
-  - `partial`：提取正文存在但因输出预算截断，提供可读取的完整正文文件路径 (`markdown_path`) 及续读起始行号 (`read_offset_line`)，明确区分正文文件与结果清单 (`manifest_path`)。
-  - `not_requested`：本次请求未包含 `markdown` 产物。
-- `output.maxInlineChars`：单次响应的整次字符预算（默认 200,000 字符），优先保障元信息与正文展示。
+  - `complete`：本次选择已读完；若本次是续读，表示剩余正文已全部提供。
+  - `partial`：因输出预算分段，返回 `cursor`。下一次使用相同 `file_path` 与原样 `cursor`，不要再次传 `pages`／`focus`；逐次拼接 `markdown_content` 即为同一选择的完整正文。
+  - `not_requested`：只请求了产物列表等不包含正文的结果。
+- `markdown_path` 是完整原始 Markdown 产物，`manifest_path` 是结果清单。筛选重建的文本不与原始文件行号对应，故不再返回误导性的 `read_offset_line`。
+- `output.maxInlineChars`：单次阅读响应的字符预算（默认 200,000 个 UTF-16 code units），约束 JSON 和 Native 英文文本各自的大小，包括元信息、续读 token 与状态说明；图片二进制另有数量与字节上限。
+
+Cursor 是无签名、无服务端状态的读取定位 token，不是授权凭证。源文件仍须存在并保持不变；解析配置、结果身份或选择不匹配时需要重新开始。完全越界页码会明确报错，部分越界给出警告；没有可靠页码／类型映射时，不会假装完成不支持的筛选。
 
 ### 常用解析参数（均可通过自然语言告知 Agent）
 
@@ -121,7 +124,8 @@ Agent 会自动根据文档长度和指令意图，智能选择同步返回或�
 | --- | --- | --- | --- |
 | `file_path` | `string` | 全部 | 待解析/读取的本地文件路径（必填） |
 | `pages` | `number` / `string` / `number[]` | `read_pdf` | 1-based 页码选择，支持单页（如 `3`）、数组（如 `[1, 2, 5]`）或范围字符串（如 `"1-3, 5"`） |
-| `focus` | `string` / `string[]` | `read_pdf` | 关注内容类型：`all`（默认全部）、`text`（正文代码公式）、`table`（表格与表题）、`image`（图表与图题） |
+| `focus` | `string` / `string[]` | `read_pdf` | `all`（默认）、`text`、`table`、`image`、`toc` 或 `artifacts` |
+| `cursor` | `string` | `read_pdf` | 原样传回上一条部分阅读响应的 token；与 `pages`／`focus` 互斥，仍须传同一 `file_path` |
 | `inline_images` | `boolean` | `read_pdf` | 是否直接内联多模态图表（模型路由支持图片时默认开启） |
 | `poll_timeout_ms` | `number` | `read_pdf` | 最大同步等待超时毫秒数 |
 
@@ -151,7 +155,7 @@ flowchart LR
 ```
 
 - **统一工具分发**：Agent 发起的同步请求（`read_pdf`）直接返回结果，异步长任务（`async_parse_pdf`）交由 DSH 原生 JobRegistry 调度。
-- **智能缓存命中**：每次解析计算文件 SHA-256 与参数指纹，若命中缓存则秒级返回不可变产物。
+- **缓存复用**：按文件 SHA-256 与解析语义寻址；命中时无需重新提交上游解析，但仍校验本地源文件及产物。
 - **并发请求合并**：同进程内的并发重复请求由 `SharedOperationRegistry` 合并，避免重复向上游提交。
 - **双 Provider 适配**：上游适配自建 FastAPI v2 或官方云 v4，解析产物经校验后原子发布。
 
@@ -161,7 +165,7 @@ flowchart LR
 | --- | --- | --- |
 | **部署难度** | ⭐ **零门槛**（仅需配置 API Key） | 需自行部署 MinerU FastAPI 服务及模型环境 |
 | **硬件要求** | 无需本地 GPU，云端集群算力支持 | 推荐配备 NVIDIA GPU 显卡 |
-| **数据安全性** | 数据上传至 MinerU 官方云端解析 | **100% 数据私有化**，数据完全不出本地内网 |
+| **数据安全性** | 数据上传至 MinerU 官方云端解析 | 由自建服务的部署位置、网络与安全配置决定 |
 | **支持模型** | 原生支持 `pipeline` 与 `vlm` | 支持 `pipeline`，亦可通过 `modelMap` 映射自建 VLM 引擎 |
 | **单文件限制** | 单文件最大 200 MB，最多 200 页 | 取决于自建服务端硬件与配置 |
 | **网络协议** | 强制 HTTPS，安全传输 | 支持 HTTP / HTTPS，本地可配置 `allowInsecureHttp` |
@@ -224,6 +228,14 @@ limits:
 
 </details>
 
+### 多进程共享存储与升级
+
+多个进程可以共享同一 `storageRoot`，前提是同一主机、同一 PID 可见命名空间及支持 hard link 的一致本地文件系统。不支持 NFS、跨主机或互不可见 PID 的容器共享这一锁协议。
+
+升级时请先停止所有使用该目录的 MinerU 进程，再统一更新并重启。新协议的 `.process.lock` 是持久版本隔离标记，实际互斥与使用记录位于 `.lock/`；它不是应当在退出时删除的“残留锁”。遇到旧锁或损坏记录，请先确认所有相关进程已停止，再按错误提示人工恢复，切勿在活跃进程运行时删除协调文件。
+
+`storageRoot` 与 `limits.*` 在启动时固定。运行中的配置保存会拒绝这些值的变更；应修改宿主配置并重启插件，不能依赖一次被拒绝的保存自动生效。
+
 ---
 
 ## ❓ 常见问题 (FAQ)
@@ -239,7 +251,7 @@ limits:
 <details>
 <summary><strong>Q: 扫描版 PDF 或图片文档识别不准怎么办？</strong></summary>
 
-普通纯文本 PDF 建议使用默认设置以获得最高速度。对于扫描件、拍照文档或生僻字体文档，对 Agent 说明“开启 OCR 模式”或在设置中将 `ocr` 设为 `true`，MinerU 将调用 OCR 引擎逐页深度识别。
+普通纯文本 PDF 通常可以使用默认设置。对于扫描件或识别效果不佳的文档，在 MinerU 设置中将 **Default Parse Method** 改为 `ocr`；`ocr` 布尔值由该选择保持一致。模型工具不接受 `ocr`、`model` 等技术参数，不能通过向 `read_pdf` 添加这些参数切换解析方式。
 </details>
 
 <details>
@@ -252,10 +264,10 @@ limits:
 <details>
 <summary><strong>Q: 解析结果保存在哪里？如何清理缓存？</strong></summary>
 
-所有解析结果经过 SHA-256 内容哈希后安全存放在 `$DSH_HOME/cache/pdf-mineru/results/` 下，确保不会因重复解析浪费额度。
+解析结果按源文件内容、解析语义及 Provider 兼容标识寻址，默认存放在 `$DSH_HOME/cache/pdf-mineru/results/`。启用缓存复用时，后续阅读可复用已发布结果；同进程并发请求合并，但不同进程仍可能分别提交上游解析，不保证跨进程只计费一次。`storage.cacheEnabled=false` 仅禁用解析前的缓存复用，结果仍会不可变发布，不等同于清空缓存或强制覆盖已有结果。
 您可以在 **Settings → Plugins → MinerU** 的运维区域中：
 - 点击 **Verify Cache** 检查缓存完整性；
-- 点击 **Clear Cache** 一键安全清理旧缓存。
+- 点击 **Clear Cache** 预览，再显式确认清除。破坏性维护在存在活跃读取或解析时拒绝执行，不会为了清理而取消它们。
 </details>
 
 <details>

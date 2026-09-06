@@ -4,7 +4,7 @@
  * Enforces:
  *   - Strict identifier validation before path concatenation (prevents path traversal)
  *   - Relative POSIX artifact path containment within result/staging roots
- *   - Safe, deterministic directory layout per ARCHITECTURE.md §12.4
+ *   - Safe, deterministic directory layout documented in ARCHITECTURE.md
  */
 import { type CacheKey, type MinerUFileId, type OperationId } from '../domain/ids.js';
 export declare function defaultStorageRoot(): string;
@@ -23,6 +23,12 @@ export declare class StoragePaths {
     stagingManifestFile(operationId: OperationId | string): string;
     quarantineDir(name?: string): string;
     processLockFile(): string;
+    /** v2 bakery lock state directory (<root>/.lock). */
+    lockDir(): string;
+    /** v2 bakery claim directory (<root>/.lock/claims). */
+    lockClaimsDir(): string;
+    /** Cross-process storage use records (<root>/.lock/users). */
+    lockUsersDir(): string;
     resolveArtifactPath(cacheKey: CacheKey | string, relativePath: string): string;
     resolveStagingArtifactPath(operationId: OperationId | string, relativePath: string): string;
 }

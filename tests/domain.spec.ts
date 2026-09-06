@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { asCacheKey, asSessionId, createFileId } from '../src/domain/ids.js'
 import { MinerUError, sanitizeDiagnostic } from '../src/domain/errors.js'
 import { CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, narrowPageSelection, normalizeFocusSelection, normalizePageSelection, type CanonicalParseRequest, type ParseDefaults, type ParseRequestInput } from '../src/domain/request.js'
-import { computeCacheKey } from '../src/service/cache-key.js'
+import { computeCacheKey } from '../src/domain/cache-key.js'
 import { RequestNormalizer, assertSourcesUnchanged, normalizePages } from '../src/service/request-normalizer.js'
 
 const roots: string[] = []
@@ -79,17 +79,21 @@ describe('request normalization', () => {
   })
 
   it('narrows page selection safely to legal document page bounds', () => {
-    expect(narrowPageSelection(undefined, 50)).toEqual({ pagesSet: undefined, pagesLabel: '1-50' })
-    expect(narrowPageSelection(undefined, 1)).toEqual({ pagesSet: undefined, pagesLabel: '1' })
-    expect(narrowPageSelection(new Set([3]), 50)).toEqual({ pagesSet: new Set([3]), pagesLabel: '3' })
-    expect(narrowPageSelection(new Set([1, 2, 3]), 50)).toEqual({ pagesSet: new Set([1, 2, 3]), pagesLabel: '1-3' })
+    expect(narrowPageSelection(undefined, 50)).toEqual({ pagesSet: undefined, pagesLabel: '1-50', outOfRange: [], fullyOutOfRange: false })
+    expect(narrowPageSelection(undefined, 1)).toEqual({ pagesSet: undefined, pagesLabel: '1', outOfRange: [], fullyOutOfRange: false })
+    expect(narrowPageSelection(new Set([3]), 50)).toEqual({ pagesSet: new Set([3]), pagesLabel: '3', outOfRange: [], fullyOutOfRange: false })
+    expect(narrowPageSelection(new Set([1, 2, 3]), 50)).toEqual({ pagesSet: new Set([1, 2, 3]), pagesLabel: '1-3', outOfRange: [], fullyOutOfRange: false })
     expect(narrowPageSelection(new Set([48, 49, 50, 51, 52]), 50)).toEqual({
       pagesSet: new Set([48, 49, 50]),
       pagesLabel: '48-50',
+      outOfRange: [51, 52],
+      fullyOutOfRange: false,
     })
     expect(narrowPageSelection(new Set([99, 100]), 50)).toEqual({
-      pagesSet: new Set([50]),
-      pagesLabel: '50',
+      pagesSet: new Set(),
+      pagesLabel: '',
+      outOfRange: [99, 100],
+      fullyOutOfRange: true,
     })
   })
 

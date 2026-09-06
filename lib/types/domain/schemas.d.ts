@@ -11,7 +11,6 @@
 import { type ArtifactKind, type CanonicalParseRequest, type CanonicalSourceFile, type MinerUModel, type ParseMethod, type ParseSemantics } from './request.js';
 import { type ArtifactRef, type ParsedDocumentManifest, type ResultProducer, type MinerUResultManifest } from './result.js';
 import type { MinerUProviderId } from './errors.js';
-import type { ProviderJobRef, ProviderSubmittedFile } from '../providers/provider.js';
 export declare const VALID_MODELS: Set<MinerUModel>;
 export declare const VALID_PARSE_METHODS: Set<ParseMethod>;
 export declare const VALID_PROVIDERS: Set<MinerUProviderId>;
@@ -28,8 +27,6 @@ export declare function parseArtifactKind(input: unknown): ArtifactKind;
 export declare function parseParseSemantics(input: unknown): ParseSemantics;
 export declare function parseCanonicalSourceFile(input: unknown): CanonicalSourceFile;
 export declare function parseCanonicalParseRequest(input: unknown): CanonicalParseRequest;
-export declare function parseProviderSubmittedFile(input: unknown): ProviderSubmittedFile;
-export declare function parseProviderJobRef(input: unknown): ProviderJobRef;
 export declare function parseArtifactRef(input: unknown): ArtifactRef;
 export declare function parseParsedDocumentManifest(input: unknown): ParsedDocumentManifest;
 export declare function parseResultProducer(input: unknown): ResultProducer;

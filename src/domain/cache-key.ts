@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
-import { asCacheKey, type CacheKey } from '../domain/ids.js'
-import { CACHE_KEY_SPEC_VERSION, RESULT_SCHEMA_VERSION, type CanonicalParseRequest, type CanonicalSourceFile } from '../domain/request.js'
+import { asCacheKey, type CacheKey } from './ids.js'
+import { CACHE_KEY_SPEC_VERSION, RESULT_SCHEMA_VERSION, type CanonicalParseRequest, type CanonicalSourceFile } from './request.js'
 
 type CanonicalJson = null | boolean | number | string | readonly CanonicalJson[] | { readonly [key: string]: CanonicalJson }
 
@@ -14,10 +14,10 @@ function normalizeJson(value: unknown): CanonicalJson {
   if (Array.isArray(value)) return value.map(normalizeJson)
   if (typeof value === 'object') {
     const source = value as Record<string, unknown>
-    const target: Record<string, CanonicalJson> = {}
+    const target: Record<string, CanonicalJson> = Object.create(null) as Record<string, CanonicalJson>
     for (const rawKey of Object.keys(source).sort()) {
       const key = rawKey.normalize('NFC')
-      if (key in target) throw new TypeError('canonical JSON key normalization collision')
+      if (Object.hasOwn(target, key)) throw new TypeError('canonical JSON key normalization collision')
       const entry = source[rawKey]
       if (entry === undefined) throw new TypeError('canonical JSON cannot contain undefined')
       target[key] = normalizeJson(entry)

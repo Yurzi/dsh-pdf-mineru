@@ -6,8 +6,6 @@ import {
   parseCanonicalSourceFile,
   parseMinerUResultManifest,
   parseParsedDocumentManifest,
-  parseProviderJobRef,
-  parseProviderSubmittedFile,
   parseResultProducer,
 } from '../src/domain/schemas.js'
 import { asCacheKey, asFileId, asProviderConfigId, asResultId } from '../src/domain/ids.js'
@@ -15,7 +13,6 @@ import { CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, type ArtifactKind } from '../sr
 import { MINERU_RESULT_MANIFEST_SCHEMA_VERSION } from '../src/domain/result.js'
 import type { CanonicalParseRequest } from '../src/domain/request.js'
 import type { MinerUResultManifest } from '../src/domain/result.js'
-import type { ProviderJobRef } from '../src/providers/provider.js'
 
 const SHA256_A = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 const SHA256_B = 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210'
@@ -166,90 +163,6 @@ describe('Domain Schemas Runtime Parsers', () => {
       }
     })
 
-  })
-
-  describe('ProviderJobRef', () => {
-    it('parses self-hosted-v2 ProviderJobRef', () => {
-      const ref: ProviderJobRef = {
-        provider: 'self-hosted-v2',
-        taskId: 'task_12345',
-        files: [
-          {
-            dataId: 'stem_0',
-            fileId: asFileId('mf_0123456789abcdef0123456789ab_0'),
-            name: 'doc.pdf',
-          },
-        ],
-      }
-      expect(parseProviderJobRef(ref)).toEqual(ref)
-    })
-
-    it('parses official-v4 ProviderJobRef', () => {
-      const ref: ProviderJobRef = {
-        provider: 'official-v4',
-        batchId: 'batch_abc',
-        files: [
-          {
-            dataId: 'data_xyz',
-            fileId: asFileId('mf_0123456789abcdef0123456789ab_0'),
-            name: 'doc.pdf',
-          },
-        ],
-      }
-      expect(parseProviderJobRef(ref)).toEqual(ref)
-    })
-
-    it('rejects ProviderJobRef containing URLs, tokens, or query strings', () => {
-      expect(() =>
-        parseProviderJobRef({
-          provider: 'official-v4',
-          batchId: 'https://mineru.net/api/v4/extract-results/batch/123',
-          files: [],
-        }),
-      ).toThrow(/must not contain URLs/)
-
-      expect(() =>
-        parseProviderJobRef({
-          provider: 'self-hosted-v2',
-          taskId: 'task_123?token=secret123',
-          files: [],
-        }),
-      ).toThrow(/must not contain URLs/)
-
-      expect(() =>
-        parseProviderJobRef({
-          provider: 'official-v4',
-          batchId: 'batch_123',
-          files: [
-            {
-              dataId: 'Bearer eyJhbGciOi...',
-              fileId: 'mf_0123456789abcdef0123456789ab_0',
-              name: 'doc.pdf',
-            },
-          ],
-        }),
-      ).toThrow(/must not contain URLs/)
-    })
-
-    it('rejects forbidden extra fields such as presigned URLs or local paths', () => {
-      expect(() =>
-        parseProviderJobRef({
-          provider: 'official-v4',
-          batchId: 'batch_123',
-          files: [],
-          put_url: 'https://tos.volces.com/upload/signed',
-        }),
-      ).toThrow(/unknown property "put_url"/)
-
-      expect(() =>
-        parseProviderJobRef({
-          provider: 'official-v4',
-          batchId: 'batch_123',
-          files: [],
-          full_zip_url: 'https://cdn.mineru.net/results.zip',
-        }),
-      ).toThrow(/unknown property "full_zip_url"/)
-    })
   })
 
   describe('MinerUResultManifest & ArtifactRef', () => {

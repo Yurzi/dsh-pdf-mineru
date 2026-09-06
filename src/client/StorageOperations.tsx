@@ -51,12 +51,17 @@ async function callMaintenance<T>(
   return result.value
 }
 
+function isPartialArea(area: StorageAreaStatistics): boolean {
+  return area.complete === false || area.truncated === true || area.depthLimitCount > 0
+}
+
 function AreaMetric({ label, area }: { readonly label: string; readonly area: StorageAreaStatistics }) {
+  const partial = isPartialArea(area)
   return (
     <div className={css.metric}>
       <dt>{label}</dt>
-      <dd>{formatBytes(area.byteUsage, area.byteUsageSaturated)}</dd>
-      <dd>{area.logicalEntryCount}</dd>
+      <dd>{formatBytes(area.byteUsage, area.byteUsageSaturated || partial)}</dd>
+      <dd>{partial ? '>= ' : ''}{area.logicalEntryCount}</dd>
     </div>
   )
 }
@@ -220,6 +225,9 @@ export function StorageOperations({ rpc, t }: StorageOperationsProps) {
             <AreaMetric label={t('ops.staging')} area={state.stats.staging} />
             <AreaMetric label={t('ops.quarantine')} area={state.stats.quarantine} />
           </dl>
+          {[state.stats.publishedResults, state.stats.staging, state.stats.quarantine].some(isPartialArea) && (
+            <p role="status" className={css.fieldHint}>{t('ops.statsIncomplete')}</p>
+          )}
         </div>
       )}
 

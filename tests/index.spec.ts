@@ -222,6 +222,18 @@ describe('plugin composition lifecycle', () => {
     expect(runtime.settingsReplace).toHaveBeenCalledOnce()
     expect(runtime.settingsReplace).toHaveBeenCalledWith(next)
 
+    const changedLimits = { ...next, limits: { ...next.limits, maxZipEntryBytes: next.limits.maxZipEntryBytes + 1 } }
+    const rejected = await runtime.rpc.handler?.(
+      'mineru/config.set', { config: changedLimits }, new AbortController().signal,
+    )
+    expect(rejected).toMatchObject({
+      ok: false,
+      error: { code: 'mineru/invalid-argument', message: expect.stringContaining('requires a MinerU plugin restart') },
+    })
+    expect(runtime.settingsReplace).toHaveBeenCalledOnce()
+    expect(await runtime.rpc.handler?.('mineru/config.get', {}, new AbortController().signal))
+      .toMatchObject({ ok: true, value: { config: next } })
+
     await dispose()
   })
 
@@ -234,6 +246,12 @@ describe('plugin composition lifecycle', () => {
     expect(parsed.providers).toHaveLength(2)
     expect(parsed.providers[1]).toEqual(base.providers[1])
     expect(parsed.providers[1]).not.toHaveProperty('modelMap')
+    const unauthenticated = { ...base.providers[0] } as Record<string, unknown>
+    delete unauthenticated.apiKeyEnv
+    delete unauthenticated.configuredVersion
+    expect(() => validate({ ...base, providers: [unauthenticated] })).not.toThrow()
+    expect(() => validate({ ...base, schemaVersion: 2 })).toThrow()
+    expect(() => validate({ ...base, storage: { ...base.storage, retainSources: true } })).toThrow()
     expect(() => validate({
       ...base,
       providers: [{ ...base.providers[0], type: 'unsupported-provider' }],

@@ -6,5 +6,4 @@ export * from './process-lock.js';
 export * from './access-gate.js';
 export * from './artifact-sink.js';
 export * from './result-repository.js';
-export * from './batch-artifact-router.js';
 export * from './maintenance-service.js';

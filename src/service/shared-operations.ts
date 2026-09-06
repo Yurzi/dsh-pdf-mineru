@@ -76,7 +76,6 @@ export class SharedOperation {
 export class SharedOperationRegistry {
   private readonly operations = new Map<string, SharedOperation>()
   private disposed = false
-  private readonly coordinatorDisposers = new Set<() => void>()
   private readonly operationKeys = new WeakMap<SharedOperation, string>()
   private readonly operationTimeouts = new WeakMap<SharedOperation, number>()
   private readonly started = new WeakSet<SharedOperation>()
@@ -137,12 +136,6 @@ export class SharedOperationRegistry {
     return reserved
   }
 
-  registerCoordinator(dispose: () => void): () => void {
-    if (this.disposed) { dispose(); return () => undefined }
-    this.coordinatorDisposers.add(dispose)
-    return () => { this.coordinatorDisposers.delete(dispose) }
-  }
-
   get(cacheKey: CacheKey, authority: ProviderConfigId): SharedOperation | undefined {
     return this.operations.get(`${cacheKey}:${authority}`)
   }
@@ -158,8 +151,6 @@ export class SharedOperationRegistry {
   dispose(): void {
     this.disposed = true
     const error = new MinerUError(failure('CANCELLED', 'MinerU plugin disposed', true))
-    for (const dispose of this.coordinatorDisposers) dispose()
-    this.coordinatorDisposers.clear()
     for (const operation of [...this.operations.values()]) {
       if (!this.release(operation, error)) operation.abort(error)
     }

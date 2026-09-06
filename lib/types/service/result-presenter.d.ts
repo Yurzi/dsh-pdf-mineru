@@ -18,7 +18,7 @@ export interface ResultFileView {
 export interface DocumentHeading {
     readonly level: number;
     readonly title: string;
-    readonly line: number;
+    readonly line?: number;
     readonly page?: number;
 }
 export interface DocumentSummary {
@@ -35,6 +35,7 @@ export interface ImageCandidateView {
     readonly caption?: string;
     readonly media_type: string;
     readonly bytes: number;
+    readonly status?: 'available' | 'unavailable' | 'unsupported' | 'failed' | 'omitted';
 }
 export interface InlinedImageView {
     readonly attachment_id: string;
@@ -44,6 +45,7 @@ export interface InlinedImageView {
     readonly height?: number;
     readonly bytes?: number;
     readonly attachmentRef?: ImageAttachmentRef;
+    readonly figure?: number;
 }
 export interface ResultView {
     readonly state: 'completed';
@@ -54,7 +56,6 @@ export interface ResultView {
     readonly markdown_content?: string;
     readonly content_status: ContentStatus;
     readonly markdown_path?: string;
-    readonly read_offset_line?: number;
     readonly manifest_path: string;
     readonly output_limit_chars: number;
     readonly inlined_images?: readonly InlinedImageView[];
@@ -62,6 +63,9 @@ export interface ResultView {
     readonly summary?: DocumentSummary;
     readonly toc?: readonly DocumentHeading[];
     readonly pages?: string;
+    /** Opaque exact-text continuation token, present only when partial. */
+    readonly cursor?: string;
+    readonly warnings?: readonly string[];
 }
 export interface FailedParseView {
     readonly state: 'failed';
@@ -93,7 +97,7 @@ export interface ContentListBlock {
 }
 export declare function getBlockCategory(type?: string): 'text' | 'table' | 'image';
 export declare function formatCaption(caption: unknown): string;
-export declare function getRasterMediaType(ext: string): 'image/jpeg' | 'image/webp' | 'image/gif' | 'image/png';
+export declare function getRasterMediaType(ext: string): 'image/jpeg' | 'image/webp' | 'image/gif' | 'image/png' | undefined;
 export declare function formatTocMarkdown(headings: readonly DocumentHeading[] | undefined, options?: {
     pageRange?: string;
 }): string;
@@ -113,14 +117,11 @@ export declare function truncateAtCleanBoundary(fullText: string, maxChars: numb
     truncated: boolean;
     resumeLine?: number;
 };
-export declare function allocateReclaimedShares(lengths: readonly number[], totalBudget: number): number[];
-export declare function readMarkdownFile(path: string, totalBytes: number, maxCharsToRead: number): Promise<{
+export declare function readMarkdownFile(path: string, totalBytes: number, _maxCharsToRead: number, summaryOnly?: boolean): Promise<{
     text: string;
     isCompleteFile: boolean;
 }>;
 export declare function findMarkdownArtifactPath(value: ResultView): string | undefined;
 export declare function extractMarkdownHeadings(fullText: string): DocumentHeading[];
 export declare function formatResultProse(value: ResultView): string;
-export declare function formatParseDocumentProse(value: ParseDocumentView): string;
 export declare function formatSingleSummaryProse(value: ResultView): string;
-export declare function formatParseSummaryProse(value: ParseDocumentView): string;

@@ -35,7 +35,6 @@ import {
   type MinerUResultManifest,
 } from './result.js'
 import type { MinerUProviderId } from './errors.js'
-import type { ProviderJobRef, ProviderSubmittedFile } from '../providers/provider.js'
 
 export const VALID_MODELS = new Set<MinerUModel>(['pipeline', 'vlm'])
 export const VALID_PARSE_METHODS = new Set<ParseMethod>(['auto', 'txt', 'ocr'])
@@ -249,53 +248,6 @@ export function parseCanonicalParseRequest(input: unknown): CanonicalParseReques
     semantics,
     requiredArtifacts,
   }
-}
-
-export function parseProviderSubmittedFile(input: unknown): ProviderSubmittedFile {
-  const obj = assertPlainObject(input, 'ProviderSubmittedFile')
-  assertNoAdditionalProperties(obj, ['dataId', 'fileId', 'name'], 'ProviderSubmittedFile')
-
-  const dataId = assertNoUrlOrSecret(
-    assertNonEmptyString(obj['dataId'], 'ProviderSubmittedFile.dataId'),
-    'ProviderSubmittedFile.dataId',
-  )
-  const fileId = asFileId(assertNonEmptyString(obj['fileId'], 'ProviderSubmittedFile.fileId'))
-  const name = assertSafeFileName(obj['name'], 'ProviderSubmittedFile.name')
-
-  return { dataId, fileId, name }
-}
-
-export function parseProviderJobRef(input: unknown): ProviderJobRef {
-  const obj = assertPlainObject(input, 'ProviderJobRef')
-  const provider = obj['provider']
-
-  if (provider === 'self-hosted-v2') {
-    assertNoAdditionalProperties(obj, ['provider', 'taskId', 'files'], 'ProviderJobRef (self-hosted-v2)')
-    const taskId = assertNoUrlOrSecret(
-      assertNonEmptyString(obj['taskId'], 'ProviderJobRef.taskId'),
-      'ProviderJobRef.taskId',
-    )
-    if (!Array.isArray(obj['files'])) {
-      throw new TypeError('ProviderJobRef.files must be an array')
-    }
-    const files = obj['files'].map(f => parseProviderSubmittedFile(f))
-    return { provider: 'self-hosted-v2', taskId, files }
-  }
-
-  if (provider === 'official-v4') {
-    assertNoAdditionalProperties(obj, ['provider', 'batchId', 'files'], 'ProviderJobRef (official-v4)')
-    const batchId = assertNoUrlOrSecret(
-      assertNonEmptyString(obj['batchId'], 'ProviderJobRef.batchId'),
-      'ProviderJobRef.batchId',
-    )
-    if (!Array.isArray(obj['files'])) {
-      throw new TypeError('ProviderJobRef.files must be an array')
-    }
-    const files = obj['files'].map(f => parseProviderSubmittedFile(f))
-    return { provider: 'official-v4', batchId, files }
-  }
-
-  throw new TypeError(`unknown provider in ProviderJobRef: "${String(provider)}"`)
 }
 
 export function parseArtifactRef(input: unknown): ArtifactRef {

@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Replaced instance-held lock bypass and unsafe stale-file reclamation with scoped, cancellable local-filesystem bakery coordination and explicit mutation authority.
+- Protected readers, image processing, producers, staging cleanup, and destructive maintenance across processes sharing a storage root; rejected symlinked traversal and publication ancestors.
+- Added exact, Unicode-safe `read_pdf` continuation cursors and honest out-of-range/unsupported-selection errors; Native output includes the actual continuation token.
+- Restricted image reads to manifest-declared artifacts, bounded attachments, and separated stable Figure identifiers from successful attachment order.
+- Made cache reads non-mutating and published-result isolation explicitly guarded; the first valid publication wins for equivalent content even when filenames or nondeterministic provider bytes differ.
+- Bounded maintenance traversal and exposed incomplete statistics as lower bounds in the settings UI.
+
+### Changed
+
+- Unified configuration parsing, snapshotted execution settings, and made startup-bound storage/payload limits explicit. Split settings sections and preserved numeric input drafts.
+- Separated parse synopsis from body projection and aligned required tool schemas, English guidance, and actionable RPC failures.
+- Consolidated current usage, architecture, deployment limits, and upgrade guidance; removed obsolete lock instructions and temporary audit/work logs.
+- **Storage protocol upgrade:** stop every MinerU process sharing the root before upgrading. `.process.lock` is now a persistent version fence, not a lock to delete at normal shutdown. Local hard-link support and shared PID visibility are required; NFS/cross-host locking is not supported.
+
+### Removed
+
+- Removed unused HTTP/transient-reference wrappers, batch router/coordinator code, migration naming, and transitional cache-key/presentation aliases.
+
 ## 0.0.10
 
 ### Fixed

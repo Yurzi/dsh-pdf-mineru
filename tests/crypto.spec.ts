@@ -35,6 +35,16 @@ describe('computeFileSha256', () => {
     expect(result).toBe(expectedHash)
   })
 
+  it('preserves the cancellation reason after a stream has been opened', async () => {
+    const filePath = join(tempDir, 'mid-stream.txt')
+    await writeFile(filePath, Buffer.alloc(1024 * 1024, 42))
+    const controller = new AbortController()
+    const reason = new Error('Hash caller cancelled')
+    const pending = computeFileSha256(filePath, controller.signal)
+    controller.abort(reason)
+    await expect(pending).rejects.toBe(reason)
+  })
+
   it('respects abort signal before hashing', async () => {
     const filePath = join(tempDir, 'abort.txt')
     await writeFile(filePath, 'sample content', 'utf8')

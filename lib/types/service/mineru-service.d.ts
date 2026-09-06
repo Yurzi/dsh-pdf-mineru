@@ -3,6 +3,7 @@ import type { MinerUProviderId } from '../domain/errors.js';
 import type { ParseRequestInput } from '../domain/request.js';
 import { ProviderRegistry } from '../providers/registry.js';
 import type { ResultRepository } from '../storage/result-repository.js';
+import type { StorageAccessGate } from '../storage/access-gate.js';
 import { type MinerUDiagnosticSink } from '../observability.js';
 import { SharedOperationRegistry } from './shared-operations.js';
 import type { ResultView } from './result-presenter.js';
@@ -36,6 +37,7 @@ export interface MinerUServiceOptions {
     readonly operations: SharedOperationRegistry;
     readonly resolveCredential: CredentialResolver;
     readonly diagnostics?: MinerUDiagnosticSink;
+    readonly accessGate?: StorageAccessGate;
 }
 export declare class MinerUService {
     private readonly options;
@@ -46,9 +48,10 @@ export declare class MinerUService {
     probe(signal: AbortSignal, draft?: ProviderConfig): Promise<ProbeView>;
     private prepare;
     private runOperation;
+    private runOperationCore;
     private fitSingleCandidate;
     private projectSingle;
     private createWaitSignal;
     /** Parse directly to immutable results. No plugin Job is created for this call. */
-    parseDocument(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal, pollTimeoutMs?: number | null): Promise<ResultView>;
+    parseDocument(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal, pollTimeoutMs?: number | null, summaryOnly?: boolean): Promise<ResultView>;
 }

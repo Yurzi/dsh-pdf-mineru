@@ -1,0 +1,23 @@
+import type { ClientConnectionRpc, RpcResult } from '@deepseek-ai/dsh-client-connection/client';
+import { type MinerUConfig, type ProviderConfig } from '../config/pure.js';
+export interface CredentialView {
+    readonly configured: boolean;
+    readonly source?: string;
+    readonly writable: boolean;
+}
+/** Current `ctx.remote.credentials` face in DSH 0.1.2. */
+export interface CredentialClient {
+    describe(refs: string[]): Promise<RpcResult<Readonly<Record<string, CredentialView>>>>;
+    set(ref: string, value: string): Promise<RpcResult<void>>;
+    unset(ref: string): Promise<RpcResult<void>>;
+}
+export declare function ensureProviderProfiles(config: MinerUConfig): MinerUConfig;
+export declare function patchActiveProvider(config: MinerUConfig, patch: Partial<ProviderConfig>): MinerUConfig;
+export declare function normalizeProviderDefaults(config: MinerUConfig, provider: ProviderConfig): MinerUConfig;
+export declare function activateProvider(config: MinerUConfig, providerId: string): MinerUConfig;
+export declare function updateConfigSection<K extends keyof MinerUConfig>(config: MinerUConfig, section: K, patch: Partial<MinerUConfig[K]>): MinerUConfig;
+export declare function callRpc<T>(rpc: ClientConnectionRpc, endpoint: string, payload: unknown): Promise<T>;
+export declare function credentialReference(provider: ProviderConfig | undefined): string | undefined;
+export declare function describeCredential(credentials: CredentialClient, reference: string): Promise<CredentialView>;
+export declare function storeCredential(credentials: CredentialClient, reference: string, value: string): Promise<void>;
+export declare function clearCredential(credentials: CredentialClient, reference: string): Promise<void>;

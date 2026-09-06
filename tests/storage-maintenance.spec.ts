@@ -20,7 +20,6 @@ import {
 } from '../src/storage/index.js'
 
 const tempRoots: string[] = []
-const heldLocks: ProcessLock[] = []
 
 async function createTempRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'mineru-maintenance-test-'))
@@ -29,7 +28,6 @@ async function createTempRoot(): Promise<string> {
 }
 
 afterEach(async () => {
-  await Promise.all(heldLocks.splice(0).map(lock => lock.release().catch(() => undefined)))
   await Promise.all(tempRoots.splice(0).map(root => rm(root, { recursive: true, force: true }).catch(() => undefined)))
 })
 
@@ -69,11 +67,9 @@ interface MaintenanceFixture {
 async function createMaintenanceFixture(): Promise<MaintenanceFixture> {
   const root = await createTempRoot()
   const paths = new StoragePaths(root)
-  const results = new ResultRepository(paths)
   const operations = new SharedOperationRegistry()
   const lock = new ProcessLock(paths)
-  await lock.acquire()
-  heldLocks.push(lock)
+  const results = new ResultRepository(paths, {}, lock)
   return { paths, results, operations, maintenance: new StorageMaintenanceService(paths, results, operations, lock), lock }
 }
 
@@ -92,7 +88,13 @@ async function holdMaintenanceBlocker(
   }
 
   let release!: () => void
-  const held = fixture.maintenance.accessGate.runShared(async () => await new Promise<void>(resolve => { release = resolve }))
+  let entered!: () => void
+  const ready = new Promise<void>(resolve => { entered = resolve })
+  const held = fixture.maintenance.accessGate.runShared(async () => {
+    entered()
+    await new Promise<void>(resolve => { release = resolve })
+  })
+  await ready
   return async () => {
     release()
     await held
@@ -144,6 +146,60 @@ describe('StorageMaintenanceService statistics and integrity', () => {
     expect(stats.quarantine.skippedSymlinkCount).toBe(1)
     expect(await readFile(outside, 'utf8')).toBe('must not be counted through a symlink')
     expect(await stat(paths.resultDir(published.cacheKey))).toBeDefined()
+  })
+
+  it('does not traverse or initialize storage through a configured-root symlink for read operations', async () => {
+    const container = await createTempRoot()
+    const outside = await createTempRoot()
+    const alias = join(container, 'storage-alias')
+    await mkdir(join(outside, 'results', 'sha256', 'aa'), { recursive: true })
+    await mkdir(join(outside, 'quarantine', 'outside_entry'), { recursive: true })
+    await writeFile(join(outside, 'quarantine', 'outside_entry', 'preserve.txt'), 'preserve')
+    await symlink(outside, alias)
+
+    const paths = new StoragePaths(alias)
+    const lock = new ProcessLock(paths)
+    const maintenance = new StorageMaintenanceService(
+      paths,
+      new ResultRepository(paths, {}, lock),
+      new SharedOperationRegistry(),
+      lock,
+    )
+    const stats = await maintenance.getStatistics()
+    expect(stats.publishedResults.complete).toBe(false)
+    expect(stats.publishedResults.byteUsage).toBe(0)
+    const integrity = await maintenance.scanIntegrity()
+    expect(integrity.validCount).toBe(0)
+    expect(integrity.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'unreadable-entry' }),
+    ]))
+    const quarantine = await maintenance.listQuarantine()
+    expect(quarantine.totalCount).toBe(0)
+    expect(quarantine.unreadableEntryCount).toBe(1)
+    expect(await readFile(join(outside, 'quarantine', 'outside_entry', 'preserve.txt'), 'utf8')).toBe('preserve')
+    await expect(stat(join(outside, '.lock'))).rejects.toThrow()
+
+    const realRoot = await createTempRoot()
+    const outsideResults = await createTempRoot()
+    await mkdir(join(realRoot, 'results'))
+    await mkdir(join(outsideResults, 'aa'), { recursive: true })
+    await writeFile(join(outsideResults, 'aa', 'preserve.txt'), 'preserve results')
+    const realPaths = new StoragePaths(realRoot)
+    await symlink(outsideResults, realPaths.resultsDir())
+    const realLock = new ProcessLock(realPaths)
+    const intermediate = new StorageMaintenanceService(
+      realPaths,
+      new ResultRepository(realPaths, {}, realLock),
+      new SharedOperationRegistry(),
+      realLock,
+    )
+    const intermediateStats = await intermediate.getStatistics()
+    expect(intermediateStats.publishedResults.complete).toBe(false)
+    expect(intermediateStats.publishedResults.byteUsage).toBe(0)
+    const intermediateScan = await intermediate.scanIntegrity()
+    expect(intermediateScan.validCount).toBe(0)
+    expect(await readFile(join(outsideResults, 'aa', 'preserve.txt'), 'utf8')).toBe('preserve results')
+    await expect(stat(join(realRoot, '.lock'))).rejects.toThrow()
   })
 
   it('uses a read-only strict scan by default and isolates invalid results only on request', async () => {
@@ -236,14 +292,14 @@ describe('StorageMaintenanceService statistics and integrity', () => {
     await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
   })
 
-  it('blocks destructive cache clear when process lock is held by another active process', async () => {
+  it('blocks destructive cache clear when process lock is held by another owner', async () => {
     const root = await createTempRoot()
     const paths = new StoragePaths(root)
     const results = new ResultRepository(paths)
     const activeLock = new ProcessLock(paths)
     await activeLock.acquire()
     try {
-      const contenderLock = new ProcessLock(paths)
+      const contenderLock = new ProcessLock(paths, { acquireTimeoutMs: 100, pollIntervalMs: 2 })
       const maintenance = new StorageMaintenanceService(paths, results, new SharedOperationRegistry(), contenderLock)
       await expect(maintenance.clearCache({ dryRun: false })).rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
     } finally {
@@ -328,7 +384,9 @@ describe('StorageMaintenanceService quarantine operations', () => {
     const physical = paths.resolveArtifactPath(published.cacheKey, published.artifactPath)
     await makePublishedWritable(paths, published.cacheKey, published.fileId)
     await rm(physical)
-    expect(await results.get(published.cacheKey)).toBeUndefined()
+    await expect(results.get(published.cacheKey)).rejects.toMatchObject({ failure: { code: 'CACHE_CORRUPT' } })
+    const isolation = await maintenance.scanIntegrity({ isolateInvalid: true })
+    expect(isolation.quarantinedCount).toBe(1)
 
     const resultQuarantine = await maintenance.listQuarantine()
     expect(resultQuarantine.totalCount).toBe(1)
@@ -379,10 +437,8 @@ describe('StorageMaintenanceService cache clear', () => {
     const reserved = operations.reserve(published.cacheKey, asProviderConfigId('mp_maintenance'), 1000)
     expect(reserved.created).toBe(true)
 
-    const report = await maintenance.clearCache({ dryRun: false })
-    expect(report.eligible).toBe(false)
-    expect(report.activeOperationCount).toBe(1)
-    expect(report.deletedCount).toBe(0)
+    await expect(maintenance.clearCache({ dryRun: false }))
+      .rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
     await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
     operations.dispose()
   })
@@ -390,12 +446,16 @@ describe('StorageMaintenanceService cache clear', () => {
     const { paths, results, maintenance } = await createMaintenanceFixture()
     const published = await publish(results, 'e'.repeat(64), '# leased')
     let release!: () => void
-    const held = maintenance.accessGate.runShared(async () => await new Promise<void>(resolve => { release = resolve }))
+    let entered!: () => void
+    const ready = new Promise<void>(resolve => { entered = resolve })
+    const held = maintenance.accessGate.runShared(async () => {
+      entered()
+      await new Promise<void>(resolve => { release = resolve })
+    })
+    await ready
 
-    const report = await maintenance.clearCache({ dryRun: false, confirmationToken: 'stale' })
-    expect(report.eligible).toBe(false)
-    expect(report.activeAccessCount).toBe(1)
-    expect(report.deletedCount).toBe(0)
+    await expect(maintenance.clearCache({ dryRun: false, confirmationToken: 'stale' }))
+      .rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
     await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
     release()
     await held

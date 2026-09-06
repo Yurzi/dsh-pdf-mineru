@@ -10,6 +10,8 @@ export type MineruKey =
   | 'section.retry'
   | 'section.output'
   | 'section.limits'
+  | 'section.limits.restartHint'
+  | 'notice.officialTxtToAuto'
   | 'field.activeProvider'
   | 'field.baseURL'
   | 'field.baseURL.placeholder'
@@ -71,6 +73,7 @@ export type MineruKey =
   | 'action.cleanupDelete'
   | 'action.cleanupConfirm'
   | 'action.running'
+  | 'ops.statsIncomplete'
   | 'ops.bytes'
   | 'ops.entries'
   | 'ops.results'
@@ -128,6 +131,8 @@ export const en: Record<MineruKey, string> = {
   'section.retry': 'Retry Policy',
   'section.output': 'Output Limits',
   'section.limits': 'Security & Payload Limits',
+  'section.limits.restartHint': 'Security and payload limits are initialized at plugin startup. Changes require restarting the plugin.',
+  'notice.officialTxtToAuto': 'Official v4 provider does not support txt extraction mode; parse method was automatically adjusted to auto.',
 
   'field.activeProvider': 'Active Provider',
   'field.baseURL': 'API Base URL',
@@ -171,7 +176,7 @@ export const en: Record<MineruKey, string> = {
   'field.retryBaseDelayMs': 'Base Retry Delay (ms)',
   'field.retryMaxDelayMs': 'Maximum Retry Delay (ms)',
 
-  'field.maxInlineChars': 'Max Inline Markdown Chars',
+  'field.maxInlineChars': 'Max Response Characters',
 
   'field.maxFileBytes': 'Max File Bytes',
   'field.maxApiResponseBytes': 'Max API Response Bytes',
@@ -197,6 +202,7 @@ export const en: Record<MineruKey, string> = {
   'action.cleanupDelete': 'Delete Selected',
   'action.cleanupConfirm': 'Confirm Delete',
   'action.running': 'Running…',
+  'ops.statsIncomplete': 'Incomplete storage scan: marked totals are lower bounds, not exact sizes or counts.',
   'ops.bytes': 'Bytes',
   'ops.entries': 'Entries',
   'ops.results': 'Published Results',
@@ -254,6 +260,8 @@ export const zh: Record<MineruKey, string> = {
   'section.retry': '网络重试策略',
   'section.output': '模型输出限制',
   'section.limits': '安全与资源上限',
+  'section.limits.restartHint': '安全与有效载荷上限在插件启动时初始化并绑定存储仓，修改需要重启插件后生效。',
+  'notice.officialTxtToAuto': '官方 v4 Provider 不支持 txt 纯文本提取模式，解析方式已自动调整为 auto。',
 
   'field.activeProvider': '当前激活的 Provider',
   'field.baseURL': 'API 服务地址',
@@ -297,7 +305,7 @@ export const zh: Record<MineruKey, string> = {
   'field.retryBaseDelayMs': '基础重试延迟 (ms)',
   'field.retryMaxDelayMs': '最大重试延迟 (ms)',
 
-  'field.maxInlineChars': 'Markdown 内联字符上限',
+  'field.maxInlineChars': '单次响应字符预算',
 
   'field.maxFileBytes': '单个源文件大小上限 (bytes)',
   'field.maxApiResponseBytes': 'API 响应体大小上限 (bytes)',
@@ -323,6 +331,7 @@ export const zh: Record<MineruKey, string> = {
   'action.cleanupDelete': '删除已选项',
   'action.cleanupConfirm': '确认删除',
   'action.running': '执行中…',
+  'ops.statsIncomplete': '存储扫描不完整：带标记的数值仅为下界，并非精确大小或条目数。',
   'ops.bytes': '字节数',
   'ops.entries': '条目数',
   'ops.results': '已发布结果',

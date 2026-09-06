@@ -15,8 +15,9 @@ import type {
 import { validateProviderCapabilities } from '../providers/provider.js'
 import { ProviderRegistry, type ResolvedProvider } from '../providers/registry.js'
 import type { ResultRepository, ResultTransaction } from '../storage/result-repository.js'
+import type { StorageAccessGate } from '../storage/access-gate.js'
 import { emitDiagnostic, type MinerUDiagnosticEvent, type MinerUDiagnosticSink } from '../observability.js'
-import { computeCacheKey } from './cache-key.js'
+import { computeCacheKey } from '../domain/cache-key.js'
 import { RequestNormalizer, assertSourcesUnchanged } from './request-normalizer.js'
 import { SharedOperationRegistry, type SharedOperation, type SharedOutcome } from './shared-operations.js'
 import type {
@@ -37,13 +38,12 @@ import {
   extractBlocksMarkdown,
   extractMarkdownHeadings,
   fallbackExtractFromMarkdown,
-  formatParseDocumentProse,
-  formatParseSummaryProse,
   formatResultProse,
   formatTocMarkdown,
   readMarkdownFile,
   truncateAtCleanBoundary,
 } from './result-presenter.js'
+import { cursorForRemainder, decodeReadCursor, MAX_CURSOR_LENGTH, type ReadCursorPayload } from './read-cursor.js'
 
 export * from './result-presenter.js'
 
@@ -52,6 +52,7 @@ export interface ServiceSession {
 }
 
 const MAX_POLL_TIMEOUT_MS = 24 * 60 * 60 * 1000
+const MAX_CONTENT_LIST_BYTES = 64 * 1024 * 1024
 
 export type CredentialResolver = (reference: string, signal: AbortSignal) => Promise<string | undefined>
 
@@ -78,6 +79,7 @@ export interface MinerUServiceOptions {
   readonly operations: SharedOperationRegistry
   readonly resolveCredential: CredentialResolver
   readonly diagnostics?: MinerUDiagnosticSink
+  readonly accessGate?: StorageAccessGate
 }
 
 interface PendingFileParse {
@@ -284,6 +286,18 @@ export class MinerUService {
     resolved: ResolvedProvider,
     compatibility: string,
   ): Promise<SharedOutcome> {
+    const work = () => this.runOperationCore(operation, prepared, resolved, compatibility)
+    return this.options.accessGate === undefined
+      ? await work()
+      : await this.options.accessGate.runProducer(work, operation.controller.signal)
+  }
+
+  private async runOperationCore(
+    operation: SharedOperation,
+    prepared: PreparedParseRequest,
+    resolved: ResolvedProvider,
+    compatibility: string,
+  ): Promise<SharedOutcome> {
     let transaction: ResultTransaction | undefined
     const startedAt = Date.now()
     const requestBytes = prepared.request.files.reduce((total, source) => total + source.bytes, 0)
@@ -405,6 +419,9 @@ export class MinerUService {
   private async projectSingle(
     data: Extract<RawParsedItem, { state: 'completed' }>,
     limit: number,
+    cursorOffset = 0,
+    cursorPayload?: ReadCursorPayload,
+    summaryOnly = false,
   ): Promise<ResultView> {
     if (!data.markdownRequested) {
       const baseFiles: ResultFileView[] = [{
@@ -425,7 +442,10 @@ export class MinerUService {
       return this.fitSingleCandidate(candidate, data.secondaryArtifacts, limit)
     }
 
-    const raw = await readMarkdownFile(data.markdownPath!, data.markdownBytes ?? 0, limit)
+    const raw = await readMarkdownFile(data.markdownPath!, data.markdownBytes ?? 0, limit, summaryOnly)
+    if (!Number.isSafeInteger(cursorOffset) || cursorOffset < 0) {
+      throw new MinerUError(failure('INVALID_REQUEST', 'Cursor offset is invalid; start over without a cursor'))
+    }
     const markdownArtifact: ArtifactView = {
       kind: 'markdown',
       path: data.markdownPath!,
@@ -436,13 +456,22 @@ export class MinerUService {
     let contentList: ContentListBlock[] | undefined
     if (contentListArtifact) {
       try {
+        if (contentListArtifact.bytes > MAX_CONTENT_LIST_BYTES) throw new MinerUError(failure('RESULT_TOO_LARGE', 'content-list artifact exceeds the bounded reader limit'))
         const rawJson = await readFile(contentListArtifact.path, 'utf8')
-        const parsed = JSON.parse(rawJson)
-        if (Array.isArray(parsed)) contentList = parsed
-        else if (Array.isArray((parsed as any)?.list)) contentList = (parsed as any).list
-        else if (Array.isArray((parsed as any)?.content_list)) contentList = (parsed as any).content_list
-      } catch {
-        contentList = undefined
+        const parsed: unknown = JSON.parse(rawJson)
+        const candidate = Array.isArray(parsed) ? parsed : (typeof parsed === 'object' && parsed !== null && Array.isArray((parsed as any).list) ? (parsed as any).list : typeof parsed === 'object' && parsed !== null && Array.isArray((parsed as any).content_list) ? (parsed as any).content_list : undefined)
+        if (candidate === undefined) throw new TypeError('content-list must be an array or contain list/content_list')
+        for (const block of candidate) {
+          if (typeof block !== 'object' || block === null || Array.isArray(block)) throw new TypeError('content-list contains a malformed block')
+          const page = (block as any).page_idx
+          if (page !== undefined && (!Number.isSafeInteger(page) || page < 0)) throw new TypeError('content-list contains an invalid page_idx')
+          const type = (block as any).type
+          if (type !== undefined && typeof type !== 'string') throw new TypeError('content-list contains an invalid type')
+        }
+        contentList = candidate as ContentListBlock[]
+      } catch (error) {
+        if (error instanceof MinerUError) throw error
+        throw new MinerUError(failure('INVALID_REQUEST', 'Malformed content-list artifact; cannot provide a reliable selection'), { cause: error })
       }
     }
 
@@ -454,18 +483,37 @@ export class MinerUService {
     let toc: readonly DocumentHeading[] | undefined
     let pagesSet: Set<number> | undefined = rawPagesSet
     let pagesLabel: string | undefined
+    const warnings: string[] = []
 
     if (contentList && contentList.length > 0) {
       docSummary = computeDocumentSummary(contentList, raw.text)
       toc = docSummary.toc
-      const narrowed = narrowPageSelection(rawPagesSet, docSummary.page_count ?? 1)
+      if (rawPagesSet !== undefined && docSummary.page_count === undefined) {
+        throw new MinerUError(failure('INVALID_REQUEST', '[SELECTION_UNAVAILABLE] The content-list has no usable page coordinates; start over without pages'))
+      }
+      const narrowed = narrowPageSelection(rawPagesSet, docSummary.page_count)
+      if (narrowed.fullyOutOfRange) {
+        throw new MinerUError(failure('INVALID_REQUEST', '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range'))
+      }
+      if (narrowed.outOfRange.length > 0) warnings.push(`Some requested pages are outside the document range: ${narrowed.outOfRange.join(', ')}`)
       pagesSet = narrowed.pagesSet
-      pagesLabel = narrowed.pagesLabel
+      pagesLabel = rawPagesSet === undefined ? undefined : narrowed.pagesLabel
     } else {
-      docSummary = { page_count: 1, table_count: 0, image_count: 0, equation_count: 0 }
-      const narrowed = narrowPageSelection(rawPagesSet, docSummary.page_count ?? 1)
-      pagesSet = narrowed.pagesSet
-      pagesLabel = narrowed.pagesLabel
+      const selectionNeedsCoordinates = rawPagesSet !== undefined || (!focusSet.has('all') && (focusSet.has('text') || focusSet.has('table') || focusSet.has('image')))
+      if (selectionNeedsCoordinates) {
+        throw new MinerUError(failure('INVALID_REQUEST', '[SELECTION_UNAVAILABLE] The result has no usable content-list page/type mapping; start over with a result that includes content-list'))
+      }
+      docSummary = { table_count: 0, image_count: 0, equation_count: 0 }
+      pagesSet = undefined
+      pagesLabel = undefined
+    }
+
+    if (summaryOnly && contentList === undefined) {
+      return {
+        state: 'completed', source: data.item.source, cache_hit: data.item.source === 'cache', result_id: data.manifest.id,
+        files: [{ file_id: data.fileId, name: data.fileName, artifacts: [] }], content_status: 'not_requested',
+        manifest_path: data.manifestPath, output_limit_chars: limit,
+      }
     }
 
     if (focusSet.size === 1 && focusSet.has('artifacts')) {
@@ -491,6 +539,16 @@ export class MinerUService {
       return this.fitSingleCandidate(candidate, data.secondaryArtifacts, limit)
     }
 
+    if (summaryOnly && contentList !== undefined) {
+      return {
+        state: 'completed', source: data.item.source, cache_hit: data.item.source === 'cache', result_id: data.manifest.id,
+        files: [{ file_id: data.fileId, name: data.fileName, artifacts: [] }], content_status: 'not_requested',
+        manifest_path: data.manifestPath, output_limit_chars: limit,
+        ...(docSummary === undefined ? {} : { summary: docSummary }),
+        ...(pagesLabel === undefined ? {} : { pages: pagesLabel }),
+      }
+    }
+
     const imageArtifacts = data.secondaryArtifacts.filter(a => a.kind === 'images')
 
     let fullSourceText = ''
@@ -502,13 +560,6 @@ export class MinerUService {
       orderedImages = extracted.orderedImages
     } else {
       let rawText = raw.text
-      if (!raw.isCompleteFile && data.markdownPath) {
-        try {
-          rawText = await readFile(data.markdownPath, 'utf8')
-        } catch {
-          // fallback to raw.text
-        }
-      }
       const fallback = fallbackExtractFromMarkdown(rawText, imageArtifacts)
       fullSourceText = fallback.text
       orderedImages = fallback.orderedImages
@@ -517,6 +568,21 @@ export class MinerUService {
       }
       docSummary = fallback.summary
       toc = fallback.summary.toc
+    }
+
+    if (summaryOnly) {
+      return {
+        state: 'completed',
+        source: data.item.source,
+        cache_hit: data.item.source === 'cache',
+        result_id: data.manifest.id,
+        files: [{ file_id: data.fileId, name: data.fileName, artifacts: [] }],
+        content_status: 'not_requested',
+        manifest_path: data.manifestPath,
+        output_limit_chars: limit,
+        ...(docSummary === undefined ? {} : { summary: docSummary }),
+        ...(pagesLabel === undefined ? {} : { pages: pagesLabel }),
+      }
     }
 
     if (focusSet.has('toc')) {
@@ -560,6 +626,8 @@ export class MinerUService {
     }
 
     let overhead = Math.max(JSON.stringify(skeleton).length, formatResultProse(skeleton).length)
+    // Reserve room for the opaque continuation token and its actionable footer.
+    if (fullSourceText.length > Math.max(0, limit - overhead)) overhead += MAX_CURSOR_LENGTH + 256
     let baseArtifacts: ArtifactView[] = [markdownArtifact]
     let baseArtifactsTruncated = false
 
@@ -581,18 +649,25 @@ export class MinerUService {
 
     let contentStatus: ContentStatus
     let content: string
-    let readOffsetLine: number | undefined
+    let nextCursor: string | undefined
     let artifactsTruncated = baseArtifactsTruncated
+    const sourceOffset = cursorPayload?.off ?? cursorOffset
+    if (sourceOffset > fullSourceText.length) throw new MinerUError(failure('INVALID_REQUEST', 'Cursor does not match the published result; start over without a cursor'))
+    if (sourceOffset > 0 && (fullSourceText.charCodeAt(sourceOffset - 1) >= 0xD800 && fullSourceText.charCodeAt(sourceOffset - 1) <= 0xDBFF || fullSourceText.charCodeAt(sourceOffset) >= 0xDC00 && fullSourceText.charCodeAt(sourceOffset) <= 0xDFFF)) {
+      throw new MinerUError(failure('INVALID_REQUEST', 'Cursor splits a Unicode character; start over without a cursor'))
+    }
+    const remainingText = fullSourceText.slice(sourceOffset)
 
-    if (fullSourceText.length <= textBudget) {
+    if (remainingText.length <= textBudget) {
       contentStatus = 'complete'
-      content = fullSourceText
-      readOffsetLine = undefined
+      content = remainingText
     } else {
       contentStatus = 'partial'
-      const cut = truncateAtCleanBoundary(fullSourceText, textBudget)
+      const cut = truncateAtCleanBoundary(remainingText, textBudget)
       content = cut.text
-      readOffsetLine = cut.resumeLine
+      const nextOffset = sourceOffset + cut.text.length
+      if (nextOffset <= sourceOffset) throw new MinerUError(failure('RESULT_TOO_LARGE', 'Output limit cannot make progress through the document'))
+      nextCursor = cursorForRemainder(data.manifest.id, pagesLabel, focusSet, nextOffset)
       if (artifactsRequested && data.secondaryArtifacts.length > 0) {
         artifactsTruncated = true
       }
@@ -639,7 +714,8 @@ export class MinerUService {
       }],
       content_status: contentStatus,
       markdown_path: data.markdownPath,
-      ...(readOffsetLine !== undefined ? { read_offset_line: readOffsetLine } : {}),
+      ...(nextCursor !== undefined ? { cursor: nextCursor } : {}),
+      ...(warnings.length > 0 ? { warnings } : {}),
       manifest_path: data.manifestPath,
       output_limit_chars: limit,
       markdown_content: content,
@@ -664,14 +740,14 @@ export class MinerUService {
       } else if (view.markdown_content && view.markdown_content.length > 0) {
         const excess = Math.max(JSON.stringify(view).length - limit, formatResultProse(view).length - limit, 10)
         const targetLen = Math.max(0, view.markdown_content.length - excess)
-        const cut = truncateAtCleanBoundary(fullSourceText, targetLen)
+        const cut = truncateAtCleanBoundary(remainingText, targetLen)
         const activeToc = view.toc ?? (docSummary?.toc ?? extractMarkdownHeadings(fullSourceText))
         view = {
           ...view,
           content_status: 'partial',
           markdown_content: cut.text,
-          read_offset_line: cut.resumeLine,
           toc: activeToc,
+          cursor: cursorForRemainder(data.manifest.id, pagesLabel, focusSet, sourceOffset + cut.text.length),
         }
       } else if (view.toc && view.toc.length > 0) {
         const nextToc = view.toc.slice(0, Math.max(0, Math.floor(view.toc.length / 2)))
@@ -722,8 +798,23 @@ export class MinerUService {
     input: ParseRequestInput,
     signal: AbortSignal,
     pollTimeoutMs?: number | null,
+    summaryOnly = false,
   ): Promise<ResultView> {
-    const { pending } = await this.prepare(session, input, signal)
+    let cursorPayload: ReadCursorPayload | undefined
+    if (input.cursor !== undefined) {
+      try {
+        cursorPayload = decodeReadCursor(input.cursor)
+      } catch (error) {
+        throw new MinerUError(failure('INVALID_REQUEST', error instanceof Error ? error.message : 'Cursor is malformed; start over without a cursor'), { cause: error })
+      }
+      if (input.pages !== undefined || input.focus !== undefined) {
+        throw new MinerUError(failure('INVALID_REQUEST', 'pages and focus must be omitted when cursor is provided'))
+      }
+    }
+    const effectiveInput: ParseRequestInput = cursorPayload === undefined
+      ? input
+      : { ...input, pages: cursorPayload.pages === '' ? undefined : cursorPayload.pages, focus: cursorPayload.focus }
+    const { pending } = await this.prepare(session, effectiveInput, signal)
     const wait = this.createWaitSignal(signal, pollTimeoutMs)
     let outcome: SharedOutcome
     try {
@@ -757,6 +848,9 @@ export class MinerUService {
       throw new MinerUError(failure('CACHE_EVICTED', 'Published MinerU result is missing or corrupt'))
     }
 
+    if (cursorPayload !== undefined && cursorPayload.rid !== String(manifest.id)) {
+      throw new MinerUError(failure('INVALID_REQUEST', 'Cursor result identity does not match the published result; start over without a cursor'))
+    }
     const document = manifest.files[0]!
     const markdownRequested = pending.markdownRequested
     const markdownRef = document.artifacts.find(artifact => artifact.kind === 'markdown')
@@ -793,6 +887,6 @@ export class MinerUService {
     }
 
     const limit = this.config().output.maxInlineChars
-    return await this.projectSingle(rawItem, limit)
+    return await this.projectSingle(rawItem, limit, cursorPayload?.off ?? 0, cursorPayload, summaryOnly)
   }
 }

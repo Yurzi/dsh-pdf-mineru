@@ -29,14 +29,6 @@ export interface JsonRequestOptions<T = unknown> {
   readonly validateResponse?: (parsed: Record<string, unknown>, response: Response) => T | void
 }
 
-export interface ExecuteJsonRequestOptions<T = unknown> extends JsonRequestOptions<T> {
-  readonly client?: ProviderHttpClient
-  readonly baseURL?: URL | string
-  readonly provider?: MinerUProviderId
-  readonly defaultRetry?: ProviderRetryOptions
-  readonly providerLabel?: string
-}
-
 /**
  * Resolves a request path against a base URL, preserving pathname prefix if any.
  */
@@ -140,47 +132,7 @@ export class ProviderHttpClient {
     this.providerLabel = options.providerLabel ?? (options.provider === 'official-v4' ? 'MinerU official API' : 'MinerU server')
   }
 
-  requestJson<T>(options: JsonRequestOptions<T>): Promise<T>
-  requestJson<T>(
-    method: string,
-    path: string,
-    body: BodyInit | undefined,
-    headers: Record<string, string> | undefined,
-    context: ProviderCallContext,
-    acceptedStatuses?: readonly number[],
-    options?: {
-      operation?: ProviderRetryOperation
-      retry?: boolean
-      validateResponse?: (parsed: Record<string, unknown>, response: Response) => T | void
-    },
-  ): Promise<T>
-  async requestJson<T>(
-    optionsOrMethod: string | JsonRequestOptions<T>,
-    path?: string,
-    body?: BodyInit,
-    headers?: Record<string, string>,
-    context?: ProviderCallContext,
-    acceptedStatuses?: readonly number[],
-    options?: {
-      operation?: ProviderRetryOperation
-      retry?: boolean
-      validateResponse?: (parsed: Record<string, unknown>, response: Response) => T | void
-    },
-  ): Promise<T> {
-    const opts: JsonRequestOptions<T> = typeof optionsOrMethod === 'string'
-      ? {
-          method: optionsOrMethod,
-          path: path!,
-          body,
-          headers,
-          context: context!,
-          acceptedStatuses,
-          operation: options?.operation,
-          retry: options?.retry,
-          validateResponse: options?.validateResponse,
-        }
-      : optionsOrMethod
-
+  async requestJson<T>(opts: JsonRequestOptions<T>): Promise<T> {
     const method = opts.method ?? 'GET'
     const reqPath = opts.path
     const reqBody = opts.body
@@ -333,17 +285,4 @@ export class ProviderHttpClient {
       fn: executeOnce,
     })
   }
-}
-
-/**
- * Unified helper to execute a JSON HTTP request with timeout, auth, status error handling, and retry.
- */
-export async function executeJsonRequest<T>(options: ExecuteJsonRequestOptions<T>): Promise<T> {
-  const client = options.client ?? new ProviderHttpClient({
-    baseURL: options.baseURL ?? 'http://localhost',
-    provider: options.provider ?? 'self-hosted-v2',
-    defaultRetry: options.defaultRetry,
-    providerLabel: options.providerLabel,
-  })
-  return await client.requestJson<T>(options)
 }

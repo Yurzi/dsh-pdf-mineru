@@ -1,9 +1,12 @@
 import { createHash, createHmac } from 'node:crypto'
-import { readFile } from 'node:fs/promises'
+import { mkdir, readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 import { chromium } from 'playwright-core'
 
 const bundle = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
+const screenshotDir = fileURLToPath(new URL('../.vitest-cache/gui/', import.meta.url))
+await mkdir(screenshotDir, { recursive: true })
 const requestedWebUrl = new URL(
   process.env.DSH_WEB_AUTH_URL ?? process.env.DSH_WEB_URL ?? 'http://127.0.0.1:3080',
 )
@@ -82,12 +85,12 @@ const config = {
 const storageArea = (byteUsage, logicalEntryCount) => ({
   byteUsage, byteUsageSaturated: false, logicalEntryCount, regularFileCount: logicalEntryCount,
   directoryCount: logicalEntryCount, skippedSymlinkCount: 0, unexpectedEntryCount: 0,
-  unreadableEntryCount: 0, depthLimitCount: 0,
+  unreadableEntryCount: 0, depthLimitCount: 0, complete: true, truncated: false,
 })
 const storageStats = {
   generatedAt: Date.now(),
   publishedResults: storageArea(4096, 2),
-  staging: storageArea(1024, 1), quarantine: storageArea(512, 2),
+  staging: { ...storageArea(1024, 1), complete: false, truncated: true }, quarantine: storageArea(512, 2),
 }
 const integrityScan = {
   generatedAt: Date.now(), readOnly: true, isolateInvalid: false, validCount: 2, corruptCount: 0,
@@ -315,14 +318,17 @@ if (await credentialInput.getAttribute('type') !== 'password') throw new Error('
 if (await credentialInput.inputValue() !== '') throw new Error('credential value was restored into the browser')
 if (await page.getByRole('button', { name: 'Clear API Key', exact: true }).count() !== 1) throw new Error('credential clear control is missing')
 await page.getByText('Provider Settings', { exact: true }).scrollIntoViewIfNeeded()
-await page.screenshot({ path: '/tmp/mineru-current-settings-credential-desktop.png', fullPage: true })
+await page.screenshot({ path: join(screenshotDir, 'mineru-current-settings-credential-desktop.png'), fullPage: true })
 const activeProvider = page.getByLabel('Active Provider')
 if (await activeProvider.inputValue() !== 'mp_self_hosted') throw new Error('initial active provider mismatch')
 if (await activeProvider.locator('option').count() !== 2) throw new Error('legacy single-provider config was not completed with both profiles')
 if (await page.getByText('Pipeline Backend Map', { exact: true }).count() !== 1) throw new Error('self-hosted fields are missing')
 const baseUrlInput = page.getByLabel('API Base URL')
 await baseUrlInput.fill('http://gpu-server:18000')
+await page.getByLabel('Default Parse Method').selectOption('txt')
 await activeProvider.selectOption('mp_official')
+if (await page.getByLabel('Default Parse Method').inputValue() !== 'auto') throw new Error('official provider did not normalize txt to auto')
+await page.getByText('Official v4 provider does not support txt extraction mode; parse method was automatically adjusted to auto.', { exact: true }).waitFor({ timeout: 5000 })
 if (await page.getByText('Supported Cloud Models', { exact: true }).count() !== 1) throw new Error('official fields are missing')
 if (await page.getByText('Pipeline Backend Map', { exact: true }).count() !== 0) throw new Error('self-hosted fields leaked into official profile')
 if (await baseUrlInput.inputValue() !== 'https://mineru.net/api/v4') throw new Error('official profile did not retain its independent base URL')
@@ -331,7 +337,12 @@ await page.getByRole('button', { name: 'Test Active Provider', exact: true }).cl
 await page.getByText(/Connection Healthy/).waitFor({ timeout: 5000 })
 await activeProvider.selectOption('mp_self_hosted')
 if (await baseUrlInput.inputValue() !== 'http://gpu-server:18000') throw new Error('self-hosted profile was reset after switching providers')
-await page.getByLabel('Maximum Attempts').fill('4')
+const attemptsInput = page.getByLabel('Maximum Attempts')
+await attemptsInput.fill('')
+if (await attemptsInput.inputValue() !== '') throw new Error('numeric input discarded an intermediate empty draft')
+await attemptsInput.blur()
+if (await attemptsInput.inputValue() !== '3') throw new Error('numeric input did not restore the last valid value on blur')
+await attemptsInput.fill('4')
 await credentialInput.fill('gui-verifier-secret')
 await page.getByRole('button', { name: 'Save Configuration', exact: true }).click()
 await page.getByRole('button', { name: 'Saved', exact: true }).waitFor({ timeout: 5000 })
@@ -340,6 +351,7 @@ if (await credentialInput.inputValue() !== '') throw new Error('credential input
 await page.getByRole('button', { name: 'Clear API Key', exact: true }).click()
 await page.getByText('No credential is configured. Enter a key and save the configuration to store it.', { exact: true }).waitFor({ timeout: 5000 })
 await page.getByRole('button', { name: 'Refresh Statistics', exact: true }).click()
+await page.getByText('Incomplete storage scan: marked totals are lower bounds, not exact sizes or counts.', { exact: true }).waitFor()
 await page.getByText('Published Results', { exact: true }).waitFor({ timeout: 5000 })
 await page.getByRole('button', { name: 'Verify Cache', exact: true }).click()
 await page.getByText('Valid: 2', { exact: true }).waitFor({ timeout: 5000 })
@@ -361,7 +373,7 @@ await page.getByRole('button', { name: 'Delete Selected', exact: true }).click()
 await page.getByRole('button', { name: 'Confirm Delete', exact: true }).click()
 await page.getByText('Deleted: 1', { exact: true }).waitFor({ timeout: 5000 })
 await page.getByText('Storage Operations', { exact: true }).evaluate(element => element.scrollIntoView({ block: 'center' }))
-await page.screenshot({ path: '/tmp/mineru-current-settings-desktop.png', fullPage: true })
+await page.screenshot({ path: join(screenshotDir, 'mineru-current-settings-desktop.png'), fullPage: true })
 
 const desktopMetrics = await page.evaluate(() => ({
   scrollWidth: document.documentElement.scrollWidth,
@@ -375,11 +387,11 @@ const mobileCredentialInput = page.getByLabel('API Key', { exact: true })
 await mobileCredentialInput.waitFor({ timeout: 5000 })
 if (await mobileCredentialInput.inputValue() !== '') throw new Error('credential value was restored into the mobile browser')
 await page.getByText('Provider Settings', { exact: true }).scrollIntoViewIfNeeded()
-await page.screenshot({ path: '/tmp/mineru-current-settings-credential-mobile.png', fullPage: true })
+await page.screenshot({ path: join(screenshotDir, 'mineru-current-settings-credential-mobile.png'), fullPage: true })
 await page.getByRole('button', { name: 'List Quarantine', exact: true }).click()
 await page.getByText('entry_corrupt_1', { exact: true }).waitFor({ timeout: 5000 })
 await page.getByText('Storage & Cache', { exact: true }).scrollIntoViewIfNeeded()
-await page.screenshot({ path: '/tmp/mineru-current-settings-mobile.png', fullPage: true })
+await page.screenshot({ path: join(screenshotDir, 'mineru-current-settings-mobile.png'), fullPage: true })
 const providerHeadingBox = await page.getByText('Provider Settings', { exact: true }).boundingBox()
 const mineruSection = page.getByRole('heading', { name: 'MinerU Configuration', exact: true }).locator('xpath=ancestor::section[1]')
 const sectionBox = await mineruSection.boundingBox()
@@ -432,6 +444,8 @@ const mobileMetrics = await page.evaluate(() => ({
   bodyText: document.body.innerText.slice(0, 5000),
 }))
 if (mobileMetrics.scrollWidth > mobileMetrics.clientWidth) throw new Error('mobile settings page has horizontal overflow')
+const clippedControls = visibleControlBoxes.filter(box => box.x < 0 || box.right > 391)
+if (clippedControls.length > 0) throw new Error(`mobile controls are clipped despite hidden document overflow: ${JSON.stringify(clippedControls)}`)
 if (sectionBox === null || sectionBox.x < 0 || sectionBox.x + sectionBox.width > 390) {
   throw new Error(`mobile MinerU section is outside the viewport: ${JSON.stringify(sectionBox)}`)
 }
@@ -466,10 +480,10 @@ console.log(JSON.stringify({
   credentialCalls,
   bundleIntercepts,
   screenshots: [
-    '/tmp/mineru-current-settings-credential-desktop.png',
-    '/tmp/mineru-current-settings-desktop.png',
-    '/tmp/mineru-current-settings-credential-mobile.png',
-    '/tmp/mineru-current-settings-mobile.png',
+    join(screenshotDir, 'mineru-current-settings-credential-desktop.png'),
+    join(screenshotDir, 'mineru-current-settings-desktop.png'),
+    join(screenshotDir, 'mineru-current-settings-credential-mobile.png'),
+    join(screenshotDir, 'mineru-current-settings-mobile.png'),
   ],
 }, null, 2))
 await browser.close()

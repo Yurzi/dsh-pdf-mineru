@@ -12,10 +12,8 @@
  */
 
 import { createHash } from 'node:crypto'
-import { spawn } from 'node:child_process'
-import { once } from 'node:events'
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
-import { hostname, tmpdir } from 'node:os'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -32,12 +30,12 @@ import {
 import { MinerUError } from '../src/domain/errors.js'
 import { CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, type CanonicalParseRequest } from '../src/domain/request.js'
 import type { ArtifactRef, MinerUResultManifest, ResultProducer } from '../src/domain/result.js'
-import { computeCacheKey } from '../src/service/cache-key.js'
+import { computeCacheKey } from '../src/domain/cache-key.js'
 import {
   ProcessLock,
-  BatchArtifactRouter,
   ResultRepository,
   StagingArtifactSink,
+  StorageAccessGate,
   StoragePaths,
   defaultStorageRoot,
 } from '../src/storage/index.js'
@@ -115,123 +113,6 @@ describe('StoragePaths & Traversal Prevention', () => {
   })
 })
 
-describe('ProcessLock', () => {
-  it('acquires and releases lock on storage root', async () => {
-    const root = await createTempRoot()
-    const paths = new StoragePaths(root)
-    const lock = new ProcessLock(paths)
-
-    expect(lock.isHeld()).toBe(false)
-    await lock.acquire()
-    expect(lock.isHeld()).toBe(true)
-
-    const lockData = JSON.parse(await readFile(paths.processLockFile(), 'utf8')) as { pid: number; hostname: string; ownerToken: string }
-    expect(lockData.pid).toBe(process.pid)
-    expect(lockData.hostname).toBe(hostname())
-    expect(typeof lockData.ownerToken).toBe('string')
-
-    // Idempotent acquire on same instance
-    await lock.acquire()
-    expect(lock.isHeld()).toBe(true)
-
-    await lock.release()
-    expect(lock.isHeld()).toBe(false)
-
-    // Lock file removed
-    await expect(readFile(paths.processLockFile(), 'utf8')).rejects.toThrow()
-  })
-
-  it('throws STORAGE_LOCKED while another lock owner is active', async () => {
-    const root = await createTempRoot()
-    const paths = new StoragePaths(root)
-    const owner = new ProcessLock(paths)
-    const contender = new ProcessLock(paths)
-    await owner.acquire()
-    await expect(contender.acquire()).rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
-    await owner.release()
-    await contender.acquire()
-    await contender.release()
-  })
-
-  it('reacquires after dead pid is killed', async () => {
-    const root = await createTempRoot()
-    const paths = new StoragePaths(root)
-    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
-    const deadPid = child.pid!
-    child.kill('SIGKILL')
-    await once(child, 'exit')
-
-    const stalePayload = {
-      pid: deadPid,
-      ownerToken: 'dead-owner-token',
-      createdAt: Date.now() - 5000,
-      hostname: hostname(),
-    }
-    await writeFile(paths.processLockFile(), JSON.stringify(stalePayload, null, 2))
-
-    const lock = new ProcessLock(paths)
-    await lock.acquire()
-    expect(lock.isHeld()).toBe(true)
-    const activePayload = JSON.parse(await readFile(paths.processLockFile(), 'utf8')) as { pid: number }
-    expect(activePayload.pid).toBe(process.pid)
-    await lock.release()
-  })
-
-  it('throws STORAGE_LOCKED while a live child process holds the lock and reacquires once killed', async () => {
-    const root = await createTempRoot()
-    const paths = new StoragePaths(root)
-    const lockFile = paths.processLockFile()
-
-    const childCode = [
-      "const { writeFileSync } = require('node:fs')",
-      "const { hostname } = require('node:os')",
-      "const payload = JSON.stringify({ pid: process.pid, ownerToken: 'child-token', createdAt: Date.now(), hostname: hostname() })",
-      "writeFileSync(process.argv[1], payload)",
-      "process.stdout.write('ready')",
-      "setInterval(() => {}, 1000)",
-    ].join(';')
-    const child = spawn(process.execPath, ['-e', childCode, lockFile], { stdio: ['ignore', 'pipe', 'inherit'] })
-    await once(child.stdout!, 'data')
-
-    const lock = new ProcessLock(paths)
-    await expect(lock.acquire()).rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
-
-    child.kill('SIGKILL')
-    await once(child, 'exit')
-
-    await lock.acquire()
-    expect(lock.isHeld()).toBe(true)
-    const activePayload = JSON.parse(await readFile(lockFile, 'utf8')) as { pid: number }
-    expect(activePayload.pid).toBe(process.pid)
-    await lock.release()
-  })
-
-  it('throws STORAGE_LOCKED and preserves lock file when metadata is corrupt or from another host', async () => {
-    const root = await createTempRoot()
-    const paths = new StoragePaths(root)
-    const foreign = JSON.stringify({ pid: 12345, ownerToken: 'tok', createdAt: Date.now(), hostname: 'other-machine' })
-    await writeFile(paths.processLockFile(), foreign)
-
-    const lock = new ProcessLock(paths)
-    await expect(lock.acquire()).rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
-    expect(await readFile(paths.processLockFile(), 'utf8')).toBe(foreign)
-
-    await writeFile(paths.processLockFile(), '{invalid-json')
-    await expect(lock.acquire()).rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
-  })
-
-  it('does not remove another owner metadata on release', async () => {
-    const root = await createTempRoot()
-    const paths = new StoragePaths(root)
-    const lock = new ProcessLock(paths)
-    await lock.acquire()
-
-    const replacement = JSON.stringify({ pid: process.pid, ownerToken: 'other-token', createdAt: Date.now(), hostname: hostname() })
-    await writeFile(paths.processLockFile(), replacement)
-    await lock.release()
-    expect(await readFile(paths.processLockFile(), 'utf8')).toBe(replacement)
-  })
-})
 
 describe('ArtifactSink & Streaming Writes', () => {
   it('writes artifacts with on-the-fly hashing and byte calculation', async () => {
@@ -414,7 +295,7 @@ describe('ResultRepository (Transactions, Publishing, Cache Hits & Quarantine)',
     expect(res2.cacheKey).toBe(res1.cacheKey)
   })
 
-  it('detects cache conflict, quarantines staging, and throws CACHE_CONFLICT', async () => {
+  it('keeps the first valid immutable publication when provider bytes differ', async () => {
     const root = await createTempRoot()
     const paths = new StoragePaths(root)
     const repo = new ResultRepository(paths)
@@ -432,20 +313,70 @@ describe('ResultRepository (Transactions, Publishing, Cache Hits & Quarantine)',
     const manifest1 = tx1.buildManifest(file, [art1])
     await repo.commitTransaction(tx1, manifest1)
 
-    // Second commit with same cache key but conflicting artifact content
+    // Same bytes under a different display name still share cache identity.
+    const renamedRequest: CanonicalParseRequest = {
+      ...req,
+      files: [{ ...file, name: 'renamed-copy.pdf' }],
+    }
+    const renamedFile = renamedRequest.files[0]!
     const op2 = createOperationId()
-    const tx2 = repo.beginTransaction(op2, req, producer)
-    const art2 = await tx2.writeArtifact(file.fileId, 'markdown', '# Content DIFFERENT', {
+    const tx2 = repo.beginTransaction(op2, renamedRequest, producer)
+    const art2 = await tx2.writeArtifact(renamedFile.fileId, 'markdown', '# Content DIFFERENT', {
       mediaType: 'text/markdown',
     })
-    const manifest2 = tx2.buildManifest(file, [art2])
+    const manifest2 = tx2.buildManifest(renamedFile, [art2])
 
-    await expect(repo.commitTransaction(tx2, manifest2)).rejects.toMatchObject({
-      failure: { code: 'CACHE_CONFLICT' },
-    })
+    const reused = await repo.commitTransaction(tx2, manifest2)
+    expect(reused.manifest.files[0]!.artifacts[0]!.sha256).toBe(art1.sha256)
+    await expect(stat(tx2.stagingDir)).rejects.toThrow()
   })
 
-  it('quarantines corrupt cache directory on physical file deletion or size mismatch and returns cache miss', async () => {
+  it('blocks direct published-result quarantine while a shared reader lease is active', async () => {
+    const root = await createTempRoot()
+    const paths = new StoragePaths(root)
+    const lock = new ProcessLock(paths)
+    const repo = new ResultRepository(paths, {}, lock)
+    const gate = new StorageAccessGate({ paths, lock })
+    const request = sampleRequest()
+    const file = request.files[0]!
+    const tx = repo.beginTransaction(createOperationId(), request, sampleProducer())
+    const artifact = await tx.writeArtifact(file.fileId, 'markdown', '# held', { mediaType: 'text/markdown' })
+    const published = await repo.commitTransaction(tx, tx.buildManifest(file, [artifact]))
+
+    let release!: () => void
+    let entered!: () => void
+    const ready = new Promise<void>(resolve => { entered = resolve })
+    const held = gate.runShared(async () => {
+      entered()
+      await new Promise<void>(resolve => { release = resolve })
+    })
+    await ready
+    await expect(repo.quarantine(paths.resultDir(published.cacheKey)))
+      .rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
+    await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
+    release()
+    await held
+  })
+
+  it('rejects a symlinked result ancestor before creating cache prefixes outside storage', async () => {
+    const root = await createTempRoot()
+    const outside = await createTempRoot()
+    const paths = new StoragePaths(root)
+    await mkdir(join(root, 'results'))
+    await symlink(outside, paths.resultsDir())
+    const repo = new ResultRepository(paths)
+    const request = sampleRequest()
+    const file = request.files[0]!
+    const tx = repo.beginTransaction(createOperationId(), request, sampleProducer())
+    const artifact = await tx.writeArtifact(file.fileId, 'markdown', '# safe', { mediaType: 'text/markdown' })
+    const manifest = tx.buildManifest(file, [artifact])
+
+    await expect(repo.commitTransaction(tx, manifest))
+      .rejects.toMatchObject({ failure: { code: 'CACHE_CORRUPT' } })
+    await expect(stat(join(outside, manifest.cacheKey.slice(0, 2)))).rejects.toThrow()
+  })
+
+  it('reports corrupt cache without mutating published data', async () => {
     const root = await createTempRoot()
     const paths = new StoragePaths(root)
     const repo = new ResultRepository(paths)
@@ -468,15 +399,11 @@ describe('ResultRepository (Transactions, Publishing, Cache Hits & Quarantine)',
     await chmod(physicalPath, 0o644)
     await rm(physicalPath)
 
-    // Attempting get(cacheKey) should detect missing artifact, quarantine resultDir, and return undefined
-    const hit = await repo.get(cacheKey)
-    expect(hit).toBeUndefined()
-
-    // The result directory in results/ was moved to quarantine
-    await expect(stat(paths.resultDir(cacheKey))).rejects.toThrow()
+    await expect(repo.get(cacheKey)).rejects.toMatchObject({ failure: { code: 'CACHE_CORRUPT' } })
+    await expect(stat(paths.resultDir(cacheKey))).resolves.toBeDefined()
   })
 
-  it('detects same-size SHA-256 corruption and quarantines the published result', async () => {
+  it('detects same-size SHA-256 corruption without implicit quarantine', async () => {
     const root = await createTempRoot()
     const paths = new StoragePaths(root)
     const repo = new ResultRepository(paths)
@@ -490,8 +417,8 @@ describe('ResultRepository (Transactions, Publishing, Cache Hits & Quarantine)',
     await chmod(paths.fileDir(manifest.cacheKey, file.fileId), 0o755)
     await chmod(physical, 0o644)
     await writeFile(physical, 'same-size-B')
-    expect(await repo.get(manifest.cacheKey)).toBeUndefined()
-    await expect(stat(paths.resultDir(manifest.cacheKey))).rejects.toThrow()
+    await expect(repo.get(manifest.cacheKey)).rejects.toMatchObject({ failure: { code: 'CACHE_CORRUPT' } })
+    await expect(stat(paths.resultDir(manifest.cacheKey))).resolves.toBeDefined()
   })
 
   it('rejects unmanaged quarantine sources and never follows staging symlinks', async () => {
@@ -527,36 +454,6 @@ describe('ResultRepository (Transactions, Publishing, Cache Hits & Quarantine)',
     })
     await expect(stat(paths.stagingDir(tx.operationId))).rejects.toThrow()
     await expect(stat(paths.resultDir(manifest.cacheKey))).rejects.toThrow()
-  })
-
-  it('routes batch artifacts to isolated transactions and preserves committed siblings', async () => {
-    const root = await createTempRoot()
-    const paths = new StoragePaths(root)
-    const repo = new ResultRepository(paths)
-    const requestA = sampleRequest('a'.repeat(64))
-    const requestB = sampleRequest('b'.repeat(64))
-    const fileA = requestA.files[0]!
-    const fileB = requestB.files[0]!
-    const txA = repo.beginTransaction(createOperationId(), requestA, sampleProducer())
-    const txB = repo.beginTransaction(createOperationId(), requestB, sampleProducer())
-    const router = new BatchArtifactRouter([
-      { fileId: fileA.fileId, transaction: txA },
-      { fileId: fileB.fileId, transaction: txB },
-    ])
-
-    const artifactA = await router.writeArtifact(fileA.fileId, 'markdown', '# A', { mediaType: 'text/markdown' })
-    await router.writeArtifact(fileB.fileId, 'markdown', '# B', { mediaType: 'text/markdown' })
-    expect(() => router.writeArtifact(asFileId('mf_ffffffffffffffffffffffffffff_0'), 'markdown', '# unknown', {
-      mediaType: 'text/markdown',
-    })).toThrow(/unknown batch fileId/)
-
-    const manifestA = txA.buildManifest(fileA, [artifactA])
-    await repo.commitTransaction(txA, manifestA)
-    await router.abortUncommitted(new Set([fileA.fileId]))
-
-    expect(await repo.get(manifestA.cacheKey)).toMatchObject({ id: manifestA.id })
-    await expect(stat(txB.stagingDir)).rejects.toThrow()
-    expect(manifestA.files).toHaveLength(1)
   })
 
   it('cleans up expired staging directories while preserving active operations', async () => {

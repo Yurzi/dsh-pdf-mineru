@@ -28,6 +28,8 @@ export interface StorageAreaStatistics {
     readonly unexpectedEntryCount: number;
     readonly unreadableEntryCount: number;
     readonly depthLimitCount: number;
+    readonly truncated: boolean;
+    readonly complete: boolean;
 }
 export interface StorageStatistics {
     readonly generatedAt: number;
@@ -168,7 +170,6 @@ export interface CacheClearReport {
     readonly diagnostics: readonly StorageMaintenanceDiagnostic[];
 }
 export declare function cacheClearConfirmationToken(cacheKeys: readonly CacheKey[]): string;
-export declare const confirmationToken: typeof cacheClearConfirmationToken;
 /** Storage maintenance is loopback-only and blocks destructive work while parse operations are active. */
 export declare class StorageMaintenanceService {
     readonly paths: StoragePaths;
@@ -177,7 +178,6 @@ export declare class StorageMaintenanceService {
     readonly lock: ProcessLock;
     readonly accessGate: StorageAccessGate;
     constructor(paths: StoragePaths, results: ResultRepository, operations: SharedOperationRegistry, lock: ProcessLock, accessGate?: StorageAccessGate);
-    static confirmationToken(cacheKeys: readonly CacheKey[]): string;
     getStatistics(signal?: AbortSignal): Promise<StorageStatistics>;
     scanIntegrity(options?: IntegrityScanOptions): Promise<CacheIntegrityScanReport>;
     private scanIntegrityInternal;
@@ -187,9 +187,7 @@ export declare class StorageMaintenanceService {
     clearCache(options?: CacheClearOptions): Promise<CacheClearReport>;
     private clearCacheInternal;
     gcDryRun(options?: GcDryRunOptions): Promise<GcDryRunReport>;
-    private acquireDestructiveAccess;
-    private countPublishedResultDirectories;
-    private countDirectDirectories;
+    private assertNoLocalOperations;
     private visitPublishedResults;
     private recordDirectoryIssue;
 }

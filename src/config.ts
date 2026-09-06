@@ -1,75 +1,22 @@
 import { homedir } from 'node:os'
-import { isAbsolute, join, resolve } from 'node:path'
-import { asProviderConfigId, type ProviderConfigId } from './domain/ids.js'
-import type { MinerUModel, ParseDefaults } from './domain/request.js'
+import { asProviderConfigId } from './domain/ids.js'
+import { join, resolve } from 'node:path'
+import type { MinerUModel, ParseMethod } from './domain/request.js'
+import {
+  DEFAULT_OUTPUT_CONFIG,
+  DEFAULT_PARSE_DEFAULTS,
+  DEFAULT_POLLING_CONFIG,
+  DEFAULT_RETRY_CONFIG,
+  DEFAULT_SECURITY_LIMITS,
+  DEFAULT_STORAGE_OPTIONS,
+  defaultProviderConfig,
+  type MinerUConfig,
+  type OfficialV4Config,
+  type ProviderConfig,
+  type SelfHostedV2Config,
+} from './config/pure.js'
 
-export interface SelfHostedV2Config {
-  readonly id: ProviderConfigId
-  readonly type: 'self-hosted-v2'
-  readonly baseURL: string
-  readonly apiKeyEnv?: string
-  readonly modelMap: Readonly<Record<MinerUModel, string>>
-  readonly configuredVersion?: string
-  readonly allowInsecureHttp: boolean
-}
-
-export interface OfficialV4Config {
-  readonly id: ProviderConfigId
-  readonly type: 'official-v4'
-  readonly baseURL: string
-  readonly apiKeyEnv: string
-  readonly models: readonly MinerUModel[]
-  readonly configuredVersion: 'v4'
-}
-
-export type ProviderConfig = SelfHostedV2Config | OfficialV4Config
-
-export interface StorageConfig {
-  readonly storageRoot: string
-  readonly cacheEnabled: boolean
-  readonly retainSources: false
-  readonly stagingTtlMs: number
-}
-
-export interface PollingConfig {
-  readonly pollIntervalMs: number
-  readonly pollTimeoutMs: number
-  readonly requestTimeoutMs: number
-  readonly operationTimeoutMs: number
-}
-
-export interface RetryConfig {
-  readonly maxAttempts: number
-  readonly baseDelayMs: number
-  readonly maxDelayMs: number
-}
-
-export interface OutputConfig {
-  /** Maximum inline character budget (UTF-16 chars) for the entire parse output across single or batch files. */
-  readonly maxInlineChars: number
-}
-
-export interface SecurityLimits {
-  readonly maxFileBytes: number
-  readonly maxApiResponseBytes: number
-  readonly maxZipDownloadBytes: number
-  readonly maxZipEntries: number
-  readonly maxZipEntryBytes: number
-  readonly maxZipTotalBytes: number
-  readonly maxZipCompressionRatio: number
-}
-
-export interface MinerUConfig {
-  readonly schemaVersion: 1
-  readonly activeProvider: ProviderConfigId
-  readonly providers: readonly ProviderConfig[]
-  readonly defaults: ParseDefaults
-  readonly storage: StorageConfig
-  readonly polling: PollingConfig
-  readonly retry: RetryConfig
-  readonly output: OutputConfig
-  readonly limits: SecurityLimits
-}
+export * from './config/pure.js'
 
 function dshHome(): string {
   const env = process.env.DSH_HOME?.trim()
@@ -79,27 +26,6 @@ function dshHome(): string {
   return resolve(env)
 }
 
-export function defaultProviderConfig(type: 'self-hosted-v2' | 'official-v4'): ProviderConfig {
-  if (type === 'official-v4') {
-    return {
-      id: asProviderConfigId('mp_official'),
-      type,
-      baseURL: 'https://mineru.net/api/v4',
-      apiKeyEnv: 'MINERU_API_KEY',
-      models: ['pipeline', 'vlm'],
-      configuredVersion: 'v4',
-    }
-  }
-  return {
-    id: asProviderConfigId('mp_self_hosted'),
-    type,
-    baseURL: 'http://localhost:18000',
-    apiKeyEnv: 'MINERU_API_KEY',
-    modelMap: { pipeline: 'pipeline', vlm: 'vlm-engine' },
-    allowInsecureHttp: true,
-  }
-}
-
 export function defaultMinerUConfig(): MinerUConfig {
   const selfHosted = defaultProviderConfig('self-hosted-v2')
   const official = defaultProviderConfig('official-v4')
@@ -107,20 +33,44 @@ export function defaultMinerUConfig(): MinerUConfig {
     schemaVersion: 1,
     activeProvider: selfHosted.id,
     providers: [selfHosted, official],
-    defaults: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true },
-    storage: { storageRoot: join(dshHome(), 'cache', 'pdf-mineru'), cacheEnabled: true, retainSources: false, stagingTtlMs: 24 * 60 * 60 * 1000 },
-    polling: { pollIntervalMs: 2000, pollTimeoutMs: 600000, requestTimeoutMs: 60000, operationTimeoutMs: 60 * 60 * 1000 },
-    retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 10000 },
-    output: { maxInlineChars: 200000 },
-    limits: {
-      maxFileBytes: 200 * 1024 * 1024,
-      maxApiResponseBytes: 8 * 1024 * 1024,
-      maxZipDownloadBytes: 512 * 1024 * 1024,
-      maxZipEntries: 10000,
-      maxZipEntryBytes: 256 * 1024 * 1024,
-      maxZipTotalBytes: 2 * 1024 * 1024 * 1024,
-      maxZipCompressionRatio: 200,
+    defaults: { ...DEFAULT_PARSE_DEFAULTS },
+    storage: {
+      storageRoot: join(dshHome(), 'cache', 'pdf-mineru'),
+      ...DEFAULT_STORAGE_OPTIONS,
     },
+    polling: { ...DEFAULT_POLLING_CONFIG },
+    retry: { ...DEFAULT_RETRY_CONFIG },
+    output: { ...DEFAULT_OUTPUT_CONFIG },
+    limits: { ...DEFAULT_SECURITY_LIMITS },
+  }
+}
+
+const ALLOWED_TOP_KEYS = new Set([
+  'schemaVersion', 'activeProvider', 'providers', 'defaults', 'storage',
+  'polling', 'retry', 'output', 'limits',
+])
+const ALLOWED_OFFICIAL_PROVIDER_KEYS = new Set([
+  'id', 'type', 'baseURL', 'apiKeyEnv', 'models', 'configuredVersion',
+])
+const ALLOWED_SELF_HOSTED_PROVIDER_KEYS = new Set([
+  'id', 'type', 'baseURL', 'apiKeyEnv', 'modelMap', 'configuredVersion', 'allowInsecureHttp',
+])
+const ALLOWED_MODEL_MAP_KEYS = new Set(['pipeline', 'vlm'])
+const ALLOWED_DEFAULTS_KEYS = new Set(['model', 'ocr', 'parseMethod', 'language', 'formula', 'table'])
+const ALLOWED_STORAGE_KEYS = new Set(['storageRoot', 'cacheEnabled', 'retainSources', 'stagingTtlMs'])
+const ALLOWED_POLLING_KEYS = new Set(['pollIntervalMs', 'pollTimeoutMs', 'requestTimeoutMs', 'operationTimeoutMs'])
+const ALLOWED_RETRY_KEYS = new Set(['maxAttempts', 'baseDelayMs', 'maxDelayMs'])
+const ALLOWED_OUTPUT_KEYS = new Set(['maxInlineChars'])
+const ALLOWED_LIMITS_KEYS = new Set([
+  'maxFileBytes', 'maxApiResponseBytes', 'maxZipDownloadBytes',
+  'maxZipEntries', 'maxZipEntryBytes', 'maxZipTotalBytes', 'maxZipCompressionRatio',
+])
+
+function assertAllowedKeys(record: Record<string, unknown>, allowed: ReadonlySet<string>, path: string): void {
+  for (const key of Object.keys(record)) {
+    if (!allowed.has(key)) {
+      throw new TypeError(`${path} contains unsupported property ${key}`)
+    }
   }
 }
 
@@ -179,7 +129,8 @@ function parseProvider(value: unknown): ProviderConfig {
   const input = record(value, 'provider')
   const id = asProviderConfigId(text(input.id, '', 'provider.id'))
   if (input.type === 'official-v4') {
-    return {
+    assertAllowedKeys(input, ALLOWED_OFFICIAL_PROVIDER_KEYS, 'provider')
+    const official: OfficialV4Config = {
       id,
       type: 'official-v4',
       baseURL: baseUrl(input.baseURL, 'https://mineru.net/api/v4', false, 'provider.baseURL'),
@@ -187,14 +138,17 @@ function parseProvider(value: unknown): ProviderConfig {
       models: models(input.models, ['pipeline', 'vlm']),
       configuredVersion: 'v4',
     }
+    return official
   }
   if (input.type !== 'self-hosted-v2') throw new TypeError('provider.type is unsupported')
+  assertAllowedKeys(input, ALLOWED_SELF_HOSTED_PROVIDER_KEYS, 'provider')
   const allowInsecureHttp = booleanValue(input.allowInsecureHttp, false, 'provider.allowInsecureHttp')
   const map = record(input.modelMap, 'provider.modelMap')
+  assertAllowedKeys(map, ALLOWED_MODEL_MAP_KEYS, 'modelMap')
   const pipeline = text(map.pipeline, '', 'modelMap.pipeline')
   const vlm = text(map.vlm, '', 'modelMap.vlm')
   if (pipeline === vlm) throw new TypeError('provider modelMap backends must be distinct')
-  return {
+  const selfHosted: SelfHostedV2Config = {
     id,
     type: 'self-hosted-v2',
     baseURL: baseUrl(input.baseURL, 'http://localhost:18000', allowInsecureHttp, 'provider.baseURL'),
@@ -203,47 +157,84 @@ function parseProvider(value: unknown): ProviderConfig {
     ...(input.configuredVersion === undefined ? {} : { configuredVersion: text(input.configuredVersion, '', 'configuredVersion') }),
     allowInsecureHttp,
   }
+  return selfHosted
 }
 
 function parseCanonical(input: Record<string, unknown>, fallback: MinerUConfig): MinerUConfig {
+  if (input.schemaVersion !== undefined) {
+    if (input.schemaVersion !== 1) {
+      throw new TypeError(`unsupported schemaVersion: ${String(input.schemaVersion)}`)
+    }
+  }
+
   if (!Array.isArray(input.providers) || input.providers.length === 0) throw new TypeError('providers must be a non-empty array')
   const providers = input.providers.map(parseProvider)
   if (new Set(providers.map(provider => provider.id)).size !== providers.length) throw new TypeError('provider ids must be unique')
   const activeProvider = asProviderConfigId(text(input.activeProvider, '', 'activeProvider'))
   if (!providers.some(provider => provider.id === activeProvider)) throw new TypeError('activeProvider does not identify a configured provider')
+
   const defaults = record(input.defaults ?? {}, 'defaults')
+  assertAllowedKeys(defaults, ALLOWED_DEFAULTS_KEYS, 'defaults')
+
   const storage = record(input.storage ?? {}, 'storage')
+  assertAllowedKeys(storage, ALLOWED_STORAGE_KEYS, 'storage')
+
   const polling = record(input.polling ?? {}, 'polling')
+  assertAllowedKeys(polling, ALLOWED_POLLING_KEYS, 'polling')
+
   const retry = record(input.retry ?? {}, 'retry')
+  assertAllowedKeys(retry, ALLOWED_RETRY_KEYS, 'retry')
+
   const output = record(input.output ?? {}, 'output')
+  assertAllowedKeys(output, ALLOWED_OUTPUT_KEYS, 'output')
+
   const limits = record(input.limits ?? {}, 'limits')
+  assertAllowedKeys(limits, ALLOWED_LIMITS_KEYS, 'limits')
+
   const model = defaults.model === undefined ? fallback.defaults.model : defaults.model
   if (model !== 'pipeline' && model !== 'vlm') throw new TypeError('defaults.model is invalid')
+
+  let parseMethod: ParseMethod
+  if (defaults.parseMethod !== undefined) {
+    if (defaults.parseMethod !== 'auto' && defaults.parseMethod !== 'txt' && defaults.parseMethod !== 'ocr') {
+      throw new TypeError('defaults.parseMethod is invalid')
+    }
+    parseMethod = defaults.parseMethod as ParseMethod
+  } else if (defaults.ocr === true) {
+    parseMethod = 'ocr'
+  } else {
+    parseMethod = fallback.defaults.parseMethod
+  }
+
+  const expectedOcr = parseMethod === 'ocr'
+  if (defaults.ocr !== undefined) {
+    const ocrVal = booleanValue(defaults.ocr, expectedOcr, 'defaults.ocr')
+    if (ocrVal !== expectedOcr) {
+      throw new TypeError('defaults.ocr conflicts with defaults.parseMethod')
+    }
+  }
+  const ocr = expectedOcr
+
   const storageRoot = text(storage.storageRoot, fallback.storage.storageRoot, 'storage.storageRoot')
+
+  if (storage.retainSources !== undefined && storage.retainSources !== false) {
+    throw new TypeError('storage.retainSources must be false')
+  }
+
   const result: MinerUConfig = {
     schemaVersion: 1,
     activeProvider,
     providers,
     defaults: {
       model,
-      ocr: (() => {
-        const method = defaults.parseMethod ?? (defaults.ocr === true ? 'ocr' : fallback.defaults.parseMethod)
-        if (method !== 'auto' && method !== 'txt' && method !== 'ocr') throw new TypeError('defaults.parseMethod is invalid')
-        const ocr = booleanValue(defaults.ocr, method === 'ocr', 'defaults.ocr')
-        if (ocr !== (method === 'ocr')) throw new TypeError('defaults.ocr conflicts with defaults.parseMethod')
-        return ocr
-      })(),
-      parseMethod: (() => {
-        const method = defaults.parseMethod ?? (defaults.ocr === true ? 'ocr' : fallback.defaults.parseMethod)
-        if (method !== 'auto' && method !== 'txt' && method !== 'ocr') throw new TypeError('defaults.parseMethod is invalid')
-        return method
-      })(),
+      ocr,
+      parseMethod,
       language: text(defaults.language, fallback.defaults.language, 'defaults.language'),
       formula: booleanValue(defaults.formula, fallback.defaults.formula, 'defaults.formula'),
       table: booleanValue(defaults.table, fallback.defaults.table, 'defaults.table'),
     },
     storage: {
-      storageRoot: isAbsolute(storageRoot) ? resolve(storageRoot) : resolve(storageRoot),
+      storageRoot: resolve(storageRoot),
       cacheEnabled: booleanValue(storage.cacheEnabled, fallback.storage.cacheEnabled, 'storage.cacheEnabled'),
       retainSources: false,
       stagingTtlMs: positive(storage.stagingTtlMs, fallback.storage.stagingTtlMs, 'storage.stagingTtlMs'),
@@ -272,6 +263,7 @@ function parseCanonical(input: Record<string, unknown>, fallback: MinerUConfig):
       maxZipCompressionRatio: positive(limits.maxZipCompressionRatio, fallback.limits.maxZipCompressionRatio, 'limits.maxZipCompressionRatio'),
     },
   }
+
   const active = providers.find(provider => provider.id === activeProvider)!
   if (active.type === 'official-v4') {
     if (!active.models.includes(result.defaults.model)) throw new TypeError('active official provider does not support defaults.model')
@@ -286,20 +278,10 @@ function parseCanonical(input: Record<string, unknown>, fallback: MinerUConfig):
   return result
 }
 
-export function migrateConfig(value: unknown): MinerUConfig {
+export function parseConfig(value: unknown): MinerUConfig {
   const fallback = defaultMinerUConfig()
   if (value === undefined || value === null) return fallback
   const input = record(value, 'config')
-  const allowed = new Set([
-    'schemaVersion', 'activeProvider', 'providers', 'defaults', 'storage',
-    'polling', 'retry', 'output', 'limits',
-  ])
-  for (const key of Object.keys(input)) {
-    if (!allowed.has(key)) throw new TypeError(`config contains unsupported property ${key}`)
-  }
+  assertAllowedKeys(input, ALLOWED_TOP_KEYS, 'config')
   return parseCanonical(input, fallback)
-}
-
-export function providerById(config: MinerUConfig, id: ProviderConfigId): ProviderConfig | undefined {
-  return config.providers.find(provider => provider.id === id)
 }

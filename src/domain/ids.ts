@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto'
-
 type Brand<T, Name extends string> = T & { readonly __brand: Name }
 
 export type MinerUResultId = Brand<string, 'MinerUResultId'>
@@ -42,7 +40,7 @@ export function asCacheKey(value: string): CacheKey {
 }
 
 function randomOperationId(): string {
-  return `mo_${randomUUID().replaceAll('-', '')}`
+  return `mo_${globalThis.crypto.randomUUID().replaceAll('-', '')}`
 }
 
 export const createOperationId = (): OperationId => asOperationId(randomOperationId())

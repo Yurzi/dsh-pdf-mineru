@@ -17,12 +17,13 @@ import { MinerUError, failure } from '../domain/errors.js'
 import type { ArtifactKind, CanonicalParseRequest, CanonicalSourceFile } from '../domain/request.js'
 import type { ArtifactRef, MinerUResultManifest, ResultProducer } from '../domain/result.js'
 import { parseMinerUResultManifest } from '../domain/schemas.js'
-import { canonicalJson, computeCacheKey } from '../service/cache-key.js'
+import { canonicalJson, computeCacheKey } from '../domain/cache-key.js'
 import { computeFileSha256 } from '../utils/crypto.js'
 import type { ArtifactInput, ArtifactSink, ArtifactWriteOptions, TemporaryArtifact } from '../providers/provider.js'
 import { StagingArtifactSink } from './artifact-sink.js'
 import type { StoragePaths } from './paths.js'
-import type { ProcessLock } from './process-lock.js'
+import { ProcessLock, type ProcessLockScope } from './process-lock.js'
+import { listUseRecords } from './access-gate.js'
 
 const DEFAULT_MAX_JSON_VALIDATION_BYTES = 64 * 1024 * 1024
 const DEFAULT_MAX_MANIFEST_BYTES = 16 * 1024 * 1024
@@ -183,11 +184,17 @@ async function validateUtf8(path: string, signal?: AbortSignal): Promise<void> {
   }
 }
 
-function samePublishedContent(left: MinerUResultManifest, right: MinerUResultManifest): boolean {
-  if (left.cacheKey !== right.cacheKey || left.sourceSha256 !== right.sourceSha256) return false
-  const byPath = (manifest: MinerUResultManifest): readonly ArtifactRef[] =>
-    [...manifest.files[0].artifacts].sort((a, b) => a.relativePath.localeCompare(b.relativePath))
-  return canonicalJson(byPath(left)) === canonicalJson(byPath(right))
+function samePublicationSemantics(left: MinerUResultManifest, right: MinerUResultManifest): boolean {
+  const leftSource = left.request.files[0]
+  const rightSource = right.request.files[0]
+  return left.cacheKey === right.cacheKey
+    && left.sourceSha256 === right.sourceSha256
+    && leftSource?.sha256 === rightSource?.sha256
+    && leftSource?.bytes === rightSource?.bytes
+    && left.request.schemaVersion === right.request.schemaVersion
+    && left.producer.compatibilityKey === right.producer.compatibilityKey
+    && canonicalJson(left.request.semantics) === canonicalJson(right.request.semantics)
+    && canonicalJson(left.request.requiredArtifacts) === canonicalJson(right.request.requiredArtifacts)
 }
 
 export class ResultTransaction implements ArtifactSink {
@@ -253,6 +260,7 @@ export class ResultRepository {
   private readonly maxJsonValidationBytes: number
   private readonly maxManifestBytes: number
   private readonly maxArtifactBytes: number | undefined
+  private readonly mutationLock: ProcessLock
 
   constructor(
     public readonly paths: StoragePaths,
@@ -265,6 +273,7 @@ export class ResultRepository {
       throw new TypeError('maxManifestBytes must be a positive safe integer')
     }
     this.maxArtifactBytes = options.maxArtifactBytes
+    this.mutationLock = lock ?? new ProcessLock(paths)
   }
 
   beginTransaction(
@@ -410,21 +419,23 @@ export class ResultRepository {
     }
 
     const targetDir = this.paths.resultDir(validated.cacheKey)
-    await mkdir(dirname(targetDir), { recursive: true, mode: 0o700 })
 
-    const resolveExisting = async (): Promise<MinerUResultManifest | undefined> => {
+    const resolveExisting = async (scope: ProcessLockScope): Promise<MinerUResultManifest | undefined> => {
       const existing = await this.get(validated.cacheKey, undefined, signal)
       if (existing === undefined) return undefined
-      if (!samePublishedContent(existing, validated)) {
-        await this.quarantine(tx.stagingDir, 'conflict')
+      if (!samePublicationSemantics(existing, validated)) {
+        await this.quarantineScoped(this.mutationLock, scope, tx.stagingDir, 'conflict')
         throw new MinerUError(failure('CACHE_CONFLICT', `Cache conflict detected for key ${validated.cacheKey}`))
       }
+      // A valid immutable publication wins even if provider output bytes differ.
       await tx.abort()
       return existing
     }
 
-    const doCommit = async () => {
-      const before = await resolveExisting()
+    const doCommit = async (scope: ProcessLockScope) => {
+      this.mutationLock.assertScope(scope)
+      await this.ensureResultParentScoped(scope, validated.cacheKey)
+      const before = await resolveExisting(scope)
       if (before !== undefined) {
         await tx.abort().catch(() => undefined)
         return { resultId: before.id, cacheKey: before.cacheKey, manifest: before }
@@ -439,32 +450,26 @@ export class ResultRepository {
         } catch (error) {
           const code = (error as NodeJS.ErrnoException).code
           if (code === 'EEXIST' || code === 'ENOTEMPTY') {
-            const raced = await resolveExisting()
+            const raced = await resolveExisting(scope)
             if (raced !== undefined) {
               await tx.abort().catch(() => undefined)
               return { resultId: raced.id, cacheKey: raced.cacheKey, manifest: raced }
             }
             continue
           }
-          await this.quarantine(tx.stagingDir, 'commit_failed').catch(() => undefined)
+          await this.quarantineScoped(this.mutationLock, scope, tx.stagingDir, 'commit_failed').catch(() => undefined)
           throw error
         }
       }
-      await this.quarantine(tx.stagingDir, 'commit_race').catch(() => undefined)
+      await this.quarantineScoped(this.mutationLock, scope, tx.stagingDir, 'commit_race').catch(() => undefined)
       throw new MinerUError(failure('CACHE_CONFLICT', `Could not atomically publish cache key ${validated.cacheKey}`))
     }
 
-    if (this.lock !== undefined) {
-      return await this.lock.withLock(doCommit, signal)
-    }
-    return await doCommit()
+    await this.mutationLock.initialize(signal)
+    return await this.mutationLock.withLock(doCommit, signal)
   }
 
-  /**
-   * Strictly verifies one published result without moving or modifying it.
-   * This is the maintenance-safe counterpart to get(), whose cache-hit path
-   * still quarantines invalid entries before returning a miss.
-   */
+  /** Strictly verifies one published result without moving or modifying it. */
   async inspectPublished(
     cacheKey: CacheKey | string,
     signal?: AbortSignal,
@@ -526,13 +531,11 @@ export class ResultRepository {
     const key = asCacheKey(cacheKey)
     const inspection = await this.inspectPublished(key, signal)
     if (inspection.status !== 'valid') {
-      if (inspection.status === 'unreadable') {
-        throw new MinerUError(failure('CACHE_CORRUPT', 'Published MinerU cache data could not be read'))
-      }
-      if (inspection.reason !== 'absent') {
-        await this.quarantine(this.paths.resultDir(key), inspection.status === 'missing' ? 'missing_manifest' : 'corrupt').catch(() => undefined)
-      }
-      return undefined
+      if (inspection.status === 'missing' && inspection.reason === 'absent') return undefined
+      throw new MinerUError(failure(
+        'CACHE_CORRUPT',
+        'Published MinerU cache data is invalid; run explicit storage integrity maintenance before retrying',
+      ))
     }
 
     const manifest = inspection.manifest
@@ -552,34 +555,70 @@ export class ResultRepository {
   }
 
   async quarantine(sourcePath: string, reason = 'quarantine'): Promise<string> {
-    const doQuarantine = async () => {
-      const safeSourcePath = assertQuarantineSourcePath(this.paths, sourcePath)
-      const id = `${String(Date.now())}_${reason}_${randomUUID().slice(0, 8)}`
-      const destination = this.paths.quarantineDir(id)
-      try {
-        const source = await lstat(safeSourcePath)
-        if (source.isSymbolicLink() || !source.isDirectory()) {
-          throw new TypeError('Only regular directories can be quarantined')
-        }
-      } catch (error) {
-        if (errnoCode(error) === 'ENOENT') return destination
-        throw new MinerUError(failure('CACHE_CORRUPT', 'Failed to isolate corrupt MinerU data safely'))
-      }
+    await this.mutationLock.initialize()
+    return await this.mutationLock.withLock(scope =>
+      this.quarantineScoped(this.mutationLock, scope, sourcePath, reason),
+    )
+  }
 
+  /** Mutation helper for callers already holding the exact authority lock. */
+  async quarantineScoped(
+    authority: ProcessLock,
+    scope: ProcessLockScope,
+    sourcePath: string,
+    reason = 'quarantine',
+  ): Promise<string> {
+    if (authority.paths.root !== this.paths.root) throw new TypeError('Quarantine lock root does not match repository root')
+    authority.assertScope(scope)
+    const safeSourcePath = assertQuarantineSourcePath(this.paths, sourcePath)
+    const publishedSegments = containedSegments(this.paths.resultsDir(), safeSourcePath)
+    if (publishedSegments?.length === 2) {
+      const users = await listUseRecords(this.paths)
+      if (users.some(user => user.kind !== 'dead')) {
+        throw new MinerUError(failure('STORAGE_LOCKED', 'Published MinerU data is in use by an active or unverifiable reader'))
+      }
+    }
+    const id = `${String(Date.now())}_${reason}_${randomUUID().slice(0, 8)}`
+    const destination = this.paths.quarantineDir(id)
+    try {
+      await assertRegularDirectoryWithin(this.paths.root, safeSourcePath)
+    } catch (error) {
+      if (errnoCode(error) === 'ENOENT') return destination
+      throw new MinerUError(failure('CACHE_CORRUPT', 'Failed to isolate corrupt MinerU data safely'))
+    }
+
+    try {
       await mkdir(this.paths.quarantineDir(), { recursive: true })
+      const quarantineRoot = await lstat(this.paths.quarantineDir())
+      if (quarantineRoot.isSymbolicLink() || !quarantineRoot.isDirectory()) {
+        throw new TypeError('Quarantine root is not a regular directory')
+      }
+      await rename(safeSourcePath, destination)
+      return destination
+    } catch (error) {
+      if (errnoCode(error) === 'ENOENT') return destination
+      throw new MinerUError(failure('CACHE_CORRUPT', 'Failed to isolate corrupt MinerU data'))
+    }
+  }
+
+  private async ensureResultParentScoped(scope: ProcessLockScope, cacheKey: CacheKey): Promise<void> {
+    this.mutationLock.assertScope(scope)
+    const ancestors = [
+      join(this.paths.root, 'results'),
+      this.paths.resultsDir(),
+      dirname(this.paths.resultDir(cacheKey)),
+    ]
+    for (const ancestor of ancestors) {
       try {
-        await rename(safeSourcePath, destination)
-        return destination
+        await mkdir(ancestor, { mode: 0o700 })
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return destination
-        throw new MinerUError(failure('CACHE_CORRUPT', 'Failed to isolate corrupt MinerU data'))
+        if (errnoCode(error) !== 'EEXIST') throw error
+      }
+      const details = await lstat(ancestor)
+      if (details.isSymbolicLink() || !details.isDirectory()) {
+        throw new MinerUError(failure('CACHE_CORRUPT', 'Result publication ancestors must be regular directories'))
       }
     }
-
-    if (this.lock !== undefined) {
-      return await this.lock.withLock(doQuarantine)
-    }
-    return await doQuarantine()
   }
 
   async cleanupStaging(
@@ -588,31 +627,44 @@ export class ResultRepository {
     signal?: AbortSignal,
   ): Promise<number> {
     if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) throw new TypeError('staging TTL must be a positive safe integer')
-    let entries: string[]
-    try {
-      entries = await readdir(this.paths.stagingDir())
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0
-      throw error
-    }
-    let cleaned = 0
-    const now = Date.now()
-    for (const entry of entries) {
-      signal?.throwIfAborted()
-      let operationId: OperationId
-      try { operationId = asOperationId(entry) } catch { continue }
-      if (activeOperationIds.has(operationId)) continue
-      const path = this.paths.stagingDir(operationId)
+    await this.mutationLock.initialize(signal)
+    return await this.mutationLock.withLock(async scope => {
+      this.mutationLock.assertScope(scope)
+      // Any live or unverifiable process user makes cleanup a no-op. Dead records
+      // are not treated as active proof; their unique directories are pruned by maintenance.
+      const users = await listUseRecords(this.paths)
+      if (users.some(user => user.kind !== 'dead')) return 0
+
+      const stagingRoot = this.paths.stagingDir()
+      let entries: string[]
       try {
-        const details = await lstat(path)
-        if (!details.isSymbolicLink() && details.isDirectory() && now - details.mtimeMs > ttlMs) {
-          await rm(path, { recursive: true, force: true })
-          cleaned++
-        }
+        const root = await lstat(stagingRoot)
+        if (root.isSymbolicLink() || !root.isDirectory()) return 0
+        entries = await readdir(stagingRoot)
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        if (errnoCode(error) === 'ENOENT') return 0
+        throw error
       }
-    }
-    return cleaned
+
+      let cleaned = 0
+      const now = Date.now()
+      for (const entry of entries) {
+        signal?.throwIfAborted()
+        let operationId: OperationId
+        try { operationId = asOperationId(entry) } catch { continue }
+        if (activeOperationIds.has(operationId)) continue
+        const path = this.paths.stagingDir(operationId)
+        try {
+          const details = await lstat(path)
+          if (!details.isSymbolicLink() && details.isDirectory() && now - details.mtimeMs > ttlMs) {
+            await rm(path, { recursive: true, force: true })
+            cleaned++
+          }
+        } catch (error) {
+          if (errnoCode(error) !== 'ENOENT') throw error
+        }
+      }
+      return cleaned
+    }, signal)
   }
 }

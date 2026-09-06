@@ -19,7 +19,8 @@ export type ParseMethod = 'auto' | 'txt' | 'ocr'
 export const FOCUS_KINDS = ['all', 'text', 'table', 'image', 'toc', 'artifacts'] as const
 export type FocusKind = typeof FOCUS_KINDS[number]
 
-export type PageSelection = number | string | readonly (number | string)[]
+/** Public page selection: a single page, a range string, or an array of page numbers. */
+export type PageSelection = number | string | readonly number[]
 
 export interface ParseSemantics {
   readonly model: MinerUModel
@@ -62,7 +63,12 @@ export interface PreparedParseRequest {
   readonly sources: readonly PreparedSourceFile[]
 }
 
-export interface ParseRequestInput {
+export interface ReadCursorInput {
+  /** Opaque continuation token from a previous partial read. */
+  readonly cursor?: string
+}
+
+export interface ParseRequestInput extends ReadCursorInput {
   readonly file_path?: string
   readonly model?: MinerUModel
   readonly ocr?: boolean
@@ -117,33 +123,17 @@ export function normalizePageRanges(input: string): string {
   return merged.map(({ start, end }) => start === end ? String(start) : `${String(start)}-${String(end)}`).join(',')
 }
 
-export function narrowPageSelection(
-  requested: ReadonlySet<number> | undefined,
-  totalPages: number,
-): { pagesSet: Set<number> | undefined; pagesLabel: string } {
-  const maxBound = Math.max(1, totalPages)
-  if (requested === undefined) {
-    const pagesLabel = maxBound > 1 ? `1-${maxBound}` : '1'
-    return { pagesSet: undefined, pagesLabel }
-  }
+export interface PageNarrowing {
+  readonly pagesSet: Set<number> | undefined
+  readonly pagesLabel: string
+  /** Pages requested but outside 1..totalPages; reported, never silently replaced. */
+  readonly outOfRange: readonly number[]
+  /** True when the request asked for pages but none overlap the document. */
+  readonly fullyOutOfRange: boolean
+}
 
-  const valid = new Set<number>()
-  for (const p of requested) {
-    if (p >= 1 && p <= maxBound) {
-      valid.add(p)
-    }
-  }
-
-  if (valid.size === 0) {
-    const minReq = Math.min(...requested)
-    if (minReq > maxBound) {
-      valid.add(maxBound)
-    } else {
-      valid.add(1)
-    }
-  }
-
-  const sorted = [...valid].sort((a, b) => a - b)
+function renderPageLabel(pages: ReadonlySet<number>): string {
+  const sorted = [...pages].sort((a, b) => a - b)
   const intervals: Array<{ start: number; end: number }> = []
   for (const p of sorted) {
     const last = intervals.at(-1)
@@ -153,10 +143,42 @@ export function narrowPageSelection(
       intervals.push({ start: p, end: p })
     }
   }
-  const pagesLabel = intervals.map(({ start, end }) => start === end ? String(start) : `${start}-${end}`).join(',')
-  return { pagesSet: valid, pagesLabel }
+  return intervals.map((seg) => seg.start === seg.end ? String(seg.start) : String(seg.start) + "-" + String(seg.end)).join(",")
 }
 
+export function narrowPageSelection(
+  requested: ReadonlySet<number> | undefined,
+  totalPages: number | undefined,
+): PageNarrowing {
+  if (requested === undefined) {
+    if (totalPages === undefined) {
+      return { pagesSet: undefined, pagesLabel: "", outOfRange: [], fullyOutOfRange: false }
+    }
+    const maxBound = Math.max(1, totalPages)
+    const pagesLabel = maxBound > 1 ? "1-" + String(maxBound) : "1"
+    return { pagesSet: undefined, pagesLabel, outOfRange: [], fullyOutOfRange: false }
+  }
+  if (totalPages === undefined) {
+    return {
+      pagesSet: new Set(requested),
+      pagesLabel: renderPageLabel(requested),
+      outOfRange: [],
+      fullyOutOfRange: false,
+    }
+  }
+  const maxBound = Math.max(1, totalPages)
+  const valid = new Set<number>()
+  const outOfRange: number[] = []
+  for (const p of requested) {
+    if (p >= 1 && p <= maxBound) valid.add(p)
+    else outOfRange.push(p)
+  }
+  outOfRange.sort((a, b) => a - b)
+  if (valid.size === 0) {
+    return { pagesSet: new Set<number>(), pagesLabel: "", outOfRange, fullyOutOfRange: true }
+  }
+  return { pagesSet: valid, pagesLabel: renderPageLabel(valid), outOfRange, fullyOutOfRange: false }
+}
 export function normalizePageSelection(input: unknown): Set<number> | undefined {
   if (input === undefined || input === null) return undefined
   if (typeof input === 'number') {
@@ -174,11 +196,6 @@ export function normalizePageSelection(input: unknown): Set<number> | undefined 
           throw new TypeError(`Invalid page number: ${String(item)}`)
         }
         set.add(item)
-      } else if (typeof item === 'string') {
-        const intervals = parsePageRangeTokens(item)
-        for (const { start, end } of intervals) {
-          for (let p = start; p <= end; p++) set.add(p)
-        }
       } else {
         throw new TypeError(`Invalid page selection item: ${String(item)}`)
       }

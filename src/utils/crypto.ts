@@ -1,26 +1,20 @@
 import { createHash } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 
-/**
- * Computes the SHA-256 hexadecimal digest of a local file via streaming.
- * Respects an optional AbortSignal and cleans up listeners and streams.
- */
+/** Stream a file into SHA-256; Node owns cancellation listener cleanup. */
 export async function computeFileSha256(filePath: string, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted()
   const digest = createHash('sha256')
-  const stream = createReadStream(filePath)
-  const onAbort = (): void => {
-    stream.destroy(signal?.reason instanceof Error ? signal.reason : new DOMException('Aborted', 'AbortError'))
-  }
-  signal?.addEventListener('abort', onAbort, { once: true })
+  const stream = createReadStream(filePath, { signal })
   try {
+    for await (const chunk of stream) digest.update(chunk as Buffer)
     signal?.throwIfAborted()
-    for await (const chunk of stream) {
-      signal?.throwIfAborted()
-      digest.update(chunk as Buffer)
-    }
     return digest.digest('hex')
+  } catch (error) {
+    // Preserve the caller's domain cancellation reason rather than Node's wrapper.
+    signal?.throwIfAborted()
+    throw error
   } finally {
-    signal?.removeEventListener('abort', onAbort)
     stream.destroy()
   }
 }

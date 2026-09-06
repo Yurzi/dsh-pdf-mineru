@@ -4,7 +4,7 @@
  * Enforces:
  *   - Strict identifier validation before path concatenation (prevents path traversal)
  *   - Relative POSIX artifact path containment within result/staging roots
- *   - Safe, deterministic directory layout per ARCHITECTURE.md §12.4
+ *   - Safe, deterministic directory layout documented in ARCHITECTURE.md
  */
 
 import { homedir } from 'node:os'
@@ -99,6 +99,21 @@ export class StoragePaths {
 
   processLockFile(): string {
     return join(this.root, '.process.lock')
+  }
+
+  /** v2 bakery lock state directory (<root>/.lock). */
+  lockDir(): string {
+    return join(this.root, '.lock')
+  }
+
+  /** v2 bakery claim directory (<root>/.lock/claims). */
+  lockClaimsDir(): string {
+    return join(this.lockDir(), 'claims')
+  }
+
+  /** Cross-process storage use records (<root>/.lock/users). */
+  lockUsersDir(): string {
+    return join(this.lockDir(), 'users')
   }
 
   resolveArtifactPath(cacheKey: CacheKey | string, relativePath: string): string {

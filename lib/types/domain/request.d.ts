@@ -8,7 +8,8 @@ export type MinerUModel = 'pipeline' | 'vlm';
 export type ParseMethod = 'auto' | 'txt' | 'ocr';
 export declare const FOCUS_KINDS: readonly ["all", "text", "table", "image", "toc", "artifacts"];
 export type FocusKind = typeof FOCUS_KINDS[number];
-export type PageSelection = number | string | readonly (number | string)[];
+/** Public page selection: a single page, a range string, or an array of page numbers. */
+export type PageSelection = number | string | readonly number[];
 export interface ParseSemantics {
     readonly model: MinerUModel;
     readonly ocr: boolean;
@@ -45,7 +46,11 @@ export interface PreparedParseRequest {
     readonly request: CanonicalParseRequest;
     readonly sources: readonly PreparedSourceFile[];
 }
-export interface ParseRequestInput {
+export interface ReadCursorInput {
+    /** Opaque continuation token from a previous partial read. */
+    readonly cursor?: string;
+}
+export interface ParseRequestInput extends ReadCursorInput {
     readonly file_path?: string;
     readonly model?: MinerUModel;
     readonly ocr?: boolean;
@@ -67,10 +72,15 @@ export interface ParseDefaults {
     readonly table: boolean;
 }
 export declare function normalizePageRanges(input: string): string;
-export declare function narrowPageSelection(requested: ReadonlySet<number> | undefined, totalPages: number): {
-    pagesSet: Set<number> | undefined;
-    pagesLabel: string;
-};
+export interface PageNarrowing {
+    readonly pagesSet: Set<number> | undefined;
+    readonly pagesLabel: string;
+    /** Pages requested but outside 1..totalPages; reported, never silently replaced. */
+    readonly outOfRange: readonly number[];
+    /** True when the request asked for pages but none overlap the document. */
+    readonly fullyOutOfRange: boolean;
+}
+export declare function narrowPageSelection(requested: ReadonlySet<number> | undefined, totalPages: number | undefined): PageNarrowing;
 export declare function normalizePageSelection(input: unknown): Set<number> | undefined;
 export declare function normalizeFocusSelection(input: unknown): Set<FocusKind>;
 export declare function normalizeArtifactKinds(kinds: readonly ArtifactKind[]): readonly ArtifactKind[];

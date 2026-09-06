@@ -3,7 +3,7 @@ import type { ArtifactKind, CanonicalParseRequest, CanonicalSourceFile } from '.
 import type { ArtifactRef, MinerUResultManifest, ResultProducer } from '../domain/result.js';
 import type { ArtifactInput, ArtifactSink, ArtifactWriteOptions, TemporaryArtifact } from '../providers/provider.js';
 import type { StoragePaths } from './paths.js';
-import type { ProcessLock } from './process-lock.js';
+import { ProcessLock, type ProcessLockScope } from './process-lock.js';
 type ResultInspectionStatus = 'valid' | 'missing' | 'corrupt' | 'unreadable';
 type ResultInspectionReason = 'absent' | 'missing-entry' | 'unsafe-entry' | 'manifest-invalid' | 'artifact-invalid' | 'io-error';
 /**
@@ -42,6 +42,7 @@ export declare class ResultRepository {
     private readonly maxJsonValidationBytes;
     private readonly maxManifestBytes;
     private readonly maxArtifactBytes;
+    private readonly mutationLock;
     constructor(paths: StoragePaths, options?: ResultRepositoryOptions, lock?: ProcessLock | undefined);
     beginTransaction(operationId: OperationId | string, request: CanonicalParseRequest, producer: ResultProducer, signal?: AbortSignal): ResultTransaction;
     private assertManifestConsistency;
@@ -53,16 +54,15 @@ export declare class ResultRepository {
         cacheKey: CacheKey;
         manifest: MinerUResultManifest;
     }>;
-    /**
-     * Strictly verifies one published result without moving or modifying it.
-     * This is the maintenance-safe counterpart to get(), whose cache-hit path
-     * still quarantines invalid entries before returning a miss.
-     */
+    /** Strictly verifies one published result without moving or modifying it. */
     inspectPublished(cacheKey: CacheKey | string, signal?: AbortSignal): Promise<PublishedResultInspection>;
     get(cacheKey: CacheKey | string, requiredArtifacts?: readonly ArtifactKind[], signal?: AbortSignal): Promise<MinerUResultManifest | undefined>;
     resolveArtifactAbsolutePath(cacheKey: CacheKey | string, relativePath: string): string;
     manifestAbsolutePath(cacheKey: CacheKey | string): string;
     quarantine(sourcePath: string, reason?: string): Promise<string>;
+    /** Mutation helper for callers already holding the exact authority lock. */
+    quarantineScoped(authority: ProcessLock, scope: ProcessLockScope, sourcePath: string, reason?: string): Promise<string>;
+    private ensureResultParentScoped;
     cleanupStaging(ttlMs: number, activeOperationIds?: ReadonlySet<OperationId | string>, signal?: AbortSignal): Promise<number>;
 }
 export {};

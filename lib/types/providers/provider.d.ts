@@ -36,7 +36,7 @@ export interface ProviderCallContext {
     readonly timeoutMs: number;
     readonly limits: ProviderCallLimits;
     readonly retry?: ProviderRetryOptions;
-    /** Persist the durable provider reference immediately after upstream acceptance. */
+    /** Observe upstream acceptance within this invocation; references remain transient. */
     readonly onAccepted?: (ref: ProviderJobRef) => Promise<void>;
 }
 export interface ProviderCompatibilityContext {

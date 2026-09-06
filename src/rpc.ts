@@ -9,13 +9,13 @@
  * Security:
  *   - Authority: strictly 'loopback'
  *   - Credential values and tokens are never returned or leaked in responses/errors.
- *   - Errors sanitized via sanitizeDiagnostic.
+ *   - Errors sanitized via sanitizeDiagnostic and mapped to allowlisted actionable error codes.
  */
 
 import type { Context } from 'cordis'
 import type { MinerUConfig } from './config.js'
-import { migrateConfig } from './config.js'
-import { sanitizeDiagnostic } from './domain/errors.js'
+import { parseConfig } from './config.js'
+import { MinerUError, type MinerUErrorCode, sanitizeDiagnostic } from './domain/errors.js'
 import type { ProbeView } from './service/mineru-service.js'
 import type { StorageMaintenanceService } from './storage/maintenance-service.js'
 
@@ -32,6 +32,34 @@ export type RpcResult<T> =
   | { readonly ok: false; readonly error: { readonly code: string; readonly message: string } }
 
 export const RPC_CHANNEL = '/dsh-pdf-mineru-api'
+
+const MINERU_TO_RPC_ERROR_CODE: Readonly<Record<MinerUErrorCode, string>> = {
+  INVALID_REQUEST: 'mineru/invalid-argument',
+  FILE_NOT_FOUND: 'mineru/not-found',
+  FILE_TOO_LARGE: 'mineru/file-too-large',
+  UNSUPPORTED_OPTION: 'mineru/unsupported-option',
+  CREDENTIAL_MISSING: 'mineru/credential-missing',
+  AUTHENTICATION_FAILED: 'mineru/auth-failed',
+  PROVIDER_UNAVAILABLE: 'mineru/provider-unavailable',
+  PROVIDER_CONFIG_MISSING: 'mineru/provider-config-missing',
+  PROVIDER_RATE_LIMITED: 'mineru/provider-rate-limited',
+  PROVIDER_QUOTA_EXHAUSTED: 'mineru/quota-exhausted',
+  UPLOAD_FAILED: 'mineru/upload-failed',
+  REMOTE_PARSE_FAILED: 'mineru/remote-parse-failed',
+  RESULT_NOT_READY: 'mineru/result-not-ready',
+  RESULT_DOWNLOAD_FAILED: 'mineru/download-failed',
+  RESULT_ARCHIVE_INVALID: 'mineru/archive-invalid',
+  RESULT_TOO_LARGE: 'mineru/result-too-large',
+  CACHE_CORRUPT: 'mineru/cache-corrupt',
+  CACHE_CONFLICT: 'mineru/cache-conflict',
+  CACHE_EVICTED: 'mineru/cache-evicted',
+  INTERRUPTED_UPLOAD: 'mineru/interrupted-upload',
+  POLL_TIMEOUT: 'mineru/timeout',
+  CANCELLED: 'mineru/cancelled',
+  UNAUTHENTICATED_SESSION: 'mineru/unauthenticated',
+  JOB_NOT_FOUND: 'mineru/not-found',
+  STORAGE_LOCKED: 'mineru/storage-locked',
+}
 
 function ok<T>(value: T): RpcResult<T> {
   return { ok: true, value }
@@ -66,6 +94,33 @@ function fail<T = unknown>(message: string, code = 'mineru/internal'): RpcResult
   }
 }
 
+export function mapRpcError(err: unknown): { code: string; message: string } {
+  if (err instanceof MinerUError) {
+    const code = MINERU_TO_RPC_ERROR_CODE[err.failure.code] ?? 'mineru/internal'
+    return {
+      code,
+      message: sanitizeDiagnostic(err.failure.message),
+    }
+  }
+  if (err instanceof TypeError) {
+    return {
+      code: 'mineru/invalid-argument',
+      message: sanitizeDiagnostic(err.message),
+    }
+  }
+  if (err instanceof Error && err.name === 'AbortError') {
+    return {
+      code: 'mineru/cancelled',
+      message: sanitizeDiagnostic(err.message),
+    }
+  }
+  const rawMsg = err instanceof Error ? err.message : String(err)
+  return {
+    code: 'mineru/internal',
+    message: sanitizeDiagnostic(rawMsg),
+  }
+}
+
 export function registerRpc(ctx: Context, deps: MineruRpcDeps): () => void | Promise<void> {
   ctx.logger?.info('dsh-pdf-mineru: registering RPC channel /dsh-pdf-mineru-api')
   const connection = ctx.connection as {
@@ -90,10 +145,10 @@ export function registerRpc(ctx: Context, deps: MineruRpcDeps): () => void | Pro
 
           case 'mineru/config.set': {
             const p = payloadRecord(payload)
-            if (!Object.prototype.hasOwnProperty.call(p, 'config') || p.config === undefined || p.config === null) {
+            if (!Object.hasOwn(p, 'config') || p.config === undefined || p.config === null) {
               throw new TypeError('payload.config must be a non-null configuration object')
             }
-            const saved = await deps.setConfig(migrateConfig(p.config))
+            const saved = await deps.setConfig(parseConfig(p.config))
             return ok({ config: saved })
           }
 
@@ -197,8 +252,8 @@ export function registerRpc(ctx: Context, deps: MineruRpcDeps): () => void | Pro
           }
         }
       } catch (err: unknown) {
-        const rawMsg = err instanceof Error ? err.message : String(err)
-        return fail(rawMsg, err instanceof TypeError ? 'mineru/invalid-argument' : 'mineru/internal')
+        const { code, message } = mapRpcError(err)
+        return { ok: false, error: { code, message } }
       }
     },
     { authority: 'loopback' },
