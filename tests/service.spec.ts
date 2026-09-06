@@ -2,6 +2,7 @@ import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { isJsonValue, snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
 import { defaultMinerUConfig, type MinerUConfig, type ProviderConfig } from '../src/config.js'
 import { failure } from '../src/domain/errors.js'
 import { asCacheKey, asProviderConfigId } from '../src/domain/ids.js'
@@ -954,6 +955,9 @@ describe('MinerUService direct parsing', () => {
 
       expect(parsed.state).toBe('completed')
       expect(parsed.content_status).toBe('complete')
+      expect(isJsonValue(parsed)).toBe(true)
+      expect(snapshotJsonValue(parsed)).toBeDefined()
+      expect('pages' in parsed).toBe(false)
       expect(parsed.markdown_content).toContain('# Document Outline')
       expect(parsed.markdown_content).toContain('- Overview (Page 1)')
       expect(parsed.markdown_content).toContain('  - Section 1 (Page 2)')
@@ -1119,6 +1123,8 @@ describe('MinerUService direct parsing', () => {
         null,
       ))
       expect(inBoundsResult.pages).toBe('1-2')
+      expect(isJsonValue(inBoundsResult)).toBe(true)
+      expect(snapshotJsonValue(inBoundsResult)).toBeDefined()
       expect(inBoundsResult.markdown_content).toContain('Page 1 text content')
       expect(inBoundsResult.markdown_content).toContain('Page 2 text content')
       expect(inBoundsResult.markdown_content).not.toContain('Page 3 text content')
@@ -1133,6 +1139,9 @@ describe('MinerUService direct parsing', () => {
         null,
       ))
       expect(allResult.pages).toBeUndefined()
+      expect('pages' in allResult).toBe(false)
+      expect(isJsonValue(allResult)).toBe(true)
+      expect(snapshotJsonValue(allResult)).toBeDefined()
       const allRendered = renderResult(allResult)[0]?.text ?? ''
       expect(allRendered).toContain('Status: Content complete. Pages: 1-3, Total Pages: 3. Full requested document markdown delivered above.')
     })

@@ -23,6 +23,7 @@ import type {
   ValueSchemaSpec,
 } from '@deepseek-ai/dsh-tools'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
+import { isJsonValue, snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
 import type {
   FailedParseView,
   MinerUService,
@@ -1322,6 +1323,38 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const text = rendered[0]?.text ?? ''
       expect(text).not.toContain('Document Outline')
       expect(text).toContain('Status: Content complete. Full requested document markdown delivered above.')
+    })
+  })
+
+  describe('lossless JSON compliance', () => {
+    it('returns strictly lossless JSON when optional fields (pages, etc.) are omitted', async () => {
+      const { ctx, registeredTools } = createMockContext()
+      const mockResult: ResultView = {
+        state: 'completed',
+        source: 'cache',
+        cache_hit: true,
+        result_id: 'mr_lossless_test',
+        files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
+        markdown_content: 'sample content',
+        content_status: 'complete',
+        manifest_path: '/cache/doc/manifest.json',
+        output_limit_chars: 2000,
+        summary: {
+          table_count: 0,
+          image_count: 0,
+          equation_count: 0,
+        },
+      }
+      registerTools(ctx, () => ({
+        parseDocument: vi.fn(async () => mockResult),
+      } as unknown as MinerUService))
+      const readTool = registeredTools.find(t => t.name === 'read_pdf')!
+      const exec = createMockExec(true)
+      const res = await readTool.execute({ file_path: '/doc.pdf' }, exec)
+
+      expect(isJsonValue(res)).toBe(true)
+      expect(snapshotJsonValue(res)).toBeDefined()
+      expect('pages' in (res as Record<string, unknown>)).toBe(false)
     })
   })
 })

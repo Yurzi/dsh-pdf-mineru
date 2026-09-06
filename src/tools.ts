@@ -208,9 +208,11 @@ function fitPostImageBudget(value: ResultView): ResultView {
   let fitted = value
   const fits = (): boolean => JSON.stringify(fitted).length <= limit && formatResultProse(fitted).length <= limit
   if (fits()) return fitted
-  fitted = { ...fitted, ordered_images: undefined }
+  const { ordered_images: _o, ...withoutImages } = fitted
+  fitted = withoutImages
   if (fits()) return fitted
-  fitted = { ...fitted, summary: undefined, toc: undefined }
+  const { summary: _s, toc: _t, ...withoutSummaryOrToc } = fitted
+  fitted = withoutSummaryOrToc
   if (fits()) return fitted
   throw new MinerUError(failure('RESULT_TOO_LARGE', 'Image attachment metadata exceeds the configured output limit'))
 }

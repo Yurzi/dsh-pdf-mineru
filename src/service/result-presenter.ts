@@ -197,9 +197,21 @@ export function computeDocumentSummary(
   }
 
   if (toc.length === 0 && fallbackFullText) {
-    return { page_count, table_count, image_count, equation_count, toc: extractMarkdownHeadings(fallbackFullText) }
+    return {
+      ...(page_count !== undefined ? { page_count } : {}),
+      table_count,
+      image_count,
+      equation_count,
+      toc: extractMarkdownHeadings(fallbackFullText),
+    }
   }
-  return { page_count, table_count, image_count, equation_count, toc }
+  return {
+    ...(page_count !== undefined ? { page_count } : {}),
+    table_count,
+    image_count,
+    equation_count,
+    toc,
+  }
 }
 
 export function extractBlocksMarkdown(
@@ -252,8 +264,8 @@ export function extractBlocksMarkdown(
       orderedImages.push({
         path: imgPath,
         name: imgName,
-        page: pageNum,
-        caption,
+        ...(pageNum !== undefined ? { page: pageNum } : {}),
+        ...(caption ? { caption } : {}),
         media_type: mediaType ?? 'application/octet-stream',
         bytes: imgBytes,
         status,
@@ -339,7 +351,7 @@ export function fallbackExtractFromMarkdown(
     orderedImages.push({
       path: imgPath ?? '',
       name: imgName,
-      caption: item.alt,
+      ...(item.alt ? { caption: item.alt } : {}),
       media_type: mediaType ?? 'application/octet-stream',
       bytes: matchedArtifact?.bytes ?? 0,
       status: matchedArtifact === undefined ? 'unavailable' : (mediaType === undefined ? 'unsupported' : 'available'),

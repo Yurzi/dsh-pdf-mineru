@@ -541,7 +541,7 @@ export class MinerUService {
         file_id: data.fileId,
         name: data.fileName,
         artifacts: [markdownArtifact, ...data.secondaryArtifacts],
-        markdown_path: data.markdownPath,
+        ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}),
       }]
       const candidate: ResultView = {
         state: 'completed',
@@ -550,11 +550,11 @@ export class MinerUService {
         result_id: data.manifest.id,
         files: baseFiles,
         content_status: 'not_requested',
-        markdown_path: data.markdownPath,
+        ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}),
         manifest_path: data.manifestPath,
         output_limit_chars: limit,
         ...(docSummary !== undefined ? { summary: docSummary } : {}),
-        pages: pagesLabel,
+        ...(pagesLabel !== undefined ? { pages: pagesLabel } : {}),
       }
       return this.fitSingleCandidate(candidate, data.secondaryArtifacts, limit)
     }
@@ -607,17 +607,17 @@ export class MinerUService {
         file_id: data.fileId,
         name: data.fileName,
         artifacts: [markdownArtifact],
-        markdown_path: data.markdownPath,
+        ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}),
       }],
       content_status: 'complete',
-      markdown_path: data.markdownPath,
+      ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}),
       manifest_path: data.manifestPath,
       output_limit_chars: limit,
       markdown_content: '',
       ordered_images: orderedImages,
-      summary: docSummary,
-      toc,
-      pages: pagesLabel,
+      ...(docSummary !== undefined ? { summary: docSummary } : {}),
+      ...(toc !== undefined ? { toc } : {}),
+      ...(pagesLabel !== undefined ? { pages: pagesLabel } : {}),
     }
 
     let overhead = Math.max(JSON.stringify(skeleton).length, formatResultProse(skeleton).length)
@@ -629,7 +629,7 @@ export class MinerUService {
     if (overhead > limit) {
       const strippedSkeleton: ResultView = {
         ...skeleton,
-        files: [{ file_id: data.fileId, name: data.fileName, artifacts: [], artifacts_truncated: true, markdown_path: data.markdownPath }],
+        files: [{ file_id: data.fileId, name: data.fileName, artifacts: [], artifacts_truncated: true, ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}) }],
       }
       overhead = Math.max(JSON.stringify(strippedSkeleton).length, formatResultProse(strippedSkeleton).length)
       if (overhead > limit) {
@@ -679,14 +679,14 @@ export class MinerUService {
         source: data.item.source,
         cache_hit: data.item.source === 'cache',
         result_id: data.manifest.id,
-        files: [{ file_id: data.fileId, name: data.fileName, artifacts: withSecondary, markdown_path: data.markdownPath }],
+        files: [{ file_id: data.fileId, name: data.fileName, artifacts: withSecondary, ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}) }],
         content_status: contentStatus,
-        markdown_path: data.markdownPath,
+        ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}),
         manifest_path: data.manifestPath,
         output_limit_chars: limit,
         markdown_content: content,
         ordered_images: orderedImages,
-        summary: docSummary,
+        ...(docSummary !== undefined ? { summary: docSummary } : {}),
       }
       if (JSON.stringify(testView).length <= limit && formatResultProse(testView).length <= limit) {
         finalArtifacts = withSecondary
@@ -705,19 +705,19 @@ export class MinerUService {
         name: data.fileName,
         artifacts: finalArtifacts,
         ...(artifactsTruncated ? { artifacts_truncated: true } : {}),
-        markdown_path: data.markdownPath,
+        ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}),
       }],
       content_status: contentStatus,
-      markdown_path: data.markdownPath,
+      ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}),
       ...(nextCursor !== undefined ? { cursor: nextCursor } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
       manifest_path: data.manifestPath,
       output_limit_chars: limit,
       markdown_content: content,
       ordered_images: orderedImages,
-      summary: docSummary,
-      ...(contentStatus === 'partial' || contentStatus === 'complete' ? { toc } : {}),
-      pages: pagesLabel,
+      ...(docSummary !== undefined ? { summary: docSummary } : {}),
+      ...((contentStatus === 'partial' || contentStatus === 'complete') && toc !== undefined ? { toc } : {}),
+      ...(pagesLabel !== undefined ? { pages: pagesLabel } : {}),
     }
 
     while (JSON.stringify(view).length > limit || formatResultProse(view).length > limit) {
@@ -727,11 +727,8 @@ export class MinerUService {
           files: [{ ...view.files[0]!, artifacts: [], ...(artifactsRequested ? { artifacts_truncated: true } : {}) }],
         }
       } else if (view.summary !== undefined || (view.ordered_images !== undefined && view.ordered_images.length > 0)) {
-        view = {
-          ...view,
-          summary: undefined,
-          ordered_images: undefined,
-        }
+        const { summary: _s, ordered_images: _o, ...rest } = view
+        view = rest
       } else if (view.markdown_content && view.markdown_content.length > 0) {
         const excess = Math.max(JSON.stringify(view).length - limit, formatResultProse(view).length - limit, 10)
         const targetLen = Math.max(0, view.markdown_content.length - excess)
@@ -746,9 +743,10 @@ export class MinerUService {
         }
       } else if (view.toc && view.toc.length > 0) {
         const nextToc = view.toc.slice(0, Math.max(0, Math.floor(view.toc.length / 2)))
+        const { toc: _t, ...rest } = view
         view = {
-          ...view,
-          ...(nextToc.length > 0 ? { toc: nextToc } : { toc: undefined }),
+          ...rest,
+          ...(nextToc.length > 0 ? { toc: nextToc } : {}),
         }
       } else {
         throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds configured model output limit'))
