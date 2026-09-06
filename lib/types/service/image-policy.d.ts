@@ -1,5 +1,4 @@
-/** Internal image attachment policy (no model-facing options). */
-export declare const MAX_INLINE_IMAGES: 6;
+/** Internal image attachment byte policy (no model-facing options). */
 /** Total decoded byte budget across one read response. */
 export declare const MAX_INLINE_IMAGE_TOTAL_BYTES: number;
 /** Per-image decoded byte budget. */

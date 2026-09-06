@@ -150,7 +150,7 @@ describe('MinerU RPC (registerRpc)', () => {
     const patchPayload = {
       config: {
         ...storedConfig,
-        output: { maxInlineChars: 50000 },
+        output: { maxInlineChars: 50000, maxInlineImages: 6 },
       },
     }
     const res1 = await handler('mineru/config.set', patchPayload, new AbortController().signal)

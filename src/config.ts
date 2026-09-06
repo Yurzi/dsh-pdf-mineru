@@ -9,6 +9,8 @@ import {
   DEFAULT_RETRY_CONFIG,
   DEFAULT_SECURITY_LIMITS,
   DEFAULT_STORAGE_OPTIONS,
+  MAX_INLINE_IMAGE_BUDGET,
+  MIN_INLINE_IMAGE_BUDGET,
   MINERU_CONFIG_SCHEMA_VERSION,
   defaultProviderConfig,
   type MinerUConfig,
@@ -61,7 +63,7 @@ const ALLOWED_DEFAULTS_KEYS = new Set(['model', 'ocr', 'parseMethod', 'language'
 const ALLOWED_STORAGE_KEYS = new Set(['storageRoot', 'cacheEnabled', 'retainSources', 'stagingTtlMs'])
 const ALLOWED_POLLING_KEYS = new Set(['pollIntervalMs', 'pollTimeoutMs', 'requestTimeoutMs', 'operationTimeoutMs'])
 const ALLOWED_RETRY_KEYS = new Set(['maxAttempts', 'baseDelayMs', 'maxDelayMs'])
-const ALLOWED_OUTPUT_KEYS = new Set(['maxInlineChars'])
+const ALLOWED_OUTPUT_KEYS = new Set(['maxInlineChars', 'maxInlineImages'])
 const ALLOWED_LIMITS_KEYS = new Set([
   'maxFileBytes', 'maxApiResponseBytes', 'maxZipDownloadBytes',
   'maxZipEntries', 'maxZipEntryBytes', 'maxZipTotalBytes', 'maxZipCompressionRatio',
@@ -98,6 +100,14 @@ function positive(value: unknown, fallback: number, label: string): number {
 function boundedPositive(value: unknown, fallback: number, label: string, min: number, max: number): number {
   const result = positive(value, fallback, label)
   if (result < min || result > max) throw new TypeError(`${label} must be between ${String(min)} and ${String(max)}`)
+  return result
+}
+
+function boundedInteger(value: unknown, fallback: number, label: string, min: number, max: number): number {
+  const result = value === undefined ? fallback : value
+  if (typeof result !== 'number' || !Number.isSafeInteger(result) || result < min || result > max) {
+    throw new TypeError(`${label} must be an integer between ${String(min)} and ${String(max)}`)
+  }
   return result
 }
 
@@ -289,6 +299,13 @@ function parseCanonical(input: Record<string, unknown>, fallback: MinerUConfig):
     },
     output: {
       maxInlineChars: boundedPositive(output.maxInlineChars, fallback.output.maxInlineChars, 'output.maxInlineChars', 1024, 1_000_000),
+      maxInlineImages: boundedInteger(
+        output.maxInlineImages,
+        fallback.output.maxInlineImages,
+        'output.maxInlineImages',
+        MIN_INLINE_IMAGE_BUDGET,
+        MAX_INLINE_IMAGE_BUDGET,
+      ),
     },
     limits: {
       maxFileBytes: positive(limits.maxFileBytes, fallback.limits.maxFileBytes, 'limits.maxFileBytes'),

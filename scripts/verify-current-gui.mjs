@@ -74,7 +74,7 @@ const config = {
   storage: { storageRoot: '/tmp/mineru-ui-verification', cacheEnabled: true, retainSources: false, stagingTtlMs: 86400000 },
   polling: { pollIntervalMs: 2000, pollTimeoutMs: 600000, requestTimeoutMs: 60000, operationTimeoutMs: 3600000 },
   retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 10000 },
-  output: { maxInlineChars: 200000 },
+  output: { maxInlineChars: 200000, maxInlineImages: 6 },
   limits: {
     maxFileBytes: 209715200, maxApiResponseBytes: 8388608,
     maxZipDownloadBytes: 536870912, maxZipEntries: 10000, maxZipEntryBytes: 268435456,
@@ -343,6 +343,9 @@ if (await attemptsInput.inputValue() !== '') throw new Error('numeric input disc
 await attemptsInput.blur()
 if (await attemptsInput.inputValue() !== '3') throw new Error('numeric input did not restore the last valid value on blur')
 await attemptsInput.fill('4')
+const inlineImagesInput = page.getByLabel('Max Inlined Images')
+if (await inlineImagesInput.inputValue() !== '6') throw new Error('initial inline image budget mismatch')
+await inlineImagesInput.fill('9')
 await credentialInput.fill('gui-verifier-secret')
 await page.getByRole('button', { name: 'Save Configuration', exact: true }).click()
 await page.getByRole('button', { name: 'Saved', exact: true }).waitFor({ timeout: 5000 })
@@ -465,6 +468,7 @@ if (savedSelfHosted?.baseURL !== 'http://gpu-server:18000') throw new Error('sav
 if (savedOfficial?.baseURL !== 'https://mineru.net/api/v4') throw new Error('save reset the official profile')
 if ('models' in savedSelfHosted || 'modelMap' in savedOfficial) throw new Error('provider-specific fields leaked across profiles')
 if (save?.payload?.config?.retry?.maxAttempts !== 4) throw new Error('save did not carry retry policy')
+if (save?.payload?.config?.output?.maxInlineImages !== 9) throw new Error('save did not carry inline image budget')
 const cacheClearPreviewCall = rpcCalls.find(call => call.endpoint === 'mineru/storage.cache.clear' && call.payload?.dry_run === true)
 if (cacheClearPreviewCall === undefined) throw new Error('cache clear preview was not requested')
 const cacheClearDeleteCall = rpcCalls.find(call => call.endpoint === 'mineru/storage.cache.clear' && call.payload?.dry_run === false)

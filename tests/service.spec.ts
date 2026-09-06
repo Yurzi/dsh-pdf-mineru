@@ -230,7 +230,7 @@ async function harness(): Promise<Harness> {
     ...base,
     storage: { ...base.storage, storageRoot: join(root, 'store') },
     polling: { ...base.polling, pollIntervalMs: 2, pollTimeoutMs: 100, operationTimeoutMs: 5000 },
-    output: { maxInlineChars: 2048 },
+    output: { maxInlineChars: 2048, maxInlineImages: 6 },
   }
   const paths = new StoragePaths(config.storage.storageRoot)
   const results = new ResultRepository(paths, { maxArtifactBytes: config.limits.maxZipEntryBytes })
@@ -824,7 +824,7 @@ describe('MinerUService direct parsing', () => {
     h.provider.complete = true
     const tinyConfig: MinerUConfig = {
       ...h.config,
-      output: { maxInlineChars: 50 },
+      output: { maxInlineChars: 50, maxInlineImages: 6 },
     }
     const tinyService = new MinerUService({
       getConfig: () => tinyConfig,

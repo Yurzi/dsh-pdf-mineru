@@ -39,7 +39,11 @@ export interface RetryConfig {
 export interface OutputConfig {
     /** Character budget (UTF-16 units) for one structured/prose read response, excluding image bytes. */
     readonly maxInlineChars: number;
+    /** Maximum number of image attachments emitted by one read response. */
+    readonly maxInlineImages: number;
 }
+export declare const MIN_INLINE_IMAGE_BUDGET: 0;
+export declare const MAX_INLINE_IMAGE_BUDGET: 100;
 export interface SecurityLimits {
     readonly maxFileBytes: number;
     readonly maxApiResponseBytes: number;

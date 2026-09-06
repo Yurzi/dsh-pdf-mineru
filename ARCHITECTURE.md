@@ -74,6 +74,7 @@ Cursor 是有长度上限的无签名 base64url JSON，携带版本、immutable 
 ### 输出与图片
 
 - `output.maxInlineChars` 约束阅读 JSON 和 Native 文本各自的完整大小，包含元信息、状态、cursor 和附件元信息；不是正文单独的预算。
+- `output.maxInlineImages` 约束单次 `read_pdf` 响应的内联图片数量；图片仍受独立的单图与总字节上限约束。
 - 预算小到不能容纳必要信息或不能推进正文时明确失败，不产生空转 cursor。
 - 图片引用只匹配 manifest 声明的产物。允许规范相对路径匹配以及无歧义 basename 兼容，不存在任意本地路径回退。
 - 最多内联 6 张，单张 8 MiB、合计 24 MiB；实际文件读取及返回附件均受限。未知格式、读取失败、无法匹配及预算省略明确标注。

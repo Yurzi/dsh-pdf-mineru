@@ -48,7 +48,12 @@ export interface RetryConfig {
 export interface OutputConfig {
   /** Character budget (UTF-16 units) for one structured/prose read response, excluding image bytes. */
   readonly maxInlineChars: number
+  /** Maximum number of image attachments emitted by one read response. */
+  readonly maxInlineImages: number
 }
+
+export const MIN_INLINE_IMAGE_BUDGET = 0 as const
+export const MAX_INLINE_IMAGE_BUDGET = 100 as const
 
 export interface SecurityLimits {
   readonly maxFileBytes: number
@@ -121,6 +126,7 @@ export const DEFAULT_RETRY_CONFIG: RetryConfig = {
 
 export const DEFAULT_OUTPUT_CONFIG: OutputConfig = {
   maxInlineChars: 200000,
+  maxInlineImages: 6,
 }
 
 export const DEFAULT_SECURITY_LIMITS: SecurityLimits = {

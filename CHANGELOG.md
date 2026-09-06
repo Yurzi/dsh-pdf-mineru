@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Added the live `output.maxInlineImages` setting for configuring the per-`read_pdf` inline image budget, defaulting to 6.
+
 ### Fixed
 
 - Removed the obsolete `defaults.artifacts` field from the shipped Cordis configuration, restoring Host startup under strict configuration validation.

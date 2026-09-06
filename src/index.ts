@@ -74,7 +74,7 @@ export const Config = z.object({
     baseDelayMs: z.number(),
     maxDelayMs: z.number(),
   }),
-  output: z.object({ maxInlineChars: z.number() }),
+  output: z.object({ maxInlineChars: z.number(), maxInlineImages: z.number() }),
   limits: z.object({
     maxFileBytes: z.number(),
     maxApiResponseBytes: z.number(),
@@ -231,7 +231,7 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
       },
     })
 
-    toolDisposer = registerTools(ctx, () => service, accessGate)
+    toolDisposer = registerTools(ctx, () => service, accessGate, () => runtimeConfig().output)
 
     ctx.inject(['connection'], (connectionCtx: Context) => {
       return registerRpc(connectionCtx, {

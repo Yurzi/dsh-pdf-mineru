@@ -218,8 +218,10 @@ describe('plugin composition lifecycle', () => {
     const dispose = await apply(runtime.ctx, entryConfig)
     expect(await stat(storedConfig.storage.storageRoot)).toBeDefined()
     await expect(stat(entryConfig.storage.storageRoot)).rejects.toThrow()
+    expect(await runtime.rpc.handler?.('mineru/config.get', {}, new AbortController().signal))
+      .toMatchObject({ ok: true, value: { config: { output: { maxInlineChars: 123456, maxInlineImages: 6 } } } })
 
-    const next = { ...storedConfig, output: { maxInlineChars: 234567 } }
+    const next = { ...storedConfig, output: { maxInlineChars: 234567, maxInlineImages: 9 } }
     const response = await runtime.rpc.handler?.(
       'mineru/config.set', { config: next }, new AbortController().signal,
     ) as { ok: boolean; value?: { config: typeof next } }

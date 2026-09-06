@@ -1,5 +1,5 @@
 import type { Dispatch, SetStateAction } from 'react'
-import type { MinerUConfig } from '../../config/pure.js'
+import { MAX_INLINE_IMAGE_BUDGET, MIN_INLINE_IMAGE_BUDGET, type MinerUConfig } from '../../config/pure.js'
 import type { MineruKey } from '../locales.js'
 import { updateConfigSection } from '../helpers.js'
 import { NumericInput } from '../NumericInput.js'
@@ -159,6 +159,17 @@ export function AdvancedSections({
               max={1000000}
               value={draft.output.maxInlineChars}
               onChange={val => setDraft(prev => prev === null ? prev : updateConfigSection(prev, 'output', { maxInlineChars: val }))}
+            />
+          </label>
+
+          <label className={css.field}>
+            <span className={css.fieldLabel}>{t('field.maxInlineImages')}</span>
+            <NumericInput
+              className={css.input}
+              min={MIN_INLINE_IMAGE_BUDGET}
+              max={MAX_INLINE_IMAGE_BUDGET}
+              value={draft.output.maxInlineImages}
+              onChange={val => setDraft(prev => prev === null ? prev : updateConfigSection(prev, 'output', { maxInlineImages: val }))}
             />
           </label>
         </div>

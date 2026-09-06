@@ -10,6 +10,7 @@ import type { ContentBlock, JsonValue, ObjectValueSchemaSpec, ParameterSchemaSpe
 import { MinerUError, failure, toMinerUFailure } from './domain/errors.js'
 import type { FocusKind, PageSelection, ParseRequestInput } from './domain/request.js'
 import { normalizeFocusSelection, normalizePageSelection } from './domain/request.js'
+import { DEFAULT_OUTPUT_CONFIG, type OutputConfig } from './config/pure.js'
 import type { StorageAccessGate } from './storage/access-gate.js'
 import type {
   FailedParseView,
@@ -23,7 +24,7 @@ import {
   formatResultProse,
   formatSingleSummaryProse,
 } from './service/mineru-service.js'
-import { MAX_INLINE_IMAGES, MAX_INLINE_IMAGE_SINGLE_BYTES, MAX_INLINE_IMAGE_TOTAL_BYTES, mediaTypeForExtension } from './service/image-policy.js'
+import { MAX_INLINE_IMAGE_SINGLE_BYTES, MAX_INLINE_IMAGE_TOTAL_BYTES, mediaTypeForExtension } from './service/image-policy.js'
 
 declare module '@deepseek-ai/dsh-jobs' {
   interface JobKindMap {
@@ -420,6 +421,7 @@ async function readImageBounded(path: string, remainingBytes: number, signal?: A
 async function inlineImagesForSingleResult(
   view: ResultView,
   attachments: AttachmentStore,
+  maxInlineImages: number,
   signal?: AbortSignal,
 ): Promise<ResultView> {
   const declared = view.ordered_images ?? []
@@ -429,8 +431,8 @@ async function inlineImagesForSingleResult(
   for (let index = 0; index < declared.length; index++) {
     const item = declared[index]!
     const mediaType = mediaTypeForExtension(extname(item.name))
-    if (index >= MAX_INLINE_IMAGES || mediaType === undefined || item.path === '') {
-      statuses[index] = { ...statuses[index], status: index >= MAX_INLINE_IMAGES ? 'omitted' : 'unsupported' }
+    if (index >= maxInlineImages || mediaType === undefined || item.path === '') {
+      statuses[index] = { ...statuses[index], status: index >= maxInlineImages ? 'omitted' : 'unsupported' }
       continue
     }
     if (item.bytes > MAX_INLINE_IMAGE_SINGLE_BYTES) {
@@ -497,7 +499,12 @@ async function checkCallingModelSupportsImage(exec: ToolRunContext, ctx: Context
   return false
 }
 
-export function registerTools(ctx: Context, getService: () => MinerUService, accessGate?: StorageAccessGate): () => Promise<void> {
+export function registerTools(
+  ctx: Context,
+  getService: () => MinerUService,
+  accessGate?: StorageAccessGate,
+  getOutputConfig: () => OutputConfig = () => DEFAULT_OUTPUT_CONFIG,
+): () => Promise<void> {
   const disposers: Array<() => void> = []
   const backgroundInvocations = new Set<{ readonly controller: AbortController; readonly done: Promise<JobOutcome> }>()
   const withStorageAccess = async <T,>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> => {
@@ -636,6 +643,7 @@ export function registerTools(ctx: Context, getService: () => MinerUService, acc
     execute: async (args: unknown, exec: ToolRunContext) => {
       const agent = requireAgent(exec)
       const { input, pollTimeoutMs, inline_images } = parseReadInput(args)
+      const { maxInlineImages } = getOutputConfig()
       const supportsImage = await checkCallingModelSupportsImage(exec, ctx)
       const attachments = ctx.get('attachments') as AttachmentStore | undefined
       const focusSet = normalizeFocusSelection(input.focus)
@@ -645,7 +653,7 @@ export function registerTools(ctx: Context, getService: () => MinerUService, acc
       return await withStorageAccess(async () => {
         const rawResult = await getService().parseDocument(agent.session, input, exec.signal, pollTimeoutMs)
         const processed = shouldInline && attachments
-          ? await inlineImagesForSingleResult(rawResult, attachments, exec.signal)
+          ? await inlineImagesForSingleResult(rawResult, attachments, maxInlineImages, exec.signal)
           : rawResult
         return fitPostImageBudget(processed)
       }, exec.signal)

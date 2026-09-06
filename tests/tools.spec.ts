@@ -715,6 +715,55 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       } finally { await rm(path, { force: true }) }
     })
 
+    it('applies the live inline image budget and snapshots it per invocation', async () => {
+      const path = join(tmpdir(), 'mineru-configured-inline-budget.png')
+      await writeFile(path, Buffer.from('fake-png-data'))
+      try {
+        let maxInlineImages = 2
+        const saveImage = vi.fn(async () => ({ attachmentId: 'att_budget', mediaType: 'image/png', name: 'budget.png', bytes: 13 }))
+        const view = {
+          state: 'completed' as const,
+          source: 'provider' as const,
+          cache_hit: false,
+          result_id: 'mr_budget',
+          files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
+          content_status: 'complete' as const,
+          manifest_path: '/cache/m.json',
+          output_limit_chars: 20_000,
+          ordered_images: Array.from({ length: 8 }, (_, index) => ({
+            path,
+            name: `figure-${String(index + 1)}.png`,
+            media_type: 'image/png' as const,
+            bytes: 13,
+          })),
+        }
+        const service = {
+          parseDocument: vi.fn(async () => {
+            maxInlineImages = 8
+            return view
+          }),
+        } as unknown as MinerUService
+        const { ctx, registeredTools } = createMockContext()
+        ;(ctx.get as any) = vi.fn((name: string) => name === 'attachments'
+          ? { saveImage }
+          : name === 'llm' ? { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text', 'image'] })) } : undefined)
+        registerTools(ctx, () => service, undefined, () => ({ maxInlineChars: 20_000, maxInlineImages }))
+        const exec = createMockExec()
+        ;(exec.agent as any).options = { provider: 'test-p', model: 'test-m' }
+        const tool = registeredTools.find(item => item.name === 'read_pdf')!
+
+        const first = await tool.execute({ file_path: '/paper.pdf', focus: 'image' }, exec) as ResultView
+        expect(first.inlined_images).toHaveLength(2)
+        expect(first.ordered_images?.map(item => item.status)).toEqual([
+          'available', 'available', 'omitted', 'omitted', 'omitted', 'omitted', 'omitted', 'omitted',
+        ])
+
+        const second = await tool.execute({ file_path: '/paper.pdf', focus: 'image' }, exec) as ResultView
+        expect(second.inlined_images).toHaveLength(8)
+        expect(saveImage).toHaveBeenCalledTimes(10)
+      } finally { await rm(path, { force: true }) }
+    })
+
     it('omits normalized images with missing or invalid emitted byte counts', async () => {
       const paths = [1, 2].map(index => join(tmpdir(), 'mineru-invalid-bytes-' + String(index) + '.png'))
       await Promise.all(paths.map(path => writeFile(path, Buffer.from('fake-png-data'))))

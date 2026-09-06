@@ -20,6 +20,7 @@ describe('MinerU config parsing and validation', () => {
     })
     expect(config.defaults).toMatchObject({ model: 'pipeline', parseMethod: 'auto', ocr: false })
     expect(config.retry).toEqual({ maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 10000 })
+    expect(config.output).toEqual({ maxInlineChars: 200000, maxInlineImages: 6 })
     expect(config.storage.storageRoot).toMatch(/[\\/]cache[\\/]pdf-mineru$/)
     expect(config.storage.retainSources).toBe(false)
   })
@@ -27,6 +28,16 @@ describe('MinerU config parsing and validation', () => {
   it('round-trips the canonical default configuration', () => {
     const base = defaultMinerUConfig()
     expect(parseConfig(base)).toEqual(base)
+  })
+
+  it('defaults and validates the inline image budget', () => {
+    const base = defaultMinerUConfig()
+    expect(parseConfig({ ...base, output: { maxInlineChars: 200000 } }).output.maxInlineImages).toBe(6)
+    expect(parseConfig({ ...base, output: { ...base.output, maxInlineImages: 0 } }).output.maxInlineImages).toBe(0)
+    expect(parseConfig({ ...base, output: { ...base.output, maxInlineImages: 100 } }).output.maxInlineImages).toBe(100)
+    expect(() => parseConfig({ ...base, output: { ...base.output, maxInlineImages: -1 } })).toThrow(/output.maxInlineImages/)
+    expect(() => parseConfig({ ...base, output: { ...base.output, maxInlineImages: 101 } })).toThrow(/output.maxInlineImages/)
+    expect(() => parseConfig({ ...base, output: { ...base.output, maxInlineImages: 1.5 } })).toThrow(/output.maxInlineImages/)
   })
 
   it('rejects unsupported schemaVersion and accepts the current schemaVersion', () => {
