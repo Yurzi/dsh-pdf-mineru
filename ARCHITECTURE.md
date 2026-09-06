@@ -54,6 +54,8 @@ Provider 不注册工具、不取得 DSH Session、不选择缓存目录、不�
 - `async_parse_pdf`：调用 `ctx.jobs.start(kind: mineru)`，传递精确的 live Agent owner；立即返回 job_id/state。完成后通过非拒绝 final-output Promise 提供摘要文本，而不是伪装为与 read_pdf 相同的正文 JSON。
 - 通用 job_output/job_list/job_kill 负责后台控制；不维护第二套 JobRepository 或专用任务控制工具。
 
+后台入口调用 `ensureParsed`，与正文入口 `parseDocument` 只共享规范化、等待及发布结果校验，不再通过 summaryOnly 布尔值让 Markdown 读取器返回虚假的空正文。`ParseSummaryView` 不包含正文／cursor／阅读字符预算字段。摘要只尝试最多 2 MiB 的 content-list，保留最多 20 项大纲及每项 160 个 UTF-16 code units；可选元数据缺失、为空、无效或超限时退化为明确的最小摘要，而仓储完整性错误与取消仍向上传递。
+
 ### 续读与完整性
 
 `complete` 表示所选内容已经读完；在续读调用中表示剩余内容已经读完。`partial` 必须提供能够取得进展的 cursor。`not_requested` 用于不要求正文的产物列表等结果。
@@ -75,6 +77,7 @@ Cursor 是有长度上限的无签名 base64url JSON，携带版本、immutable 
 - 预算小到不能容纳必要信息或不能推进正文时明确失败，不产生空转 cursor。
 - 图片引用只匹配 manifest 声明的产物。允许规范相对路径匹配以及无歧义 basename 兼容，不存在任意本地路径回退。
 - 最多内联 6 张，单张 8 MiB、合计 24 MiB；实际文件读取及返回附件均受限。未知格式、读取失败、无法匹配及预算省略明确标注。
+- 读取失败也消耗预算：每次已报告的读取字节在失败路径中记账，包括部分读取、最终 stat 和 close 失败。读取前检查剩余额度，不能让反复失败绕过累计上限。规范化附件必须提供有效实际 ref.bytes，不能用源大小代替未知附件大小；最后一张图片处理期间的取消也必须传递。
 - Figure 编号是文档选择中的稳定编号，不等同于成功交付的第几个附件。
 - 插件生成的模型描述、状态和恢复示例用英文；PDF 自身的文字不受该语言约束。
 

@@ -67,6 +67,8 @@ export interface ResultView {
     readonly cursor?: string;
     readonly warnings?: readonly string[];
 }
+/** Parse completion metadata, independent of body output and its character budget. */
+export type ParseSummaryView = Pick<ResultView, 'state' | 'source' | 'cache_hit' | 'result_id' | 'files' | 'content_status' | 'manifest_path' | 'summary' | 'toc' | 'warnings'>;
 export interface FailedParseView {
     readonly state: 'failed';
     readonly source: SubmissionSource;
@@ -117,11 +119,11 @@ export declare function truncateAtCleanBoundary(fullText: string, maxChars: numb
     truncated: boolean;
     resumeLine?: number;
 };
-export declare function readMarkdownFile(path: string, totalBytes: number, _maxCharsToRead: number, summaryOnly?: boolean): Promise<{
+export declare function readMarkdownFile(path: string, totalBytes: number): Promise<{
     text: string;
     isCompleteFile: boolean;
 }>;
 export declare function findMarkdownArtifactPath(value: ResultView): string | undefined;
 export declare function extractMarkdownHeadings(fullText: string): DocumentHeading[];
 export declare function formatResultProse(value: ResultView): string;
-export declare function formatSingleSummaryProse(value: ResultView): string;
+export declare function formatSingleSummaryProse(value: ParseSummaryView): string;

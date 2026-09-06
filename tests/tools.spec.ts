@@ -261,7 +261,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       }
 
       const mockService = {
-        parseDocument: vi.fn(async () => completedResult),
+        ensureParsed: vi.fn(async () => completedResult),
       } as unknown as MinerUService
       registerTools(ctx, () => mockService)
       const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
@@ -273,12 +273,10 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const hooks = specs[0]!.run()
       const outcome = await hooks.done
 
-      expect(mockService.parseDocument).toHaveBeenCalledWith(
+      expect(mockService.ensureParsed).toHaveBeenCalledWith(
         exec.agent?.session,
         { file_path: '/sample.pdf' },
         expect.any(AbortSignal),
-        null,
-        true,
       )
       expect(outcome.status).toBe('completed')
       expect(outcome.detail).toBe('completed')
@@ -294,7 +292,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const { ctx, registeredTools } = createMockContext(registry)
 
       const mockService = {
-        parseDocument: vi.fn(async (_session, _input, signal: AbortSignal) => {
+        ensureParsed: vi.fn(async (_session, _input, signal: AbortSignal) => {
           return new Promise<ResultView>((_resolve, reject) => {
             signal.addEventListener('abort', () => {
               reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
@@ -320,7 +318,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const { registry, specs } = createMockJobRegistry()
       const { ctx, registeredTools } = createMockContext(registry)
       const mockService = {
-        parseDocument: vi.fn(async (_session, _input, signal: AbortSignal) => {
+        ensureParsed: vi.fn(async (_session, _input, signal: AbortSignal) => {
           return await new Promise<ResultView>((_resolve, reject) => {
             if (signal.aborted) { reject(signal.reason); return }
             signal.addEventListener('abort', () => reject(signal.reason), { once: true })
@@ -342,7 +340,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const { ctx, registeredTools } = createMockContext(registry)
 
       const mockService = {
-        parseDocument: vi.fn(async () => {
+        ensureParsed: vi.fn(async () => {
           throw new MinerUError(failure('FILE_TOO_LARGE', 'Input exceeds limit'))
         }),
       } as unknown as MinerUService
@@ -388,7 +386,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         output_limit_chars: 1000,
       }
       const mockService = {
-        parseDocument: vi.fn(async () => completedResult),
+        ensureParsed: vi.fn(async () => completedResult),
       } as unknown as MinerUService
 
       registerTools(ctx, () => mockService, accessGate)
@@ -694,6 +692,62 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       } finally {
         await rm(testImgPath, { force: true })
       }
+    })
+
+    it.each([
+      { copies: 1, bytes: 25 * 1024 * 1024, attached: 0 },
+      { copies: 4, bytes: 8 * 1024 * 1024, attached: 3 },
+    ])('limits normalized growth for $copies images independently of source bytes', async ({ copies, bytes, attached }) => {
+      const path = join(tmpdir(), 'mineru-normalized-growth.png')
+      await writeFile(path, Buffer.from('fake-png-data'))
+      try {
+        const saveImage = vi.fn(async () => ({ attachmentId: 'att_growth', mediaType: 'image/png', name: 'growth.png', bytes }))
+        const service = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'provider' as const, cache_hit: false, result_id: 'mr_growth', files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }], content_status: 'complete' as const, manifest_path: '/cache/m.json', output_limit_chars: 20_000, ordered_images: Array.from({ length: copies }, () => ({ path, name: 'growth.png', media_type: 'image/png', bytes: 13 })) })) } as unknown as MinerUService
+        const { ctx, registeredTools } = createMockContext()
+        ;(ctx.get as any) = vi.fn((name: string) => name === 'attachments' ? { saveImage } : name === 'llm' ? { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text', 'image'] })) } : undefined)
+        registerTools(ctx, () => service)
+        const exec = createMockExec()
+        ;(exec.agent as any).options = { provider: 'test-p', model: 'test-m' }
+        const value = await registeredTools.find(item => item.name === 'read_pdf')!.execute({ file_path: '/paper.pdf', focus: 'image' }, exec) as ResultView
+        expect(value.inlined_images?.length ?? 0).toBe(attached)
+        expect(value.ordered_images?.at(-1)?.status).toBe('omitted')
+        expect(saveImage).toHaveBeenCalledTimes(copies)
+      } finally { await rm(path, { force: true }) }
+    })
+
+    it('omits normalized images with missing or invalid emitted byte counts', async () => {
+      const paths = [1, 2].map(index => join(tmpdir(), 'mineru-invalid-bytes-' + String(index) + '.png'))
+      await Promise.all(paths.map(path => writeFile(path, Buffer.from('fake-png-data'))))
+      try {
+        const saveImage = vi.fn()
+          .mockResolvedValueOnce({ attachmentId: 'att_missing', mediaType: 'image/png', name: 'missing.png' })
+          .mockResolvedValueOnce({ attachmentId: 'att_invalid', mediaType: 'image/png', name: 'invalid.png', bytes: '13' })
+        const service = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'provider' as const, cache_hit: false, result_id: 'mr_invalid_bytes', files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }], content_status: 'complete' as const, manifest_path: '/cache/m.json', output_limit_chars: 20_000, ordered_images: paths.map((path, index) => ({ path, name: 'figure-' + String(index + 1) + '.png', media_type: 'image/png', bytes: 13 })) })) } as unknown as MinerUService
+        const { ctx, registeredTools } = createMockContext()
+        ;(ctx.get as any) = vi.fn((name: string) => name === 'attachments' ? { saveImage } : name === 'llm' ? { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text', 'image'] })) } : undefined)
+        registerTools(ctx, () => service)
+        const exec = createMockExec()
+        ;(exec.agent as any).options = { provider: 'test-p', model: 'test-m' }
+        const value = await registeredTools.find(item => item.name === 'read_pdf')!.execute({ file_path: '/paper.pdf', focus: 'image' }, exec) as ResultView
+        expect(value.inlined_images).toBeUndefined()
+        expect(value.ordered_images?.map(item => item.status)).toEqual(['omitted', 'omitted'])
+      } finally { await Promise.all(paths.map(path => rm(path, { force: true }))) }
+    })
+
+    it('propagates cancellation after saving the last image', async () => {
+      const path = join(tmpdir(), 'mineru-last-image-abort.png')
+      await writeFile(path, Buffer.from('fake-png-data'))
+      try {
+        const controller = new AbortController()
+        const saveImage = vi.fn(async () => { controller.abort(); return { attachmentId: 'att_last', mediaType: 'image/png', name: 'last.png', bytes: 13 } })
+        const service = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'provider' as const, cache_hit: false, result_id: 'mr_last_abort', files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }], content_status: 'complete' as const, manifest_path: '/cache/m.json', output_limit_chars: 20_000, ordered_images: [{ path, name: 'last.png', media_type: 'image/png', bytes: 13 }] })) } as unknown as MinerUService
+        const { ctx, registeredTools } = createMockContext()
+        ;(ctx.get as any) = vi.fn((name: string) => name === 'attachments' ? { saveImage } : name === 'llm' ? { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text', 'image'] })) } : undefined)
+        registerTools(ctx, () => service)
+        const exec = createMockExec(true, controller.signal)
+        ;(exec.agent as any).options = { provider: 'test-p', model: 'test-m' }
+        await expect(registeredTools.find(item => item.name === 'read_pdf')!.execute({ file_path: '/paper.pdf', focus: 'image' }, exec)).rejects.toThrow()
+      } finally { await rm(path, { force: true }) }
     })
 
     it('reports failed and omitted figures while preserving stable numbering', async () => {

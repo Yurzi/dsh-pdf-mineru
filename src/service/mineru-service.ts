@@ -1,4 +1,5 @@
-import { readFile } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { open } from 'node:fs/promises'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { MinerUConfig, ProviderConfig } from '../config.js'
 import type { MinerUFailure, MinerUProviderId } from '../domain/errors.js'
@@ -29,6 +30,7 @@ import type {
   FailedParseView,
   ImageCandidateView,
   ParseDocumentView,
+  ParseSummaryView,
   ResultFileView,
   ResultView,
   SubmissionSource,
@@ -41,6 +43,7 @@ import {
   formatResultProse,
   formatTocMarkdown,
   readMarkdownFile,
+  safeStringSlice,
   truncateAtCleanBoundary,
 } from './result-presenter.js'
 import { cursorForRemainder, decodeReadCursor, MAX_CURSOR_LENGTH, type ReadCursorPayload } from './read-cursor.js'
@@ -53,6 +56,44 @@ export interface ServiceSession {
 
 const MAX_POLL_TIMEOUT_MS = 24 * 60 * 60 * 1000
 const MAX_CONTENT_LIST_BYTES = 64 * 1024 * 1024
+const MAX_SYNOPSIS_CONTENT_LIST_BYTES = 2 * 1024 * 1024
+const MAX_SYNOPSIS_HEADINGS = 20
+const MAX_SYNOPSIS_TITLE_CHARS = 160
+
+/** Read only a manifest-declared index, with actual file size and short-read checks. */
+async function readContentList(artifact: ArtifactView, maxBytes: number, signal?: AbortSignal): Promise<ContentListBlock[]> {
+  signal?.throwIfAborted()
+  if (artifact.bytes > maxBytes) throw new MinerUError(failure('RESULT_TOO_LARGE', 'content-list artifact exceeds the bounded reader limit'))
+  const handle = await open(artifact.path, constants.O_RDONLY | constants.O_NOFOLLOW)
+  try {
+    const before = await handle.stat()
+    if (!before.isFile() || before.size !== artifact.bytes) throw new Error('content-list artifact changed before reading')
+    if (before.size > maxBytes) throw new MinerUError(failure('RESULT_TOO_LARGE', 'content-list artifact exceeds the bounded reader limit'))
+    const buffer = Buffer.alloc(before.size)
+    let offset = 0
+    while (offset < buffer.length) {
+      signal?.throwIfAborted()
+      const result = await handle.read(buffer, offset, buffer.length - offset, offset)
+      if (result.bytesRead === 0) throw new Error('content-list artifact changed during reading')
+      offset += result.bytesRead
+    }
+    signal?.throwIfAborted()
+    const after = await handle.stat()
+    if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) throw new Error('content-list artifact changed during reading')
+    const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(buffer))
+    const container = typeof parsed === 'object' && parsed !== null ? parsed as Record<string, unknown> : undefined
+    const candidate = Array.isArray(parsed) ? parsed : container?.list ?? container?.content_list
+    if (!Array.isArray(candidate)) throw new TypeError('content-list must be an array or contain list/content_list')
+    for (const block of candidate) {
+      if (typeof block !== 'object' || block === null || Array.isArray(block)) throw new TypeError('content-list contains a malformed block')
+      if (block.page_idx !== undefined && (!Number.isSafeInteger(block.page_idx) || block.page_idx < 0)) throw new TypeError('content-list contains an invalid page_idx')
+      if (block.type !== undefined && typeof block.type !== 'string') throw new TypeError('content-list contains an invalid type')
+    }
+    return candidate as ContentListBlock[]
+  } finally {
+    await handle.close()
+  }
+}
 
 export type CredentialResolver = (reference: string, signal: AbortSignal) => Promise<string | undefined>
 
@@ -421,7 +462,6 @@ export class MinerUService {
     limit: number,
     cursorOffset = 0,
     cursorPayload?: ReadCursorPayload,
-    summaryOnly = false,
   ): Promise<ResultView> {
     if (!data.markdownRequested) {
       const baseFiles: ResultFileView[] = [{
@@ -442,7 +482,7 @@ export class MinerUService {
       return this.fitSingleCandidate(candidate, data.secondaryArtifacts, limit)
     }
 
-    const raw = await readMarkdownFile(data.markdownPath!, data.markdownBytes ?? 0, limit, summaryOnly)
+    const raw = await readMarkdownFile(data.markdownPath!, data.markdownBytes ?? 0)
     if (!Number.isSafeInteger(cursorOffset) || cursorOffset < 0) {
       throw new MinerUError(failure('INVALID_REQUEST', 'Cursor offset is invalid; start over without a cursor'))
     }
@@ -456,19 +496,7 @@ export class MinerUService {
     let contentList: ContentListBlock[] | undefined
     if (contentListArtifact) {
       try {
-        if (contentListArtifact.bytes > MAX_CONTENT_LIST_BYTES) throw new MinerUError(failure('RESULT_TOO_LARGE', 'content-list artifact exceeds the bounded reader limit'))
-        const rawJson = await readFile(contentListArtifact.path, 'utf8')
-        const parsed: unknown = JSON.parse(rawJson)
-        const candidate = Array.isArray(parsed) ? parsed : (typeof parsed === 'object' && parsed !== null && Array.isArray((parsed as any).list) ? (parsed as any).list : typeof parsed === 'object' && parsed !== null && Array.isArray((parsed as any).content_list) ? (parsed as any).content_list : undefined)
-        if (candidate === undefined) throw new TypeError('content-list must be an array or contain list/content_list')
-        for (const block of candidate) {
-          if (typeof block !== 'object' || block === null || Array.isArray(block)) throw new TypeError('content-list contains a malformed block')
-          const page = (block as any).page_idx
-          if (page !== undefined && (!Number.isSafeInteger(page) || page < 0)) throw new TypeError('content-list contains an invalid page_idx')
-          const type = (block as any).type
-          if (type !== undefined && typeof type !== 'string') throw new TypeError('content-list contains an invalid type')
-        }
-        contentList = candidate as ContentListBlock[]
+        contentList = await readContentList(contentListArtifact, MAX_CONTENT_LIST_BYTES)
       } catch (error) {
         if (error instanceof MinerUError) throw error
         throw new MinerUError(failure('INVALID_REQUEST', 'Malformed content-list artifact; cannot provide a reliable selection'), { cause: error })
@@ -508,14 +536,6 @@ export class MinerUService {
       pagesLabel = undefined
     }
 
-    if (summaryOnly && contentList === undefined) {
-      return {
-        state: 'completed', source: data.item.source, cache_hit: data.item.source === 'cache', result_id: data.manifest.id,
-        files: [{ file_id: data.fileId, name: data.fileName, artifacts: [] }], content_status: 'not_requested',
-        manifest_path: data.manifestPath, output_limit_chars: limit,
-      }
-    }
-
     if (focusSet.size === 1 && focusSet.has('artifacts')) {
       const baseFiles: ResultFileView[] = [{
         file_id: data.fileId,
@@ -539,16 +559,6 @@ export class MinerUService {
       return this.fitSingleCandidate(candidate, data.secondaryArtifacts, limit)
     }
 
-    if (summaryOnly && contentList !== undefined) {
-      return {
-        state: 'completed', source: data.item.source, cache_hit: data.item.source === 'cache', result_id: data.manifest.id,
-        files: [{ file_id: data.fileId, name: data.fileName, artifacts: [] }], content_status: 'not_requested',
-        manifest_path: data.manifestPath, output_limit_chars: limit,
-        ...(docSummary === undefined ? {} : { summary: docSummary }),
-        ...(pagesLabel === undefined ? {} : { pages: pagesLabel }),
-      }
-    }
-
     const imageArtifacts = data.secondaryArtifacts.filter(a => a.kind === 'images')
 
     let fullSourceText = ''
@@ -568,21 +578,6 @@ export class MinerUService {
       }
       docSummary = fallback.summary
       toc = fallback.summary.toc
-    }
-
-    if (summaryOnly) {
-      return {
-        state: 'completed',
-        source: data.item.source,
-        cache_hit: data.item.source === 'cache',
-        result_id: data.manifest.id,
-        files: [{ file_id: data.fileId, name: data.fileName, artifacts: [] }],
-        content_status: 'not_requested',
-        manifest_path: data.manifestPath,
-        output_limit_chars: limit,
-        ...(docSummary === undefined ? {} : { summary: docSummary }),
-        ...(pagesLabel === undefined ? {} : { pages: pagesLabel }),
-      }
     }
 
     if (focusSet.has('toc')) {
@@ -792,14 +787,60 @@ export class MinerUService {
     }
   }
 
-  /** Parse directly to immutable results. No plugin Job is created for this call. */
-  async parseDocument(
+  /** Ensure publication and return a bounded synopsis, never a body projection. */
+  async ensureParsed(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal): Promise<ParseSummaryView> {
+    if (input.cursor !== undefined) throw new MinerUError(failure('INVALID_REQUEST', 'A parse summary cannot resume a read cursor; use read_pdf'))
+    const { data } = await this.resolveParsedResult(session, input, signal, null)
+    return this.projectSummary(data, signal)
+  }
+
+  /** Read selected content from a published result. */
+  async parseDocument(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal, pollTimeoutMs?: number | null): Promise<ResultView> {
+    const { data, cursor, limit } = await this.resolveParsedResult(session, input, signal, pollTimeoutMs)
+    return this.projectSingle(data, limit, cursor?.off ?? 0, cursor)
+  }
+
+  private async projectSummary(data: Extract<RawParsedItem, { state: 'completed' }>, signal: AbortSignal): Promise<ParseSummaryView> {
+    signal.throwIfAborted()
+    const artifact = data.secondaryArtifacts.find(item => item.kind === 'content-list')
+    let summary: DocumentSummary | undefined
+    const warnings: string[] = []
+    if (artifact !== undefined) {
+      try {
+        const blocks = await readContentList(artifact, MAX_SYNOPSIS_CONTENT_LIST_BYTES, signal)
+        if (blocks.length > 0) {
+          const full = computeDocumentSummary(blocks)
+          const headings = full.toc ?? []
+          const toc = headings.slice(0, MAX_SYNOPSIS_HEADINGS).map(heading => ({
+            ...heading, title: safeStringSlice(heading.title, MAX_SYNOPSIS_TITLE_CHARS),
+          }))
+          summary = { ...full, toc }
+          if (headings.length > toc.length || headings.some(heading => heading.title.length > MAX_SYNOPSIS_TITLE_CHARS)) {
+            warnings.push('Outline shortened for the parse summary; use read_pdf to inspect the complete outline.')
+          }
+        }
+      } catch {
+        signal.throwIfAborted()
+        warnings.push('Optional summary metadata is unavailable or exceeds the synopsis budget; the parsed result remains cached. Use read_pdf to inspect it.')
+      }
+    }
+    signal.throwIfAborted()
+    return {
+      state: 'completed', source: data.item.source, cache_hit: data.item.source === 'cache', result_id: data.manifest.id,
+      files: [{ file_id: data.fileId, name: data.fileName, artifacts: [] }], content_status: 'not_requested',
+      manifest_path: data.manifestPath,
+      ...(summary !== undefined ? { summary } : {}),
+      ...(warnings.length > 0 ? { warnings } : {}),
+    }
+  }
+
+  /** Shared parse/publication path. Repository integrity checks remain mandatory. */
+  private async resolveParsedResult(
     session: ServiceSession,
     input: ParseRequestInput,
     signal: AbortSignal,
     pollTimeoutMs?: number | null,
-    summaryOnly = false,
-  ): Promise<ResultView> {
+  ): Promise<{ data: Extract<RawParsedItem, { state: 'completed' }>; cursor?: ReadCursorPayload; limit: number }> {
     let cursorPayload: ReadCursorPayload | undefined
     if (input.cursor !== undefined) {
       try {
@@ -887,6 +928,6 @@ export class MinerUService {
     }
 
     const limit = this.config().output.maxInlineChars
-    return await this.projectSingle(rawItem, limit, cursorPayload?.off ?? 0, cursorPayload, summaryOnly)
+    return { data: rawItem, cursor: cursorPayload, limit }
   }
 }

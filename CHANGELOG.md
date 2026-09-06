@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Routed async completion through a separate bounded synopsis API instead of Markdown projection flags; oversized/invalid optional summary indexes now degrade explicitly without masking cache-integrity failures.
+- Charged consumed image bytes on partial-read, final-stat, and close failures; required actual normalized attachment sizes and propagated cancellation after the final image.
 - Replaced instance-held lock bypass and unsafe stale-file reclamation with scoped, cancellable local-filesystem bakery coordination and explicit mutation authority.
 - Protected readers, image processing, producers, staging cleanup, and destructive maintenance across processes sharing a storage root; rejected symlinked traversal and publication ancestors.
 - Added exact, Unicode-safe `read_pdf` continuation cursors and honest out-of-range/unsupported-selection errors; Native output includes the actual continuation token.

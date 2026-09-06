@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -29,6 +29,7 @@ import {
   safeStringSlice,
   extractMarkdownHeadings,
   formatTocMarkdown,
+  formatSingleSummaryProse,
   type DocumentHeading,
 } from '../src/service/mineru-service.js'
 import { renderResult } from '../src/tools.js'
@@ -268,6 +269,89 @@ afterEach(async () => {
     await makeWritable(item.root)
     await rm(item.root, { recursive: true, force: true })
   }))
+})
+
+describe('MinerUService bounded parse synopsis', () => {
+  it('publishes oversized Markdown without body projection or the read response budget', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    h.provider.markdown = '# Large document\n' + 'x'.repeat(64 * 1024 * 1024)
+    Object.assign(h.config.output, { maxInlineChars: 1 })
+    const input = { file_path: h.file }
+    const result = await h.service.ensureParsed(session('summary-large'), input, new AbortController().signal)
+    expect(result.content_status).toBe('not_requested')
+    expect(result).not.toHaveProperty('markdown_content')
+    expect(result.summary).toBeUndefined()
+    expect(formatSingleSummaryProse(result)).not.toMatch(/Total Pages|Tables|Figures/)
+    await expect(h.service.parseDocument(session('read-large'), input, new AbortController().signal, null))
+      .rejects.toMatchObject({ failure: { code: 'RESULT_TOO_LARGE' } })
+    expect(h.provider.submitCount).toBe(1)
+  }, 15000)
+
+  it('returns unknown counts when there is no structured index', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    h.provider.markdown = '# Heading\n<table><tr><td>Table</td></tr></table>\n![Figure](figure.png)'
+    const result = await h.service.ensureParsed(session('summary-no-index'), { file_path: h.file, artifacts: ['markdown'] }, new AbortController().signal)
+    expect(result.summary).toBeUndefined()
+    expect(result).not.toHaveProperty('markdown_content')
+    expect(result.state).toBe('completed')
+  })
+
+  it('skips an index above the synopsis budget without making parsed content unreadable', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    h.provider.extraArtifactsByFileName.set('input.pdf', [{ kind: 'content-list', content: JSON.stringify([
+      { type: 'text', page_idx: 0, text: 'x'.repeat(2 * 1024 * 1024) },
+    ]) }])
+    const result = await h.service.ensureParsed(session('summary-index-budget'), { file_path: h.file }, new AbortController().signal)
+    expect(result.summary).toBeUndefined()
+    expect(formatSingleSummaryProse(result)).toContain('synopsis budget')
+    const read = await h.service.parseDocument(session('read-index'), { file_path: h.file, focus: 'text' }, new AbortController().signal, null)
+    expect(read.markdown_content).toMatch(/^x+/)
+    expect(read.content_status).toBe('partial')
+    expect(h.provider.submitCount).toBe(1)
+  })
+
+  it('degrades malformed optional summary metadata but does not hide cache corruption', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    h.provider.extraArtifactsByFileName.set('input.pdf', [{ kind: 'content-list', content: '{}' }])
+    const input = { file_path: h.file }
+    const result = await h.service.ensureParsed(session('summary-malformed'), input, new AbortController().signal)
+    expect(result.summary).toBeUndefined()
+    expect(result.warnings).toHaveLength(1)
+    await expect(h.service.parseDocument(session('read-malformed'), input, new AbortController().signal, null))
+      .rejects.toThrow('Malformed content-list')
+    const stored = JSON.parse(await readFile(result.manifest_path!, 'utf8'))
+    const key = asCacheKey(stored.cacheKey)
+    const manifest = (await h.results.get(key))!
+    const artifact = manifest.files[0].artifacts.find(item => item.kind === 'markdown')!
+    const path = h.results.resolveArtifactAbsolutePath(key, artifact.relativePath)
+    await chmod(path, 0o600)
+    await writeFile(path, 'changed cached body')
+    await expect(h.service.ensureParsed(session('summary-corrupt'), input, new AbortController().signal))
+      .rejects.toMatchObject({ failure: { code: 'CACHE_CORRUPT' } })
+  })
+
+  it('bounds synopsis headings and titles while preserving known counts and page coordinates', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    h.provider.extraArtifactsByFileName.set('input.pdf', [{ kind: 'content-list', content: JSON.stringify([
+      ...Array.from({ length: 40 }, (_, page_idx) => ({ type: 'text', text_level: 1, page_idx, text: 'Title ' + '😀'.repeat(300) })),
+      { type: 'table', page_idx: 39, table_body: '<table></table>' },
+    ]) }])
+    const result = await h.service.ensureParsed(session('summary-outline'), { file_path: h.file }, new AbortController().signal)
+    expect(result.summary).toMatchObject({ page_count: 40, table_count: 1 })
+    expect(result.summary!.toc).toHaveLength(20)
+    for (const heading of result.summary!.toc!) {
+      expect(heading.title.length).toBeLessThanOrEqual(160)
+      expect(heading.title.isWellFormed()).toBe(true)
+      expect(heading.line).toBeUndefined()
+    }
+    expect(formatSingleSummaryProse(result)).toContain('Outline shortened')
+    expect(formatSingleSummaryProse(result).length).toBeLessThan(8192)
+  })
 })
 
 describe('MinerUService direct parsing', () => {

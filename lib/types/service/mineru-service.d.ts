@@ -6,7 +6,7 @@ import type { ResultRepository } from '../storage/result-repository.js';
 import type { StorageAccessGate } from '../storage/access-gate.js';
 import { type MinerUDiagnosticSink } from '../observability.js';
 import { SharedOperationRegistry } from './shared-operations.js';
-import type { ResultView } from './result-presenter.js';
+import type { ParseSummaryView, ResultView } from './result-presenter.js';
 export * from './result-presenter.js';
 export interface ServiceSession {
     readonly header: {
@@ -52,6 +52,11 @@ export declare class MinerUService {
     private fitSingleCandidate;
     private projectSingle;
     private createWaitSignal;
-    /** Parse directly to immutable results. No plugin Job is created for this call. */
-    parseDocument(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal, pollTimeoutMs?: number | null, summaryOnly?: boolean): Promise<ResultView>;
+    /** Ensure publication and return a bounded synopsis, never a body projection. */
+    ensureParsed(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal): Promise<ParseSummaryView>;
+    /** Read selected content from a published result. */
+    parseDocument(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal, pollTimeoutMs?: number | null): Promise<ResultView>;
+    private projectSummary;
+    /** Shared parse/publication path. Repository integrity checks remain mandatory. */
+    private resolveParsedResult;
 }

@@ -16,6 +16,7 @@ import type {
   ImageCandidateView,
   InlinedImageView,
   MinerUService,
+  ParseSummaryView,
   ResultView,
 } from './service/mineru-service.js'
 import {
@@ -349,7 +350,7 @@ function backgroundLabel(input: ParseRequestInput): string {
   return 'Parse ' + name + ' with MinerU'
 }
 
-function nativeSuccessOutcome(value: ResultView): JobOutcome {
+function nativeSuccessOutcome(value: ParseSummaryView): JobOutcome {
   const output = formatSingleSummaryProse(value)
   return { status: 'completed', detail: 'completed', output }
 }
@@ -362,26 +363,57 @@ interface ImageCandidate {
   readonly index: number
 }
 
-async function readImageBounded(path: string, remainingBytes: number, signal?: AbortSignal): Promise<Buffer> {
+interface BoundedImageRead {
+  readonly data: Buffer
+  readonly bytesRead: number
+}
+
+class BoundedImageReadError extends Error {
+  readonly status: 'budget' | 'failed'
+  readonly bytesRead: number
+
+  constructor(status: 'budget' | 'failed', message: string, bytesRead: number) {
+    super(message)
+    this.name = 'BoundedImageReadError'
+    this.status = status
+    this.bytesRead = bytesRead
+  }
+}
+
+async function readImageBounded(path: string, remainingBytes: number, signal?: AbortSignal): Promise<BoundedImageRead> {
   signal?.throwIfAborted()
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+  let consumed = 0
   try {
     const details = await handle.stat()
-    if (!details.isFile() || details.size > MAX_INLINE_IMAGE_SINGLE_BYTES) throw new Error('image exceeds inline budget')
-    if (remainingBytes <= 0 || details.size > remainingBytes) throw new Error('image exceeds remaining inline budget')
+    if (!details.isFile() || details.size > MAX_INLINE_IMAGE_SINGLE_BYTES) throw new BoundedImageReadError('budget', 'image exceeds inline budget', consumed)
+    if (remainingBytes <= 0 || details.size > remainingBytes) throw new BoundedImageReadError('budget', 'image exceeds remaining inline budget', consumed)
     const buffer = Buffer.alloc(details.size)
     let offset = 0
     while (offset < buffer.length) {
       signal?.throwIfAborted()
-      const read = await handle.read(buffer, offset, buffer.length - offset, offset)
-      if (read.bytesRead === 0) throw new Error('image changed during read')
-      offset += read.bytesRead
+      try {
+        const read = await handle.read(buffer, offset, buffer.length - offset, offset)
+        consumed += read.bytesRead
+        if (read.bytesRead === 0) throw new BoundedImageReadError('failed', 'image changed during read', consumed)
+        offset += read.bytesRead
+      } catch (error) {
+        if (error instanceof BoundedImageReadError) throw error
+        throw new BoundedImageReadError('failed', 'image read failed', consumed)
+      }
     }
     const finalDetails = await handle.stat()
-    if (!finalDetails.isFile() || finalDetails.size !== offset) throw new Error('image changed during read')
-    return buffer
+    if (!finalDetails.isFile() || finalDetails.size !== offset) throw new BoundedImageReadError('failed', 'image changed during read', consumed)
+    return { data: buffer, bytesRead: consumed }
+  } catch (error) {
+    if (error instanceof BoundedImageReadError) throw error
+    throw new BoundedImageReadError('failed', 'image read failed', consumed)
   } finally {
-    await handle.close()
+    try {
+      await handle.close()
+    } catch {
+      throw new BoundedImageReadError('failed', 'image close failed', consumed)
+    }
   }
 }
 
@@ -414,14 +446,16 @@ async function inlineImagesForSingleResult(
   for (const item of candidates) {
     signal?.throwIfAborted()
     try {
-      const imageBytes = await readImageBounded(item.path, MAX_INLINE_IMAGE_TOTAL_BYTES - actualTotalBytes, signal)
-      if (imageBytes.length > MAX_INLINE_IMAGE_SINGLE_BYTES || actualTotalBytes + imageBytes.length > MAX_INLINE_IMAGE_TOTAL_BYTES) {
+      const imageRead = await readImageBounded(item.path, MAX_INLINE_IMAGE_TOTAL_BYTES - actualTotalBytes, signal)
+      actualTotalBytes += imageRead.bytesRead
+      const imageBytes = imageRead.data
+      if (imageBytes.length > MAX_INLINE_IMAGE_SINGLE_BYTES || actualTotalBytes > MAX_INLINE_IMAGE_TOTAL_BYTES) {
         statuses[item.index] = { ...statuses[item.index]!, status: 'omitted' }
         continue
       }
-      actualTotalBytes += imageBytes.length
       const ref = await attachments.saveImage({ data: imageBytes, mediaType: item.mediaType, name: item.name })
-      const emittedBytes = ref.bytes ?? imageBytes.length
+      signal?.throwIfAborted()
+      const emittedBytes = ref.bytes
       if (!Number.isSafeInteger(emittedBytes) || emittedBytes < 0 || emittedBytes > MAX_INLINE_IMAGE_SINGLE_BYTES || emittedTotalBytes + emittedBytes > MAX_INLINE_IMAGE_TOTAL_BYTES) {
         statuses[item.index] = { ...statuses[item.index]!, status: 'omitted' }
         continue
@@ -435,7 +469,13 @@ async function inlineImagesForSingleResult(
         ...(ref.bytes !== undefined ? { bytes: ref.bytes } : {}),
       })
     } catch (error) {
-      statuses[item.index] = { ...statuses[item.index]!, status: error instanceof Error && error.message.includes('remaining inline budget') ? 'omitted' : 'failed' }
+      if (signal?.aborted) signal.throwIfAborted()
+      if (error instanceof BoundedImageReadError) {
+        actualTotalBytes += error.bytesRead
+        statuses[item.index] = { ...statuses[item.index]!, status: error.status === 'budget' ? 'omitted' : 'failed' }
+      } else {
+        statuses[item.index] = { ...statuses[item.index]!, status: 'failed' }
+      }
     }
   }
   return { ...view, ordered_images: statuses, ...(inlined.length > 0 ? { inlined_images: inlined } : {}) }
@@ -499,7 +539,7 @@ export function registerTools(ctx: Context, getService: () => MinerUService, acc
       const jobId = jobs.start({
         kind: 'mineru', label: backgroundLabel(input), owner: agent,
         run: () => {
-          const done = withStorageAccess(() => getService().parseDocument(agent.session, input, controller.signal, null, true), controller.signal)
+          const done = withStorageAccess(() => getService().ensureParsed(agent.session, input, controller.signal), controller.signal)
             .then((value): JobOutcome => nativeSuccessOutcome(value))
             .catch((error): JobOutcome => {
               if (controller.signal.aborted) return { status: 'killed', detail: 'cancelled' }
