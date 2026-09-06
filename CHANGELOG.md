@@ -1,13 +1,26 @@
 # Changelog
 
-## Unreleased
+## 0.0.11
 
 ### Added
 
 - Added the live `output.maxInlineImages` setting for configuring the per-`read_pdf` inline image budget, defaulting to 6.
+- Added `artifacts` focus option to `read_pdf`, gating secondary artifact file paths (such as `layout.json` and `model.json`) so they are omitted by default unless explicitly requested.
+- Added automatic legal document boundary clamping (`narrowPageSelection`) for page range selections in `read_pdf`.
+
+### Changed
+
+- **Storage protocol upgrade (Breaking Change):** Stop every MinerU process sharing the root before upgrading. `.process.lock` is now a persistent version fence, not a lock to delete at normal shutdown. Local hard-link support and shared PID visibility are required; NFS/cross-host locking is not supported.
+- **Configuration schema v2 (Breaking Change):** Versioned the current plugin configuration as schema v2 and added a bounded v1 migration that validates and removes obsolete `defaults.artifacts` and `limits.maxFilesPerRequest` fields before persisting the canonical v2 settings.
+- **Continuation cursor contract (Breaking Change):** Replaced numeric line offsets (`read_offset_line`) with an opaque Unicode-safe `cursor` token for partial reading continuations.
+- Cleaned up output prose presentation: removed verbose result headers and redundant manifest paths, displaying clear page range, total page count, and standardized figure labeling (`Figure N (Page X, "Title")`).
+- Unified configuration parsing, snapshotted execution settings, and made startup-bound storage/payload limits explicit. Split settings sections and preserved numeric input drafts.
+- Separated parse synopsis from body projection and aligned required tool schemas, English guidance, and actionable RPC failures.
+- Consolidated current usage, architecture, deployment limits, and upgrade guidance; removed obsolete lock instructions and temporary audit/work logs.
 
 ### Fixed
 
+- Ensured all tool outputs strictly conform to lossless JSON by omitting undefined optional properties instead of serializing `undefined`.
 - Removed the obsolete `defaults.artifacts` field from the shipped Cordis configuration, restoring Host startup under strict configuration validation.
 - Routed async completion through a separate bounded synopsis API instead of Markdown projection flags; oversized/invalid optional summary indexes now degrade explicitly without masking cache-integrity failures.
 - Charged consumed image bytes on partial-read, final-stat, and close failures; required actual normalized attachment sizes and propagated cancellation after the final image.
@@ -17,14 +30,6 @@
 - Restricted image reads to manifest-declared artifacts, bounded attachments, and separated stable Figure identifiers from successful attachment order.
 - Made cache reads non-mutating and published-result isolation explicitly guarded; the first valid publication wins for equivalent content even when filenames or nondeterministic provider bytes differ.
 - Bounded maintenance traversal and exposed incomplete statistics as lower bounds in the settings UI.
-
-### Changed
-
-- Versioned the current plugin configuration as schema v2 and added a bounded v1 migration that validates and removes obsolete `defaults.artifacts` and `limits.maxFilesPerRequest` fields before persisting the canonical v2 settings.
-- Unified configuration parsing, snapshotted execution settings, and made startup-bound storage/payload limits explicit. Split settings sections and preserved numeric input drafts.
-- Separated parse synopsis from body projection and aligned required tool schemas, English guidance, and actionable RPC failures.
-- Consolidated current usage, architecture, deployment limits, and upgrade guidance; removed obsolete lock instructions and temporary audit/work logs.
-- **Storage protocol upgrade:** stop every MinerU process sharing the root before upgrading. `.process.lock` is now a persistent version fence, not a lock to delete at normal shutdown. Local hard-link support and shared PID visibility are required; NFS/cross-host locking is not supported.
 
 ### Removed
 
