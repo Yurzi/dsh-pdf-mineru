@@ -3,7 +3,7 @@ import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { parseReadInput, registerTools } from '../src/tools.js'
 import { cursorForRemainder, decodeReadCursor } from '../src/service/read-cursor.js'
 import { narrowPageSelection } from '../src/domain/request.js'
-import { formatResultProse, formatSingleSummaryProse, type ResultView } from '../src/service/result-presenter.js'
+import { formatPageOutOfRangeMessage, formatResultProse, formatSingleSummaryProse, type ResultView } from '../src/service/result-presenter.js'
 
 describe('reader repairs', () => {
   it('round-trips a canonical cursor and preserves Unicode-safe offsets', () => {
@@ -57,5 +57,26 @@ describe('reader repairs', () => {
   it('marks fully out-of-range pages instead of replacing them', () => {
     expect(narrowPageSelection(new Set([50, 60]), 3)).toMatchObject({ pagesSet: new Set(), pagesLabel: '', fullyOutOfRange: true, outOfRange: [50, 60] })
     expect(narrowPageSelection(new Set([2, 60]), 3)).toMatchObject({ pagesSet: new Set([2]), pagesLabel: '2', fullyOutOfRange: false, outOfRange: [60] })
+  })
+
+  it('formats model-facing out-of-range error message with valid page range', () => {
+    expect(formatPageOutOfRangeMessage(3)).toBe(
+      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range (valid: 1-3, total pages: 3)'
+    )
+    expect(formatPageOutOfRangeMessage(1)).toBe(
+      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range (valid: 1, total pages: 1)'
+    )
+    expect(formatPageOutOfRangeMessage(50)).toBe(
+      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range (valid: 1-50, total pages: 50)'
+    )
+    expect(formatPageOutOfRangeMessage(undefined)).toBe(
+      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range'
+    )
+    expect(formatPageOutOfRangeMessage(0)).toBe(
+      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range'
+    )
+    expect(formatPageOutOfRangeMessage(-5)).toBe(
+      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range'
+    )
   })
 })

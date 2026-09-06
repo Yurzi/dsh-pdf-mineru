@@ -40,6 +40,7 @@ import {
   extractBlocksMarkdown,
   extractMarkdownHeadings,
   fallbackExtractFromMarkdown,
+  formatPageOutOfRangeMessage,
   formatResultProse,
   formatTocMarkdown,
   readMarkdownFile,
@@ -521,7 +522,7 @@ export class MinerUService {
       }
       const narrowed = narrowPageSelection(rawPagesSet, docSummary.page_count)
       if (narrowed.fullyOutOfRange) {
-        throw new MinerUError(failure('INVALID_REQUEST', '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range'))
+        throw new MinerUError(failure('INVALID_REQUEST', formatPageOutOfRangeMessage(docSummary.page_count)))
       }
       if (narrowed.outOfRange.length > 0) warnings.push(`Some requested pages are outside the document range: ${narrowed.outOfRange.join(', ')}`)
       pagesSet = narrowed.pagesSet

@@ -1107,13 +1107,13 @@ describe('MinerUService direct parsing', () => {
         { kind: 'images', content: 'fake-png-data' },
       ])
 
-      // 1. Calling pages: '50-60' on a 3-page document is an explicit error
+      // 1. Calling pages: '50-60' on a 3-page document is an explicit error reporting valid range
       await expect(h.service.parseDocument(
         session('session-oob-pages'),
         { file_path: h.file, pages: '50-60' },
         new AbortController().signal,
         null,
-      )).rejects.toThrow('[PAGE_OUT_OF_RANGE]')
+      )).rejects.toThrow('[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range (valid: 1-3, total pages: 3)')
 
       // 2. Calling pages: '1-2' on a 3-page document shows Pages: 1-2, Total Pages: 3
       const inBoundsResult = asResult(await h.service.parseDocument(

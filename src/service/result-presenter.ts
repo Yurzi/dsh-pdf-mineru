@@ -610,3 +610,16 @@ export function formatSingleSummaryProse(value: ParseSummaryView): string {
 
   return lines.join('\n')
 }
+
+/**
+ * Formats the model-facing error message when requested pages fall completely outside the document bounds.
+ * Retains the standard `[PAGE_OUT_OF_RANGE]` prefix and appends legal 1-based bounds when `totalPages` is known.
+ */
+export function formatPageOutOfRangeMessage(totalPages?: number): string {
+  const prefix = '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range'
+  if (typeof totalPages === 'number' && Number.isSafeInteger(totalPages) && totalPages >= 1) {
+    const validRange = totalPages === 1 ? '1' : `1-${totalPages}`
+    return `${prefix} (valid: ${validRange}, total pages: ${totalPages})`
+  }
+  return prefix
+}

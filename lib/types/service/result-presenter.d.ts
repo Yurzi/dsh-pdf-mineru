@@ -127,3 +127,8 @@ export declare function findMarkdownArtifactPath(value: ResultView): string | un
 export declare function extractMarkdownHeadings(fullText: string): DocumentHeading[];
 export declare function formatResultProse(value: ResultView): string;
 export declare function formatSingleSummaryProse(value: ParseSummaryView): string;
+/**
+ * Formats the model-facing error message when requested pages fall completely outside the document bounds.
+ * Retains the standard `[PAGE_OUT_OF_RANGE]` prefix and appends legal 1-based bounds when `totalPages` is known.
+ */
+export declare function formatPageOutOfRangeMessage(totalPages?: number): string;
