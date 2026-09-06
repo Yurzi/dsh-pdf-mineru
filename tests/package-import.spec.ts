@@ -6,6 +6,13 @@ import { describe, expect, it } from 'vitest'
 const execFileAsync = promisify(execFile)
 
 describe('package contract', () => {
+  it('ships a current configuration bundle without removed v1 fields', async () => {
+    const patch = await readFile(new URL('../cordis.patch.yml', import.meta.url), 'utf8')
+    expect(patch).toMatch(/schemaVersion:\s*2/u)
+    expect(patch).not.toMatch(/^\s+artifacts:/mu)
+    expect(patch).not.toMatch(/^\s+maxFilesPerRequest:/mu)
+  })
+
   it('declares every injected Client package as a runtime peer', async () => {
     const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as {
       dsh?: { client?: { inject?: string[] } }

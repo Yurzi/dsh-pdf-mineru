@@ -9,6 +9,7 @@ import {
   DEFAULT_RETRY_CONFIG,
   DEFAULT_SECURITY_LIMITS,
   DEFAULT_STORAGE_OPTIONS,
+  MINERU_CONFIG_SCHEMA_VERSION,
   defaultProviderConfig,
   type MinerUConfig,
   type OfficialV4Config,
@@ -30,7 +31,7 @@ export function defaultMinerUConfig(): MinerUConfig {
   const selfHosted = defaultProviderConfig('self-hosted-v2')
   const official = defaultProviderConfig('official-v4')
   return {
-    schemaVersion: 1,
+    schemaVersion: MINERU_CONFIG_SCHEMA_VERSION,
     activeProvider: selfHosted.id,
     providers: [selfHosted, official],
     defaults: { ...DEFAULT_PARSE_DEFAULTS },
@@ -64,6 +65,9 @@ const ALLOWED_OUTPUT_KEYS = new Set(['maxInlineChars'])
 const ALLOWED_LIMITS_KEYS = new Set([
   'maxFileBytes', 'maxApiResponseBytes', 'maxZipDownloadBytes',
   'maxZipEntries', 'maxZipEntryBytes', 'maxZipTotalBytes', 'maxZipCompressionRatio',
+])
+const LEGACY_ARTIFACT_KINDS = new Set([
+  'markdown', 'layout', 'model-output', 'content-list', 'images',
 ])
 
 function assertAllowedKeys(record: Record<string, unknown>, allowed: ReadonlySet<string>, path: string): void {
@@ -125,6 +129,39 @@ function models(value: unknown, fallback: readonly MinerUModel[]): readonly Mine
   return [...new Set(input as MinerUModel[])]
 }
 
+function hasLegacyV1Fields(input: Record<string, unknown>): boolean {
+  const defaults = record(input.defaults ?? {}, 'defaults')
+  const limits = record(input.limits ?? {}, 'limits')
+  return Object.hasOwn(defaults, 'artifacts') || Object.hasOwn(limits, 'maxFilesPerRequest')
+}
+
+function migrateV1Fields(input: Record<string, unknown>): Record<string, unknown> {
+  const defaults = record(input.defaults ?? {}, 'defaults')
+  const legacyArtifacts = defaults.artifacts
+  if (legacyArtifacts !== undefined && (
+    !Array.isArray(legacyArtifacts)
+    || legacyArtifacts.some(item => typeof item !== 'string' || !LEGACY_ARTIFACT_KINDS.has(item))
+  )) {
+    throw new TypeError('defaults.artifacts contains an unsupported artifact')
+  }
+  const migratedDefaults = { ...defaults }
+  delete migratedDefaults.artifacts
+
+  const limits = record(input.limits ?? {}, 'limits')
+  if (limits.maxFilesPerRequest !== undefined) {
+    positive(limits.maxFilesPerRequest, 1, 'limits.maxFilesPerRequest')
+  }
+  const migratedLimits = { ...limits }
+  delete migratedLimits.maxFilesPerRequest
+
+  return {
+    ...input,
+    schemaVersion: MINERU_CONFIG_SCHEMA_VERSION,
+    defaults: migratedDefaults,
+    limits: migratedLimits,
+  }
+}
+
 function parseProvider(value: unknown): ProviderConfig {
   const input = record(value, 'provider')
   const id = asProviderConfigId(text(input.id, '', 'provider.id'))
@@ -162,7 +199,7 @@ function parseProvider(value: unknown): ProviderConfig {
 
 function parseCanonical(input: Record<string, unknown>, fallback: MinerUConfig): MinerUConfig {
   if (input.schemaVersion !== undefined) {
-    if (input.schemaVersion !== 1) {
+    if (input.schemaVersion !== MINERU_CONFIG_SCHEMA_VERSION) {
       throw new TypeError(`unsupported schemaVersion: ${String(input.schemaVersion)}`)
     }
   }
@@ -222,7 +259,7 @@ function parseCanonical(input: Record<string, unknown>, fallback: MinerUConfig):
   }
 
   const result: MinerUConfig = {
-    schemaVersion: 1,
+    schemaVersion: MINERU_CONFIG_SCHEMA_VERSION,
     activeProvider,
     providers,
     defaults: {
@@ -278,10 +315,35 @@ function parseCanonical(input: Record<string, unknown>, fallback: MinerUConfig):
   return result
 }
 
-export function parseConfig(value: unknown): MinerUConfig {
+export interface ParsedMinerUConfig {
+  readonly config: MinerUConfig
+  readonly migrated: boolean
+  readonly migratedFrom?: 1
+}
+
+function parseConfigInput(value: unknown, allowCurrentLegacyFields: boolean): ParsedMinerUConfig {
   const fallback = defaultMinerUConfig()
-  if (value === undefined || value === null) return fallback
+  if (value === undefined || value === null) return { config: fallback, migrated: false }
   const input = record(value, 'config')
   assertAllowedKeys(input, ALLOWED_TOP_KEYS, 'config')
-  return parseCanonical(input, fallback)
+  if (input.schemaVersion === 1) {
+    return { config: parseCanonical(migrateV1Fields(input), fallback), migrated: true, migratedFrom: 1 }
+  }
+  if (
+    allowCurrentLegacyFields
+    && (input.schemaVersion === undefined || input.schemaVersion === MINERU_CONFIG_SCHEMA_VERSION)
+    && hasLegacyV1Fields(input)
+  ) {
+    return { config: parseCanonical(migrateV1Fields(input), fallback), migrated: true }
+  }
+  return { config: parseCanonical(input, fallback), migrated: false }
+}
+
+/** Parse startup/settings input, including legacy fields merged over a current composition base. */
+export function parseConfigWithMigration(value: unknown): ParsedMinerUConfig {
+  return parseConfigInput(value, true)
+}
+
+export function parseConfig(value: unknown): MinerUConfig {
+  return parseConfigInput(value, false).config
 }

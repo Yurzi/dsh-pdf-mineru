@@ -185,7 +185,7 @@ flowchart LR
 
 ### 1. 官方云 (Official v4) 推荐配置
 ```yaml
-schemaVersion: 1
+schemaVersion: 2
 activeProvider: mp_official
 providers:
   - id: mp_official
@@ -202,7 +202,7 @@ defaults:
 
 ### 2. 本地私有化 (Self-hosted v2) 推荐配置
 ```yaml
-schemaVersion: 1
+schemaVersion: 2
 activeProvider: mp_self_hosted
 providers:
   - id: mp_self_hosted

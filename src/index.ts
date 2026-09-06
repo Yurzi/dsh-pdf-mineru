@@ -1,6 +1,12 @@
 import z from '@deepseek-ai/schemastery'
 import type { Context } from 'cordis'
-import { parseConfig, type MinerUConfig, type ProviderConfig } from './config.js'
+import {
+  MINERU_CONFIG_SCHEMA_VERSION,
+  parseConfig,
+  parseConfigWithMigration,
+  type MinerUConfig,
+  type ProviderConfig,
+} from './config.js'
 import { ProviderRegistry } from './providers/registry.js'
 import { MinerUService } from './service/mineru-service.js'
 import { SharedOperationRegistry } from './service/shared-operations.js'
@@ -38,7 +44,9 @@ const ProviderSchema = z.union([
 ])
 
 export const Config = z.object({
-  schemaVersion: z.const(1),
+  // Settings resolves its schema before invoking our migration-aware validator.
+  // Accept v1 here so persisted Provider-based configurations can reach it.
+  schemaVersion: z.union([z.const(1), z.const(MINERU_CONFIG_SCHEMA_VERSION)]),
   activeProvider: z.string(),
   providers: z.array(ProviderSchema),
   defaults: z.object({
@@ -89,6 +97,13 @@ interface SettingsService {
     namespace: string, schema: unknown,
     options: { readonly base: object; readonly applies: 'live' | 'restart'; readonly validate: (value: unknown) => void },
   ): SettingsScope
+  mutate(
+    namespace: string,
+    operations: readonly (
+      | { readonly op: 'set'; readonly path: readonly string[]; readonly value: unknown }
+      | { readonly op: 'unset'; readonly path: readonly string[] }
+    )[],
+  ): Promise<void>
 }
 
 interface CredentialService {
@@ -113,7 +128,7 @@ function parseDraftProvider(value: unknown, current: MinerUConfig): ProviderConf
 }
 
 export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<() => Promise<void>> {
-  let persistedConfig = parseConfig(entryConfig)
+  let persistedConfig = parseConfigWithMigration(entryConfig).config
   let fixedStorageRoot: string | undefined
   let fixedLimits: MinerUConfig['limits'] | undefined
   let toolDisposer: (() => Promise<void>) | undefined
@@ -124,8 +139,7 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
   // synchronously so an in-flight initialization never resumes into ctx APIs.
   ctx.effect(() => () => startup.abort(), 'dsh-pdf-mineru startup cancellation')
 
-  const validateRuntimeConfig = (value: unknown): MinerUConfig => {
-    const next = parseConfig(value)
+  const validateParsedRuntimeConfig = (next: MinerUConfig): MinerUConfig => {
     if (fixedStorageRoot !== undefined && next.storage.storageRoot !== fixedStorageRoot) {
       throw new TypeError('storage.storageRoot cannot change while the MinerU plugin is running')
     }
@@ -138,22 +152,48 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
     }
     return next
   }
+  const validateRuntimeConfig = (value: unknown): MinerUConfig => validateParsedRuntimeConfig(parseConfig(value))
+  const migrateRuntimeConfig = (value: unknown) => {
+    const parsed = parseConfigWithMigration(value)
+    return { ...parsed, config: validateParsedRuntimeConfig(parsed.config) }
+  }
   const runtimeConfig = (): MinerUConfig => persistedConfig
 
   // The user layer can retain a storage root from an older bundle default.
   // Resolve it before fixing the process-wide root and acquiring its lock.
   const settings = ctx.get('settings') as SettingsService | undefined
   if (settings === undefined) throw new Error('settings service is unavailable')
+  const persistMigration = async (): Promise<void> => {
+    try {
+      await settings.mutate('dsh-pdf-mineru', [
+        { op: 'set', path: ['schemaVersion'], value: MINERU_CONFIG_SCHEMA_VERSION },
+        { op: 'unset', path: ['defaults', 'artifacts'] },
+        { op: 'unset', path: ['limits', 'maxFilesPerRequest'] },
+      ])
+    } catch {
+      ctx.logger?.warn('dsh-pdf-mineru: migrated v1 settings in memory but could not persist v2')
+    }
+  }
   const settingsScope = settings.register('dsh-pdf-mineru', Config, {
     base: asObject(persistedConfig),
     applies: 'live',
-    validate: value => { validateRuntimeConfig(value) },
+    validate: value => { migrateRuntimeConfig(value) },
   })
-  persistedConfig = validateRuntimeConfig(settingsScope.get())
+  const storedConfig = migrateRuntimeConfig(settingsScope.get())
+  persistedConfig = storedConfig.config
+  if (storedConfig.migrated) {
+    await persistMigration()
+  }
   fixedStorageRoot = persistedConfig.storage.storageRoot
   fixedLimits = { ...persistedConfig.limits }
   ctx.effect(
-    () => settingsScope.watch(next => { persistedConfig = validateRuntimeConfig(next) }),
+    () => settingsScope.watch(async next => {
+      const parsed = migrateRuntimeConfig(next)
+      persistedConfig = parsed.config
+      if (parsed.migrated) {
+        await persistMigration()
+      }
+    }),
     'dsh-pdf-mineru settings watch',
   )
 

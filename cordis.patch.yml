@@ -4,7 +4,7 @@
     - id: dsh-pdf-mineru
       name: 'dsh-pdf-mineru'
       config:
-        schemaVersion: 1
+        schemaVersion: 2
         activeProvider: mp_self_hosted
         providers:
           - id: mp_self_hosted
@@ -30,8 +30,6 @@
           language: ch
           formula: true
           table: true
-          artifacts:
-            - markdown
         retry:
           maxAttempts: 3
           baseDelayMs: 500

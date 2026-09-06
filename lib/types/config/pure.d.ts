@@ -1,5 +1,6 @@
 import type { MinerUModel, ParseDefaults } from '../domain/request.js';
 import { type ProviderConfigId } from '../domain/ids.js';
+export declare const MINERU_CONFIG_SCHEMA_VERSION: 2;
 export interface SelfHostedV2Config {
     readonly id: ProviderConfigId;
     readonly type: 'self-hosted-v2';
@@ -49,7 +50,7 @@ export interface SecurityLimits {
     readonly maxZipCompressionRatio: number;
 }
 export interface MinerUConfig {
-    readonly schemaVersion: 1;
+    readonly schemaVersion: typeof MINERU_CONFIG_SCHEMA_VERSION;
     readonly activeProvider: ProviderConfigId;
     readonly providers: readonly ProviderConfig[];
     readonly defaults: ParseDefaults;

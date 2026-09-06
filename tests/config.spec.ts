@@ -3,6 +3,7 @@ import {
   defaultMinerUConfig,
   defaultProviderConfig,
   parseConfig,
+  parseConfigWithMigration,
   providerById,
 } from '../src/config.js'
 import { asProviderConfigId } from '../src/domain/ids.js'
@@ -10,7 +11,7 @@ import { asProviderConfigId } from '../src/domain/ids.js'
 describe('MinerU config parsing and validation', () => {
   it('creates complete independent self-hosted and official defaults', () => {
     const config = defaultMinerUConfig()
-    expect(config.schemaVersion).toBe(1)
+    expect(config.schemaVersion).toBe(2)
     expect(config.activeProvider).toBe('mp_self_hosted')
     expect(config.providers).toHaveLength(2)
     expect(config.providers[0]).toMatchObject({ id: 'mp_self_hosted', type: 'self-hosted-v2', allowInsecureHttp: true })
@@ -28,12 +29,56 @@ describe('MinerU config parsing and validation', () => {
     expect(parseConfig(base)).toEqual(base)
   })
 
-  it('rejects unsupported schemaVersion and accepts schemaVersion 1', () => {
+  it('rejects unsupported schemaVersion and accepts the current schemaVersion', () => {
     const base = defaultMinerUConfig()
-    expect(parseConfig({ ...base, schemaVersion: 1 }).schemaVersion).toBe(1)
-    expect(() => parseConfig({ ...base, schemaVersion: 2 })).toThrow(/unsupported schemaVersion/)
+    expect(parseConfig({ ...base, schemaVersion: 2 }).schemaVersion).toBe(2)
+    expect(() => parseConfig({ ...base, schemaVersion: 3 })).toThrow(/unsupported schemaVersion/)
     expect(() => parseConfig({ ...base, schemaVersion: 0 })).toThrow(/unsupported schemaVersion/)
     expect(() => parseConfig({ ...base, schemaVersion: '1' as unknown as number })).toThrow(/unsupported schemaVersion/)
+  })
+
+  it('migrates bounded Provider-based v1 settings without mutating the input', () => {
+    const base = defaultMinerUConfig()
+    const legacy = {
+      ...base,
+      schemaVersion: 1,
+      defaults: { ...base.defaults, artifacts: ['markdown', 'layout'] },
+      limits: { ...base.limits, maxFilesPerRequest: 4 },
+    }
+
+    const parsed = parseConfigWithMigration(legacy)
+    expect(parsed.migrated).toBe(true)
+    expect(parsed.migratedFrom).toBe(1)
+    expect(parsed.config.schemaVersion).toBe(2)
+    expect(parsed.config.defaults).not.toHaveProperty('artifacts')
+    expect(parsed.config.limits).not.toHaveProperty('maxFilesPerRequest')
+    expect(legacy.defaults.artifacts).toEqual(['markdown', 'layout'])
+    expect(legacy.limits.maxFilesPerRequest).toBe(4)
+  })
+
+  it('validates removed v1 fields and keeps v2 unknown-field rejection strict', () => {
+    const base = defaultMinerUConfig()
+    expect(() => parseConfig({
+      ...base,
+      schemaVersion: 1,
+      defaults: { ...base.defaults, artifacts: ['unknown'] },
+    })).toThrow(/defaults.artifacts contains an unsupported artifact/)
+    expect(() => parseConfig({
+      ...base,
+      schemaVersion: 1,
+      limits: { ...base.limits, maxFilesPerRequest: 0 },
+    })).toThrow(/limits.maxFilesPerRequest must be a positive safe integer/)
+    expect(() => parseConfig({
+      ...base,
+      defaults: { ...base.defaults, artifacts: ['markdown'] },
+    })).toThrow(/defaults contains unsupported property artifacts/)
+    const mergedLegacySettings = parseConfigWithMigration({
+      ...base,
+      defaults: { ...base.defaults, artifacts: ['markdown'] },
+    })
+    expect(mergedLegacySettings.migrated).toBe(true)
+    expect(mergedLegacySettings.migratedFrom).toBeUndefined()
+    expect(mergedLegacySettings.config.defaults).not.toHaveProperty('artifacts')
   })
 
   it('rejects removed flat configuration fields', () => {

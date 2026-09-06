@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Context } from 'cordis'
-import { defaultMinerUConfig } from '../src/config.js'
+import { defaultMinerUConfig, parseConfig } from '../src/config.js'
 import { ProcessLock, ResultRepository } from '../src/storage/index.js'
 
 vi.mock('@deepseek-ai/dsh-tools', () => ({ defineTool: (definition: unknown) => definition }))
@@ -23,19 +23,22 @@ interface FakeRuntime {
     handler?: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>
   }
   readonly settingsReplace: ReturnType<typeof vi.fn>
+  readonly settingsMutate: ReturnType<typeof vi.fn>
 }
 
 function fakeContext(
   config: ReturnType<typeof defaultMinerUConfig>,
   failToolRegistration = false,
-  storedConfig: ReturnType<typeof defaultMinerUConfig> = config,
+  storedConfig: unknown = config,
 ): FakeRuntime {
   const definitions: unknown[] = []
   const effects: Array<() => void | Promise<void>> = []
   const rpc: FakeRuntime['rpc'] = { authority: undefined, disposeCount: 0 }
   const settingsReplace = vi.fn((_section: object) => Promise.resolve())
+  const settingsMutate = vi.fn((_namespace: string, _operations: readonly unknown[]) => Promise.resolve())
+  let resolvedConfig = storedConfig
   const scope = {
-    get: () => storedConfig,
+    get: () => resolvedConfig,
     watch: (_callback: (next: unknown) => void) => () => undefined,
     replace: settingsReplace,
   }
@@ -63,8 +66,10 @@ function fakeContext(
     },
     get: (name: string) => name === 'settings'
       ? {
-          register: (_namespace: string, _schema: unknown, options: { validate(value: unknown): void }) => {
-            options.validate(storedConfig)
+          mutate: settingsMutate,
+          register: (_namespace: string, schema: unknown, options: { validate(value: unknown): void }) => {
+            resolvedConfig = (schema as (value: unknown) => unknown)(storedConfig)
+            options.validate(resolvedConfig)
             return scope
           },
         }
@@ -82,7 +87,7 @@ function fakeContext(
     },
     logger: { info: () => undefined, warn: () => undefined, error: () => undefined, debug: () => undefined },
   }
-  return { ctx: value as unknown as Context, definitions, effects, rpc, settingsReplace }
+  return { ctx: value as unknown as Context, definitions, effects, rpc, settingsReplace, settingsMutate }
 }
 
 function cancellableContext(config: ReturnType<typeof defaultMinerUConfig>): FakeRuntime & { disposeContext(): Promise<void> } {
@@ -237,6 +242,38 @@ describe('plugin composition lifecycle', () => {
     await dispose()
   })
 
+  it('migrates and rewrites persisted Provider-based v1 settings during startup', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mineru-index-migration-'))
+    roots.push(root)
+    const base = defaultMinerUConfig()
+    const entryConfig = { ...base, storage: { ...base.storage, storageRoot: join(root, 'new-default') } }
+    const legacyStored = {
+      ...base,
+      schemaVersion: 1,
+      defaults: { ...base.defaults, artifacts: ['markdown', 'content-list'] },
+      limits: { ...base.limits, maxFilesPerRequest: 2 },
+      storage: { ...base.storage, storageRoot: join(root, 'persisted-user-root') },
+    }
+    const expected = parseConfig(legacyStored)
+    const runtime = fakeContext(entryConfig, false, legacyStored)
+    const { apply } = await import('../src/index.js')
+
+    const dispose = await apply(runtime.ctx, entryConfig)
+
+    expect(await stat(expected.storage.storageRoot)).toBeDefined()
+    expect(runtime.settingsReplace).not.toHaveBeenCalled()
+    expect(runtime.settingsMutate).toHaveBeenCalledOnce()
+    expect(runtime.settingsMutate).toHaveBeenCalledWith('dsh-pdf-mineru', [
+      { op: 'set', path: ['schemaVersion'], value: 2 },
+      { op: 'unset', path: ['defaults', 'artifacts'] },
+      { op: 'unset', path: ['limits', 'maxFilesPerRequest'] },
+    ])
+    expect(await runtime.rpc.handler?.('mineru/config.get', {}, new AbortController().signal))
+      .toMatchObject({ ok: true, value: { config: expected } })
+
+    await dispose()
+  })
+
   it('keeps provider schema branches discriminated by type', async () => {
     const { Config } = await import('../src/index.js')
     const validate = Config as unknown as (value: unknown) => Record<string, unknown>
@@ -250,7 +287,8 @@ describe('plugin composition lifecycle', () => {
     delete unauthenticated.apiKeyEnv
     delete unauthenticated.configuredVersion
     expect(() => validate({ ...base, providers: [unauthenticated] })).not.toThrow()
-    expect(() => validate({ ...base, schemaVersion: 2 })).toThrow()
+    expect(() => validate({ ...base, schemaVersion: 1 })).not.toThrow()
+    expect(() => validate({ ...base, schemaVersion: 3 })).toThrow()
     expect(() => validate({ ...base, storage: { ...base.storage, retainSources: true } })).toThrow()
     expect(() => validate({
       ...base,

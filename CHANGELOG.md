@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Removed the obsolete `defaults.artifacts` field from the shipped Cordis configuration, restoring Host startup under strict configuration validation.
 - Routed async completion through a separate bounded synopsis API instead of Markdown projection flags; oversized/invalid optional summary indexes now degrade explicitly without masking cache-integrity failures.
 - Charged consumed image bytes on partial-read, final-stat, and close failures; required actual normalized attachment sizes and propagated cancellation after the final image.
 - Replaced instance-held lock bypass and unsafe stale-file reclamation with scoped, cancellable local-filesystem bakery coordination and explicit mutation authority.
@@ -15,6 +16,7 @@
 
 ### Changed
 
+- Versioned the current plugin configuration as schema v2 and added a bounded v1 migration that validates and removes obsolete `defaults.artifacts` and `limits.maxFilesPerRequest` fields before persisting the canonical v2 settings.
 - Unified configuration parsing, snapshotted execution settings, and made startup-bound storage/payload limits explicit. Split settings sections and preserved numeric input drafts.
 - Separated parse synopsis from body projection and aligned required tool schemas, English guidance, and actionable RPC failures.
 - Consolidated current usage, architecture, deployment limits, and upgrade guidance; removed obsolete lock instructions and temporary audit/work logs.

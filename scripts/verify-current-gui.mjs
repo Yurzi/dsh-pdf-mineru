@@ -64,13 +64,13 @@ function injectCurrentPlugin(html) {
 }
 
 const config = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   activeProvider: 'mp_self_hosted',
   providers: [{
     id: 'mp_self_hosted', type: 'self-hosted-v2', baseURL: 'http://localhost:18000',
     apiKeyEnv: 'MINERU_API_KEY', modelMap: { pipeline: 'pipeline', vlm: 'vlm-engine' }, allowInsecureHttp: true,
   }],
-  defaults: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true, artifacts: ['markdown'] },
+  defaults: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true },
   storage: { storageRoot: '/tmp/mineru-ui-verification', cacheEnabled: true, retainSources: false, stagingTtlMs: 86400000 },
   polling: { pollIntervalMs: 2000, pollTimeoutMs: 600000, requestTimeoutMs: 60000, operationTimeoutMs: 3600000 },
   retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 10000 },
