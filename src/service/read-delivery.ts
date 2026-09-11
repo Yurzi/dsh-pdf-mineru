@@ -2,7 +2,7 @@
 import { createHash } from 'node:crypto'
 import { MinerUError, failure } from '../domain/errors.js'
 import { cursorForRemainder, type ReadCursorPayload } from './read-cursor.js'
-import { formatResultProse, safeStringSlice, truncateAtCleanBoundary, type ImageCandidateView, type ProjectedBlockRange, type ResultView } from './result-presenter.js'
+import { formatResultProse, safeStringSlice, truncateAtCleanBoundary, type ImageCandidateView, type ProjectedBlockRange, type ReadDiagnostic, type VerificationHint, type ShortenedMetadata, type ResultView } from './result-presenter.js'
 import type { FocusKind } from '../domain/request.js'
 
 /** Below DSH console object's 10,000-character string preview limit. */
@@ -23,9 +23,23 @@ export function fitsReadBudget(view: ResultView): boolean {
     && Buffer.byteLength(json, 'utf8') <= MAX_MODEL_RESPONSE_BYTES && Buffer.byteLength(prose, 'utf8') <= MAX_MODEL_RESPONSE_BYTES
 }
 
+/** Last-resort metadata degradation never changes text, status, cursor, or image records. */
+export function compactReadMetadata(value: ResultView): ResultView {
+  let view = value
+  for (const key of ['summary', 'provenance', 'verification_hints', 'diagnostics', 'warnings'] as const) {
+    if (fitsReadBudget(view)) break
+    if (view[key] === undefined) continue
+    const { [key]: _removed, ...rest } = view
+    view = { ...rest, metadata_shortened: [...new Set([...(view.metadata_shortened ?? []), key])] }
+  }
+  return view
+}
+
 export function deliverReadChunk(options: {
   base: ResultView; text: string; focus: ReadonlySet<FocusKind>; images: readonly ImageCandidateView[];
-  cursor?: ReadCursorPayload; selection?: { block?: string; query?: string }; ranges?: readonly ProjectedBlockRange[]; identity?: string; signal?: AbortSignal;
+  cursor?: ReadCursorPayload; selection?: { block?: string; query?: string }; ranges?: readonly ProjectedBlockRange[]; identity?: string; signal?: AbortSignal; inlineImages?: boolean;
+  diagnosticsForBlocks?: (ids: ReadonlySet<string>) => readonly ReadDiagnostic[];
+  verificationHints?: readonly VerificationHint[]; scopeDiagnostics?: readonly ReadDiagnostic[];
 }): ResultView {
   const { base, text, focus, images, cursor, selection, ranges = [] } = options
   options.signal?.throwIfAborted()
@@ -53,19 +67,31 @@ export function deliverReadChunk(options: {
     // attached early and preceding figures are not replayed on every continuation.
     const chunkBlockIds = new Set(ranges.filter(range => range.start >= offset && range.start < offset + content.length).map(range => range.block_id))
     const chunkImages = images.filter(image => image.block_id ? chunkBlockIds.has(image.block_id) : offset === 0)
+    const activeIds = new Set(ranges.filter(range => range.start < offset + content.length && range.end > offset).map(range => range.block_id))
+    const diagnostics = [...(offset === 0 ? options.scopeDiagnostics ?? [] : []), ...(options.diagnosticsForBlocks?.(activeIds) ?? [])]
+    const hints = (options.verificationHints ?? []).filter(hint => activeIds.has(hint.block_id))
+    const shortened: ShortenedMetadata[] = [...(diagnostics.length > 6 ? ['diagnostics' as const] : []), ...(hints.length > 4 ? ['verification_hints' as const] : [])]
     const warnings = boundedWarnings([
-      ...(base.warnings ?? []),
+      ...(offset === 0 ? base.warnings ?? [] : []),
       ...(chunkImages.length > 20 ? ['[VISUAL_METADATA_SHORTENED] Use block_id to inspect images not listed in this chunk.'] : []),
     ])
+    const { warnings: _scopeWarnings, provenance: _provenance, ...chunkBase } = base
     const view: ResultView = {
-      ...base, markdown_content: content, content_status: partial ? 'partial' : 'complete',
+      ...chunkBase, ...(offset === 0 && base.provenance ? { provenance: base.provenance } : {}), markdown_content: content, content_status: partial ? 'partial' : 'complete',
       ...(partial && base.files.some(file => file.artifacts.length > 0) ? { files: base.files.map(file => ({ ...file, artifacts: [], artifacts_truncated: true })) } : {}),
-      cursor: partial ? cursorForRemainder(base.result_id, base.pages, focus, offset + content.length, { ...selection, projection }) : null,
+      cursor: partial ? cursorForRemainder(base.result_id, base.pages, focus, offset + content.length, { ...selection, projection, inline_images: options.inlineImages ?? cursor?.inline_images ?? true }) : null,
       ...(chunkImages.length ? { ordered_images: chunkImages.slice(0, 20).map(image => ({ ...image, ...(image.caption ? { caption: safeStringSlice(image.caption, 256) } : {}) })) } : {}),
       ...(warnings.length ? { warnings } : {}),
+      ...(diagnostics.length ? { diagnostics: diagnostics.slice(0, 6) } : {}),
+      ...(hints.length ? { verification_hints: hints.slice(0, 4) } : {}),
+      ...(shortened.length ? { metadata_shortened: shortened } : {}),
       ...(activeBlock ? { continuation_block: { block_id: activeBlock.block_id, ...(activeBlock.page === undefined ? {} : { page: activeBlock.page }), ...(activeBlock.document_label ? { document_label: activeBlock.document_label } : {}) } } : {}),
     }
     if (fitsReadBudget(view)) return view
+    if (target <= 256) {
+      const compact = compactReadMetadata(view)
+      if (fitsReadBudget(compact)) return compact
+    }
     if (target === 0) throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds model output budget'))
     target = Math.max(0, Math.floor(Math.min(target, content.length) * 0.75))
   }

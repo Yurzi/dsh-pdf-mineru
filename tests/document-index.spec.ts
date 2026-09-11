@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import type { ContentListBlock } from '../src/service/result-presenter.js'
-import { extractDocumentLabel, normalizeDocumentBlocks } from '../src/service/document-index.js'
+import {
+  collectBlockDiagnostics,
+  DOCUMENT_INDEX_VERSION,
+  extractDocumentLabel,
+  normalizeDocumentBlocks,
+} from '../src/service/document-index.js'
 
 describe('document index', () => {
   it('assigns result-bound identities before selection and retains caption labels', () => {
@@ -277,5 +282,170 @@ it('keeps late critical gaps visible and scopes warnings without renumbering blo
   expect(selected.blocks[40]?.block_id).toBe('mr_test:b41')
   expect(selected.warnings).toHaveLength(1)
   expect(selected.warnings[0]).toContain('block 41')
+})
+
+it('accepts known page metadata and reference text without hiding empty content', () => {
+  const blocks = ['header', 'footer', 'page_number', 'page_footnote', 'ref_text'].map(type => ({ type, text: 'kept', page_idx: 0 }))
+  const result = normalizeDocumentBlocks(blocks, 'mr_metadata')
+  expect(result.warnings).toEqual([])
+  expect(result.blocks.map(block => block.text)).toEqual(['kept', 'kept', 'kept', 'kept', 'kept'])
+  expect(normalizeDocumentBlocks([{ type: 'header' }], 'mr_metadata').warnings).toEqual([expect.stringContaining('EMPTY_CONTENT')])
+})
+
+describe('MinerU list projection', () => {
+  it('projects official-v4 ref_text string items without changing authored numbering or lines', () => {
+    const listItems = Array.from({ length: 15 }, (_, index) =>
+      `[${String(index + 1)}] Reference ${String(index + 1)}${index === 7 ? '\ncontinued on its authored line' : ''}`)
+    const source: ContentListBlock = {
+      type: 'list',
+      sub_type: 'ref_text',
+      page_idx: 8,
+      list_items: listItems,
+    }
+
+    const result = normalizeDocumentBlocks([source], 'mr_refs')
+
+    expect(DOCUMENT_INDEX_VERSION).toBe(2)
+    expect(result.blocks[0]?.text).toBe(listItems.join('\n'))
+    expect(result.blocks[0]?.list_items).toBe(listItems)
+    expect(result.blocks[0]?.sub_type).toBe('ref_text')
+    expect(result.blocks[0]?.text).toContain('[1] Reference 1')
+    expect(result.blocks[0]?.text).toContain('[15] Reference 15')
+    expect(result.blocks[0]?.text).not.toContain('- [1]')
+    expect(result.warnings).toEqual([])
+    expect(source.text).toBeUndefined()
+  })
+
+  it('keeps one authoritative representation and diagnoses flat/nested/list conflicts', () => {
+    const result = normalizeDocumentBlocks([
+      {
+        type: 'list',
+        sub_type: 'ref_text',
+        text: 'flat authoritative',
+        list_items: ['[1] list representation'],
+        lines: [{ spans: [{ type: 'text', content: 'nested representation' }] }],
+      },
+      {
+        type: 'list',
+        text: '   ',
+        content: '',
+        list_items: ['1. authored first\ncontinuation', '4) authored fourth'],
+        lines: [{ spans: [{ type: 'text', content: 'different nested representation' }] }],
+      },
+    ], 'mr_list_conflict')
+
+    expect(result.blocks[0]?.text).toBe('flat authoritative')
+    expect(result.blocks[0]?.text).not.toContain('list representation')
+    expect(result.blocks[0]?.text).not.toContain('nested representation')
+    expect(result.blocks[1]?.text).toBe('1. authored first\ncontinuation\n4) authored fourth')
+    expect(result.blocks[1]?.text).not.toContain('different nested representation')
+    expect(result.warnings).toEqual([
+      '[DOCUMENT_INDEX_CONFLICTING_CONTENT] block 1: nonempty flat and list text differ; flat content was kept',
+      '[DOCUMENT_INDEX_CONFLICTING_CONTENT] block 1: nonempty flat and nested text differ; flat content was kept',
+      '[DOCUMENT_INDEX_CONFLICTING_CONTENT] block 2: nonempty list and nested text differ; list content was kept',
+    ])
+  })
+
+  it('omits unsupported items individually, preserves usable strings, and reports empty lists', () => {
+    const secret = 'PRIVATE_LIST_OBJECT'
+    const result = normalizeDocumentBlocks([
+      {
+        type: 'list',
+        list_items: ['[1] usable', { text: secret }, '[3] still usable', 42],
+      },
+      { type: 'list', list_items: [] },
+    ], 'mr_list_mixed')
+
+    expect(result.blocks[0]?.text).toBe('[1] usable\n[3] still usable')
+    expect(result.blocks[0]?.list_items).toEqual(['[1] usable', '[3] still usable'])
+    expect(result.warnings).toContain('[DOCUMENT_INDEX_UNSUPPORTED_CONTENT] block 1 list item 2: list item is not a supported string; item was omitted')
+    expect(result.warnings).toContain('[DOCUMENT_INDEX_UNSUPPORTED_CONTENT] block 1 list item 4: list item is not a supported string; item was omitted')
+    expect(result.warnings).toContain('[DOCUMENT_INDEX_EMPTY_CONTENT] block 2: list_items is empty')
+    expect(JSON.stringify(result.blocks)).not.toContain(secret)
+    expect(JSON.stringify(result.blocks)).not.toContain('[object Object]')
+  })
+})
+
+describe('structured block diagnostics', () => {
+  it('uses stable source-bound IDs and diagnoses only selected original-order blocks', () => {
+    const untouched = {} as ContentListBlock
+    Object.defineProperty(untouched, 'type', {
+      get: () => { throw new Error('unselected block was inspected') },
+    })
+    const secret = 'PRIVATE_DIAGNOSTIC_VALUE'
+    const blocks: ContentListBlock[] = [
+      untouched,
+      { type: 'list', page_idx: 4, list_items: [{ text: secret }, 9] },
+      { type: 'future_type', text: 'usable' },
+    ]
+
+    const first = collectBlockDiagnostics(blocks, 'mr_diagnostics', new Set([2]))
+    const repeated = collectBlockDiagnostics(blocks, 'mr_diagnostics', new Set([2]))
+    const otherSource = collectBlockDiagnostics(blocks, 'mr_other', new Set([2]))
+
+    expect(first).toEqual(repeated)
+    expect(first).toHaveLength(3)
+    expect(first.map(item => item.block_id)).toEqual(['mr_diagnostics:b2', 'mr_diagnostics:b2', 'mr_diagnostics:b2'])
+    expect(first.map(item => item.page)).toEqual([5, 5, 5])
+    expect(first.every(item => item.scope === 'chunk')).toBe(true)
+    expect(first.every(item => /^document-index:[a-f0-9]{24}$/.test(item.id))).toBe(true)
+    expect(new Set(first.map(item => item.id))).toHaveProperty('size', 3)
+    expect(otherSource.map(item => item.id)).not.toEqual(first.map(item => item.id))
+    expect(JSON.stringify(first)).not.toContain(secret)
+
+    const third = collectBlockDiagnostics(blocks, 'mr_diagnostics', new Set([3]))
+    expect(third).toMatchObject([{
+      code: 'DOCUMENT_INDEX_UNKNOWN_BLOCK_TYPE',
+      scope: 'chunk',
+      block_id: 'mr_diagnostics:b3',
+    }])
+    expect(third[0]).not.toHaveProperty('page')
+    expect(collectBlockDiagnostics(blocks, 'mr_diagnostics', new Set())).toEqual([])
+  })
+
+  it('caps details with an honestly counted block-scoped omission record', () => {
+    const items = Array.from({ length: 25 }, (_, index) => ({ unknown: index }))
+    const diagnostics = collectBlockDiagnostics([
+      { type: 'list', page_idx: 2, list_items: items },
+    ], 'mr_diagnostic_cap', new Set([1]))
+
+    expect(diagnostics).toHaveLength(20)
+    expect(diagnostics.at(-1)).toMatchObject({
+      code: 'DOCUMENT_INDEX_WARNINGS_OMITTED',
+      scope: 'chunk',
+      block_id: 'mr_diagnostic_cap:b1',
+      page: 3,
+      message: '7 additional normalization warning(s) omitted.',
+    })
+  })
+})
+
+describe('narrow observed text-gap signals', () => {
+  it('flags only the additional observed Chinese slots without modifying or guessing text', () => {
+    const positives = [
+      '其中， 表示可训练参数',
+      '参考规约和 计算交叉熵',
+      '批次大小为 ，',
+    ]
+    const negatives = [
+      '其中，参数表示可训练参数',
+      '参考规约和模型计算交叉熵',
+      '批次大小为 32，',
+      '矩阵 A \\times B 保持原始 LaTeX；EOS、theta 和 B 均未缺失。',
+      '普通中文在标点后 有空格，但不是已观察到的缺失槽。',
+    ]
+    const result = normalizeDocumentBlocks([
+      ...positives.map(text => ({ type: 'text', text })),
+      ...negatives.map(text => ({ type: 'text', text })),
+    ], 'mr_more_gaps')
+
+    expect(result.blocks.map(block => block.text)).toEqual([...positives, ...negatives])
+    expect(result.warnings).toEqual(positives.map((_, index) =>
+      `[DOCUMENT_INDEX_POSSIBLE_TEXT_GAP] block ${String(index + 1)}: possible missing value detected; verify the original page`))
+    expect(result.blocks[6]?.text).toContain('\\times')
+    expect(result.blocks.slice(0, 3).map(block => block.text).join('')).not.toContain('theta')
+    expect(result.blocks.slice(0, 3).map(block => block.text).join('')).not.toContain('EOS')
+    expect(result.blocks.slice(0, 3).map(block => block.text).join('')).not.toContain('B')
+  })
 })
 

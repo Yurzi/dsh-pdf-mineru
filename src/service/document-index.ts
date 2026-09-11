@@ -1,4 +1,19 @@
+import { createHash } from 'node:crypto'
+
 import type { ContentListBlock } from '../service/result-presenter.js'
+
+/** Version of the provider-content projection semantics. */
+export const DOCUMENT_INDEX_VERSION = 2 as const
+
+/** A bounded, block-scoped diagnostic suitable for chunk delivery. */
+export interface BlockDiagnostic {
+  readonly id: string
+  readonly code: string
+  readonly scope: 'chunk'
+  readonly message: string
+  readonly block_id: string
+  readonly page?: number
+}
 
 /** A content-list block with an identity fixed before page/focus selection. */
 export interface IndexedContentBlock extends ContentListBlock {
@@ -18,37 +33,128 @@ interface MutableBlock extends Record<string, unknown> {
   content?: unknown
   code?: unknown
   table_body?: unknown
+  list_items?: unknown
+}
+
+interface DiagnosticDetail {
+  readonly code: string
+  readonly location: string
+  readonly message: string
+  readonly priority: number
+  readonly documentOrder: number
+  readonly blockId: string
+  readonly page?: number
+}
+
+function diagnosticId(resultId: string, detail: Pick<DiagnosticDetail, 'documentOrder' | 'code' | 'location' | 'message'>): string {
+  const hash = createHash('sha256')
+    .update([resultId, String(detail.documentOrder), detail.code, detail.location, detail.message].join('\0'))
+    .digest('hex')
+  return `document-index:${hash.slice(0, 24)}`
+}
+
+interface DiagnosticWriter {
+  add(code: string, location: string, message: string): void
 }
 
 class WarningCollector {
-  readonly #details: Array<{ text: string; priority: number }> = []
+  readonly #details: DiagnosticDetail[] = []
   #omitted = 0
-  constructor(private readonly orders?: ReadonlySet<number>) {}
+  #omissionScope: Pick<DiagnosticDetail, 'documentOrder' | 'blockId' | 'page'> | undefined
 
-  add(code: string, location: string, message: string): void {
-    if (this.orders !== undefined && !this.orders.has(Number(/^block ([0-9]+)/.exec(location)?.[1]))) return
-    const priority = /POSSIBLE_TEXT_GAP|CONFLICTING|UNKNOWN_NESTED|UNSUPPORTED_CONTENT/.test(code) ? 2 : /EMPTY_CONTENT/.test(code) ? 1 : 0
-    const detail = { text: `[${code}] ${location}: ${message}`, priority }
-    if (this.#details.length < MAX_DETAIL_WARNINGS) this.#details.push(detail)
-    else {
-      const lowest = Math.min(...this.#details.map(item => item.priority))
-      if (priority > lowest) this.#details[this.#details.findIndex(item => item.priority === lowest)] = detail
-      this.#omitted++
+  constructor(
+    private readonly resultId: string,
+    private readonly orders?: ReadonlySet<number>,
+  ) {}
+
+  forBlock(documentOrder: number, page: number | undefined): DiagnosticWriter {
+    const blockId = `${this.resultId}:b${String(documentOrder)}`
+    return {
+      add: (code, location, message): void => {
+        if (this.orders !== undefined && !this.orders.has(documentOrder)) return
+        const priority = /POSSIBLE_TEXT_GAP|CONFLICTING|UNKNOWN_NESTED|UNSUPPORTED_CONTENT/.test(code) ? 2 : /EMPTY_CONTENT/.test(code) ? 1 : 0
+        const detail: DiagnosticDetail = {
+          code,
+          location,
+          message,
+          priority,
+          documentOrder,
+          blockId,
+          ...(page === undefined ? {} : { page }),
+        }
+        if (this.#details.length < MAX_DETAIL_WARNINGS) {
+          this.#details.push(detail)
+          return
+        }
+
+        const lowest = Math.min(...this.#details.map(item => item.priority))
+        let omittedDetail = detail
+        if (priority > lowest) {
+          const replacementIndex = this.#details.findIndex(item => item.priority === lowest)
+          omittedDetail = this.#details[replacementIndex]!
+          this.#details[replacementIndex] = detail
+        }
+        this.#omitted++
+        this.#omissionScope ??= {
+          documentOrder: omittedDetail.documentOrder,
+          blockId: omittedDetail.blockId,
+          ...(omittedDetail.page === undefined ? {} : { page: omittedDetail.page }),
+        }
+      },
     }
   }
 
+  #sortedDetails(): readonly DiagnosticDetail[] {
+    return [...this.#details].sort((a, b) => b.priority - a.priority)
+  }
+
   finish(): readonly string[] {
-    const details = [...this.#details].sort((a, b) => b.priority - a.priority).map(detail => detail.text)
+    const details = this.#sortedDetails().map(detail => `[${detail.code}] ${detail.location}: ${detail.message}`)
     if (this.#omitted === 0) return details
     return [
       ...details,
       `[DOCUMENT_INDEX_WARNINGS_OMITTED] ${String(this.#omitted)} additional normalization warning(s) omitted.`,
     ]
   }
+
+  finishDiagnostics(): readonly BlockDiagnostic[] {
+    const diagnostics = this.#sortedDetails().map((detail): BlockDiagnostic => ({
+      id: diagnosticId(this.resultId, detail),
+      code: detail.code,
+      scope: 'chunk',
+      message: detail.message,
+      block_id: detail.blockId,
+      ...(detail.page === undefined ? {} : { page: detail.page }),
+    }))
+    if (this.#omitted === 0 || this.#omissionScope === undefined) return diagnostics
+
+    const message = `${String(this.#omitted)} additional normalization warning(s) omitted.`
+    const detail: DiagnosticDetail = {
+      code: 'DOCUMENT_INDEX_WARNINGS_OMITTED',
+      location: `block ${String(this.#omissionScope.documentOrder)}`,
+      message,
+      priority: 0,
+      documentOrder: this.#omissionScope.documentOrder,
+      blockId: this.#omissionScope.blockId,
+      ...(this.#omissionScope.page === undefined ? {} : { page: this.#omissionScope.page }),
+    }
+    return [
+      ...diagnostics,
+      {
+        id: diagnosticId(this.resultId, detail),
+        code: detail.code,
+        scope: 'chunk',
+        message,
+        block_id: detail.blockId,
+        ...(detail.page === undefined ? {} : { page: detail.page }),
+      },
+    ]
+  }
 }
 
 const KNOWN_BLOCK_TYPES = new Set([
-  'text', 'title',
+  'text', 'title', 'list',
+  'header', 'footer', 'page_number', 'page_footnote', 'ref_text',
   'table',
   'image', 'chart', 'figure',
   'equation', 'interline_equation', 'inline_equation',
@@ -60,6 +166,9 @@ const KNOWN_BLOCK_TYPES = new Set([
 const POSSIBLE_TEXT_GAP_PATTERNS = [
   /中的\s+个/u,
   /(?:包含|通过率为|分别通过)\s+(?:个|和|，|；|。)/u,
+  /其中，\s+表示可训练参数/u,
+  /参考规约和\s+计算交叉熵/u,
+  /批次大小为\s+，/u,
 ] as const
 
 function blockKind(type: unknown): BlockKind {
@@ -125,7 +234,7 @@ function safeStringField(
   target: MutableBlock,
   field: 'text' | 'content' | 'code' | 'language' | 'table_body' | 'img_path' | 'image_path' | 'path',
   blockLocation: string,
-  warnings: WarningCollector,
+  warnings: DiagnosticWriter,
 ): string | undefined {
   const value = source[field]
   if (value === undefined) return undefined
@@ -151,7 +260,7 @@ function safeCaptionField(
   target: MutableBlock,
   field: CaptionField,
   blockLocation: string,
-  warnings: WarningCollector,
+  warnings: DiagnosticWriter,
 ): CaptionValue | undefined {
   const value = source[field]
   if (value === undefined) return undefined
@@ -168,6 +277,42 @@ function safeCaptionField(
     return strings
   }
   return value as readonly string[]
+}
+
+function contentFromListItems(
+  value: unknown,
+  target: MutableBlock,
+  blockLocation: string,
+  warnings: DiagnosticWriter,
+): string | undefined {
+  if (!Array.isArray(value)) {
+    delete target.list_items
+    warnings.add('DOCUMENT_INDEX_UNSUPPORTED_CONTENT', blockLocation, 'list_items is not an array; list content was omitted')
+    return undefined
+  }
+  if (value.length === 0) {
+    warnings.add('DOCUMENT_INDEX_EMPTY_CONTENT', blockLocation, 'list_items is empty')
+    return undefined
+  }
+
+  const strings: string[] = []
+  for (let itemIndex = 0; itemIndex < value.length; itemIndex++) {
+    const item = value[itemIndex]
+    const itemLocation = `${blockLocation} list item ${String(itemIndex + 1)}`
+    if (typeof item !== 'string') {
+      warnings.add('DOCUMENT_INDEX_UNSUPPORTED_CONTENT', itemLocation, 'list item is not a supported string; item was omitted')
+      continue
+    }
+    strings.push(item)
+    if (item.length === 0) warnings.add('DOCUMENT_INDEX_EMPTY_CONTENT', itemLocation, 'list item is empty')
+  }
+
+  if (strings.length !== value.length) target.list_items = strings
+  if (strings.length === 0) return undefined
+  // Each provider item is already authored text (including any reference label).
+  // Joining only at item boundaries preserves item order, numbering, and all
+  // line boundaries within each item without inventing bullets or labels.
+  return strings.join('\n')
 }
 
 function inlineEquation(content: string): string {
@@ -199,7 +344,7 @@ function comparableText(value: string): string {
 function contentFromNestedLines(
   lines: unknown,
   blockLocation: string,
-  warnings: WarningCollector,
+  warnings: DiagnosticWriter,
 ): string | undefined {
   if (!Array.isArray(lines)) {
     warnings.add('DOCUMENT_INDEX_UNSUPPORTED_CONTENT', blockLocation, 'nested lines is not an array; nested content was omitted')
@@ -268,15 +413,19 @@ function contentFromNestedLines(
  * Add stable document identities and faithfully expose known MinerU nested text.
  * The input array and its blocks are never mutated.
  */
-export function normalizeDocumentBlocks(
+function normalizeDocumentBlockSubset(
   contentList: readonly ContentListBlock[],
   resultId: string,
-  warningBlockOrders?: ReadonlySet<number>,
-): { blocks: readonly IndexedContentBlock[]; warnings: readonly string[] } {
-  const warnings = new WarningCollector(warningBlockOrders)
-  const blocks = contentList.map((source, index): IndexedContentBlock => {
-    const documentOrder = index + 1
+  warningCollector: WarningCollector,
+  documentOrders?: readonly number[],
+): readonly IndexedContentBlock[] {
+  return contentList.map((source, index): IndexedContentBlock => {
+    const documentOrder = documentOrders?.[index] ?? index + 1
     const blockLocation = `block ${String(documentOrder)}`
+    const page = typeof source.page_idx === 'number' && Number.isSafeInteger(source.page_idx) && source.page_idx >= 0
+      ? source.page_idx + 1
+      : undefined
+    const warnings = warningCollector.forBlock(documentOrder, page)
     const target: MutableBlock = { ...source }
     delete target.document_label
 
@@ -284,7 +433,7 @@ export function normalizeDocumentBlocks(
       delete target.type
       warnings.add('DOCUMENT_INDEX_UNSUPPORTED_CONTENT', blockLocation, 'non-string block type was omitted')
     } else if (typeof source.type === 'string' && !KNOWN_BLOCK_TYPES.has(source.type.toLowerCase())) {
-      warnings.add('DOCUMENT_INDEX_UNKNOWN_BLOCK_TYPE', blockLocation, 'unknown top-level block type was preserved')
+      warnings.add('DOCUMENT_INDEX_UNKNOWN_BLOCK_TYPE', blockLocation, 'unknown block type; only supported fields were projected, so textual coverage is not guaranteed')
     }
 
     const text = safeStringField(source, target, 'text', blockLocation, warnings)
@@ -310,7 +459,11 @@ export function normalizeDocumentBlocks(
       if (imageFootnote !== undefined) target.image_footnote = imageFootnote
     }
 
+    const sourceType = typeof source.type === 'string' ? source.type.toLowerCase() : undefined
     const kind = blockKind(source.type)
+    const listText = sourceType === 'list' && source.list_items !== undefined
+      ? contentFromListItems(source.list_items, target, blockLocation, warnings)
+      : undefined
     const flatText = preferNonBlank(text, content)
     const selectedFlat = kind === 'code'
       ? preferNonBlank(code, text, content)
@@ -332,15 +485,24 @@ export function normalizeDocumentBlocks(
 
     if (kind !== 'table' && kind !== 'image') {
       if (nonBlank(selectedFlat)) {
-        // A nonblank flat value is authoritative; nested text is comparison-only.
+        // A nonblank flat value is authoritative; other representations are
+        // comparison-only and are never appended.
         if (kind === 'code') target.code = selectedFlat
         else target.text = selectedFlat
+        if (nonBlank(listText) && comparableText(selectedFlat) !== comparableText(listText)) {
+          warnings.add('DOCUMENT_INDEX_CONFLICTING_CONTENT', blockLocation, 'nonempty flat and list text differ; flat content was kept')
+        }
         if (nonBlank(nestedText) && comparableText(selectedFlat) !== comparableText(nestedText)) {
           warnings.add('DOCUMENT_INDEX_CONFLICTING_CONTENT', blockLocation, 'nonempty flat and nested text differ; flat content was kept')
         }
+      } else if (nonBlank(listText)) {
+        target.text = listText
+        if (nonBlank(nestedText) && comparableText(listText) !== comparableText(nestedText)) {
+          warnings.add('DOCUMENT_INDEX_CONFLICTING_CONTENT', blockLocation, 'nonempty list and nested text differ; list content was kept')
+        }
       } else if (nonBlank(nestedText)) {
-        // Blank flat placeholders are not evidence that the nested representation
-        // is empty. Recover known spans without appending to the placeholder.
+        // Blank flat placeholders and unusable lists are not evidence that the
+        // nested representation is empty. Recover known spans without appending.
         if (kind === 'code') target.code = nestedText
         else target.text = nestedText
       } else if (selectedFlat !== undefined) {
@@ -355,7 +517,6 @@ export function normalizeDocumentBlocks(
       else if (source.lines === undefined) warnings.add('DOCUMENT_INDEX_EMPTY_CONTENT', blockLocation, 'no supported textual content was present')
     }
 
-    const sourceType = typeof source.type === 'string' ? source.type.toLowerCase() : undefined
     const normalizedProse = typeof target.text === 'string'
       ? target.text
       : typeof target.content === 'string'
@@ -375,6 +536,40 @@ export function normalizeDocumentBlocks(
       document_order: documentOrder,
     } as IndexedContentBlock
   })
+}
 
-  return { blocks, warnings: warnings.finish() }
+/**
+ * Add stable document identities and faithfully expose known MinerU content.
+ * The input array and its blocks are never mutated.
+ */
+export function normalizeDocumentBlocks(
+  contentList: readonly ContentListBlock[],
+  resultId: string,
+  warningBlockOrders?: ReadonlySet<number>,
+): { blocks: readonly IndexedContentBlock[]; warnings: readonly string[] } {
+  const warnings = new WarningCollector(resultId, warningBlockOrders)
+  return {
+    blocks: normalizeDocumentBlockSubset(contentList, resultId, warnings),
+    warnings: warnings.finish(),
+  }
+}
+
+/** Diagnose only selected one-based original-order blocks without renumbering. */
+export function collectBlockDiagnostics(
+  contentList: readonly ContentListBlock[],
+  resultId: string,
+  orders: ReadonlySet<number>,
+): readonly BlockDiagnostic[] {
+  const selectedBlocks: ContentListBlock[] = []
+  const selectedOrders: number[] = []
+  for (let index = 0; index < contentList.length; index++) {
+    const documentOrder = index + 1
+    if (!orders.has(documentOrder)) continue
+    selectedBlocks.push(contentList[index]!)
+    selectedOrders.push(documentOrder)
+  }
+
+  const diagnostics = new WarningCollector(resultId)
+  normalizeDocumentBlockSubset(selectedBlocks, resultId, diagnostics, selectedOrders)
+  return diagnostics.finishDiagnostics()
 }

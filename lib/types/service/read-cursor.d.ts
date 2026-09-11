@@ -1,6 +1,6 @@
 import { type FocusKind } from '../domain/request.js';
 /** Cursor payload version. Bump only with an explicit compatibility rule. */
-export declare const READ_CURSOR_VERSION: 2;
+export declare const READ_CURSOR_VERSION: 3;
 /** Hard cap on the encoded cursor length (base64url JSON). */
 export declare const MAX_CURSOR_LENGTH: 2048;
 /** Hard cap on encoded canonical selection complexity (pages + focus tokens). */
@@ -15,6 +15,8 @@ export interface ReadCursorPayload {
     readonly focus: readonly FocusKind[];
     /** UTF-16 offset into the exact projected selection text. */
     readonly off: number;
+    /** Caller presentation intent, independent of runtime attachment capability and budgets. */
+    readonly inline_images: boolean;
     readonly block?: string;
     readonly query?: string;
     readonly projection?: string;
@@ -24,7 +26,9 @@ export interface ResolvedSelection {
     readonly focus: ReadonlySet<FocusKind>;
 }
 /** Encode a cursor bound to one result identity, selection, and text offset. */
-export declare function encodeReadCursor(payload: ReadCursorPayload): string;
+export declare function encodeReadCursor(payload: Omit<ReadCursorPayload, 'inline_images'> & {
+    readonly inline_images?: boolean;
+}): string;
 /** Decode and structurally validate a cursor token. Never throws MinerUError. */
 export declare function decodeReadCursor(token: string): ReadCursorPayload;
 /** Resolve the canonical selection stored in a decoded cursor. */
@@ -36,4 +40,5 @@ export declare function cursorForRemainder(resultId: string, pagesLabel: string 
     block?: string;
     query?: string;
     projection?: string;
+    inline_images?: boolean;
 }): string;

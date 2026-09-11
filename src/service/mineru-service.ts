@@ -1,4 +1,5 @@
 import { constants } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { open } from 'node:fs/promises'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { MinerUConfig, ProviderConfig } from '../config.js'
@@ -33,6 +34,8 @@ import type {
   ParseSummaryView,
   ResultFileView,
   ResultView,
+  ReadDiagnostic,
+  VerificationHint,
   SubmissionSource,
 } from './result-presenter.js'
 import {
@@ -47,9 +50,9 @@ import {
   readMarkdownFile,
   safeStringSlice,
 } from './result-presenter.js'
-import { decodeReadCursor, type ReadCursorPayload } from './read-cursor.js'
-import { normalizeDocumentBlocks } from './document-index.js'
-import { boundedWarnings, deliverReadChunk, fitsReadBudget } from './read-delivery.js'
+import { decodeReadCursor, READ_CURSOR_VERSION, type ReadCursorPayload } from './read-cursor.js'
+import { normalizeDocumentBlocks, collectBlockDiagnostics, DOCUMENT_INDEX_VERSION } from './document-index.js'
+import { boundedWarnings, deliverReadChunk, fitsReadBudget, compactReadMetadata } from './read-delivery.js'
 import { renderPdfPage } from './page-renderer.js'
 import { asResultId, createFileId } from '../domain/ids.js'
 
@@ -456,11 +459,7 @@ export class MinerUService {
     }
   }
 
-  private fitSingleCandidate(
-    candidate: ResultView,
-    secondaryArtifacts: readonly ArtifactView[],
-    limit: number,
-  ): ResultView {
+  private fitSingleCandidate(candidate: ResultView): ResultView {
     let view = candidate
     if (fitsReadBudget(view)) return view
 
@@ -469,7 +468,7 @@ export class MinerUService {
       artifacts: [],
       ...(f.artifacts.length > 0 ? { artifacts_truncated: true } : {}),
     }))
-    view = { ...view, files: strippedFiles }
+    view = compactReadMetadata({ ...view, files: strippedFiles })
     if (!fitsReadBudget(view)) {
       throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds configured model output limit'))
     }
@@ -500,13 +499,12 @@ export class MinerUService {
         throw new MinerUError(failure('INVALID_REQUEST', 'Malformed content-list artifact; cannot provide a reliable selection'), { cause: error })
       }
     }
-    const warningOrders = rawPagesSet === undefined && blockId === undefined ? undefined : new Set(rawBlocks.flatMap((block, index) =>
-      (rawPagesSet === undefined || typeof block.page_idx === 'number' && rawPagesSet.has(block.page_idx + 1)) && (blockId === undefined || blockId === data.manifest.id + ':b' + (index + 1)) ? [index + 1] : []))
-    const normalized = normalizeDocumentBlocks(rawBlocks, data.manifest.id, warningOrders)
+    // Index all evidence once, but diagnose only blocks actually delivered below.
+    const normalized = normalizeDocumentBlocks(rawBlocks, data.manifest.id, new Set())
     const blocks = normalized.blocks
     const summary = blocks.length ? computeDocumentSummary(blocks) : undefined
     const { toc: outline, ...counts } = summary ?? {}
-    const warnings = [...normalized.warnings]
+    const warnings: string[] = []
     let physicalPageCount: number | undefined
     try { physicalPageCount = await readLayoutPageCount(data.secondaryArtifacts.find(artifact => artifact.kind === 'layout'), signal) }
     catch { signal?.throwIfAborted(); warnings.push('[PAGE_COUNT_UNAVAILABLE] Layout page metadata could not be read reliably; use original page view to verify physical bounds.') }
@@ -530,15 +528,17 @@ export class MinerUService {
       files: [{ file_id: data.fileId, name: data.fileName, artifacts: artifactList.slice(0, 20), ...(artifactList.length > 20 ? { artifacts_truncated: true } : {}) }],
       content_status: 'not_requested', cursor: null, output_limit_chars: limit,
       source_sha256: data.item.prepared.request.files[0]!.sha256,
+      provenance: { provider: data.manifest.producer.providerId, model: data.manifest.request.semantics.model, parse_method: data.manifest.request.semantics.parseMethod, upstream_version: null, index_version: DOCUMENT_INDEX_VERSION, reader_version: READ_CURSOR_VERSION },
       ...(artifactsRequested ? { manifest_path: data.manifestPath, ...(data.markdownPath ? { markdown_path: data.markdownPath } : {}) } : {}),
       ...(summary ? { summary: counts } : {}),
       ...(pagesLabel ? { pages: pagesLabel } : {}),
       ...(warnings.length ? { warnings: boundedWarnings(warnings) } : {}),
     }
-    if (focusSet.size === 1 && artifactsRequested || !data.markdownRequested) return this.fitSingleCandidate(base, data.secondaryArtifacts, limit)
+    if (focusSet.size === 1 && artifactsRequested || !data.markdownRequested) return this.fitSingleCandidate(base)
     let fullText = ''
     let images: readonly ImageCandidateView[] = []
     let ranges: readonly ProjectedBlockRange[] = []
+    let verificationHints: readonly VerificationHint[] = []
     if (blocks.length) {
       const selected = blocks.filter(block => {
         const page = typeof block.page_idx === 'number' ? block.page_idx + 1 : undefined
@@ -547,6 +547,7 @@ export class MinerUService {
       if (blockId !== undefined && !blocks.some(block => block.block_id === blockId)) throw new MinerUError(failure('INVALID_REQUEST', '[BLOCK_NOT_FOUND] This block does not belong to the current parsed result; search again'))
       const matching = blockId === undefined ? selected : selected.filter(block => block.block_id === blockId)
       if (blockId !== undefined && matching.length === 0) throw new MinerUError(failure('INVALID_REQUEST', '[BLOCK_NOT_FOUND] Block is outside the requested pages/focus'))
+      verificationHints = matching.filter(block => ['equation', 'interline_equation', 'inline_equation'].includes((block.type ?? '').toLowerCase())).map(block => ({ reason: 'formula' as const, block_id: block.block_id, view: 'page' as const, ...(typeof block.page_idx === 'number' ? { page: block.page_idx + 1 } : {}) }))
       const imageArtifacts = data.secondaryArtifacts.filter(a => a.kind === 'images')
       if (query !== undefined) {
         const escaped = [...query].map(character => '\\.^$*+?()[]{}|'.includes(character) ? '\\' + character : character).join('')
@@ -594,7 +595,14 @@ export class MinerUService {
       images = focusSet.has('toc') && !focusSet.has('all') ? [] : fallback.orderedImages
       warnings.push('[LOCATION_UNAVAILABLE] Reading Markdown fallback; page/block coordinates are unavailable.')
     }
-    return deliverReadChunk({ base: { ...base, ...(warnings.length ? { warnings: boundedWarnings(warnings) } : {}) }, text: fullText, focus: focusSet, images, ranges, cursor: cursorPayload, signal, identity: JSON.stringify(data.manifest.files),
+    const scopeDiagnostics: ReadDiagnostic[] = warnings.map(warning => {
+      const code = /^\[([^\]]+)\]/.exec(warning)?.[1] ?? 'PAGE_SELECTION_ADJUSTED'
+      const scope = /PAGE_COUNT_LOWER_BOUND|PAGE_SELECTION/.test(code) ? 'selection' as const : 'document' as const
+      return { id: createHash('sha256').update(data.manifest.id + '|' + scope + '|' + warning).digest('hex').slice(0, 24), code, scope, message: warning.replace(/^\[[^\]]+\]\s*/, '') }
+    })
+    return deliverReadChunk({ base: { ...base, ...(warnings.length ? { warnings: boundedWarnings(warnings) } : {}) }, text: fullText, focus: focusSet, images, ranges, cursor: cursorPayload, signal, identity: JSON.stringify({ index_version: DOCUMENT_INDEX_VERSION, reader_version: READ_CURSOR_VERSION, files: data.manifest.files }),
+      inlineImages: input.inline_images ?? cursorPayload?.inline_images ?? true, verificationHints, scopeDiagnostics,
+      diagnosticsForBlocks: ids => collectBlockDiagnostics(rawBlocks, data.manifest.id, new Set([...ids].map(id => Number(id.slice(id.lastIndexOf(':b') + 2))))),
       selection: { ...(blockId ? { block: blockId } : {}), ...(query ? { query } : {}) },
     })
   }

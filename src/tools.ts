@@ -4,7 +4,7 @@ import { constants } from 'node:fs'
 import { basename, extname } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { fitsReadBudget, boundedWarnings } from './service/read-delivery.js'
+import { fitsReadBudget, boundedWarnings, compactReadMetadata } from './service/read-delivery.js'
 import type { JobOutcome, JobRegistry } from '@deepseek-ai/dsh-jobs'
 import type { AttachmentStore, ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
 import type { ObjectValueSchemaSpec, ParameterSchemaSpec, ToolRunContext, ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
@@ -28,6 +28,7 @@ import {
   formatSingleSummaryProse,
 } from './service/mineru-service.js'
 import { MAX_INLINE_IMAGE_SINGLE_BYTES, MAX_INLINE_IMAGE_TOTAL_BYTES, mediaTypeForExtension } from './service/image-policy.js'
+import { decodeReadCursor } from './service/read-cursor.js'
 
 declare module '@deepseek-ai/dsh-jobs' {
   interface JobKindMap {
@@ -135,6 +136,10 @@ const resultViewSchema = {
       description: 'Non-empty continuation token when content_status is partial; null otherwise. Stop reading when null.',
     },
     warnings: { type: 'array', items: { type: 'string' } },
+    provenance: { type: 'object', properties: { provider: { type: 'string', enum: ['self-hosted-v2', 'official-v4'], required: true }, model: { type: 'string', enum: ['pipeline', 'vlm'], required: true }, parse_method: { type: 'string', enum: ['auto', 'txt', 'ocr'], required: true }, upstream_version: { type: 'null', required: true }, index_version: { type: 'integer', required: true }, reader_version: { type: 'integer', required: true } }, additionalProperties: false },
+    diagnostics: { type: 'array', items: { type: 'object', properties: { id: { type: 'string', required: true }, code: { type: 'string', required: true }, scope: { type: 'string', enum: ['document', 'selection', 'chunk'], required: true }, message: { type: 'string', required: true }, block_id: { type: 'string' }, page: { type: 'integer' } }, additionalProperties: false } },
+    verification_hints: { type: 'array', items: { type: 'object', properties: { reason: { type: 'string', enum: ['formula'], required: true }, block_id: { type: 'string', required: true }, page: { type: 'integer' }, view: { type: 'string', enum: ['page'], required: true } }, additionalProperties: false } },
+    metadata_shortened: { type: 'array', items: { type: 'string', enum: ['summary', 'provenance', 'diagnostics', 'verification_hints', 'warnings'] } },
     manifest_path: { type: 'string' },
     source_sha256: { type: 'string' },
     continuation_block: { type: 'object', properties: { block_id: { type: 'string', required: true }, page: { type: 'integer' }, document_label: { type: 'string' } }, additionalProperties: false },
@@ -239,7 +244,7 @@ function fitPostImageBudget(value: ResultView): ResultView {
   }
   if (fitted.summary !== undefined || fitted.toc !== undefined) {
     const { summary: _summary, toc: _toc, ...rest } = fitted
-    fitted = rest
+    fitted = { ...rest, metadata_shortened: [...new Set([...(rest.metadata_shortened ?? []), 'summary' as const])] }
     warn('[SUMMARY_SHORTENED] Summary metadata was omitted to fit the response; request a narrower selection.')
     if (fitsReadBudget(fitted)) return fitted
   }
@@ -248,6 +253,8 @@ function fitPostImageBudget(value: ResultView): ResultView {
     warn('[ARTIFACT_METADATA_SHORTENED] Artifact records were omitted to fit the response; use focus: artifacts separately.')
     if (fitsReadBudget(fitted)) return fitted
   }
+  fitted = compactReadMetadata(fitted)
+  if (fitsReadBudget(fitted)) return fitted
   throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds the output budget; narrow the selection or increase maxInlineChars'))
 }
 
@@ -338,10 +345,16 @@ export function parseReadInput(args: unknown): ParsedToolInput {
   }
 
   let cursor: string | undefined
+  let cursorInlineImages: boolean | undefined
   if (obj.cursor !== undefined) {
     if (typeof obj.cursor !== 'string' || obj.cursor.trim() === '') throw new MinerUError(failure('INVALID_REQUEST', 'cursor must be a non-empty string'))
     cursor = obj.cursor.trim()
     if (obj.pages !== undefined || obj.focus !== undefined || obj.block_id !== undefined || obj.query !== undefined) throw new MinerUError(failure('INVALID_REQUEST', 'pages and focus must be omitted when cursor is provided, as must block_id and query'))
+    try {
+      cursorInlineImages = decodeReadCursor(cursor).inline_images
+    } catch (error) {
+      throw new MinerUError(failure('INVALID_REQUEST', error instanceof Error ? error.message : 'Cursor is malformed; start over without a cursor'), { cause: error })
+    }
   }
 
   let pages: PageSelection | undefined
@@ -364,18 +377,19 @@ export function parseReadInput(args: unknown): ParsedToolInput {
     }
   }
 
+  const resolvedInlineImages = inline_images ?? cursorInlineImages ?? true
   return {
     input: {
       file_path: filePath,
       ...(pages !== undefined ? { pages } : {}),
       ...(focus !== undefined ? { focus } : {}),
-      ...(inline_images !== undefined ? { inline_images } : {}),
+      inline_images: resolvedInlineImages,
       ...(cursor !== undefined ? { cursor } : {}),
       ...(typeof obj.block_id === 'string' ? { block_id: obj.block_id } : {}),
       ...(typeof obj.query === 'string' ? { query: obj.query.trim() } : {}),
     },
     ...(pollTimeoutMs !== undefined ? { pollTimeoutMs } : {}),
-    ...(inline_images !== undefined ? { inline_images } : {}),
+    inline_images: resolvedInlineImages,
   }
 }
 
@@ -626,7 +640,7 @@ export function registerTools(
 
   disposers.push(ctx.tools.register(defineTool({
     name: 'read_pdf',
-    description: 'Read PDF evidence in bounded chunks with physical pages and stable block IDs. Start with focus: toc or a short query; use block_id to read a search hit. markdown_content contains selected parsed text; partial requires continuing with the unchanged cursor and same file_path only (no pages/focus/block_id/query). The cursor is null when complete or not_requested. Continue only when partial; stop rather than passing null back. Complete ends that text selection, not a guarantee of OCR fidelity or visual coverage; check warnings and visuals. Use view: page with one page number to inspect the original PDF locally without Provider upload, optionally checking source_sha256 via expected_sha256. Use focus: artifacts only for exported cache paths. Output in run_code should preserve markdown_content and cursor, rather than dumping large/debug objects.',
+    description: 'Read PDF evidence in bounded chunks with physical pages and stable block IDs. Start with focus: toc or a short query; use block_id to read a search hit. markdown_content contains selected parsed text; partial requires continuing with the unchanged cursor and same file_path only (no pages/focus/block_id/query). The cursor is null when complete or not_requested. Continue only when partial; stop rather than passing null back. Complete ends that text selection, not a guarantee of OCR fidelity or visual coverage; check diagnostics and visuals. Diagnostics are scoped to delivered blocks; document/selection notices appear initially. verification_hints recommend original-page checks for formulas, not automatic corrections. provenance separates parsing configuration from index/reader versions; upstream_version null means unknown. Omitted inline_images inherits the cursor intent; an explicit boolean overrides it. metadata_shortened identifies budget-limited metadata. Use view: page with one page number to inspect the original PDF locally without Provider upload, optionally checking source_sha256 via expected_sha256. Use focus: artifacts only for exported cache paths. Output in run_code should preserve markdown_content and cursor, rather than dumping large/debug objects.',
     parameters: readPdfParameters,
     output: {
       schema: parseOutputSchema,
@@ -691,6 +705,10 @@ export function registerTools(
           } : {}),
           ...(single.pages !== undefined ? { pages: single.pages } : {}),
           cursor: single.cursor,
+          ...(single.provenance ? { provenance: { ...single.provenance } } : {}),
+          ...(single.diagnostics ? { diagnostics: single.diagnostics.map(d => ({ ...d })) } : {}),
+          ...(single.verification_hints ? { verification_hints: single.verification_hints.map(hint => ({ ...hint })) } : {}),
+          ...(single.metadata_shortened ? { metadata_shortened: [...single.metadata_shortened] } : {}),
           ...(single.warnings !== undefined ? { warnings: [...single.warnings] } : {}),
         }
       },
@@ -723,7 +741,7 @@ export function registerTools(
       }
       const focusSet = normalizeFocusSelection(input.focus)
       const focusIncludesImages = focusSet.has('all') || focusSet.has('image')
-      const shouldInline = inline_images !== false && focusIncludesImages && supportsImage && attachments !== undefined
+      const shouldInline = inline_images === true && focusIncludesImages && supportsImage && attachments !== undefined
 
       return await withStorageAccess(async () => {
         const rawResult = await getService().parseDocument(agent.session, input, exec.signal, pollTimeoutMs)

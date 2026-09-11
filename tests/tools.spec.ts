@@ -32,6 +32,8 @@ import type {
 } from '../src/service/mineru-service.js'
 import { failure, MinerUError } from '../src/domain/errors.js'
 import { StorageAccessGate } from '../src/storage/access-gate.js'
+import { cursorForRemainder } from '../src/service/read-cursor.js'
+import { fitsReadBudget } from '../src/service/read-delivery.js'
 
 interface NativeJobOutcome {
   readonly status: 'completed' | 'killed' | 'failed'
@@ -489,7 +491,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
 
       expect(mockService.parseDocument).toHaveBeenCalledWith(
         exec.agent?.session,
-        { file_path: '/sync.pdf' },
+        { file_path: '/sync.pdf', inline_images: true },
         exec.signal,
         30000,
       )
@@ -531,10 +533,28 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       await readTool.execute({ file_path: '/single.pdf' }, exec)
       expect(mockService.parseDocument).toHaveBeenCalledWith(
         exec.agent?.session,
-        { file_path: '/single.pdf' },
+        { file_path: '/single.pdf', inline_images: true },
         exec.signal,
         undefined,
       )
+    })
+
+    it('passes restored and overridden cursor image intent to the service', async () => {
+      const { ctx, registeredTools } = createMockContext()
+      const mockService = { parseDocument: vi.fn(async () => ({
+        state: 'completed' as const, source: 'cache' as const, cache_hit: true, result_id: 'mr_intent', files: [],
+        content_status: 'complete' as const, cursor: null, output_limit_chars: 1000,
+      })) } as unknown as MinerUService
+      registerTools(ctx, () => mockService)
+      const readTool = registeredTools.find(t => t.name === 'read_pdf')!
+      const exec = createMockExec(true)
+      const cursor = cursorForRemainder('mr_intent', undefined, new Set(['all']), 10, { inline_images: false })
+
+      await readTool.execute({ file_path: '/intent.pdf', cursor }, exec)
+      await readTool.execute({ file_path: '/intent.pdf', cursor, inline_images: true }, exec)
+
+      expect(mockService.parseDocument).toHaveBeenNthCalledWith(1, exec.agent?.session, { file_path: '/intent.pdf', cursor, inline_images: false }, exec.signal, undefined)
+      expect(mockService.parseDocument).toHaveBeenNthCalledWith(2, exec.agent?.session, { file_path: '/intent.pdf', cursor, inline_images: true }, exec.signal, undefined)
     })
 
     it('rejects removed technical parameters (model, ocr, formula, table, language, artifacts, max_inline_images)', async () => {
@@ -1043,6 +1063,39 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       } finally {
         await rm(testImgPath, { force: true })
       }
+    })
+
+    it('preserves the summary compaction marker after its warning is compacted away', async () => {
+      const { ctx, registeredTools } = createMockContext()
+      const largeText = 'x'.repeat(300)
+      const service = { parseDocument: vi.fn(async (): Promise<ResultView> => ({
+        state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_summary_marker',
+        files: [{ file_id: 'mf_1', name: 'paper.pdf', artifacts: [] }],
+        markdown_content: 'Bounded evidence.', content_status: 'complete', cursor: null, output_limit_chars: 650,
+        summary: { page_count: 40, image_count: 8, table_count: 4, equation_count: 2 },
+        toc: Array.from({ length: 8 }, (_, index) => ({ level: 1, title: `Heading ${index} ${largeText}` })),
+        provenance: { provider: 'self-hosted-v2', model: 'pipeline', parse_method: 'auto', upstream_version: null, index_version: 1, reader_version: 1 },
+        diagnostics: Array.from({ length: 4 }, (_, index) => ({ id: `diag-${index}`, code: 'SOURCE_REPAIR', scope: 'chunk' as const, message: largeText })),
+        verification_hints: Array.from({ length: 4 }, (_, index) => ({ reason: 'formula' as const, block_id: `mr_summary_marker:b${index + 1}`, page: index + 1, view: 'page' as const })),
+        warnings: Array.from({ length: 8 }, (_, index) => `warning-${index}-${largeText}`),
+        ordered_images: Array.from({ length: 4 }, (_, index) => ({ path: `/cache/${largeText}-${index}.png`, name: `image-${index}.png`, media_type: 'image/png', bytes: 10, caption: largeText })),
+        visuals: { listed: 4, attached: 0, omitted: 4, scope: 'chunk' },
+      })) } as unknown as MinerUService
+      registerTools(ctx, () => service)
+      const readTool = registeredTools.find(t => t.name === 'read_pdf')!
+
+      const value = await readTool.execute({ file_path: '/paper.pdf' }, createMockExec(true)) as ResultView
+
+      expect(value.summary).toBeUndefined()
+      expect(value.toc).toBeUndefined()
+      expect(value.metadata_shortened).toContain('summary')
+      expect(value.warnings?.some(warning => warning.includes('[SUMMARY_SHORTENED]')) ?? false).toBe(false)
+      expect(fitsReadBudget(value)).toBe(true)
+      expect(validateJsonSchemaValue(readTool.output.schema, value, 'value')).toEqual([])
+      const rendered = readTool.output.render({ file_path: '/paper.pdf' }, value)
+      expect(rendered).toHaveLength(1)
+      expect(rendered[0]?.text.length).toBeLessThanOrEqual(value.output_limit_chars)
+      expect(rendered[0]?.text).not.toContain('[RESULT_TOO_LARGE]')
     })
 
     it('projects structured presentation metadata for single result', () => {

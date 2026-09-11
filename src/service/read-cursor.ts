@@ -11,7 +11,7 @@ import { MinerUError, failure } from '../domain/errors.js';
 import { FOCUS_KINDS, normalizePageRanges, type FocusKind } from '../domain/request.js';
 
 /** Cursor payload version. Bump only with an explicit compatibility rule. */
-export const READ_CURSOR_VERSION = 2 as const;
+export const READ_CURSOR_VERSION = 3 as const;
 /** Hard cap on the encoded cursor length (base64url JSON). */
 export const MAX_CURSOR_LENGTH = 2048 as const;
 /** Hard cap on encoded canonical selection complexity (pages + focus tokens). */
@@ -27,6 +27,8 @@ export interface ReadCursorPayload {
   readonly focus: readonly FocusKind[];
   /** UTF-16 offset into the exact projected selection text. */
   readonly off: number;
+  /** Caller presentation intent, independent of runtime attachment capability and budgets. */
+  readonly inline_images: boolean;
   readonly block?: string;
   readonly query?: string;
   readonly projection?: string;
@@ -87,17 +89,19 @@ function fromBase64Url(input: string): string {
 }
 
 /** Encode a cursor bound to one result identity, selection, and text offset. */
-export function encodeReadCursor(payload: ReadCursorPayload): string {
+export function encodeReadCursor(payload: Omit<ReadCursorPayload, 'inline_images'> & { readonly inline_images?: boolean }): string {
   if (!Number.isSafeInteger(payload.off) || payload.off < 0) {
     throw new TypeError('cursor offset must be a non-negative safe integer');
   }
   if (payload.rid.trim() === '') throw new TypeError('cursor result identity is required');
+  if (payload.inline_images !== undefined && typeof payload.inline_images !== 'boolean') throw new TypeError('cursor inline_images must be a boolean');
   const canonical = {
     v: READ_CURSOR_VERSION,
     rid: payload.rid,
     pages: payload.pages,
     focus: [...payload.focus].sort(),
     off: payload.off,
+    inline_images: payload.inline_images ?? true,
     ...(payload.block === undefined ? {} : { block: payload.block }),
     ...(payload.query === undefined ? {} : { query: payload.query }),
     ...(payload.projection === undefined ? {} : { projection: payload.projection }),
@@ -138,11 +142,12 @@ export function decodeReadCursor(token: string): ReadCursorPayload {
   }
   const obj = raw as Record<string, unknown>;
   const keys = Object.keys(obj).sort();
-  if (keys.some(key => !['focus', 'off', 'pages', 'rid', 'v', 'block', 'query', 'projection'].includes(key))) throw new TypeError('cursor is malformed or expired; re-read without a cursor');
+  if (keys.some(key => !['focus', 'off', 'pages', 'rid', 'v', 'inline_images', 'block', 'query', 'projection'].includes(key))) throw new TypeError('cursor is malformed or expired; re-read without a cursor');
   if (obj.block !== undefined && (typeof obj.block !== 'string' || !/^mr_[a-zA-Z0-9_-]+:b[1-9][0-9]*$/.test(obj.block) || obj.block.length > 160)) throw new TypeError('cursor block is malformed');
   if (obj.query !== undefined && (typeof obj.query !== 'string' || obj.query.trim() === '' || obj.query.length > 256)) throw new TypeError('cursor query is malformed');
   if (obj.block !== undefined && obj.query !== undefined) throw new TypeError('cursor selection is malformed');
   if (obj.v !== READ_CURSOR_VERSION) throw new TypeError('cursor is expired; re-read without a cursor');
+  if (typeof obj.inline_images !== 'boolean') throw new TypeError('cursor inline_images must be a boolean');
   if (typeof obj.rid !== 'string' || obj.rid.trim() === '') {
     throw new TypeError('cursor is malformed or expired; re-read without a cursor');
   }
@@ -155,7 +160,7 @@ export function decodeReadCursor(token: string): ReadCursorPayload {
   if (typeof obj.off !== 'number' || !Number.isSafeInteger(obj.off) || obj.off < 0) {
     throw new TypeError('cursor is malformed or expired; re-read without a cursor');
   }
-  return { v: READ_CURSOR_VERSION, rid: obj.rid, pages, focus, off: obj.off,
+  return { v: READ_CURSOR_VERSION, rid: obj.rid, pages, focus, off: obj.off, inline_images: obj.inline_images,
     ...(typeof obj.block === 'string' ? { block: obj.block } : {}),
     ...(typeof obj.query === 'string' ? { query: obj.query } : {}),
     ...(typeof obj.projection === 'string' ? { projection: obj.projection } : {}),
@@ -191,7 +196,7 @@ export function cursorForRemainder(
   pagesLabel: string | undefined,
   focus: ReadonlySet<FocusKind>,
   offset: number,
-  selection: { block?: string; query?: string; projection?: string } = {},
+  selection: { block?: string; query?: string; projection?: string; inline_images?: boolean } = {},
 ): string {
   return encodeReadCursor({ v: READ_CURSOR_VERSION, rid: resultId, pages: pagesLabel ?? '', focus: canonicalFocusList(focus), off: offset, ...selection });
 }

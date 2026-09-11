@@ -54,6 +54,30 @@ export interface InlinedImageView {
     readonly attachmentRef?: ImageAttachmentRef;
     readonly figure?: number;
 }
+/** Parsing identity is distinct from the current reader/projection implementation. */
+export interface ReadProvenance {
+    readonly provider: 'self-hosted-v2' | 'official-v4';
+    readonly model: 'pipeline' | 'vlm';
+    readonly parse_method: 'auto' | 'txt' | 'ocr';
+    readonly upstream_version: null;
+    readonly index_version: number;
+    readonly reader_version: number;
+}
+export interface ReadDiagnostic {
+    readonly id: string;
+    readonly code: string;
+    readonly scope: 'document' | 'selection' | 'chunk';
+    readonly message: string;
+    readonly block_id?: string;
+    readonly page?: number;
+}
+export interface VerificationHint {
+    readonly reason: 'formula';
+    readonly block_id: string;
+    readonly page?: number;
+    readonly view: 'page';
+}
+export type ShortenedMetadata = 'summary' | 'provenance' | 'diagnostics' | 'verification_hints' | 'warnings';
 export interface ResultView {
     readonly state: 'completed';
     readonly source: SubmissionSource;
@@ -73,6 +97,10 @@ export interface ResultView {
     /** Non-empty exact-text continuation token when partial; null otherwise. */
     readonly cursor: string | null;
     readonly warnings?: readonly string[];
+    readonly diagnostics?: readonly ReadDiagnostic[];
+    readonly verification_hints?: readonly VerificationHint[];
+    readonly provenance?: ReadProvenance;
+    readonly metadata_shortened?: readonly ShortenedMetadata[];
     readonly source_sha256?: string;
     readonly view?: 'content' | 'page';
     readonly continuation_block?: {

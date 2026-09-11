@@ -168,6 +168,7 @@ class MockProviderRegistry extends ProviderRegistry {
 interface HarnessOptions {
   maxInlineChars?: number
   maxInlineImages?: number
+  attachmentSupport?: boolean
 }
 
 interface SavedAttachment {
@@ -267,7 +268,7 @@ async function createHarness(options: HarnessOptions = {}): Promise<TestHarness>
     },
     get: (name: string) => {
       if (name === 'llm') return { resolveModelInfo }
-      if (name === 'attachments') return { saveImage }
+      if (name === 'attachments') return options.attachmentSupport === false ? undefined : { saveImage }
       return undefined
     },
     effect: () => {},
@@ -410,7 +411,7 @@ describe('read_pdf model reading contract', () => {
     expect(inspected).not.toContain('more character')
   })
 
-  it('provides null cursor on complete delivery and valid V2 cursor on partial delivery', async () => {
+  it('provides null cursor on complete delivery and valid V3 cursor on partial delivery', async () => {
     const h = await createHarness()
     h.provider.contentList = [
       { type: 'text', page_idx: 0, text: 'Short document fitting in one single chunk.' },
@@ -435,31 +436,40 @@ describe('read_pdf model reading contract', () => {
 
     const decoded = decodeReadCursor(partialResult.cursor!)
     expect(decoded.v).toBe(READ_CURSOR_VERSION)
-    expect(decoded.v).toBe(2)
+    expect(decoded.v).toBe(3)
+    expect(decoded.inline_images).toBe(true)
     expect(decoded.rid).toBe(partialResult.result_id)
     expect(decoded.off).toBeGreaterThan(0)
   })
 
-  it('rejects legacy V1 cursor tokens', async () => {
+  it('rejects legacy V1 and V2 cursor tokens', async () => {
     const h = await createHarness()
     h.provider.contentList = [{ type: 'text', page_idx: 0, text: 'Content text.' }]
     const first = await h.executeRead({ file_path: h.file })
 
-    // Valid base64url JSON with version 1
-    const v1Payload = {
-      v: 1,
-      rid: first.result_id,
-      pages: '',
-      focus: ['all'],
-      off: 10,
+    for (const version of [1, 2]) {
+      const legacyToken = Buffer.from(JSON.stringify({
+        v: version, rid: first.result_id, pages: '', focus: ['all'], off: 10,
+        ...(version === 2 ? { inline_images: true } : {}),
+      }), 'utf8').toString('base64url')
+
+      expect(() => decodeReadCursor(legacyToken)).toThrow(/cursor is expired; re-read without a cursor/)
+      await expect(h.executeRead({ file_path: h.file, cursor: legacyToken })).rejects.toMatchObject({
+        failure: { code: 'INVALID_REQUEST' },
+      })
     }
-    const v1Token = Buffer.from(JSON.stringify(v1Payload), 'utf8').toString('base64url')
+  })
 
-    expect(() => decodeReadCursor(v1Token)).toThrow(/cursor is expired; re-read without a cursor/)
-
-    await expect(h.executeRead({ file_path: h.file, cursor: v1Token })).rejects.toMatchObject({
-      failure: { code: 'INVALID_REQUEST' },
-    })
+  it('rejects missing and malformed v3 inline_images intent through the native tool', async () => {
+    const h = await createHarness()
+    const payload = { v: 3, rid: 'mr_sample', pages: '', focus: ['all'], off: 0 }
+    for (const inline_images of [undefined, 'true', 0, null]) {
+      const token = Buffer.from(JSON.stringify({ ...payload, inline_images }), 'utf8').toString('base64url')
+      expect(() => decodeReadCursor(token)).toThrow(/inline_images must be a boolean/)
+      await expect(h.executeRead({ file_path: h.file, cursor: token })).rejects.toMatchObject({
+        failure: { code: 'INVALID_REQUEST', message: expect.stringContaining('inline_images must be a boolean') },
+      })
+    }
   })
 
   it('concatenates multi-chunk projected text without loss or duplication, preserving emojis and math', async () => {
@@ -921,6 +931,84 @@ describe('read_pdf model reading contract', () => {
     expect(chunk2.ordered_images!.some(img => img.name.includes('second'))).toBe(true)
     expect(chunk2.ordered_images!.some(img => img.name.includes('first'))).toBe(false)
   })
+
+  it('keeps explicit false intent across several cursor-only chunks containing images', async () => {
+    const h = await createHarness({ maxInlineImages: 6 })
+    h.provider.images = Array.from({ length: 5 }, (_, index) => ({
+      relativeName: `images/off-${index}.png`, data: PNG_1X1, mediaType: 'image/png',
+    }))
+    h.provider.contentList = h.provider.images.flatMap((image, index): ContentListBlock[] => [
+      { type: 'image', page_idx: index, caption: `Figure ${index + 1}: Disabled image`, img_path: image.relativeName },
+      { type: 'text', page_idx: index, text: `Chunk filler ${index}. ` + 'disabled '.repeat(800) },
+    ])
+
+    let view = await h.executeRead({ file_path: h.file, inline_images: false })
+    let chunks = 0
+    let listedImages = 0
+    while (true) {
+      chunks++
+      listedImages += view.ordered_images?.length ?? 0
+      expect(view.inlined_images).toBeUndefined()
+      expect(validateJsonSchemaValue(h.readPdfTool.output.schema, view, 'value')).toEqual([])
+      if (!view.cursor) break
+      expect(decodeReadCursor(view.cursor).inline_images).toBe(false)
+      view = await h.executeRead({ file_path: h.file, cursor: view.cursor })
+    }
+
+    expect(chunks).toBeGreaterThanOrEqual(4)
+    expect(listedImages).toBe(5)
+    expect(h.savedAttachments).toHaveLength(0)
+  })
+
+  it('persists explicit true and false overrides into each next cursor', async () => {
+    const h = await createHarness({ maxInlineImages: 6 })
+    h.provider.images = Array.from({ length: 7 }, (_, index) => ({
+      relativeName: `images/override-${index}.png`, data: PNG_1X1, mediaType: 'image/png',
+    }))
+    h.provider.contentList = h.provider.images.flatMap((image, index): ContentListBlock[] => [
+      { type: 'image', page_idx: index, caption: `Figure ${index + 1}: Override image`, img_path: image.relativeName },
+      { type: 'text', page_idx: index, text: `Override filler ${index}. ` + 'intent '.repeat(900) },
+    ])
+
+    const off = await h.executeRead({ file_path: h.file, inline_images: false })
+    expect(off.cursor).toBeTypeOf('string')
+    expect(decodeReadCursor(off.cursor!).inline_images).toBe(false)
+    expect(h.savedAttachments).toHaveLength(0)
+
+    const on = await h.executeRead({ file_path: h.file, cursor: off.cursor, inline_images: true })
+    expect(on.cursor).toBeTypeOf('string')
+    expect(decodeReadCursor(on.cursor!).inline_images).toBe(true)
+    expect(h.savedAttachments.length).toBeGreaterThan(0)
+    const savedAfterOn = h.savedAttachments.length
+
+    const offAgain = await h.executeRead({ file_path: h.file, cursor: on.cursor, inline_images: false })
+    expect(offAgain.cursor).toBeTypeOf('string')
+    expect(decodeReadCursor(offAgain.cursor!).inline_images).toBe(false)
+    expect(h.savedAttachments).toHaveLength(savedAfterOn)
+  })
+
+  it.each([
+    { name: 'text-only model', maxInlineImages: 6, hasVision: false, attachmentSupport: true },
+    { name: 'missing attachment store', maxInlineImages: 6, hasVision: true, attachmentSupport: false },
+    { name: 'zero image budget', maxInlineImages: 0, hasVision: true, attachmentSupport: true },
+  ])('keeps true cursor intent when $name suppresses effective attachments', async ({ maxInlineImages, hasVision, attachmentSupport }) => {
+    const h = await createHarness({ maxInlineImages, attachmentSupport })
+    h.provider.images = [{ relativeName: 'images/limited.png', data: PNG_1X1, mediaType: 'image/png' }]
+    h.provider.contentList = [
+      { type: 'image', page_idx: 0, caption: 'Figure 1: Limited image', img_path: 'images/limited.png' },
+      { type: 'text', page_idx: 0, text: 'Runtime limit filler. ' + 'limit '.repeat(3500) },
+    ]
+
+    const first = await h.executeRead({ file_path: h.file, inline_images: true }, { hasVision })
+    expect(first.cursor).toBeTypeOf('string')
+    expect(decodeReadCursor(first.cursor!).inline_images).toBe(true)
+    expect(first.inlined_images).toBeUndefined()
+    expect(h.savedAttachments).toHaveLength(0)
+
+    const next = await h.executeRead({ file_path: h.file, cursor: first.cursor }, { hasVision })
+    if (next.cursor) expect(decodeReadCursor(next.cursor).inline_images).toBe(true)
+    expect(h.savedAttachments).toHaveLength(0)
+  })
 })
 
 describe('literal search Unicode and service boundary regressions', () => {
@@ -1141,41 +1229,41 @@ describe('review regression suite', () => {
 
   it('(9) decoder rejects empty/duplicate/unsorted focus, query+toc and wrong-result block selectors', () => {
     const toToken = (payload: Record<string, unknown>): string =>
-      Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
+      Buffer.from(JSON.stringify({ inline_images: true, ...payload }), 'utf8').toString('base64url')
 
     // Empty focus
     expect(() =>
-      decodeReadCursor(toToken({ v: 2, rid: 'mr_sample', pages: '', focus: [], off: 0 })),
+      decodeReadCursor(toToken({ v: 3, rid: 'mr_sample', pages: '', focus: [], off: 0 })),
     ).toThrow(/cursor focus is not canonical/)
 
     // Duplicate focus
     expect(() =>
-      decodeReadCursor(toToken({ v: 2, rid: 'mr_sample', pages: '', focus: ['text', 'text'], off: 0 })),
+      decodeReadCursor(toToken({ v: 3, rid: 'mr_sample', pages: '', focus: ['text', 'text'], off: 0 })),
     ).toThrow(/cursor focus is not canonical/)
 
     // Unsorted focus
     expect(() =>
-      decodeReadCursor(toToken({ v: 2, rid: 'mr_sample', pages: '', focus: ['text', 'all'], off: 0 })),
+      decodeReadCursor(toToken({ v: 3, rid: 'mr_sample', pages: '', focus: ['text', 'all'], off: 0 })),
     ).toThrow(/cursor focus is not canonical/)
 
     // Query + toc
     expect(() =>
       decodeReadCursor(
-        toToken({ v: 2, rid: 'mr_sample', pages: '', focus: ['all', 'toc'], off: 0, query: 'test' }),
+        toToken({ v: 3, rid: 'mr_sample', pages: '', focus: ['all', 'toc'], off: 0, query: 'test' }),
       ),
     ).toThrow(/cursor selection cannot use toc or artifacts/)
 
     // Query + artifacts
     expect(() =>
       decodeReadCursor(
-        toToken({ v: 2, rid: 'mr_sample', pages: '', focus: ['all', 'artifacts'], off: 0, query: 'test' }),
+        toToken({ v: 3, rid: 'mr_sample', pages: '', focus: ['all', 'artifacts'], off: 0, query: 'test' }),
       ),
     ).toThrow(/cursor selection cannot use toc or artifacts/)
 
     // Wrong-result block
     expect(() =>
       decodeReadCursor(
-        toToken({ v: 2, rid: 'mr_alpha', pages: '', focus: ['all'], off: 0, block: 'mr_beta:b1' }),
+        toToken({ v: 3, rid: 'mr_alpha', pages: '', focus: ['all'], off: 0, block: 'mr_beta:b1' }),
       ),
     ).toThrow(/cursor block belongs to another result/)
   })

@@ -1,6 +1,6 @@
 # 架构与维护约束
 
-本文描述当前实现，不保留已经完成的迁移计划或未来接口草案。安装和调用示例见 [README.md](README.md)，开发约束见 [AGENTS.md](AGENTS.md)，变更摘要见 [CHANGELOG.md](CHANGELOG.md)。
+本文描述当前实现，不保留已经完成的迁移计划或未来接口草案。安装和调用示例见 [README.md](README.md)，模型阅读契约与验证方法见 [docs/model-reading.md](docs/model-reading.md)，开发约束见 [AGENTS.md](AGENTS.md)，变更摘要见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 1. 模块职责
 
@@ -11,9 +11,11 @@ read_pdf / async_parse_pdf
        ├─ RequestNormalizer
        ├─ SharedOperationRegistry
        ├─ ResultRepository
-       └─ ProviderRegistry
-            ├─ SelfHostedV2Provider
-            └─ OfficialV4Provider
+       ├─ ProviderRegistry
+       │    ├─ SelfHostedV2Provider
+       │    └─ OfficialV4Provider
+       ├─ document-index → read-delivery → tools 附件／最终预算（content）
+       └─ page-renderer → 本地 pdfinfo / pdftoppm（page，无 Provider）
 
 loopback RPC → StorageMaintenanceService
                   ├─ StorageAccessGate
@@ -25,7 +27,10 @@ loopback RPC → StorageMaintenanceService
 | --- | --- |
 | `src/tools.ts` | 两个工具的 schema、DSH owner/job 适配、模型能力判断、受限附件与最终输出 |
 | `src/service/mineru-service.ts` | 固定调用配置、规范化、命中／合并、Provider 编排、解析发布与阅读入口 |
-| `src/service/result-presenter.ts`、`read-cursor.ts`、`image-policy.ts` | 内容投影、摘要、英文展示、续读定位、图片限制 |
+| `src/service/document-index.ts` | 选择前建立稳定 block ID、物理页坐标、已知 span 的忠实规范化、原文标签和诊断 |
+| `src/service/read-delivery.ts`、`read-cursor.ts` | 有界正文投影、cursor-v3、交付 block 范围内的诊断／公式核验建议和元数据裁剪 |
+| `src/service/result-presenter.ts`、`image-policy.ts` | 摘要／英文展示、图片候选与限制，最终附件及预算由工具层执行 |
+| `src/service/page-renderer.ts` | 临时流式源快照、本地原页渲染、哈希绑定、子进程与输出限制，不调用 Provider |
 | `src/domain/` | branded ID、规范请求、缓存身份、manifest、严格边界校验和错误 |
 | `src/providers/` | 仅适配上游协议、重试、下载与安全解包 |
 | `src/storage/` | 受控路径、staging sink、不可变仓储、多进程互斥、使用屏障和运维 |
@@ -44,13 +49,15 @@ Provider 不注册工具、不取得 DSH Session、不选择缓存目录、不�
 
 `src/domain/cache-key.ts` 的 canonical JSON 是缓存格式的一部分：排序键、规范化 Unicode 和数字，并明确拒绝规范化后的键碰撞。不可改为依赖属性插入顺序的普通 JSON.stringify。固定向量测试保护 v1 身份。
 
-缓存等价由源内容、解析语义、所需产物、Provider 兼容标识及相应 schema 版本决定。源显示名称、阅读 pages/focus/cursor、输出预算和附件开关不改变解析身份。`txt` 不等于 `auto`；official-v4 不能表达 txt，必须拒绝，不能偷偷折叠为 ocr=false。
+缓存等价由源内容、解析语义、所需产物、Provider 兼容标识及相应 schema 版本决定。源显示名称、阅读 pages/focus/query/block_id/cursor、输出预算和附件开关不改变解析身份；view: page 是独立本地路径，不创建解析缓存。`txt` 不等于 `auto`；official-v4 不能表达 txt，必须拒绝，不能偷偷折叠为 ocr=false。
 
 ## 3. 工具与阅读契约
 
 两个工具都要求真实 `exec.agent.session`，并在 schema 中声明 file_path 必填。工具参数只关注阅读，不暴露 model/ocr/backend 等底层解析设置。
 
-- `read_pdf`：直接返回选择投影，不创建插件任务。支持 1-based pages、focus、inline_images、poll_timeout_ms 和 cursor。
+- `read_pdf`：直接返回选择投影，不创建插件任务。当前参数为 `file_path`、`view`、`pages`、`focus`、`block_id`、`query`、`expected_sha256`、`inline_images`、`poll_timeout_ms`、`cursor`。
+  - `view: content`（默认）读取解析块；`pages` 是从 1 开始的物理页，`focus` 支持 all/text/table/image/toc/artifacts。`query` 是 1–256 字符、不区分大小写的字面搜索，返回有界片段和 ID；`block_id` 精确读取同一解析结果的稳定 block。两者互斥，也不能与 toc/artifacts focus 组合。
+  - `view: page` 只接受 `file_path`、恰好一页的 `pages` 和可选 `expected_sha256`；哈希必须为 64 个小写十六进制字符的 SHA-256，取自先前结果的 `source_sha256`。此参数不用于 content 模式。页面模式要求支持图片的模型且 maxInlineImages > 0，不接受 focus/cursor/query/block_id/inline_images/poll_timeout_ms。
 - `async_parse_pdf`：调用 `ctx.jobs.start(kind: mineru)`，传递精确的 live Agent owner；立即返回 job_id/state。完成后通过非拒绝 final-output Promise 提供摘要文本，而不是伪装为与 read_pdf 相同的正文 JSON。
 - 通用 job_output/job_list/job_kill 负责后台控制；不维护第二套 JobRepository 或专用任务控制工具。
 
@@ -58,29 +65,43 @@ Provider 不注册工具、不取得 DSH Session、不选择缓存目录、不�
 
 ### 续读与完整性
 
-`complete` 表示所选内容已经读完；在续读调用中表示剩余内容已经读完。`partial` 必须提供能够取得进展的 cursor。`not_requested` 用于不要求正文的产物列表等结果。
+`content_status: complete` 只表示所选解析文本（或续读剩余文本）已交付，不保证 OCR 忠实性、原文完整抽取、图片已看过或视觉覆盖完整。`partial` 必须提供能够取得进展的非空 cursor；complete/not_requested 的 cursor 为 null，调用方应停止而不是传回 null。`not_requested` 用于不要求正文的产物列表或原页视图。
 
-Cursor 是有长度上限的无签名 base64url JSON，携带版本、immutable result 身份、规范 pages/focus 和 UTF-16 偏移。它不是授权凭证，也不是无需源文件的 result_id 读取接口。
+Cursor v3 是最长 2048 字符的无签名 base64url JSON，携带 immutable result 身份、规范 pages/focus、可选 block/query、UTF-16 偏移及 inline_images 意图。projection SHA-256 绑定精确投影文本、索引／reader 版本和 manifest 文件／产物身份（含摘要）；变化后拒绝旧偏移。它不是授权凭证，也不是无需源文件的 result_id 读取接口。
 
-1. 初次使用 file_path + 可选 pages/focus。
-2. partial 后原样传回 cursor，保持同一 file_path，不再传 pages/focus。
+1. 初次使用 file_path + 可选 pages/focus/query/block_id，建议先 toc 或短 query，再精读 block_id。
+2. partial 后原样传回 cursor，保持同一 file_path，不再传 pages/focus/block_id/query。省略 inline_images 继承 cursor 的调用意图；显式布尔值覆盖它，不能把运行时模型能力或附件预算导致的省略写成用户关闭图片。
 3. Native 展示必须包含实际 token，不只说“使用返回的 cursor”。
-4. 各次 markdown_content 顺序拼接必须与同一选择的完整文本一致；切分不能拆 Unicode 代理对。
+4. 各次 markdown_content 顺序拼接必须与同一选择的完整文本一致；切分不能拆 Unicode 代理对或生成的 block locator。长块内部续读通过 continuation_block 保留定位。
 5. 默认全选编码为 pages=""，不能在续读中改成显式 1-N，避免丢失无 page_idx 的 block。
-6. 源文件仍需存在并匹配；结果／相关解析配置变化、无效偏移或不合法 token 明确要求重新开始。
+6. 续读严格 cache-only，即使 cacheEnabled=false 也只查既有发布结果，不启动 Provider。源文件仍需存在并匹配；缓存缺失／损坏、结果／相关解析配置变化、无效偏移或不合法 token 明确要求重新开始。
 
-完全越界页码返回 `[PAGE_OUT_OF_RANGE]`，部分越界有警告。缺少可靠页码／内容类型映射时，不支持的筛选返回 `[SELECTION_UNAVAILABLE]`；未知 page_count 或无法定位的原始行号不捏造。markdown_path 是完整原始产物，筛选重建文本不能用 read_offset_line 指向它。
+物理页数优先使用 layout（包括末尾空白页），仅有 content-list 时 page_count 是已知页坐标下界；page_count_source 明确为 layout 或 content-list-lower-bound，本地原页模式为 pdfinfo。只有可靠物理页数才能判定完全越界 `[PAGE_OUT_OF_RANGE]` 或部分越界；下界之外的空选择不能证明该页不存在或空白。缺少可靠页码／内容类型映射时，不支持的筛选返回 `[SELECTION_UNAVAILABLE]`；未知计数不捏造。markdown_path 是完整原始产物，筛选重建文本不能用 read_offset_line 指向它。
+
+### 证据、诊断与来源
+
+- document-index 在筛选前分配稳定、绑定结果的 block_id；只规范化已知 span，保留不熟悉的结构并诊断，不猜测修正 OCR。
+- diagnostics 使用 document/selection/chunk scope；文档／选择级通知在首块出现，block 诊断只覆盖本次实际交付的块（长块续读仍有其诊断），不是全篇诊断每次重放。
+- provenance 区分 provider/model/parse_method 与 index_version/reader_version；upstream_version: null 表示未知，不能把插件版本冒充上游版本。
+- verification_hints 是公式的原页核验建议，包含 block_id、可用的物理页及 view: page；不是公式错误判定或自动校正。
+- metadata_shortened 明确列出被预算缩短或移除的 summary/provenance/diagnostics/verification_hints/warnings；缺少这些字段不代表没有问题。
 
 ### 输出与图片
 
-- `output.maxInlineChars` 约束阅读 JSON 和 Native 文本各自的完整大小，包含元信息、状态、cursor 和附件元信息；不是正文单独的预算。
-- `output.maxInlineImages` 约束单次 `read_pdf` 响应的内联图片数量；图片仍受独立的单图与总字节上限约束。
+- `output.maxInlineChars` 默认 12,000 个 UTF-16 code units，约束阅读 JSON 和 Native 文本各自的完整大小，包含元信息、状态、cursor 和附件元信息；不是正文单独的预算。正文另有 8,000 字符硬上限，JSON／Native 文本各有 48 KB（48,000 UTF-8 bytes）上限。
+- `output.maxInlineImages` 约束单次 `read_pdf` 响应的内联图片数量，默认 6，可配置整数 0–100（0 关闭附件）；6 不是固定最大值。图片仍受独立的单图与总字节上限约束。
 - 预算小到不能容纳必要信息或不能推进正文时明确失败，不产生空转 cursor。
 - 图片引用只匹配 manifest 声明的产物。允许规范相对路径匹配以及无歧义 basename 兼容，不存在任意本地路径回退。
-- 最多内联 6 张，单张 8 MiB、合计 24 MiB；实际文件读取及返回附件均受限。未知格式、读取失败、无法匹配及预算省略明确标注。
+- 单张 8 MiB、合计 24 MiB；实际文件读取及返回附件均受限。未知格式、读取失败、无法匹配及预算省略明确标注；visuals 汇总本次 chunk 的 listed/attached/omitted，不是全篇视觉覆盖率。
 - 读取失败也消耗预算：每次已报告的读取字节在失败路径中记账，包括部分读取、最终 stat 和 close 失败。读取前检查剩余额度，不能让反复失败绕过累计上限。规范化附件必须提供有效实际 ref.bytes，不能用源大小代替未知附件大小；最后一张图片处理期间的取消也必须传递。
-- Figure 编号是文档选择中的稳定编号，不等同于成功交付的第几个附件。
+- document_label 保存原文图／表／公式标签；附件 ordinal（兼容字段 figure）只是附件选择序号，不是论文图号，不能拿它重新编号原文。图片只随其 locator 所在 chunk 提供，不提前交付后文图片，也不在每次续读重放前文附件。
 - 插件生成的模型描述、状态和恢复示例用英文；PDF 自身的文字不受该语言约束。
+
+### 本地原页验证边界
+
+page-renderer 不调用 Provider、不上传、不依赖解析缓存。它对受文件大小限制的源文件建立私有临时流式快照并计算 SHA-256，expected_sha256 不匹配则在渲染前拒绝；完成、失败或取消都清理临时文件，不长期保留源。依赖本地 Poppler 的 pdfinfo/pdftoppm，缺失时明确失败，不回退为上传。
+
+默认最多 2 个并发渲染、45 秒运行预算；等比例长边目标 1600 px，另验宽 ≤1600、高 ≤2000、总像素 ≤3,200,000，PNG ≤8 MiB。子进程 stdout/stderr 与输出文件增长有界并可取消。**这些限制不是 OS sandbox，也不是进程内存硬限制**；处理不可信 PDF 时仍需宿主部署操作系统级隔离及资源限制。
 
 ## 4. Producer、waiter 与配置
 

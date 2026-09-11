@@ -68,6 +68,34 @@ export interface InlinedImageView {
   readonly figure?: number
 }
 
+/** Parsing identity is distinct from the current reader/projection implementation. */
+export interface ReadProvenance {
+  readonly provider: 'self-hosted-v2' | 'official-v4'
+  readonly model: 'pipeline' | 'vlm'
+  readonly parse_method: 'auto' | 'txt' | 'ocr'
+  readonly upstream_version: null
+  readonly index_version: number
+  readonly reader_version: number
+}
+
+export interface ReadDiagnostic {
+  readonly id: string
+  readonly code: string
+  readonly scope: 'document' | 'selection' | 'chunk'
+  readonly message: string
+  readonly block_id?: string
+  readonly page?: number
+}
+
+export interface VerificationHint {
+  readonly reason: 'formula'
+  readonly block_id: string
+  readonly page?: number
+  readonly view: 'page'
+}
+
+export type ShortenedMetadata = 'summary' | 'provenance' | 'diagnostics' | 'verification_hints' | 'warnings'
+
 export interface ResultView {
   readonly state: 'completed'
   readonly source: SubmissionSource
@@ -87,6 +115,10 @@ export interface ResultView {
   /** Non-empty exact-text continuation token when partial; null otherwise. */
   readonly cursor: string | null
   readonly warnings?: readonly string[]
+  readonly diagnostics?: readonly ReadDiagnostic[]
+  readonly verification_hints?: readonly VerificationHint[]
+  readonly provenance?: ReadProvenance
+  readonly metadata_shortened?: readonly ShortenedMetadata[]
   readonly source_sha256?: string
   readonly view?: 'content' | 'page'
   readonly continuation_block?: { readonly block_id: string; readonly page?: number; readonly document_label?: string }
@@ -586,6 +618,13 @@ export function formatResultProse(value: ResultView): string {
   } else {
     footer = '\n---\n[Status: Markdown content was not requested.' + (pagesParts.length > 0 ? ' ' + pagesParts.join(', ') + '.' : '') + ']'
   }
+  if (value.provenance) {
+    const p = value.provenance
+    lines.push('', `Parse provenance: ${p.provider}/${p.model}, method ${p.parse_method}; upstream engine version unknown. Index v${p.index_version}, reader protocol v${p.reader_version}.`)
+  }
+  if (value.diagnostics?.length) lines.push('', 'Diagnostics:', ...value.diagnostics.map(d => `- [${d.code}] (${d.scope})${d.block_id ? ' [' + d.block_id + ']' : ''}${d.page === undefined ? '' : ' Page ' + d.page}: ${d.message}`))
+  if (value.verification_hints?.length) lines.push('', 'Formula verification suggested (advisory, not a detected error):', ...value.verification_hints.map(hint => `- [${hint.block_id}]${hint.page === undefined ? '' : ' Page ' + hint.page}: inspect the original page before relying on formula symbols.`))
+  if (value.metadata_shortened?.length) lines.push('', 'Metadata shortened to fit: ' + value.metadata_shortened.join(', ') + '. Narrow the selection to inspect omitted details.')
   if (value.view === 'page') lines.push('', 'Original PDF page rendered locally; no Provider parsing was performed.')
   if (value.visuals) lines.push('', `Visuals in this chunk: ${value.visuals.attached}/${value.visuals.listed} attached, ${value.visuals.omitted} not attached.`)
   if (value.continuation_block) lines.push('', 'Continuing block [' + value.continuation_block.block_id + ']' + (value.continuation_block.page ? ' (Page ' + value.continuation_block.page + ')' : ''))

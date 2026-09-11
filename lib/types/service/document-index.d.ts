@@ -1,4 +1,15 @@
 import type { ContentListBlock } from '../service/result-presenter.js';
+/** Version of the provider-content projection semantics. */
+export declare const DOCUMENT_INDEX_VERSION: 2;
+/** A bounded, block-scoped diagnostic suitable for chunk delivery. */
+export interface BlockDiagnostic {
+    readonly id: string;
+    readonly code: string;
+    readonly scope: 'chunk';
+    readonly message: string;
+    readonly block_id: string;
+    readonly page?: number;
+}
 /** A content-list block with an identity fixed before page/focus selection. */
 export interface IndexedContentBlock extends ContentListBlock {
     readonly block_id: string;
@@ -14,10 +25,12 @@ export interface IndexedContentBlock extends ContentListBlock {
  */
 export declare function extractDocumentLabel(block: ContentListBlock): string | undefined;
 /**
- * Add stable document identities and faithfully expose known MinerU nested text.
+ * Add stable document identities and faithfully expose known MinerU content.
  * The input array and its blocks are never mutated.
  */
 export declare function normalizeDocumentBlocks(contentList: readonly ContentListBlock[], resultId: string, warningBlockOrders?: ReadonlySet<number>): {
     blocks: readonly IndexedContentBlock[];
     warnings: readonly string[];
 };
+/** Diagnose only selected one-based original-order blocks without renumbering. */
+export declare function collectBlockDiagnostics(contentList: readonly ContentListBlock[], resultId: string, orders: ReadonlySet<number>): readonly BlockDiagnostic[];

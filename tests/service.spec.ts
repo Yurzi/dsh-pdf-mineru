@@ -1286,3 +1286,126 @@ describe('MinerUService direct parsing', () => {
     })
   })
 })
+
+describe('feedback-driven scoped evidence reading', () => {
+  async function reader(blocks: Record<string, unknown>[], budget = 12000) {
+    const h = await harness()
+    h.provider.complete = true
+    Object.assign(h.config.output, { maxInlineChars: budget })
+    h.provider.extraArtifactsByFileName.set('input.pdf', [{ kind: 'content-list', content: JSON.stringify(blocks) }])
+    const read = async (args: Record<string, unknown> = {}) => asResult(await h.service.parseDocument(session('quality'), { file_path: h.file, ...args }, new AbortController().signal, null))
+    return { h, read }
+  }
+
+  it('scopes diagnostics to TOC, table, query and exact blocks without renumbering', async () => {
+    const { read } = await reader([
+      { type: 'text', text: 'Methods', text_level: 1, page_idx: 0 },
+      { type: 'unknown-widget', text: 'unsupported but retained', page_idx: 0 },
+      { type: 'table', table_body: '<table><tr><td>42</td></tr></table>', page_idx: 0 },
+      { type: 'text', text: '其中， 表示可训练参数', page_idx: 1 },
+    ])
+    expect((await read({ focus: 'toc' })).diagnostics ?? []).toEqual([])
+    expect((await read({ focus: 'table', pages: 1 })).diagnostics?.filter(d => d.scope === 'chunk') ?? []).toEqual([])
+    const query = await read({ query: '其中' })
+    expect(query.diagnostics).toHaveLength(1)
+    expect(query.diagnostics![0]).toMatchObject({ code: 'DOCUMENT_INDEX_POSSIBLE_TEXT_GAP', scope: 'chunk', block_id: query.result_id + ':b4', page: 2 })
+    const exact = await read({ block_id: query.result_id + ':b4' })
+    expect(exact.diagnostics).toEqual(query.diagnostics)
+    expect((await read({ block_id: query.result_id + ':b2' })).diagnostics?.[0]?.code).toBe('DOCUMENT_INDEX_UNKNOWN_BLOCK_TYPE')
+  })
+
+  it('returns all reference entries and finds a later list item without reparsing', async () => {
+    const references = Array.from({ length: 15 }, (_, index) => '[' + (index + 1) + '] Reference author ' + (index + 1))
+    const { h, read } = await reader([{ type: 'list', sub_type: 'ref_text', list_items: references, page_idx: 16 }])
+    const first = await read()
+    for (const reference of references) expect(first.markdown_content).toContain(reference)
+    expect(first.diagnostics ?? []).toEqual([])
+    const found = await read({ query: 'author 15' })
+    expect(found.markdown_content).toContain(first.result_id + ':b1')
+    expect(found.markdown_content).toContain('author 15')
+    expect(h.provider.submitCount).toBe(1)
+  })
+
+  it('never rewrites suspect mathematics and makes verification explicitly advisory', async () => {
+    const formula = String.raw`$$ P  Q \equiv \lnot P \times Q \tag{7} $$`
+    const { read } = await reader([{ type: 'equation', text: formula, page_idx: 6 }])
+    const result = await read()
+    expect(result.markdown_content).toContain(formula)
+    expect(result.verification_hints).toEqual([{ reason: 'formula', block_id: result.result_id + ':b1', page: 7, view: 'page' }])
+    expect(result.diagnostics ?? []).toEqual([])
+    expect(formatResultProse(result)).toContain('advisory, not a detected error')
+    expect(result.provenance).toMatchObject({ provider: 'self-hosted-v2', model: defaultMinerUConfig().defaults.model, upstream_version: null, index_version: 2, reader_version: 3 })
+  })
+
+  it('emits only current chunk diagnostics and avoids replaying scope notices', async () => {
+    const { read } = await reader(Array.from({ length: 15 }, (_, index) => ({ type: 'unknown-widget', text: 'Block ' + index + ' ' + 'x'.repeat(1700), page_idx: 0 })))
+    let view = await read({ pages: 1, inline_images: false })
+    expect(view.provenance).toBeDefined()
+    expect(view.diagnostics?.some(d => d.scope === 'selection')).toBe(true)
+    for (let count = 0; count < 20; count++) {
+      for (const diagnostic of view.diagnostics ?? []) {
+        if (diagnostic.scope !== 'chunk') continue
+        expect(view.markdown_content?.includes('[' + diagnostic.block_id) || view.continuation_block?.block_id === diagnostic.block_id).toBe(true)
+      }
+      if (!view.cursor) break
+      view = await read({ cursor: view.cursor })
+      expect(view.provenance).toBeUndefined()
+      expect(view.diagnostics?.some(d => d.scope !== 'chunk') ?? false).toBe(false)
+      expect(view.warnings?.some(warning => warning.includes('PAGE_COUNT_LOWER_BOUND')) ?? false).toBe(false)
+    }
+    expect(view.content_status).toBe('complete')
+  })
+
+  it('makes progress under the minimum budget with explicit metadata degradation', async () => {
+    const { read } = await reader([{ type: 'unknown-widget', text: '其中， 表示可训练参数 ' + 'x'.repeat(1600), page_idx: 0 }], 1024)
+    let view = await read()
+    expect(view.metadata_shortened?.length).toBeGreaterThan(0)
+    for (let rounds = 0; view.cursor && rounds < 40; rounds++) {
+      expect(JSON.stringify(view).length).toBeLessThanOrEqual(1024)
+      expect(formatResultProse(view).length).toBeLessThanOrEqual(1024)
+      expect(view.markdown_content!.length).toBeGreaterThan(0)
+      view = await read({ cursor: view.cursor })
+    }
+    expect(view.content_status).toBe('complete')
+  })
+})
+
+it('includes original-page hints for all accepted top-level equation kinds', async () => {
+  const h = await harness()
+  h.provider.complete = true
+  Object.assign(h.config.output, { maxInlineChars: 12000 })
+  const blocks = ['equation', 'Equation', 'interline_equation', 'INLINE_EQUATION'].map(type => ({ type, content: 'x', page_idx: 0 }))
+  h.provider.extraArtifactsByFileName.set('input.pdf', [{ kind: 'content-list', content: JSON.stringify(blocks) }])
+  const view = asResult(await h.service.parseDocument(session('formula-types'), { file_path: h.file }, new AbortController().signal, null))
+  expect(view.verification_hints).toHaveLength(4)
+  expect(view.verification_hints?.map(hint => hint.block_id)).toEqual(blocks.map((_, index) => view.result_id + ':b' + (index + 1)))
+})
+
+it('preserves initial selection notices when one block has many diagnostics', async () => {
+  const h = await harness()
+  h.provider.complete = true
+  Object.assign(h.config.output, { maxInlineChars: 12000 })
+  const block = { type: 'list', list_items: ['[1] Valid', ...Array.from({ length: 20 }, () => ({ unsupported: true }))], page_idx: 0 }
+  h.provider.extraArtifactsByFileName.set('input.pdf', [{ kind: 'content-list', content: JSON.stringify([block]) }])
+  const view = asResult(await h.service.parseDocument(session('scope-priority'), { file_path: h.file, pages: 1 }, new AbortController().signal, null))
+  expect(view.diagnostics?.[0]).toMatchObject({ scope: 'selection', code: 'PAGE_COUNT_LOWER_BOUND' })
+  expect(view.diagnostics?.some(diagnostic => diagnostic.scope === 'chunk')).toBe(true)
+  expect(view.metadata_shortened).toContain('diagnostics')
+  expect(view.diagnostics!.length).toBeLessThanOrEqual(6)
+})
+
+it('compacts optional metadata for artifact-only reads under a small budget', async () => {
+  const h = await harness()
+  h.provider.complete = true
+  Object.assign(h.config.output, { maxInlineChars: 1024 })
+  const name = 'r'.repeat(180) + '.pdf'
+  const file = join(h.root, name)
+  await writeFile(file, '%PDF-1.4 long-name artifact fixture')
+  h.provider.extraArtifactsByFileName.set(name, [{ kind: 'content-list', content: JSON.stringify([{ type: 'text', text: 'content', page_idx: 0 }]) }])
+  const view = asResult(await h.service.parseDocument(session('small-artifacts'), { file_path: file, focus: 'artifacts' }, new AbortController().signal, null))
+  expect(view.content_status).toBe('not_requested')
+  expect(view.metadata_shortened?.length).toBeGreaterThan(0)
+  expect(view.files[0]!.artifacts_truncated).toBe(true)
+  expect(JSON.stringify(view).length).toBeLessThanOrEqual(1024)
+  expect(formatResultProse(view).length).toBeLessThanOrEqual(1024)
+})

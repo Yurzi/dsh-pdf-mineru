@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.0.14
+
+This release includes the bounded-reader work recorded under 0.0.13; the previous published release is 0.0.12.
+
+### Fixed
+
+- Kept the continuation cursor explicitly nullable in every read response, including completed selections.
+- Cursor continuations now inherit the caller's image presentation intent; explicit `inline_images` overrides update the next cursor without bypassing current model capabilities or image budgets.
+- Restored reference lists and other supported `list_items` content from cached MinerU results without reparsing, renumbering or fabricating text.
+- Scoped block quality diagnostics to the actual delivered text, including TOC, table, search and continuation selections; document/selection notices are not replayed on every chunk.
+- Recognized known header/footer/page-number/footnote and flat reference blocks instead of emitting misleading unknown-type warnings for them.
+
+### Added
+
+- Added stable structured `diagnostics`, advisory formula `verification_hints`, and `provenance` separating upstream parsing configuration from index/reader versions. Unknown upstream engine versions are explicitly null.
+- Added bounded inline-gap diagnostics and dual-provider offline review-paper regressions; suspect formulas remain unchanged and are never silently repaired.
+- Added explicit `metadata_shortened` markers when quality/provenance metadata cannot fit a small output budget.
+
+### Changed
+
+- Consolidated interim implementation reports into the maintained PDF reading guide and refreshed README/architecture documentation.
+- Reader cursor v3 persists image intent and rejects v1/v2 tokens with a restart instruction. Index v2 reprojects existing immutable artifacts; it does not invalidate parse caches or automatically upload documents.
+
 ## 0.0.13
 
 ### Added

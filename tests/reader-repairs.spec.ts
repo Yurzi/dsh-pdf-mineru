@@ -9,7 +9,7 @@ describe('reader repairs', () => {
   it('round-trips a canonical cursor and preserves Unicode-safe offsets', () => {
     const token = cursorForRemainder('mr_result', '1-3', new Set(['text', 'table']), 7)
     const decoded = decodeReadCursor(token)
-    expect(decoded).toMatchObject({ v: 2, rid: 'mr_result', pages: '1-3', focus: ['table', 'text'], off: 7 })
+    expect(decoded).toMatchObject({ v: 3, rid: 'mr_result', pages: '1-3', focus: ['table', 'text'], off: 7, inline_images: true })
     expect(decodeReadCursor(cursorForRemainder('mr_result', undefined, new Set(['text']), 9)).pages).toBe('')
   })
 
@@ -17,20 +17,23 @@ describe('reader repairs', () => {
     const token = cursorForRemainder('mr_result', '1-3', new Set(['text']), 4)
     const altered = token.slice(0, -1) + (token.endsWith('A') ? 'B' : 'A')
     expect(() => decodeReadCursor(altered)).toThrow()
-    const payload = Buffer.from(JSON.stringify({ v: 2, rid: 'mr_result', pages: '3,1', focus: ['text'], off: 4 })).toString('base64url')
+    const payload = Buffer.from(JSON.stringify({ v: 3, rid: 'mr_result', pages: '3,1', focus: ['text'], off: 4, inline_images: true })).toString('base64url')
     expect(() => decodeReadCursor(payload)).toThrow(/canonical/)
   })
 
   it('requires file_path, rejects unknown arguments, and accepts cursor-only continuation', () => {
     expect(() => parseReadInput({ pages: 1 })).toThrow(/file_path.*required/)
     expect(() => parseReadInput({ file_path: '/tmp/a.pdf', unexpected: true })).toThrow(/Unsupported parameter/)
-    expect(parseReadInput({ file_path: '/tmp/a.pdf' }).input).toEqual({ file_path: '/tmp/a.pdf' })
-    expect(parseReadInput({ file_path: '/tmp/a.pdf', cursor: 'opaque' }).input).toEqual({ file_path: '/tmp/a.pdf', cursor: 'opaque' })
+    expect(parseReadInput({ file_path: '/tmp/a.pdf' }).input).toEqual({ file_path: '/tmp/a.pdf', inline_images: true })
+    const cursor = cursorForRemainder('mr_result', undefined, new Set(['all']), 4, { inline_images: false })
+    expect(parseReadInput({ file_path: '/tmp/a.pdf', cursor }).input).toEqual({ file_path: '/tmp/a.pdf', inline_images: false, cursor })
+    expect(parseReadInput({ file_path: '/tmp/a.pdf', cursor, inline_images: true }).input).toEqual({ file_path: '/tmp/a.pdf', inline_images: true, cursor })
+    expect(() => parseReadInput({ file_path: '/tmp/a.pdf', cursor: 'opaque' })).toThrow(/cursor/)
     for (const cursor of [null, '', '   ']) {
       expect(() => parseReadInput({ file_path: '/tmp/a.pdf', cursor })).toThrow(/cursor must be a non-empty string/)
     }
     for (const selection of [{ pages: 1 }, { focus: 'text' }, { focus: ['text', 'table'] }]) {
-      expect(() => parseReadInput({ file_path: '/tmp/a.pdf', cursor: 'opaque', ...selection })).toThrow(/must be omitted/)
+      expect(() => parseReadInput({ file_path: '/tmp/a.pdf', cursor, ...selection })).toThrow(/must be omitted/)
     }
   })
 
