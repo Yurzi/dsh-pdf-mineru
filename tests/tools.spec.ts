@@ -123,7 +123,7 @@ async function createCallingRouteFixture(route: CallingRouteFixture, signal = ne
   const view: ResultView = {
     state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_route',
     files: [{ file_id: 'mf_route', name: 'paper.pdf', artifacts: [] }],
-    content_status: 'complete', manifest_path: '/cache/manifest.json', output_limit_chars: 20_000,
+    content_status: 'complete', cursor: null, manifest_path: '/cache/manifest.json', output_limit_chars: 20_000,
     ordered_images: [{ path, name: 'figure.png', media_type: 'image/png', bytes: 13 }],
   }
   const resolveModelInfo = vi.fn(async (_provider: string, model: string, _signal?: AbortSignal): Promise<{ inputModalities?: readonly string[] } | undefined> => ({
@@ -303,7 +303,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
           },
         ],
         markdown_content: '# Background Parsed Content',
-        content_status: 'complete',
+        content_status: 'complete', cursor: null,
         manifest_path: '/cache/sample/manifest.json',
         output_limit_chars: 2000,
         summary: {
@@ -434,7 +434,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         cache_hit: true,
         result_id: 'mr_gate_1',
         files: [],
-        content_status: 'complete',
+        content_status: 'complete', cursor: null,
         manifest_path: '/cache/manifest.json',
         output_limit_chars: 1000,
       }
@@ -471,7 +471,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
           },
         ],
         markdown_content: '# Synchronous Direct Result',
-        content_status: 'complete',
+        content_status: 'complete', cursor: null,
         manifest_path: '/cache/sync/manifest.json',
         output_limit_chars: 2000,
       }
@@ -508,9 +508,10 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const { ctx, registeredTools } = createMockContext()
       registerTools(ctx, () => ({} as MinerUService))
       const parseTool = registeredTools.find(t => t.name === 'read_pdf')!
-      expect(parseTool.description).toContain('When content_status is complete')
+      expect(parseTool.description).toContain('null when complete or not_requested')
       expect(parseTool.description).toContain('markdown_content')
-      expect(parseTool.description).toContain('When content_status is partial')
+      expect(parseTool.description).toContain('Continue only when partial')
+      expect(parseTool.description).toContain('stop rather than passing null back')
       expect(parseTool.description).not.toContain('If pre-parsed by async_parse_pdf, reads instantly from local cache.')
       expect(parseTool.description).not.toContain('reads instantly from local cache')
     })
@@ -518,7 +519,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
     it('accepts single file_path parameter on both tools and normalizes appropriately', async () => {
       const { registry } = createMockJobRegistry()
       const { ctx, registeredTools } = createMockContext(registry)
-      const mockService = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'cache' as const, cache_hit: true, result_id: 'mr_1', files: [], content_status: 'complete' as const, manifest_path: '/p/m.json', output_limit_chars: 1000 })) } as unknown as MinerUService
+      const mockService = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'cache' as const, cache_hit: true, result_id: 'mr_1', files: [], content_status: 'complete' as const, cursor: null, manifest_path: '/p/m.json', output_limit_chars: 1000 })) } as unknown as MinerUService
       registerTools(ctx, () => mockService)
       const asyncTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
       const readTool = registeredTools.find(t => t.name === 'read_pdf')!
@@ -557,7 +558,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
           cache_hit: true,
           result_id: 'mr_1',
           files: [],
-          content_status: 'complete' as const,
+          content_status: 'complete' as const, cursor: null,
           manifest_path: '/cache/m.json',
           output_limit_chars: 1000,
         })),
@@ -755,7 +756,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
             name: 'doc.pdf',
             artifacts: [{ kind: 'images', path: '/fake/img.png', bytes: 100 }],
           }],
-          content_status: 'complete' as const,
+          content_status: 'complete' as const, cursor: null,
           manifest_path: '/cache/m.json',
           output_limit_chars: 1000,
           ordered_images: [],
@@ -825,7 +826,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
               name: 'doc.pdf',
               artifacts: [],
             }],
-            content_status: 'complete' as const,
+            content_status: 'complete' as const, cursor: null,
             manifest_path: '/cache/m.json',
             output_limit_chars: 1000,
             ordered_images: [{
@@ -864,7 +865,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       await writeFile(path, Buffer.from('fake-png-data'))
       try {
         const saveImage = vi.fn(async () => ({ attachmentId: 'att_growth', mediaType: 'image/png', name: 'growth.png', bytes }))
-        const service = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'provider' as const, cache_hit: false, result_id: 'mr_growth', files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }], content_status: 'complete' as const, manifest_path: '/cache/m.json', output_limit_chars: 20_000, ordered_images: Array.from({ length: copies }, () => ({ path, name: 'growth.png', media_type: 'image/png', bytes: 13 })) })) } as unknown as MinerUService
+        const service = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'provider' as const, cache_hit: false, result_id: 'mr_growth', files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }], content_status: 'complete' as const, cursor: null, manifest_path: '/cache/m.json', output_limit_chars: 20_000, ordered_images: Array.from({ length: copies }, () => ({ path, name: 'growth.png', media_type: 'image/png', bytes: 13 })) })) } as unknown as MinerUService
         const { ctx, registeredTools } = createMockContext()
         ;(ctx.get as any) = vi.fn((name: string) => name === 'attachments' ? { saveImage } : name === 'llm' ? { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text', 'image'] })) } : undefined)
         registerTools(ctx, () => service)
@@ -889,7 +890,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
           cache_hit: false,
           result_id: 'mr_budget',
           files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
-          content_status: 'complete' as const,
+          content_status: 'complete' as const, cursor: null,
           manifest_path: '/cache/m.json',
           output_limit_chars: 20_000,
           ordered_images: Array.from({ length: 8 }, (_, index) => ({
@@ -933,7 +934,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         const saveImage = vi.fn()
           .mockResolvedValueOnce({ attachmentId: 'att_missing', mediaType: 'image/png', name: 'missing.png' })
           .mockResolvedValueOnce({ attachmentId: 'att_invalid', mediaType: 'image/png', name: 'invalid.png', bytes: '13' })
-        const service = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'provider' as const, cache_hit: false, result_id: 'mr_invalid_bytes', files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }], content_status: 'complete' as const, manifest_path: '/cache/m.json', output_limit_chars: 20_000, ordered_images: paths.map((path, index) => ({ path, name: 'figure-' + String(index + 1) + '.png', media_type: 'image/png', bytes: 13 })) })) } as unknown as MinerUService
+        const service = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'provider' as const, cache_hit: false, result_id: 'mr_invalid_bytes', files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }], content_status: 'complete' as const, cursor: null, manifest_path: '/cache/m.json', output_limit_chars: 20_000, ordered_images: paths.map((path, index) => ({ path, name: 'figure-' + String(index + 1) + '.png', media_type: 'image/png', bytes: 13 })) })) } as unknown as MinerUService
         const { ctx, registeredTools } = createMockContext()
         ;(ctx.get as any) = vi.fn((name: string) => name === 'attachments' ? { saveImage } : name === 'llm' ? { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text', 'image'] })) } : undefined)
         registerTools(ctx, () => service)
@@ -951,7 +952,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       try {
         const controller = new AbortController()
         const saveImage = vi.fn(async () => { controller.abort(); return { attachmentId: 'att_last', mediaType: 'image/png', name: 'last.png', bytes: 13 } })
-        const service = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'provider' as const, cache_hit: false, result_id: 'mr_last_abort', files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }], content_status: 'complete' as const, manifest_path: '/cache/m.json', output_limit_chars: 20_000, ordered_images: [{ path, name: 'last.png', media_type: 'image/png', bytes: 13 }] })) } as unknown as MinerUService
+        const service = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'provider' as const, cache_hit: false, result_id: 'mr_last_abort', files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }], content_status: 'complete' as const, cursor: null, manifest_path: '/cache/m.json', output_limit_chars: 20_000, ordered_images: [{ path, name: 'last.png', media_type: 'image/png', bytes: 13 }] })) } as unknown as MinerUService
         const { ctx, registeredTools } = createMockContext()
         ;(ctx.get as any) = vi.fn((name: string) => name === 'attachments' ? { saveImage } : name === 'llm' ? { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text', 'image'] })) } : undefined)
         registerTools(ctx, () => service)
@@ -969,7 +970,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
           .mockResolvedValueOnce({ attachmentId: 'att_1', mediaType: 'image/png', name: 'one.png', bytes: 13 })
           .mockRejectedValueOnce(new Error('save failed'))
           .mockResolvedValueOnce({ attachmentId: 'att_3', mediaType: 'image/png', name: 'three.png', bytes: 25 * 1024 * 1024 })
-        const service = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'provider' as const, cache_hit: false, result_id: 'mr_figures', files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }], content_status: 'complete' as const, manifest_path: '/cache/m.json', output_limit_chars: 20_000, ordered_images: paths.map((path, index) => ({ path, name: 'figure-' + String(index + 1) + '.png', media_type: 'image/png', bytes: 13, page: index + 1 })) })) } as unknown as MinerUService
+        const service = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'provider' as const, cache_hit: false, result_id: 'mr_figures', files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }], content_status: 'complete' as const, cursor: null, manifest_path: '/cache/m.json', output_limit_chars: 20_000, ordered_images: paths.map((path, index) => ({ path, name: 'figure-' + String(index + 1) + '.png', media_type: 'image/png', bytes: 13, page: index + 1 })) })) } as unknown as MinerUService
         const { ctx, registeredTools } = createMockContext()
         ;(ctx.get as any) = vi.fn((name: string) => name === 'attachments' ? { saveImage } : name === 'llm' ? { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text', 'image'] })) } : undefined)
         registerTools(ctx, () => service)
@@ -1009,7 +1010,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
               artifacts: [],
             }],
             markdown_content: '# Document with Figures\n> 🖼️ **[Attached Image #1]** Page 1: Diagram',
-            content_status: 'complete' as const,
+            content_status: 'complete' as const, cursor: null,
             manifest_path: '/cache/m.json',
             output_limit_chars: 1000,
             ordered_images: [{
@@ -1056,11 +1057,12 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         result_id: 'mr_test_1',
         files: [{ file_id: 'mf_1', name: 'paper.pdf', artifacts: [{ kind: 'markdown', path: '/p/out.md', bytes: 50 }] }],
         manifest_path: '/p/manifest.json',
-        content_status: 'complete',
+        content_status: 'complete', cursor: null,
         output_limit_chars: 2000,
       }
       expect(parseTool.output.presentationMeta?.({}, singleResult)).toEqual({
         result_id: 'mr_test_1',
+        cursor: null,
         source: 'cache',
         cache_hit: true,
         manifest_path: '/p/manifest.json',
@@ -1074,7 +1076,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         result_id: 'mr_test_toc',
         files: [{ file_id: 'mf_1', name: 'paper.pdf', artifacts: [] }],
         manifest_path: '/p/manifest.json',
-        content_status: 'partial',
+        content_status: 'partial', cursor: 'opaque-test-cursor',
         output_limit_chars: 2000,
         toc: [
           { level: 1, title: 'Introduction', line: 1 },
@@ -1083,6 +1085,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       }
       expect(parseTool.output.presentationMeta?.({}, singleWithToc)).toEqual({
         result_id: 'mr_test_toc',
+        cursor: 'opaque-test-cursor',
         source: 'provider',
         cache_hit: false,
         manifest_path: '/p/manifest.json',
@@ -1129,7 +1132,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         result_id: 'mr_long_preview',
         files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
         markdown_content: 'A'.repeat(5000),
-        content_status: 'partial',
+        content_status: 'partial', cursor: 'opaque-test-cursor',
         manifest_path: '/cache/doc/manifest.json',
         output_limit_chars: 150,
       }
@@ -1145,7 +1148,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         cache_hit: false,
         result_id: 'mr_truncated_artifacts',
         files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [], artifacts_truncated: true }],
-        content_status: 'complete',
+        content_status: 'complete', cursor: null,
         manifest_path: '/cache/manifest.json',
         output_limit_chars: 2000,
       })
@@ -1160,7 +1163,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         result_id: 'mr_trunc',
         files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [{ kind: 'markdown', path: '/cache/doc/full.md', bytes: 5000 }] }],
         markdown_content: '# Truncated Content',
-        content_status: 'partial',
+        content_status: 'partial', cursor: 'opaque-test-cursor',
         manifest_path: '/cache/doc/manifest.json',
         output_limit_chars: 2000,
       }
@@ -1186,7 +1189,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
           ],
         }],
         markdown_content: '# Document with Secondary Artifacts',
-        content_status: 'complete',
+        content_status: 'complete', cursor: null,
         manifest_path: '/cache/doc/manifest.json',
         output_limit_chars: 2000,
       }
@@ -1209,7 +1212,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
             { kind: 'images', path: '/cache/scan/images', bytes: 1200 },
           ],
         }],
-        content_status: 'not_requested',
+        content_status: 'not_requested', cursor: null,
         manifest_path: '/cache/scan/manifest.json',
         output_limit_chars: 2000,
       }
@@ -1221,7 +1224,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       expect(rendered[0]?.text).toContain('Artifacts: layout (300 bytes): /cache/scan/layout.json, images (1200 bytes): /cache/scan/images')
     })
 
-    it('renders resume offset line when content is partial and read_offset_line is present', () => {
+    it('renders unchanged continuation token when content is partial', () => {
       const resultData: ResultView = {
         state: 'completed',
         source: 'provider',
@@ -1233,14 +1236,15 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
           artifacts: [{ kind: 'markdown', path: '/cache/doc/full.md', bytes: 8000 }],
         }],
         markdown_content: '# First Part of Text\nLine 2',
-        content_status: 'partial',
+        content_status: 'partial', cursor: 'opaque-test-cursor',
         markdown_path: '/cache/doc/full.md',
         manifest_path: '/cache/doc/manifest.json',
         output_limit_chars: 2000,
       }
       const rendered = renderResult(resultData)
       expect(rendered[0]?.text).toContain('Status: Content partial (truncated to output limit)')
-      expect(rendered[0]?.text).toContain('Full markdown artifact available in local result storage.')
+      expect(rendered[0]?.text).toContain('cursor: "opaque-test-cursor"')
+      expect(rendered[0]?.text).toContain('omit pages/focus.')
       expect(rendered[0]?.text).not.toContain('Manifest:')
     })
 
@@ -1256,7 +1260,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
           artifacts: [{ kind: 'markdown', path: '/cache/doc/full.md', bytes: 500 }],
         }],
         markdown_content: '# Document with Figures\n> 🖼️ **[Attached Image #1]** Page 2: Chart',
-        content_status: 'complete',
+        content_status: 'complete', cursor: null,
         manifest_path: '/cache/doc/manifest.json',
         output_limit_chars: 2000,
         ordered_images: [
@@ -1280,7 +1284,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         result_id: 'mr_with_img',
         files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
         markdown_content: '# Visual Doc',
-        content_status: 'complete',
+        content_status: 'complete', cursor: null,
         manifest_path: '/cache/doc/manifest.json',
         output_limit_chars: 2000,
         inlined_images: [
@@ -1321,7 +1325,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         result_id: 'mr_with_img_no_ref',
         files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
         markdown_content: '# Visual Doc',
-        content_status: 'complete',
+        content_status: 'complete', cursor: null,
         manifest_path: '/cache/doc/manifest.json',
         output_limit_chars: 2000,
         inlined_images: [
@@ -1362,7 +1366,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         result_id: 'mr_schema_test',
         files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
         markdown_content: '# Test',
-        content_status: 'complete',
+        content_status: 'complete', cursor: null,
         manifest_path: '/cache/doc/manifest.json',
         output_limit_chars: 2000,
         inlined_images: [
@@ -1414,7 +1418,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
           artifacts: [{ kind: 'markdown', path: '/cache/paper/full.md', bytes: 15000 }],
         }],
         markdown_content: '# Introduction\nThis is the beginning...',
-        content_status: 'partial',
+        content_status: 'partial', cursor: 'opaque-test-cursor',
         markdown_path: '/cache/paper/full.md',
         manifest_path: '/cache/paper/manifest.json',
         output_limit_chars: 2000,
@@ -1450,7 +1454,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
           artifacts: [{ kind: 'markdown', path: '/cache/doc/full.md', bytes: 5000 }],
         }],
         markdown_content: 'Some plain text...',
-        content_status: 'partial',
+        content_status: 'partial', cursor: 'opaque-test-cursor',
         markdown_path: '/cache/doc/full.md',
         manifest_path: '/cache/doc/manifest.json',
         output_limit_chars: 2000,
@@ -1475,7 +1479,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
           artifacts: [{ kind: 'markdown', path: '/cache/doc/full.md', bytes: 500 }],
         }],
         markdown_content: '# Heading 1\nContent',
-        content_status: 'complete',
+        content_status: 'complete', cursor: null,
         manifest_path: '/cache/doc/manifest.json',
         output_limit_chars: 2000,
         toc: [{ level: 1, title: 'Heading 1', line: 1 }],
@@ -1488,6 +1492,38 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
   })
 
   describe('lossless JSON compliance', () => {
+    it.each([
+      ['complete', null],
+      ['not_requested', null],
+      ['partial', 'opaque-token'],
+    ] as const)('keeps model-projected cursor and metadata lossless for %s', async (content_status, cursor) => {
+      const { ctx, registeredTools } = createMockContext()
+      const value: ResultView = {
+        state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_projection',
+        files: [], content_status, cursor, manifest_path: '/cache/manifest.json', output_limit_chars: 2000,
+      }
+      const dispose = registerTools(ctx, () => ({ parseDocument: vi.fn(async () => value) }) as unknown as MinerUService)
+      try {
+        const tool = registeredTools.find(t => t.name === 'read_pdf')!
+        const result = await tool.execute({ file_path: '/doc.pdf' }, createMockExec(true)) as ResultView
+        // Reproduce the model's projection, deliberately without a ?? null workaround.
+        const projected = { contentStatus: result.content_status, cursor: result.cursor }
+        expect(projected).toEqual({ contentStatus: content_status, cursor })
+        expect(isJsonValue(projected)).toBe(true)
+        expect(snapshotJsonValue(projected)).toEqual(projected)
+        const meta = tool.output.presentationMeta?.({}, result)
+        expect(meta).toHaveProperty('cursor', cursor)
+        expect(isJsonValue(meta)).toBe(true)
+        const rendered = renderResult(result)[0]?.text ?? ''
+        if (cursor === null) {
+          expect(rendered).not.toContain('Continue with')
+          expect(rendered).not.toContain('cursor: "null"')
+        } else {
+          expect(rendered).toContain('cursor: "opaque-token"')
+        }
+      } finally { await dispose() }
+    })
+
     it('returns strictly lossless JSON when optional fields (pages, etc.) are omitted', async () => {
       const { ctx, registeredTools } = createMockContext()
       const mockResult: ResultView = {
@@ -1497,7 +1533,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         result_id: 'mr_lossless_test',
         files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
         markdown_content: 'sample content',
-        content_status: 'complete',
+        content_status: 'complete', cursor: null,
         manifest_path: '/cache/doc/manifest.json',
         output_limit_chars: 2000,
         summary: {

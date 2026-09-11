@@ -63,8 +63,8 @@ export interface ResultView {
     readonly summary?: DocumentSummary;
     readonly toc?: readonly DocumentHeading[];
     readonly pages?: string;
-    /** Opaque exact-text continuation token, present only when partial. */
-    readonly cursor?: string;
+    /** Non-empty exact-text continuation token when partial; null otherwise. */
+    readonly cursor: string | null;
     readonly warnings?: readonly string[];
 }
 /** Parse completion metadata, independent of body output and its character budget. */

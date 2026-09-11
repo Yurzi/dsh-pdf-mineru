@@ -76,8 +76,8 @@ export interface ResultView {
   readonly summary?: DocumentSummary
   readonly toc?: readonly DocumentHeading[]
   readonly pages?: string
-  /** Opaque exact-text continuation token, present only when partial. */
-  readonly cursor?: string
+  /** Non-empty exact-text continuation token when partial; null otherwise. */
+  readonly cursor: string | null
   readonly warnings?: readonly string[]
 }
 
@@ -515,7 +515,7 @@ export function formatResultProse(value: ResultView): string {
       const location = heading.page !== undefined ? ` (Page ${String(heading.page)})` : (heading.line !== undefined ? ` (line ${String(heading.line)})` : '')
       lines.push(`${indent}- ${heading.title}${location}`)
     }
-    if (value.cursor !== undefined) lines.push('', 'Continue with the returned cursor using the same file_path.')
+    if (typeof value.cursor === 'string' && value.cursor.length > 0) lines.push('', 'Continue with the returned cursor using the same file_path.')
   }
 
   const totalPages = value.summary?.page_count
@@ -529,7 +529,7 @@ export function formatResultProse(value: ResultView): string {
   if (status === 'complete') {
     footer = '\n---\n[Status: Content complete. ' + pagesInfo + 'Full requested document markdown delivered above.]'
   } else if (status === 'partial') {
-    const mdGuidance = value.cursor !== undefined
+    const mdGuidance = typeof value.cursor === 'string' && value.cursor.length > 0
       ? `Continue with read_pdf({ file_path: "<same file_path>", cursor: "${value.cursor}" }); omit pages/focus.`
       : 'Full markdown artifact available in local result storage.'
     footer = '\n---\n[Status: Content partial (truncated to output limit). ' + pagesInfo + mdGuidance + ']'

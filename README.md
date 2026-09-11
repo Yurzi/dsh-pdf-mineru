@@ -115,6 +115,7 @@ Agent 会自动根据文档长度和指令意图，智能选择同步返回或�
   - `complete`：本次选择已读完；若本次是续读，表示剩余正文已全部提供。
   - `partial`：因输出预算分段，返回 `cursor`。下一次使用相同 `file_path` 与原样 `cursor`，不要再次传 `pages`／`focus`；逐次拼接 `markdown_content` 即为同一选择的完整正文。
   - `not_requested`：只请求了产物列表等不包含正文的结果。
+- `cursor`：必定存在的 `string | null` 字段。仅 `partial` 时为非空续读 token；`complete`／`not_requested` 时显式为 `null`，此时应停止续读。输入参数仍只接受非空字符串，不接受 `null`，也不会将 `null` 静默解释为重新读取。
 - `markdown_path` 是完整原始 Markdown 产物，`manifest_path` 是结果清单。筛选重建的文本不与原始文件行号对应，故不再返回误导性的 `read_offset_line`。
 - `output.maxInlineChars`：单次阅读响应的字符预算（默认 200,000 个 UTF-16 code units），约束 JSON 和 Native 英文文本各自的大小，包括元信息、续读 token 与状态说明。
 - `output.maxInlineImages`：单次 `read_pdf` 响应的内联图片数量预算（默认 6，可配置为 0–100；0 表示全局禁用）；图片仍受单图与总字节安全上限约束。

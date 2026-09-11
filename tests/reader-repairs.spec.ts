@@ -24,15 +24,21 @@ describe('reader repairs', () => {
   it('requires file_path, rejects unknown arguments, and accepts cursor-only continuation', () => {
     expect(() => parseReadInput({ pages: 1 })).toThrow(/file_path.*required/)
     expect(() => parseReadInput({ file_path: '/tmp/a.pdf', unexpected: true })).toThrow(/Unsupported parameter/)
+    expect(parseReadInput({ file_path: '/tmp/a.pdf' }).input).toEqual({ file_path: '/tmp/a.pdf' })
     expect(parseReadInput({ file_path: '/tmp/a.pdf', cursor: 'opaque' }).input).toEqual({ file_path: '/tmp/a.pdf', cursor: 'opaque' })
-    expect(() => parseReadInput({ file_path: '/tmp/a.pdf', cursor: 'opaque', pages: 1 })).toThrow(/must be omitted/)
+    for (const cursor of [null, '', '   ']) {
+      expect(() => parseReadInput({ file_path: '/tmp/a.pdf', cursor })).toThrow(/cursor must be a non-empty string/)
+    }
+    for (const selection of [{ pages: 1 }, { focus: 'text' }, { focus: ['text', 'table'] }]) {
+      expect(() => parseReadInput({ file_path: '/tmp/a.pdf', cursor: 'opaque', ...selection })).toThrow(/must be omitted/)
+    }
   })
 
   it('real compiled output schema rejects an empty nested result file', () => {
     let definition: any
     const ctx = { tools: { register: (value: any) => { definition = value; return () => undefined }, schemas: () => [] }, get: () => undefined } as any
     registerTools(ctx, () => { throw new Error('not executed') })
-    const invalid = { state: 'completed', source: 'provider', cache_hit: false, result_id: 'mr_empty', files: [{}], content_status: 'complete', manifest_path: '/cache/m.json', output_limit_chars: 1000 }
+    const invalid = { state: 'completed', source: 'provider', cache_hit: false, result_id: 'mr_empty', files: [{}], content_status: 'complete', cursor: null, manifest_path: '/cache/m.json', output_limit_chars: 1000 }
     const violations = validateJsonSchemaValue(definition.output.schema, invalid, 'value')
     expect(violations.some((value: string) => value.includes('value.files[0].file_id'))).toBe(true)
     expect(violations.some((value: string) => value.includes('value.files[0].name'))).toBe(true)
@@ -46,12 +52,26 @@ describe('reader repairs', () => {
       files: [{ file_id: 'mf_test', name: 'document.pdf', artifacts: [] }],
       content_status: 'partial', markdown_content: 'First chunk',
       cursor: cursorForRemainder('mr_test', undefined, new Set(['all']), 11),
+      manifest_path: '/cache/m.json', output_limit_chars: 2048,
       summary: { toc }, toc,
     }
     for (const render of [formatResultProse, formatSingleSummaryProse]) {
       expect(render(view)).toContain('Title without a location')
       expect(render(view)).not.toMatch(/line undefined|line 0/)
     }
+  })
+
+  it.each(['complete', 'not_requested'] as const)('does not advertise continuation for %s output with a null cursor', content_status => {
+    const view: ResultView = {
+      state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_test',
+      files: [{ file_id: 'mf_test', name: 'document.pdf', artifacts: [] }],
+      content_status, cursor: null,
+      ...(content_status === 'complete' ? { markdown_content: 'Full selected text' } : {}),
+      manifest_path: '/cache/m.json', output_limit_chars: 2048,
+    }
+    const prose = formatResultProse(view)
+    expect(prose).not.toContain('Continue with')
+    expect(prose).not.toContain('cursor:')
   })
 
   it('marks fully out-of-range pages instead of replacing them', () => {

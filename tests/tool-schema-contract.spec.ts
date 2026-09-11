@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import type { Context } from 'cordis'
-import { ToolArgsError, validateJsonSchemaValue, type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools'
+import { jsonSchemaToTs, ToolArgsError, validateJsonSchemaValue, type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { registerTools } from '../src/tools.js'
 
 // Deliberately use the real defineTool compiler, unlike the execution mocks.
@@ -33,6 +33,38 @@ describe('real DSH schema compilation', () => {
     expect(tool.parameters.properties?.cursor).toMatchObject({ type: 'string' })
     expect(tool.parameters.required).not.toContain('cursor')
     expect(validateJsonSchemaValue(tool.output.schema, {}, 'value').length).toBeGreaterThan(0)
+  })
+
+  it.each([
+    ['complete', null],
+    ['not_requested', null],
+    ['partial', 'opaque-token'],
+  ] as const)('requires an explicit nullable output cursor for %s', (content_status, cursor) => {
+    const tool = definitions().get('read_pdf')!
+    const value = {
+      state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_fixture',
+      files: [], content_status, cursor, manifest_path: '/cache/manifest.json', output_limit_chars: 2000,
+    }
+    expect(tool.output.schema.required).toContain('cursor')
+    expect(validateJsonSchemaValue(tool.output.schema, value, 'value')).toEqual([])
+    const { cursor: _cursor, ...missingCursor } = value
+    expect(validateJsonSchemaValue(tool.output.schema, missingCursor, 'value').length).toBeGreaterThan(0)
+    expect(validateJsonSchemaValue(tool.output.schema, { ...value, cursor: 123 }, 'value').length).toBeGreaterThan(0)
+  })
+
+  it('generates a required string-or-null cursor in the model-facing output type', () => {
+    const tool = definitions().get('read_pdf')!
+    const outputType = jsonSchemaToTs(tool.output.schema)
+    expect(outputType).toMatch(/cursor: string \| null/)
+    expect(outputType).not.toContain('cursor?:')
+    expect(jsonSchemaToTs(tool.parameters)).toContain('cursor?: string')
+  })
+
+  it('rejects null input cursor before entering the tool body rather than restarting', async () => {
+    const tool = definitions().get('read_pdf')!
+    const args = { file_path: '/source.pdf', cursor: null }
+    const exec: ToolRunContext = { callId: 'schema-check', name: 'read_pdf', arguments: args, signal: new AbortController().signal }
+    await expect(tool.execute(args, exec)).rejects.toBeInstanceOf(ToolArgsError)
   })
 
   it('enforces the immediate native background job contract', () => {

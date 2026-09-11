@@ -33,7 +33,10 @@ import {
   formatSingleSummaryProse,
   type DocumentHeading,
 } from '../src/service/mineru-service.js'
-import { renderResult } from '../src/tools.js'
+import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
+import { registerTools, renderResult } from '../src/tools.js'
+import { cursorForRemainder, decodeReadCursor } from '../src/service/read-cursor.js'
+import { formatResultProse } from '../src/service/result-presenter.js'
 import { SharedOperationRegistry } from '../src/service/shared-operations.js'
 import { ResultRepository } from '../src/storage/result-repository.js'
 import { StoragePaths } from '../src/storage/paths.js'
@@ -555,6 +558,137 @@ describe('MinerUService direct parsing', () => {
     expect('job_id' in parsed).toBe(false)
   })
 
+  it('continues selected Unicode text through read_pdf with exact advancing chunks and bounded output', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    // Long unbroken astral runs force cuts within text, not just at paragraph boundaries.
+    // Quotes, backslashes, and newlines also exercise JSON escaping overhead.
+    const selectedBlocks = [
+      '😀'.repeat(1600) + ' first end',
+      '第二段 "quoted" \\ path\n' + '🧪界'.repeat(1200) + ' final end',
+    ]
+    const expectedText = selectedBlocks.join('\n\n')
+    h.provider.markdown = 'UNSELECTED raw Markdown must not leak into continuation'
+    h.provider.extraArtifactsByFileName.set('input.pdf', [{
+      kind: 'content-list',
+      content: JSON.stringify([
+        { type: 'text', text: 'UNSELECTED first page', page_idx: 0 },
+        { type: 'text', text: selectedBlocks[0], page_idx: 1 },
+        { type: 'table', table_body: 'UNSELECTED table on selected page', page_idx: 1 },
+        { type: 'text', text: selectedBlocks[1], page_idx: 2 },
+        { type: 'text', text: 'UNSELECTED last page', page_idx: 3 },
+      ]),
+    }])
+    let readTool: any
+    const ctx = {
+      tools: {
+        register: (definition: any) => {
+          if (definition.name === 'read_pdf') readTool = definition
+          return () => undefined
+        },
+        schemas: () => [],
+      },
+      get: () => undefined,
+    } as any
+    const dispose = registerTools(ctx, () => h.service, undefined, () => h.config.output)
+    const exec = { agent: { session: session('continuation') }, signal: new AbortController().signal } as any
+    let args: Record<string, unknown> = { file_path: h.file, pages: '2-3', focus: 'text', inline_images: false }
+    const chunks: string[] = []
+    const cursors = new Set<string>()
+    let offset = 0
+    let resultId: string | undefined
+    let finalView: ResultView | undefined
+    try {
+      // Bound the loop so a stuck or cycling cursor fails deterministically.
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const view = await readTool.execute(args, exec) as ResultView
+        resultId ??= view.result_id
+        expect(view.result_id).toBe(resultId)
+        expect(view.pages).toBe('2-3')
+        expect(view.source).toBe(attempt === 0 ? 'provider' : 'cache')
+        expect(view.cache_hit).toBe(attempt > 0)
+        expect(validateJsonSchemaValue(readTool.output.schema, view, 'value')).toEqual([])
+        expect(isJsonValue(view)).toBe(true)
+        const chunk = view.markdown_content!
+        expect(typeof chunk).toBe('string')
+        expect(chunk.length).toBeGreaterThan(0)
+        expect(chunk).not.toMatch(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/)
+        expect(Buffer.from(chunk, 'utf8').toString('utf8')).toBe(chunk)
+        expect(chunk).toBe(expectedText.slice(offset, offset + chunk.length))
+        chunks.push(chunk)
+        const nextOffset = offset + chunk.length
+        const limit = h.config.output.maxInlineChars
+        expect(view.output_limit_chars).toBe(limit)
+        expect(chunk.length).toBeLessThanOrEqual(limit)
+        expect(JSON.stringify(view).length).toBeLessThanOrEqual(limit)
+        const prose = formatResultProse(view)
+        expect(prose.length).toBeLessThanOrEqual(limit)
+        const rendered = readTool.output.render(args, view)
+        expect(rendered).toEqual(renderResult(view))
+        expect(rendered[0]?.text).toBe(prose)
+        expect(prose).toContain(chunk)
+        expect(prose).not.toContain('[Output truncated to limit]')
+        const meta = readTool.output.presentationMeta(args, view)
+        expect(JSON.stringify(meta).length).toBeLessThanOrEqual(limit)
+        expect(meta.cursor).toBe(view.cursor)
+        if (view.content_status === 'complete') {
+          expect(view.cursor).toBeNull()
+          expect(nextOffset).toBe(expectedText.length)
+          finalView = view
+          break
+        }
+        expect(view.content_status).toBe('partial')
+        expect(typeof view.cursor).toBe('string')
+        expect(view.cursor!.length).toBeGreaterThan(0)
+        const cursor = view.cursor!
+        expect(cursors.has(cursor)).toBe(false)
+        cursors.add(cursor)
+        const decoded = decodeReadCursor(cursor)
+        expect(decoded).toMatchObject({ rid: resultId, pages: '2-3', focus: ['text'], off: nextOffset })
+        expect(decoded.off).toBeGreaterThan(offset)
+        expect(decoded.off).toBeLessThan(expectedText.length)
+        expect(expectedText.slice(0, decoded.off)).not.toMatch(/[\uD800-\uDBFF]$/)
+        expect(expectedText.slice(decoded.off)).not.toMatch(/^[\uDC00-\uDFFF]/)
+        offset = decoded.off
+        // The cursor alone must restore both pages and focus on every continuation.
+        args = { file_path: h.file, cursor }
+      }
+      expect(finalView?.content_status).toBe('complete')
+      expect(finalView?.cursor).toBeNull()
+      expect(chunks.length).toBeGreaterThan(2)
+      expect(chunks.join('')).toBe(expectedText)
+      expect(h.provider.submitCount).toBe(1)
+      expect(h.provider.collectCount).toBe(1)
+    } finally {
+      await dispose()
+    }
+  })
+
+  it('rejects continuation for another result and selection overrides without reparsing', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    h.provider.markdown = '😀'.repeat(3000)
+    const signal = new AbortController().signal
+    const owner = session('invalid-continuation')
+    const first = await h.service.parseDocument(owner, { file_path: h.file }, signal, null)
+    expect(first.content_status).toBe('partial')
+    const cursor = first.cursor!
+    const payload = decodeReadCursor(cursor)
+    const wrongIdentity = cursorForRemainder('mr_other_result', undefined, new Set(['all']), payload.off)
+    await expect(h.service.parseDocument(owner, { file_path: h.file, cursor: wrongIdentity }, signal, null))
+      .rejects.toThrow(/result identity does not match/)
+    for (const selection of [{ pages: 1 }, { focus: 'text' }]) {
+      await expect(h.service.parseDocument(owner, { file_path: h.file, cursor, ...selection }, signal, null))
+        .rejects.toThrow(/pages and focus must be omitted/)
+    }
+    // Even a structurally valid token cannot resume halfway through a surrogate pair.
+    const splitCharacter = cursorForRemainder(first.result_id, undefined, new Set(['all']), 1)
+    await expect(h.service.parseDocument(owner, { file_path: h.file, cursor: splitCharacter }, signal, null))
+      .rejects.toThrow(/splits a Unicode character/)
+    expect(h.provider.submitCount).toBe(1)
+    expect(h.provider.collectCount).toBe(1)
+  })
+
   it('populates markdown_content and content_status correctly on complete document', async () => {
     const h = await harness()
     h.provider.markdown = '# Complete Document Content\nFull text delivered.'
@@ -565,6 +699,7 @@ describe('MinerUService direct parsing', () => {
     ))
     expect(parsed.state).toBe('completed')
     expect(parsed.content_status).toBe('complete')
+    expect(parsed.cursor).toBeNull()
     expect(parsed.markdown_content).toBe('# Complete Document Content\nFull text delivered.')
     expect(parsed.read_offset_line).toBeUndefined()
     expect('job_id' in parsed).toBe(false)
@@ -580,6 +715,7 @@ describe('MinerUService direct parsing', () => {
     ))
     expect(parsed.state).toBe('completed')
     expect(parsed.content_status).toBe('complete')
+    expect(parsed.cursor).toBeNull()
     expect(parsed.markdown_content).toBe('')
     expect(parsed.read_offset_line).toBeUndefined()
   })
@@ -597,6 +733,7 @@ describe('MinerUService direct parsing', () => {
     ))
     expect(parsed.state).toBe('completed')
     expect(parsed.content_status).toBe('not_requested')
+    expect(parsed.cursor).toBeNull()
     expect(parsed.markdown_content).toBeUndefined()
     expect(parsed.read_offset_line).toBeUndefined()
     const rendered = renderResult(parsed)[0]?.text ?? ''
@@ -789,6 +926,7 @@ describe('MinerUService direct parsing', () => {
 
     expect(parsed.state).toBe('completed')
     expect(parsed.content_status).toBe('not_requested')
+    expect(parsed.cursor).toBeNull()
     expect(parsed.markdown_content).toBeUndefined()
     expect(parsed.files[0]?.artifacts.some(a => a.kind === 'layout')).toBe(true)
     expect(parsed.files[0]?.artifacts.some(a => a.kind === 'images')).toBe(true)
@@ -955,6 +1093,7 @@ describe('MinerUService direct parsing', () => {
 
       expect(parsed.state).toBe('completed')
       expect(parsed.content_status).toBe('complete')
+      expect(parsed.cursor).toBeNull()
       expect(isJsonValue(parsed)).toBe(true)
       expect(snapshotJsonValue(parsed)).toBeDefined()
       expect('pages' in parsed).toBe(false)

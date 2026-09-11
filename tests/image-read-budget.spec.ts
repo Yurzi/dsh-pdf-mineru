@@ -48,7 +48,7 @@ describe('actual image read accounting across I/O failure', () => {
     } as unknown as Context
     const view: ResultView = {
       state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_fixture',
-      content_status: 'complete', markdown_content: 'Figures', output_limit_chars: 200000,
+      content_status: 'complete', cursor: null, markdown_content: 'Figures', output_limit_chars: 200000,
       manifest_path: '/virtual-budget/manifest.json',
       files: [{ file_id: 'mf_fixture', name: 'document.pdf', artifacts: [] }],
       ordered_images: Array.from({ length: 6 }, (_, i) => ({

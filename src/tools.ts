@@ -121,7 +121,11 @@ const resultViewSchema = {
     markdown_content: { type: 'string' },
     content_status: { type: 'string', enum: ['complete', 'partial', 'not_requested'], required: true },
     markdown_path: { type: 'string' },
-    cursor: { type: 'string' },
+    cursor: {
+      oneOf: [{ type: 'string' }, { type: 'null' }],
+      required: true,
+      description: 'Non-empty continuation token when content_status is partial; null otherwise. Stop reading when null.',
+    },
     warnings: { type: 'array', items: { type: 'string' } },
     manifest_path: { type: 'string', required: true },
     output_limit_chars: { type: 'integer', required: true },
@@ -191,7 +195,7 @@ const readPdfParameters: ParameterSchemaSpec = {
   },
   cursor: {
     type: 'string',
-    description: 'Opaque continuation cursor returned by a previous partial read. When provided, file_path is required and pages/focus must be omitted.',
+    description: 'Opaque continuation cursor returned by a previous partial read. Pass only a non-empty returned token, unchanged; null means stop, not restart. When provided, file_path is required and pages/focus must be omitted.',
   },
 }
 
@@ -580,7 +584,7 @@ export function registerTools(
 
   disposers.push(ctx.tools.register(defineTool({
     name: 'read_pdf',
-    description: 'Read and extract structured content from PDF documents synchronously. Supports page selection and content focus. When content_status is complete, full Markdown is provided in markdown_content. When content_status is partial, continue with the returned cursor using the same file_path and no new selection arguments.',
+    description: 'Read and extract structured content from PDF documents synchronously. Supports page selection and content focus. Requested Markdown is returned in markdown_content. The output cursor is always present: a non-empty string when content_status is partial, null when complete or not_requested. Continue only when partial, using the unchanged cursor with the same file_path and no pages/focus. Complete means the current selection has been fully delivered across this read and any preceding chunks; stop rather than passing null back.',
     parameters: readPdfParameters,
     output: {
       schema: parseOutputSchema,
@@ -644,7 +648,7 @@ export function registerTools(
             })),
           } : {}),
           ...(single.pages !== undefined ? { pages: single.pages } : {}),
-          ...(single.cursor !== undefined ? { cursor: single.cursor } : {}),
+          cursor: single.cursor,
           ...(single.warnings !== undefined ? { warnings: [...single.warnings] } : {}),
         }
       },
