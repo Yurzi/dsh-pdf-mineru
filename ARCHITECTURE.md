@@ -15,7 +15,7 @@ read_pdf / async_parse_pdf
        │    ├─ SelfHostedV2Provider
        │    └─ OfficialV4Provider
        ├─ document-index → read-delivery → tools 附件／最终预算（content）
-       └─ page-renderer → 本地 pdfinfo / pdftoppm（page，无 Provider）
+       └─ page-renderer → Poppler 优先 / PDF.js + Canvas 子进程回退（page，无 Provider）
 
 loopback RPC → StorageMaintenanceService
                   ├─ StorageAccessGate
@@ -76,7 +76,7 @@ Cursor v3 是最长 2048 字符的无签名 base64url JSON，携带 immutable re
 5. 默认全选编码为 pages=""，不能在续读中改成显式 1-N，避免丢失无 page_idx 的 block。
 6. 续读严格 cache-only，即使 cacheEnabled=false 也只查既有发布结果，不启动 Provider。源文件仍需存在并匹配；缓存缺失／损坏、结果／相关解析配置变化、无效偏移或不合法 token 明确要求重新开始。
 
-物理页数优先使用 layout（包括末尾空白页），仅有 content-list 时 page_count 是已知页坐标下界；page_count_source 明确为 layout 或 content-list-lower-bound，本地原页模式为 pdfinfo。只有可靠物理页数才能判定完全越界 `[PAGE_OUT_OF_RANGE]` 或部分越界；下界之外的空选择不能证明该页不存在或空白。缺少可靠页码／内容类型映射时，不支持的筛选返回 `[SELECTION_UNAVAILABLE]`；未知计数不捏造。markdown_path 是完整原始产物，筛选重建文本不能用 read_offset_line 指向它。
+物理页数优先使用 layout（包括末尾空白页），仅有 content-list 时 page_count 是已知页坐标下界；page_count_source 明确为 layout 或 content-list-lower-bound，本地原页模式按后端为 pdfinfo 或 pdfjs。只有可靠物理页数才能判定完全越界 `[PAGE_OUT_OF_RANGE]` 或部分越界；下界之外的空选择不能证明该页不存在或空白。缺少可靠页码／内容类型映射时，不支持的筛选返回 `[SELECTION_UNAVAILABLE]`；未知计数不捏造。markdown_path 是完整原始产物，筛选重建文本不能用 read_offset_line 指向它。
 
 ### 证据、诊断与来源
 
@@ -99,9 +99,19 @@ Cursor v3 是最长 2048 字符的无签名 base64url JSON，携带 immutable re
 
 ### 本地原页验证边界
 
-page-renderer 不调用 Provider、不上传、不依赖解析缓存。它对受文件大小限制的源文件建立私有临时流式快照并计算 SHA-256，expected_sha256 不匹配则在渲染前拒绝；完成、失败或取消都清理临时文件，不长期保留源。依赖本地 Poppler 的 pdfinfo/pdftoppm，缺失时明确失败，不回退为上传。
+page-renderer 不调用 Provider、不上传、不依赖解析缓存。它对受文件大小限制的源文件建立私有临时流式快照并计算 SHA-256，expected_sha256 不匹配则在渲染前拒绝；完成、失败或取消都清理临时文件，不长期保留源。优先执行本地 Poppler 的 pdfinfo/pdftoppm；仅依赖或执行环境不可用才自动切换到 PDF.js + @napi-rs/canvas。工具与 Provider 不参与本地渲染命令或临时路径的构造，不回退为上传。
 
-默认最多 2 个并发渲染、45 秒运行预算；等比例长边目标 1600 px，另验宽 ≤1600、高 ≤2000、总像素 ≤3,200,000，PNG ≤8 MiB。子进程 stdout/stderr 与输出文件增长有界并可取消。**这些限制不是 OS sandbox，也不是进程内存硬限制**；处理不可信 PDF 时仍需宿主部署操作系统级隔离及资源限制。
+默认最多 2 个并发渲染、45 秒总截止时间（含排队、快照、Poppler执行与fallback）；截止时间用单调时钟计算剩余量，并结合AbortSignal终止进程。两个后端共享同一并发槽和同一快照，不重新读取原始PDF、不重置预算。等比例长边 ≤1600 px，保留独立宽/高/像素防御检查，PNG ≤8 MiB；子进程 stdout/stderr 与输出文件增长有界，PNG读取前后复核大小和身份，统一尺寸及完整块结构/CRC/IDAT/IEND检查后才交给附件层解码。
+
+能力检测就是实际执行，不另开探测进程，也不在文本阅读中探测、缓存永久不可用或引入设置UI。只有执行环境 errno ENOENT/EACCES/EPERM/ENOEXEC/ENOSYS 被归类为内部 RendererUnavailable；Poppler文档失败、页数输出错误、越界、摘要/身份不匹配、取消、超限及超时都不触发切换。PDF.js成功结果包含顶层renderer，严格schema和Native展示/metadata一致，summary.page_count_source对应pdfjs；普通文本结果不添加renderer。
+
+PDF.js入口是发布包内独立 ESM 文件 lib/pdfjs-worker.mjs，pdfjs-backend只在父进程构造固定参数；runPdfPageProcess以process.execPath运行、不用shell、不继承NODE_OPTIONS等用户注入环境。小型进程协议为成功exit0 +唯一JSON {page_count}；20仅依赖/资源不可用、21文档/页错误、22资源限制、23其他错误。父进程不把stdout/stderr或原始异常透传给模型。取消/超时杀死并等待close，回收后清理；清理失败不覆盖主要错误。
+
+PDF.js 6.3 已移除旧 isEvalSupported 选项；子进程用 Node --disallow-code-generation-from-strings 禁止字符串代码生成，不导入 PDF scripting sandbox、不执行 OpenAction/JavaScript/URI 动作，XFA及系统字体关闭。AnnotationMode.ENABLE仅绘制PDF已有的注释外观，不创建交互viewer。BinaryDataFactory只允许固定资源kind、basename与扩展，单资源 ≤16 MiB，按包目录以O_NOFOLLOW读取；网络API另外禁用。PDF.js快照硬限200MiB（同时遵守更小的配置上限），页原始边 ≤1,000,000 pt，Canvas每边 ≤1600 px，单Canvas/嵌入图像 ≤3,200,000像素，活动Canvas合计 ≤12,800,000像素；超限失败而非默默省略图像。PDF.js 6.3 的严格operator-list路径可能吞掉超图异常，worker使用其容错路径并仅在进程内捕获固定maxImageSize警告来返回资源错误；依赖升级必须重跑该真实fixture，不能只依赖旧选项名或错误类型。此后端不是PDF完整性验证器，禁用系统字体/XFA也可能影响特殊或未嵌入字体文档的保真。
+
+正常生产dependencies包含固定版本pdfjs-dist和@napi-rs/canvas；它们不打入host/client bundle。PDF.js包本身携带字体、CMap、WASM及PDF worker，入口按模块安装位置解析资源、而非开发cwd；构建末尾copy-page-worker复制固定入口，clean会移除旧入口后重新生成，package.files明确保留。平台Canvas二进制由其optionalDependencies提供，不需要开发依赖或安装期本地编译；缺失只在选用fallback时报告，不在插件加载时导入原生库。
+
+**这些限制不是 OS sandbox，也不是进程内存硬限制**；PDF.js的512MiB old-space限制不涵盖Buffer/typed-array backing、原生Canvas/WASM分配及同页解码图像缓存的总和；单图与活动Canvas计数不是聚合RSS预算。只使用本地数据和包资源，禁用PDF JS eval/交互执行及网络加载，但不能将应用层限制当作引擎漏洞隔离。处理不可信 PDF 时仍需宿主部署操作系统级隔离及资源限制。
 
 ## 4. Producer、waiter 与配置
 

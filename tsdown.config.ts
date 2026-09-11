@@ -12,8 +12,8 @@ const host: UserConfig = {
   dts: false,
   clean: false,
   deps: {
-    neverBundle: [/^@deepseek-ai\//, /^node:/],
-    alwaysBundle: (id: string) => !id.startsWith('@deepseek-ai/') && !id.startsWith('node:'),
+    neverBundle: [/^@deepseek-ai\//, /^node:/, /^pdfjs-dist(?:\/|$)/, /^@napi-rs\/canvas(?:\/|$)/],
+    alwaysBundle: (id: string) => !id.startsWith('@deepseek-ai/') && !id.startsWith('node:') && !id.startsWith('pdfjs-dist') && !id.startsWith('@napi-rs/canvas'),
     onlyBundle: false,
   },
 }

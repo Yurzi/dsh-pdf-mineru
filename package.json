@@ -1,6 +1,6 @@
 {
   "name": "dsh-pdf-mineru",
-  "version": "0.0.14",
+  "version": "0.0.15",
   "description": "Provider-independent DSH document parsing powered by MinerU, with native background jobs, immutable results, and safe request coalescing.",
   "keywords": ["dsh-plugin"],
   "license": "MIT",
@@ -19,7 +19,7 @@
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
-  "files": ["lib/index.js", "lib/client.js", "lib/client.js.map", "lib/types/**/*.d.ts", "cordis.patch.yml", "CHANGELOG.md"],
+  "files": ["lib/index.js", "lib/pdfjs-worker.mjs", "lib/client.js", "lib/client.js.map", "lib/types/**/*.d.ts", "cordis.patch.yml", "CHANGELOG.md"],
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": {
@@ -28,7 +28,7 @@
     }
   },
   "scripts": {
-    "build": "pnpm run clean && pnpm run build:types && tsdown --config tsdown.config.ts",
+    "build": "pnpm run clean && pnpm run build:types && tsdown --config tsdown.config.ts && node scripts/copy-page-worker.mjs",
     "build:types": "tsc -b tsconfig.host.json tsconfig.client.json",
     "clean": "tsc -b tsconfig.host.json tsconfig.client.json --clean && node scripts/clean.mjs",
     "typecheck": "tsc -b tsconfig.host.json tsconfig.client.json --pretty false",
@@ -41,7 +41,11 @@
     "smoke:reader-local": "node scripts/smoke-reader-local.mjs",
     "smoke:reader-cache": "node scripts/smoke-reader-cache.mjs"
   },
-  "dependencies": { "yauzl": "^3.4.0" },
+  "dependencies": {
+    "@napi-rs/canvas": "1.0.9",
+    "pdfjs-dist": "6.3.289",
+    "yauzl": "^3.4.0"
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1 || ^4.0.2",
     "@deepseek-ai/dsh-api-remotes": "^0.1.5-rc.2",

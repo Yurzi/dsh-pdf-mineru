@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { testPng } from './fixtures/png.js'
 import { mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -23,14 +24,8 @@ function result(stdout: Uint8Array | string = '', stderr: Uint8Array | string = 
   }
 }
 
-function png(width = 1200, height = 1600, totalBytes = 24): Buffer {
-  const bytes = Buffer.alloc(totalBytes)
-  Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(bytes)
-  bytes.writeUInt32BE(13, 8)
-  bytes.write('IHDR', 12, 'ascii')
-  bytes.writeUInt32BE(width, 16)
-  bytes.writeUInt32BE(height, 20)
-  return bytes
+function png(width = 1200, height = 1600, totalBytes?: number): Buffer {
+  return testPng(width, height, totalBytes)
 }
 
 function outputPrefix(request: PdfPageProcessRequest): string {
@@ -193,7 +188,7 @@ describe('renderPdfPage', () => {
     await expectTemporaryCleanup()
   })
 
-  it('maps a missing Poppler executable to a clear typed unsupported failure', async () => {
+  it('maps unavailable Poppler and PDF.js executables to an actionable failure', async () => {
     const runner: PdfPageProcessRunner = async request => {
       throw Object.assign(new Error('not installed'), { code: 'ENOENT', path: request.command })
     }
@@ -202,7 +197,7 @@ describe('renderPdfPage', () => {
     await expect(render(input())).rejects.toMatchObject({
       failure: {
         code: 'UNSUPPORTED_OPTION',
-        message: expect.stringContaining('pdfinfo Poppler executable'),
+        message: expect.stringContaining('install Poppler (pdfinfo and pdftoppm)'),
       },
     })
     await expectTemporaryCleanup()

@@ -64,6 +64,7 @@ export declare class MinerUService {
         result_id: MinerUResultId;
         file_id: import("../domain/ids.js").MinerUFileId;
         output_limit_chars: number;
+        renderer: "poppler" | "pdfjs";
         name: string;
         page: number;
         page_count: number;

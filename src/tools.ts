@@ -101,7 +101,7 @@ const documentSummarySchema = {
   type: 'object',
   properties: {
     page_count: { type: 'integer' },
-    page_count_source: { type: 'string', enum: ['layout', 'content-list-lower-bound', 'pdfinfo'] },
+    page_count_source: { type: 'string', enum: ['layout', 'content-list-lower-bound', 'pdfinfo', 'pdfjs'] },
     table_count: { type: 'integer' },
     image_count: { type: 'integer' },
     equation_count: { type: 'integer' },
@@ -144,6 +144,7 @@ const resultViewSchema = {
     source_sha256: { type: 'string' },
     continuation_block: { type: 'object', properties: { block_id: { type: 'string', required: true }, page: { type: 'integer' }, document_label: { type: 'string' } }, additionalProperties: false },
     view: { type: 'string', enum: ['content', 'page'] },
+    renderer: { type: 'string', enum: ['poppler', 'pdfjs'] },
     visuals: { type: 'object', properties: { listed: { type: 'integer', required: true }, attached: { type: 'integer', required: true }, omitted: { type: 'integer', required: true }, scope: { type: 'string', enum: ['chunk'], required: true } }, additionalProperties: false },
     output_limit_chars: { type: 'integer', required: true },
     inlined_images: { type: 'array', items: inlinedImageViewSchema },
@@ -649,6 +650,7 @@ export function registerTools(
         const single = value as ResultView
         return {
           result_id: single.result_id,
+          ...(single.renderer === undefined ? {} : { renderer: single.renderer }),
           source: single.source,
           cache_hit: single.cache_hit,
           ...(single.manifest_path === undefined ? {} : { manifest_path: single.manifest_path }),
@@ -682,6 +684,7 @@ export function registerTools(
           ...(single.summary !== undefined ? {
             summary: {
               ...(single.summary.page_count !== undefined ? { page_count: single.summary.page_count } : {}),
+              ...(single.summary.page_count_source !== undefined ? { page_count_source: single.summary.page_count_source } : {}),
               ...(single.summary.table_count !== undefined ? { table_count: single.summary.table_count } : {}),
               ...(single.summary.image_count !== undefined ? { image_count: single.summary.image_count } : {}),
               ...(single.summary.equation_count !== undefined ? { equation_count: single.summary.equation_count } : {}),
@@ -730,10 +733,10 @@ export function registerTools(
         exec.signal.throwIfAborted()
         if (!Number.isSafeInteger(ref.bytes) || ref.bytes < 0 || ref.bytes > MAX_INLINE_IMAGE_SINGLE_BYTES) throw new MinerUError(failure('RESULT_TOO_LARGE', 'Rendered page attachment exceeds the image limit'))
         const value: ResultView = {
-          state: 'completed', source: 'local', cache_hit: false, result_id: page.result_id, view: 'page',
+          state: 'completed', source: 'local', cache_hit: false, result_id: page.result_id, view: 'page', renderer: page.renderer,
           files: [{ file_id: page.file_id, name: page.name, artifacts: [] }],
           content_status: 'not_requested', cursor: null, output_limit_chars: page.output_limit_chars,
-          source_sha256: page.sha256, pages: String(page.page), summary: { page_count: page.page_count, page_count_source: 'pdfinfo' },
+          source_sha256: page.sha256, pages: String(page.page), summary: { page_count: page.page_count, page_count_source: page.renderer === 'pdfjs' ? 'pdfjs' : 'pdfinfo' },
           inlined_images: [{ attachment_id: String(ref.attachmentId), name: ref.name ?? 'page-' + page.page + '.png', media_type: ref.mediaType, bytes: ref.bytes, page: page.page, ...(ref.width === undefined ? {} : { width: ref.width }), ...(ref.height === undefined ? {} : { height: ref.height }) }],
           visuals: { listed: 1, attached: 1, omitted: 0, scope: 'chunk' },
         }

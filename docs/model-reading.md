@@ -1,6 +1,6 @@
 # 面向模型的 PDF 阅读指南
 
-适用于 dsh-pdf-mineru 0.0.14：索引版本2、阅读协议/游标版本3。安装与Provider配置见[README](../README.md)，实现和安全约束见[ARCHITECTURE](../ARCHITECTURE.md)，历史变化见[CHANGELOG](../CHANGELOG.md)。
+适用于 dsh-pdf-mineru 0.0.15：索引版本2、阅读协议/游标版本3。安装与Provider配置见[README](../README.md)，实现和安全约束见[ARCHITECTURE](../ARCHITECTURE.md)，历史变化见[CHANGELOG](../CHANGELOG.md)。
 
 ## 1. 推荐工作流
 
@@ -52,7 +52,7 @@
 {"file_path":"paper.pdf","view":"page","pages":7,"expected_sha256":"<此前返回的source_sha256>"}
 ```
 
-`expected_sha256` 可省略；提供时会拒绝已变化的源文件。page模式仅接受 file_path、单页pages及可选expected_sha256，不接受文本选择或呈现参数。原页结果为 `source: "local"`，不调用Provider。
+`expected_sha256` 可省略；提供时会拒绝已变化的源文件。page模式仅接受 file_path、单页pages及可选expected_sha256，不接受文本选择或呈现参数。原页结果为 `source: "local"`，不调用Provider。仅原页响应包含 `renderer: "poppler"` 或 `"pdfjs"`；Native展示同一标识，普通文本不添加该字段。成功自动回退不会先返回一次依赖错误。
 
 ## 2. 图像呈现设置
 
@@ -90,11 +90,11 @@
 - `upstream_version`：真实上游引擎版本；目前未知时为null。official-v4/self-hosted-v2是接口身份，不是OCR引擎版本。
 - `index_version`、`reader_version`：当前索引与阅读协议版本，不冒充上游版本。
 
-`summary.page_count_source` 区分layout/pdfinfo的页数与content-list推算的页数下界。有权威页数时，完全越界报错、部分越界提示；没有时不把尾部未解析页面误判为不存在。按页筛选若会静默丢掉相关的无坐标块，则拒绝该筛选。
+`summary.page_count_source` 区分layout/pdfinfo/pdfjs的页数与content-list推算的页数下界。有权威页数时，完全越界报错、部分越界提示；没有时不把尾部未解析页面误判为不存在。按页筛选若会静默丢掉相关的无坐标块，则拒绝该筛选。
 
 ### 升级规则
 
-0.0.14使用游标v3，旧v1/v2 token明确过期，需要不带cursor重新读取。**解析缓存无需迁移或重新上传。**
+0.0.14起使用游标v3，0.0.15保持游标v3及索引v2；旧v1/v2 token明确过期，需要不带cursor重新读取。**解析缓存无需迁移或重新上传。**
 
 游标是有界、无签名、无服务端会话状态的定位token，不是授权凭证。它绑定结果、文本投影、产物摘要、索引/阅读版本及选择。源文件仍须存在并保持一致。
 
@@ -120,9 +120,15 @@
 
 ### 本地原页依赖
 
-PATH中需要Poppler的 `pdfinfo` 和 `pdftoppm`，还需要支持图像的模型、附件服务及大于0的图像预算。页码、源摘要、临时快照、取消与清理均有保护；最长边保持比例缩放至1600像素，PNG最多8MiB，并发最多2，总运行时间45秒。
+优先运行 PATH 中的 Poppler（pdfinfo、pdftoppm）。仅找不到命令或明确无法执行（ENOENT/EACCES/EPERM/ENOEXEC/ENOSYS）时，自动用正常安装依赖中的 PDF.js 6.3.289 + @napi-rs/canvas 1.0.9 运行原页。无需系统安装 Poppler，但 Canvas 仍需相应平台原生二进制与系统 ABI；支持范围、安装体积及恢复方式见[README](../README.md#本地原页渲染的安装条件)。不新增模型参数或持久设置。
 
-**这不是OS级隔离沙箱。** 不承诺cgroup/rlimit级CPU/内存隔离，也不能隔离Poppler本身的漏洞；不可信PDF应在受限容器或宿主中处理。
+图像模型、附件服务及大于0的图像预算在源文件读取前校验。源身份与可选摘要匹配后，两后端使用同一私有临时快照；不会因回退重新读取变化的原始路径。PDF.js快照另有200MiB硬上限（同时受更小的limits.maxFileBytes约束）；原始页边超过1,000,000 pt会在Canvas分配前拒绝。单页保持纵横比（包含旋转），最长边至多1600像素，PNG最多8MiB，同进程并发最多2；从入队、快照、Poppler能力/实际执行到PDF.js执行共享45秒截止时间。普通文本阅读不探测渲染器；没有永久负缓存，之后安装好Poppler可在下次请求恢复优先使用。
+
+损坏、加密或不支持的PDF、页码越界、摘要/身份不匹配、取消、超时及资源限制均不是自动回退理由。两后端都不可用返回脱敏的 UNSUPPORTED_OPTION，提示安装Poppler或恢复平台依赖，不显示临时路径、内部命令行或原始错误。PDF.js无法处理的文档明确失败，不上传给Provider重试。
+
+PDF.js重型解析与Canvas只在固定Node子进程运行；取消/超时会终止并等待退出，然后清理临时目录并释放同一个并发槽。输出文件增长、读取前后字节数及PNG尺寸、块结构/CRC/IEND统一校验；清理失败不覆盖已经确定的主要错误。字体、CMap、WASM从包内资源本地加载，不使用CDN或PDF内的远程资源，不执行PDF脚本/交互动作。不同引擎可能在字体、抗锯齿、透明度等处有保真差异，不能据此声称像素等价。
+
+**这不是OS级隔离沙箱。** 512MiB V8 old-space与应用层画布检查不是总进程内存硬限制；PDF.js可能缓存同页多个解码图像，Buffer/typed-array backing、字体和WASM/原生内存不计入该V8堆限额。不承诺cgroup/rlimit级CPU/内存隔离，也不能隔离Poppler、PDF.js或原生Canvas的漏洞；不可信PDF应在受限容器或宿主中处理。
 
 ## 6. 导出、错误恢复与后台解析
 
@@ -147,13 +153,22 @@ pnpm run verify:gui
 显式选择的离线真实文档测试：
 
 ```sh
-# 通用原页工具链，禁止网络访问
-pnpm run smoke:reader-local -- /absolute/path/sample.pdf 1
+# 通用原页工具链，禁止网络访问；auto保留PATH，pdfjs使用空PATH触发回退
+pnpm run smoke:reader-local -- /absolute/path/sample.pdf 1 .vitest-cache/page-auto --backend=auto
+pnpm run smoke:reader-local -- /absolute/path/sample.pdf 1 .vitest-cache/page-pdfjs --backend=pdfjs
 
 # rx033论文的专用缓存回放，分别传入self-hosted-v2/vlm和official-v4/pipeline的manifest
 pnpm run smoke:reader-cache -- /absolute/path/rx033.pdf /absolute/path/manifest.json
 ```
 
 缓存回放脚本核对源文件与所有产物的SHA-256、完整参考文献、图表/公式定位、文本保留、诊断范围、图像意图继承及输出schema。它针对已知案例，不接受任意论文替代；测试PDF和缓存需由有权限的开发者提供，不随仓库分发。**已有缓存回放不等于新的OCR质量测试。**
+
+发布前还应检查实际tarball：运行 `pnpm pack --out .vitest-cache/dsh-pdf-mineru.tgz`，在独立临时项目内安装该包的生产依赖和DSH宿主peers（不要让pnpm误选父workspace）。再执行：
+
+```sh
+node scripts/smoke-reader-package.mjs /absolute/installed/node_modules/dsh-pdf-mineru /absolute/path/sample.pdf 1 .vitest-cache/page-package --backend=pdfjs
+```
+
+此脚本检查入口、生产依赖和包资源，并从无关cwd调用完整read_pdf工具链。也可将两个smoke脚本复制到该临时项目，使验收脚本自身仅使用生产安装的宿主包。真实验收应覆盖嵌入中文字体、数学符号、双栏、横版/旋转与透明图形，并实际查看图片；对比引擎的字重、抗锯齿和图像编码差异，不把相同尺寸当作像素等价证明。PDF及验收图片只放忽略目录，不加入发布包。
 
 GUI验收在现有DSH Web shell隔离加载当前client bundle，验证设置、凭据和维护交互，不启动替代服务器、不表示生产后端已热更新。测试产物保存在被忽略的 `.vitest-cache/`。

@@ -44,7 +44,7 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 - Cursor-v3 continuation is cache-only and binds result/selection, exact projection and artifact digests, reader/index versions, offset, and caller inline-image intent. Never start a Provider on a continuation miss. Omitted `inline_images` inherits intent; an explicit boolean overrides it.
 - Keep block diagnostics and formula verification advisories scoped to delivered blocks; document/selection notices appear initially. Preserve parsing provenance separately from reader/index versions, and mark budget-shortened metadata with `metadata_shortened`.
 - Preserve original `document_label`; attachment ordinal (`figure` compatibility field) is not a paper figure number. Default output is 12,000 characters overall, at most 8,000 body characters and 48,000 UTF-8 bytes per JSON/native response. Image count defaults to 6 but is configurable from 0–100, with separate byte limits.
-- Original-page view verifies an optional source SHA-256 against a temporary streaming snapshot before rendering. Poppler time/concurrency/dimension/output limits are not an OS sandbox or a hard process-memory limit; deployment isolation remains necessary for hostile PDFs.
+- Original-page view verifies an optional source SHA-256 against a temporary streaming snapshot before rendering. Poppler-first/PDF.js-fallback share one snapshot, deadline and semaphore slot. Renderer time/concurrency/dimension/output limits are not an OS sandbox or a hard process-memory limit; deployment isolation remains necessary for hostile PDFs.
 
 ## Security invariants
 
@@ -70,12 +70,15 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 - `src/storage/*`: validated paths, process lock, ResultRepository, staging sink, and privileged maintenance service.
 - `src/service/mineru-service.ts`: direct-result use-case orchestration and same-process operation coalescing.
 - `src/service/document-index.ts`, `read-delivery.ts`: stable pre-selection block identity, faithful known-span normalization, bounded model projection and cursor-v3 delivery with inherited image intent and delivered-block diagnostics.
-- `src/service/page-renderer.ts`: local original-page verification via bounded Poppler subprocesses and temporary streaming snapshots; never calls a Provider or retains sources.
+- `src/service/page-renderer.ts`: local original-page verification via Poppler-first/PDF.js-fallback subprocesses and temporary streaming snapshots; owns the shared deadline, semaphore and cleanup, never calls a Provider or retains sources.
+- `src/service/pdfjs-backend.ts`, `pdfjs-worker.mjs`: fixed Node subprocess protocol, package-local resources and bounded Canvas rendering. Do not import heavy PDF/native dependencies into the host bundle or execute PDF scripting/network actions.
 - `src/tools.ts`: two defineTool schemas (`read_pdf` and `async_parse_pdf`), native DSH job adaptation, and pure renderers.
 - `src/rpc.ts`, `src/loopback-rpc.ts`, `src/client/*`: loopback config/maintenance RPC, caller-local guarded native transport registration, and Provider-aware settings page.
 - `src/observability.ts`: typed, non-throwing structured diagnostic events.
 - `scripts/smoke-reader-cache.mjs`: explicit offline replay of the known rx033 review PDF and existing cached manifest through the built reader/tool chain; rejects network fetches, not a fresh extraction or generic arbitrary-PDF smoke.
-- `scripts/smoke-reader-local.mjs`: explicit local original-page smoke with Poppler and no upload.
+- `scripts/smoke-reader-local.mjs`: explicit full-tool-chain local page smoke, automatic backend or forced missing-Poppler path, no upload.
+- `scripts/copy-page-worker.mjs`: copies the unbundled ESM worker to lib after build; package.files must retain it. PDF.js resources remain in the production dependency package.
+- `scripts/smoke-reader-package.mjs`: checks an installed pack artifact from an unrelated cwd with an empty PATH.
 - `scripts/smoke-official-v4.mjs`: explicit live smoke through the built plugin tool chain.
 - `scripts/verify-current-gui.mjs`: isolated current-bundle verification in the existing DSH Web shell.
 
@@ -93,8 +96,9 @@ pnpm run build
 git diff --check
 pnpm run verify:gui
 
-# Explicit local-only real-PDF smoke (requires Poppler; no upload).
-pnpm run smoke:reader-local -- /absolute/path/sample.pdf 1
+# Explicit local-only real-PDF smoke; no upload, pdfjs mode empties PATH only for this smoke.
+pnpm run smoke:reader-local -- /absolute/path/sample.pdf 1 --backend=auto
+pnpm run smoke:reader-local -- /absolute/path/sample.pdf 1 .vitest-cache/pdfjs --backend=pdfjs
 
 # Explicit offline known-fixture cache replay (requires a current build and matching cached artifacts).
 # Optional third argument: output-directory for local evidence, not committed reports.
@@ -104,7 +108,7 @@ pnpm run smoke:reader-cache -- /absolute/path/rx033.pdf /absolute/path/manifest.
 MINERU_API_KEY=<token> pnpm run smoke:official-v4 -- /absolute/path/sample.pdf
 ```
 
-Tests must remain mock/fixture based by default and cover failure, cancellation, retry exhaustion, Retry-After, unsafe POST non-retry, security, concurrency, persistence, maintenance fail-closed behavior, confirmations, and render/output limits. All ESM relative imports include `.js`. Every object in a tool schema declares `additionalProperties`.
+Tests must remain mock/fixture based by default and cover failure, cancellation, retry exhaustion, Retry-After, unsafe POST non-retry, security, concurrency, persistence, maintenance fail-closed behavior, confirmations, and render/output limits. TypeScript ESM relative imports include `.js`; the standalone renderer entry is explicitly `.mjs`. Rebuild after worker edits: the host watch command alone does not copy the standalone worker. Every object in a tool schema declares `additionalProperties`.
 
 ## Documentation maintenance
 

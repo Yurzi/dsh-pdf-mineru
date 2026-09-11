@@ -35,7 +35,7 @@ export interface DocumentHeading {
 
 export interface DocumentSummary {
   readonly page_count?: number
-  readonly page_count_source?: 'layout' | 'content-list-lower-bound' | 'pdfinfo'
+  readonly page_count_source?: 'layout' | 'content-list-lower-bound' | 'pdfinfo' | 'pdfjs'
   readonly table_count?: number
   readonly image_count?: number
   readonly equation_count?: number
@@ -121,6 +121,8 @@ export interface ResultView {
   readonly metadata_shortened?: readonly ShortenedMetadata[]
   readonly source_sha256?: string
   readonly view?: 'content' | 'page'
+  /** Present only for local original-page rendering. */
+  readonly renderer?: 'poppler' | 'pdfjs'
   readonly continuation_block?: { readonly block_id: string; readonly page?: number; readonly document_label?: string }
   readonly visuals?: { readonly listed: number; readonly attached: number; readonly omitted: number; readonly scope: 'chunk' }
 }
@@ -625,7 +627,7 @@ export function formatResultProse(value: ResultView): string {
   if (value.diagnostics?.length) lines.push('', 'Diagnostics:', ...value.diagnostics.map(d => `- [${d.code}] (${d.scope})${d.block_id ? ' [' + d.block_id + ']' : ''}${d.page === undefined ? '' : ' Page ' + d.page}: ${d.message}`))
   if (value.verification_hints?.length) lines.push('', 'Formula verification suggested (advisory, not a detected error):', ...value.verification_hints.map(hint => `- [${hint.block_id}]${hint.page === undefined ? '' : ' Page ' + hint.page}: inspect the original page before relying on formula symbols.`))
   if (value.metadata_shortened?.length) lines.push('', 'Metadata shortened to fit: ' + value.metadata_shortened.join(', ') + '. Narrow the selection to inspect omitted details.')
-  if (value.view === 'page') lines.push('', 'Original PDF page rendered locally; no Provider parsing was performed.')
+  if (value.view === 'page') lines.push('', 'Original PDF page rendered locally' + (value.renderer ? ' (' + value.renderer + ')' : '') + '; no Provider parsing was performed.')
   if (value.visuals) lines.push('', `Visuals in this chunk: ${value.visuals.attached}/${value.visuals.listed} attached, ${value.visuals.omitted} not attached.`)
   if (value.continuation_block) lines.push('', 'Continuing block [' + value.continuation_block.block_id + ']' + (value.continuation_block.page ? ' (Page ' + value.continuation_block.page + ')' : ''))
   lines.push(footer)

@@ -54,6 +54,16 @@ dsh plugin --profile web add dsh-pdf-mineru
 
 > 本地开发或测试源码时，可使用：`dsh plugin --profile web add link:/absolute/path/to/dsh-pdf-mineru`
 
+### 本地原页渲染的安装条件
+
+正常安装插件会安装固定版本的 [pdfjs-dist 6.3.289](https://www.npmjs.com/package/pdfjs-dist/v/6.3.289)（Apache-2.0）和 [@napi-rs/canvas 1.0.9](https://www.npmjs.com/package/@napi-rs/canvas/v/1.0.9)（MIT）。在支持的平台且未禁用平台可选依赖时，**无需系统安装 Poppler 即可使用原有原页接口**；字体、CMap、WASM 都从安装包本地加载，无 CDN。
+
+这并非“纯 JavaScript、无原生依赖”：Canvas 使用预编译 Skia/N-API 平台二进制，包管理器通过 optionalDependencies 选择平台包，无安装期编译脚本。上游提供 Linux x64/arm64（glibc、musl）、Linux armv7（glibc）、Linux riscv64（glibc）、macOS x64/arm64、Windows x64/arm64 和 Android arm64 包；仍要求匹配的系统 ABI/运行库和本插件 Node 版本；Canvas上游文档要求glibc ≥2.18、Linux arm64为Cortex-A57或更新、armv7为Cortex-A7或更新，Node自身的系统要求仍须同时满足。实际验收平台为 Linux x64 glibc（Node 22.19.0 与26.8.2的独立生产安装包），其它平台有上游二进制不等于本仓库逐一验收。不要使用会删掉平台包的 --no-optional 安装选项。两后端均不可用时会提示安装 Poppler，或在支持平台重新安装插件及其平台可选依赖；不会使普通文本阅读失效。
+
+PDF.js 包解压约34.8 MB，Canvas JS 约0.13 MB，Linux x64 glibc 二进制约34.8 MB（十进制，其他平台不同），这是安装依赖体积，不是插件 tarball 体积。PDF.js 的 Node 要求覆盖本插件现有 Node.js `^22.19.0 || >=24.0.0` 范围。
+
+只对依赖/执行环境不可用自动切换：损坏、加密、解析失败、页码越界、源摘要不匹配、取消、资源超限或超时不会通过换后端重试。后端间可能存在字体、抗锯齿、透明度和裁切保真差异，不承诺像素相同；详见[阅读指南](docs/model-reading.md)。
+
 ### 2. 配置与连接
 
 打开 DSH 界面中的 **Settings → Plugins → MinerU**，根据您的使用场景选择 Provider：
@@ -117,8 +127,8 @@ Agent 会自动根据文档长度和指令意图，智能选择同步返回或�
 
 - 默认响应预算12,000个UTF-16单元、正文每块最多8,000；JSON和Native文本各最多48,000字节。默认不重复返回缓存路径；导出用focus: artifacts。
 - `inline_images` 首次省略默认true，续读省略继承，显式布尔值覆盖；模型能力和图像预算始终构成上限。
-- **0.0.14使用v3游标，旧v1/v2游标需重新开始；解析缓存无需迁移。** 续读不会在缓存丢失时偷偷重新上传。
-- 原页模式需要Poppler（pdfinfo/pdftoppm）、图像模型、附件服务及大于0的图像预算。它是本地有界执行，不是OS级隔离沙箱。
+- **0.0.14起使用v3游标，0.0.15保持该协议及索引v2；旧v1/v2游标需重新开始，解析缓存无需迁移。** 续读不会在缓存丢失时偷偷重新上传。
+- 原页模式优先使用 PATH 中的 Poppler（pdfinfo/pdftoppm），命令缺失或明确不可执行时自动回退到 PDF.js + Node Canvas 子进程；仍需图像模型、附件服务及大于0的图像预算。结果以 `renderer: "poppler" | "pdfjs"` 标明后端，不会上传PDF或要求模型重新调用。它是本地有界执行，不是OS级隔离沙箱。
 
 字段语义、完整示例、来源/索引版本、预算、安全边界、错误恢复和离线验收见 **[PDF阅读指南](docs/model-reading.md)**。更新插件后需要让宿主重新加载工具定义；只构建源码或刷新Web页面不等于后端已重载。
 
@@ -305,8 +315,9 @@ pnpm run build
 # 4. 在运行中的 DSH Web 中验证前端设置组件
 pnpm run verify:gui
 
-# 5. （可选）本地原页验证，无上传，需要Poppler
-pnpm run smoke:reader-local -- /path/to/sample.pdf 1
+# 5. （可选）本地原页验证，无上传；第二条用空PATH验证PDF.js自动回退
+pnpm run smoke:reader-local -- /path/to/sample.pdf 1 --backend=auto
+pnpm run smoke:reader-local -- /path/to/sample.pdf 1 .vitest-cache/pdfjs --backend=pdfjs
 
 # 6. （显式选择）使用真实 Token 运行在线解析，会上传文档
 MINERU_API_KEY=<token> pnpm run smoke:official-v4 -- /path/to/sample.pdf

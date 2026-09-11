@@ -24,7 +24,7 @@ export interface DocumentHeading {
 }
 export interface DocumentSummary {
     readonly page_count?: number;
-    readonly page_count_source?: 'layout' | 'content-list-lower-bound' | 'pdfinfo';
+    readonly page_count_source?: 'layout' | 'content-list-lower-bound' | 'pdfinfo' | 'pdfjs';
     readonly table_count?: number;
     readonly image_count?: number;
     readonly equation_count?: number;
@@ -103,6 +103,8 @@ export interface ResultView {
     readonly metadata_shortened?: readonly ShortenedMetadata[];
     readonly source_sha256?: string;
     readonly view?: 'content' | 'page';
+    /** Present only for local original-page rendering. */
+    readonly renderer?: 'poppler' | 'pdfjs';
     readonly continuation_block?: {
         readonly block_id: string;
         readonly page?: number;

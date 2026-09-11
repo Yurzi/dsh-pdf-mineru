@@ -7,10 +7,12 @@ import { basename, extname, join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { crc32 } from 'node:zlib'
 import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { MinerUError, failure } from '../domain/errors.js'
 import { emitDiagnostic } from '../observability.js'
+import { buildPdfjsArgs } from './pdfjs-backend.js'
 import type { MinerUDiagnosticSink } from '../observability.js'
 
 /** Aspect-preserving Poppler target: the longer page edge is capped at 1600 pixels. */
@@ -40,6 +42,7 @@ export interface RenderPdfPageInput {
 }
 
 export interface RenderedPdfPage {
+  readonly renderer: 'poppler' | 'pdfjs'
   readonly name: string
   readonly page: number
   readonly page_count: number
@@ -52,7 +55,7 @@ export interface RenderedPdfPage {
 }
 
 export interface PdfPageProcessRequest {
-  readonly command: 'pdfinfo' | 'pdftoppm'
+  readonly command: 'pdfinfo' | 'pdftoppm' | 'pdfjs'
   readonly args: readonly string[]
   readonly cwd: string
   readonly signal: AbortSignal
@@ -82,7 +85,7 @@ export interface PdfPageRendererDependencies {
   readonly diagnostics?: MinerUDiagnosticSink
 }
 
-type ProcessFailureKind = 'spawn' | 'timeout' | 'output-limit'
+type ProcessFailureKind = 'timeout' | 'output-limit' | 'output-io'
 
 class ProcessFailure extends Error {
   constructor(readonly kind: ProcessFailureKind, message: string, options?: ErrorOptions) {
@@ -152,12 +155,12 @@ function killChild(child: ChildProcess): void {
   }
 }
 
-/** Spawn one fixed local Poppler command without a shell and resolve only after it closes. */
+/** Spawn a fixed local renderer command without a shell; settle only after child close/reaping. */
 export const runPdfPageProcess: PdfPageProcessRunner = request => new Promise((resolvePromise, rejectPromise) => {
   request.signal.throwIfAborted()
   let child: ChildProcess
   try {
-    child = spawn(request.command, [...request.args], {
+    child = spawn(request.command === 'pdfjs' ? process.execPath : request.command, [...request.args], {
       cwd: request.cwd,
       env: { PATH: process.env.PATH ?? '', LANG: 'C', LC_ALL: 'C' },
       shell: false,
@@ -216,7 +219,7 @@ export const runPdfPageProcess: PdfPageProcessRunner = request => new Promise((r
         failAndKill(new ProcessFailure('output-limit', 'Rendered PNG exceeded its byte limit'))
       }
     }, error => {
-      if (errorCode(error) !== 'ENOENT') failAndKill(error)
+      if (errorCode(error) !== 'ENOENT') failAndKill(new ProcessFailure('output-io', 'Failed to inspect rendered output', { cause: error }))
     }).finally(() => { watching = false })
   }, 25)
   outputWatch?.unref()
@@ -375,13 +378,10 @@ async function invokeProcess(runProcess: PdfPageProcessRunner, request: PdfPageP
   try {
     return boundedProcessResult(await runProcess(request), request)
   } catch (error) {
-    if (error instanceof MinerUError) throw error
     if (request.signal.aborted) throw request.signal.reason
-    if (errorCode(error) === 'ENOENT') {
-      throw new MinerUError(failure(
-        'UNSUPPORTED_OPTION',
-        'Local PDF page rendering requires the ' + request.command + ' Poppler executable',
-      ), { cause: error })
+    if (error instanceof MinerUError) throw error
+    if (['ENOENT', 'EACCES', 'EPERM', 'ENOEXEC', 'ENOSYS'].includes(errorCode(error) ?? '')) {
+      throw new RendererUnavailable()
     }
     if (error instanceof ProcessFailure && error.kind === 'output-limit') {
       throw new MinerUError(failure('RESULT_TOO_LARGE', request.command + ' output exceeded its byte limit'), { cause: error })
@@ -391,6 +391,29 @@ async function invokeProcess(runProcess: PdfPageProcessRunner, request: PdfPageP
     }
     throw new MinerUError(failure('PROVIDER_UNAVAILABLE', 'Failed to execute local ' + request.command, true), { cause: error })
   }
+}
+
+/** Only dependency/execution-environment failures qualify for backend selection. */
+class RendererUnavailable extends Error {}
+
+function unavailableRenderers(): MinerUError {
+  return new MinerUError(failure('UNSUPPORTED_OPTION',
+    'Local PDF page rendering is unavailable: install Poppler (pdfinfo and pdftoppm) or reinstall the plugin with PDF.js and @napi-rs/canvas platform optional dependencies enabled on a supported Node/platform combination.'))
+}
+
+function parsePdfjsPageCount(result: PdfPageProcessResult): number {
+  if (result.signal !== null) throw new MinerUError(failure('PROVIDER_UNAVAILABLE', 'PDF.js page renderer exited unexpectedly', true))
+  if (result.exitCode === 20) throw unavailableRenderers()
+  if (result.exitCode === 22) throw new MinerUError(failure('RESULT_TOO_LARGE', 'PDF.js page rendering exceeded a resource limit'))
+  if (result.exitCode === 21) throw invalid('PDF.js could not inspect or render the requested PDF page (invalid, encrypted, unsupported PDF, or page out of range)')
+  if (result.exitCode !== 0) throw new MinerUError(failure('PROVIDER_UNAVAILABLE', 'PDF.js page renderer exited unexpectedly', true))
+  let parsed: unknown
+  try { parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(result.stdout)) } catch { throw invalid('PDF.js returned invalid page metadata') }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed) || Object.keys(parsed).length !== 1 || !('page_count' in parsed)
+    || !Number.isSafeInteger(parsed.page_count) || typeof parsed.page_count !== 'number' || parsed.page_count < 1 || parsed.page_count > MAX_PAGE_COUNT) {
+    throw invalid('PDF.js returned invalid page metadata')
+  }
+  return parsed.page_count
 }
 
 function parsePageCount(stdout: Uint8Array): number {
@@ -445,14 +468,38 @@ function pngDimensions(data: Uint8Array): { width: number; height: number } {
   const bytes = Buffer.from(data.buffer, data.byteOffset, data.byteLength)
   if (bytes.byteLength < 24 || !bytes.subarray(0, 8).equals(PNG_SIGNATURE)
     || bytes.readUInt32BE(8) !== 13 || bytes.toString('ascii', 12, 16) !== 'IHDR') {
-    throw invalid('pdftoppm returned an invalid PNG')
+    throw invalid('Page renderer returned an invalid PNG')
   }
   const width = bytes.readUInt32BE(16)
   const height = bytes.readUInt32BE(20)
   if (width < 1 || height < 1 || width > MAX_PDF_PAGE_WIDTH || height > MAX_PDF_PAGE_HEIGHT
-    || width * height > MAX_PDF_PAGE_PIXELS) {
+    || Math.max(width, height) > PDF_PAGE_MAX_LONG_EDGE || width * height > MAX_PDF_PAGE_PIXELS) {
     throw new MinerUError(failure('RESULT_TOO_LARGE', 'Rendered PNG dimensions exceed the page-rendering limit'))
   }
+  // Validate the complete bounded PNG container, not just a plausible IHDR.
+  // Attachment delivery still performs its normal image decoding/normalization.
+  let offset = 8
+  let imageData = false
+  let ended = false
+  let chunks = 0
+  while (offset < bytes.length) {
+    if (++chunks > 65_536 || bytes.length - offset < 12) throw invalid('Page renderer returned a malformed PNG')
+    const length = bytes.readUInt32BE(offset)
+    if (length > bytes.length - offset - 12) throw invalid('Page renderer returned a truncated PNG')
+    const type = bytes.toString('ascii', offset + 4, offset + 8)
+    if (!/^[A-Za-z]{4}$/.test(type) || (offset !== 8 && type === 'IHDR')) throw invalid('Page renderer returned a malformed PNG')
+    if (crc32(bytes.subarray(offset + 4, offset + 8 + length)) !== bytes.readUInt32BE(offset + 8 + length)) {
+      throw invalid('Page renderer returned a PNG with an invalid checksum')
+    }
+    if (type === 'IDAT') imageData ||= length > 0
+    offset += length + 12
+    if (type === 'IEND') {
+      if (length !== 0 || !imageData || offset !== bytes.length) throw invalid('Page renderer returned a malformed PNG')
+      ended = true
+      break
+    }
+  }
+  if (!ended) throw invalid('Page renderer returned an incomplete PNG')
   return { width, height }
 }
 
@@ -495,6 +542,7 @@ export function createPdfPageRenderer(dependencies: PdfPageRendererDependencies 
       throw new MinerUError(failure('UNSUPPORTED_OPTION', 'Original-page rendering supports PDF files only'))
     }
 
+    const expiresAt = performance.now() + runtimeMs
     let timedOut = false
     const operation = new AbortController()
     const onAbort = (): void => operation.abort(new DOMException('PDF page rendering was cancelled', 'AbortError'))
@@ -506,6 +554,16 @@ export function createPdfPageRenderer(dependencies: PdfPageRendererDependencies 
       operation.abort(new DOMException('PDF page rendering timed out', 'TimeoutError'))
     }, runtimeMs)
     deadline.unref()
+    const remainingMs = (cap = runtimeMs): number => {
+      operation.signal.throwIfAborted()
+      const remaining = Math.ceil(expiresAt - performance.now())
+      if (remaining <= 0) {
+        timedOut = true
+        operation.abort(new DOMException('PDF page rendering timed out', 'TimeoutError'))
+        operation.signal.throwIfAborted()
+      }
+      return Math.min(cap, remaining)
+    }
 
     let release: (() => void) | undefined
     let temporaryDirectory: string | undefined
@@ -526,49 +584,68 @@ export function createPdfPageRenderer(dependencies: PdfPageRendererDependencies 
         throw invalid('PDF source hash does not match expectedSha256: ' + sourceName)
       }
 
-      const infoRequest: PdfPageProcessRequest = {
-        command: 'pdfinfo',
-        args: ['-enc', 'UTF-8', snapshotPath],
-        cwd: temporaryDirectory,
-        signal: operation.signal,
-        timeoutMs: Math.min(10_000, runtimeMs),
-        maxStdoutBytes: MAX_PDFINFO_STDOUT_BYTES,
-        maxStderrBytes: MAX_PROCESS_STDERR_BYTES,
+      // Executing the real operation is also the capability probe: no text-read probes,
+      // duplicate probe processes, stale negative cache, or retry of document failures.
+      let renderer: 'poppler' | 'pdfjs' = 'poppler'
+      let pageCount: number
+      try {
+        const info = await invokeProcess(runProcess, {
+          command: 'pdfinfo', args: ['-enc', 'UTF-8', snapshotPath],
+          cwd: temporaryDirectory, signal: operation.signal,
+          timeoutMs: remainingMs(10_000), maxStdoutBytes: MAX_PDFINFO_STDOUT_BYTES,
+          maxStderrBytes: MAX_PROCESS_STDERR_BYTES,
+        })
+        remainingMs()
+        if (info.signal !== null || info.exitCode === 2) throw new MinerUError(failure('PROVIDER_UNAVAILABLE', 'pdfinfo exited unexpectedly or encountered local output I/O failure', true))
+        if (info.exitCode !== 0) throw invalid('pdfinfo could not inspect the PDF')
+        pageCount = parsePageCount(info.stdout)
+        if (input.page > pageCount) {
+          throw invalid('PDF page ' + String(input.page) + ' is outside the physical page range 1-' + String(pageCount))
+        }
+        const rendered = await invokeProcess(runProcess, {
+          command: 'pdftoppm',
+          args: ['-f', String(input.page), '-l', String(input.page), '-singlefile', '-png',
+            '-scale-to', String(PDF_PAGE_MAX_LONG_EDGE), snapshotPath, outputPrefix],
+          cwd: temporaryDirectory, signal: operation.signal, timeoutMs: remainingMs(30_000),
+          maxStdoutBytes: MAX_RENDER_STDOUT_BYTES, maxStderrBytes: MAX_PROCESS_STDERR_BYTES,
+          watchedOutput: { path: outputPath, maxBytes: MAX_RENDERED_PNG_BYTES },
+        })
+        remainingMs()
+        if (rendered.signal !== null || rendered.exitCode === 2) throw new MinerUError(failure('PROVIDER_UNAVAILABLE', 'pdftoppm exited unexpectedly or encountered local output I/O failure', true))
+        if (rendered.exitCode !== 0) throw invalid('pdftoppm could not render the requested PDF page')
+      } catch (error) {
+        remainingMs() // Cancellation/deadline wins over dependency unavailability.
+        if (!(error instanceof RendererUnavailable)) throw error
+        renderer = 'pdfjs'
+        let rendered: PdfPageProcessResult
+        try {
+          rendered = await invokeProcess(runProcess, {
+            command: 'pdfjs', args: buildPdfjsArgs(snapshotPath, outputPath, input.page, input.maxFileBytes),
+            cwd: temporaryDirectory, signal: operation.signal, timeoutMs: remainingMs(),
+            maxStdoutBytes: MAX_RENDER_STDOUT_BYTES, maxStderrBytes: MAX_PROCESS_STDERR_BYTES,
+            watchedOutput: { path: outputPath, maxBytes: MAX_RENDERED_PNG_BYTES },
+          })
+        } catch (fallbackError) {
+          remainingMs()
+          if (fallbackError instanceof RendererUnavailable) throw unavailableRenderers()
+          throw fallbackError
+        }
+        remainingMs()
+        pageCount = parsePdfjsPageCount(rendered)
+        if (input.page > pageCount) throw invalid('PDF page is outside the physical page range')
       }
-      const info = await invokeProcess(runProcess, infoRequest)
-      if (info.exitCode !== 0) throw invalid('pdfinfo could not inspect the PDF')
-      const pageCount = parsePageCount(info.stdout)
-      if (input.page > pageCount) {
-        throw invalid('PDF page ' + String(input.page) + ' is outside the physical page range 1-' + String(pageCount))
-      }
-
-      const renderRequest: PdfPageProcessRequest = {
-        command: 'pdftoppm',
-        args: [
-          '-f', String(input.page), '-l', String(input.page), '-singlefile', '-png',
-          '-scale-to', String(PDF_PAGE_MAX_LONG_EDGE),
-          snapshotPath, outputPrefix,
-        ],
-        cwd: temporaryDirectory,
-        signal: operation.signal,
-        timeoutMs: Math.min(30_000, runtimeMs),
-        maxStdoutBytes: MAX_RENDER_STDOUT_BYTES,
-        maxStderrBytes: MAX_PROCESS_STDERR_BYTES,
-        watchedOutput: { path: outputPath, maxBytes: MAX_RENDERED_PNG_BYTES },
-      }
-      const rendered = await invokeProcess(runProcess, renderRequest)
-      if (rendered.exitCode !== 0) throw invalid('pdftoppm could not render the requested PDF page')
       operation.signal.throwIfAborted()
       let data: Uint8Array
       try {
         data = await readBoundedFile(outputPath, MAX_RENDERED_PNG_BYTES)
       } catch (error) {
-        if (errorCode(error) === 'ENOENT') throw invalid('pdftoppm did not produce the requested PNG', error)
+        if (errorCode(error) === 'ENOENT') throw invalid('Page renderer did not produce the requested PNG', error)
         throw error
       }
       const dimensions = pngDimensions(data)
-      operation.signal.throwIfAborted()
+      remainingMs()
       outcome = {
+        renderer,
         name: outputName(sourceName, input.page),
         page: input.page,
         page_count: pageCount,
@@ -595,6 +672,9 @@ export function createPdfPageRenderer(dependencies: PdfPageRendererDependencies 
       }
     }
     if (primaryFailure !== undefined) throw primaryFailure
+    // Cleanup/reaping can outlive the render itself; never turn a cancellation or
+    // expired request into success (or replace it with a cleanup-only failure).
+    try { remainingMs() } catch (error) { throw normalizeFailure(error, timedOut) }
     if (cleanupFailed) {
       throw new MinerUError(failure(
         'PROVIDER_UNAVAILABLE', 'Failed to remove temporary PDF page-rendering data', true,

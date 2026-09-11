@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.0.15
+
+### Added
+
+- Added a local PDF.js 6.3.289 + @napi-rs/canvas 1.0.9 subprocess fallback for original-page rendering. Normal installation includes renderer dependencies and package-local font/CMap/WASM resources; no system Poppler installation is required on supported native platforms.
+- Added explicit original-page renderer identity to result types, strict tool output schemas, Native text and presentation metadata; physical page-count provenance distinguishes pdfinfo from pdfjs.
+- Added deterministic backend-selection regressions, isolated PDF.js worker tests, full-tool offline auto/fallback smoke modes and an installed-package smoke from an unrelated working directory.
+
+### Changed
+
+- Keep Poppler preferred; fall back only when an executable is missing or explicitly unavailable in the execution environment, never for PDF failures, page/hash validation, cancellation, timeout or resource limits.
+- Both backends share one checked snapshot, concurrency slot and total deadline. PDF.js parsing and Canvas allocation run only in a fixed child process with bounded output and local package resources; cancellation waits for process reaping before cleanup.
+- Ship the unbundled PDF.js subprocess entry explicitly and keep native/PDF runtime dependencies external to host/client bundles. Document native-platform installation conditions, resource controls and fidelity differences without claiming OS sandbox isolation or pixel equivalence.
+
+### Fixed
+
+- Preserve cancellation and the shared deadline when temporary cleanup completes late; cleanup failures cannot replace an already determined primary error.
+- Distinguish Poppler output I/O failures and abnormal process termination from invalid PDFs without retrying another backend.
+- Reject truncated/corrupt PNG containers with bounded chunk, checksum and end-marker validation before attachment delivery.
+
+Reader cursor v3, index v2, Provider contracts and parsed cache formats remain unchanged.
+
 ## 0.0.14
 
 This release includes the bounded-reader work recorded under 0.0.13; the previous published release is 0.0.12.

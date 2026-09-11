@@ -17,6 +17,7 @@ export interface RenderPdfPageInput {
     readonly expectedSha256?: string;
 }
 export interface RenderedPdfPage {
+    readonly renderer: 'poppler' | 'pdfjs';
     readonly name: string;
     readonly page: number;
     readonly page_count: number;
@@ -28,7 +29,7 @@ export interface RenderedPdfPage {
     readonly height?: number;
 }
 export interface PdfPageProcessRequest {
-    readonly command: 'pdfinfo' | 'pdftoppm';
+    readonly command: 'pdfinfo' | 'pdftoppm' | 'pdfjs';
     readonly args: readonly string[];
     readonly cwd: string;
     readonly signal: AbortSignal;
@@ -57,7 +58,7 @@ export interface PdfPageRendererDependencies {
     readonly removeTemporaryDirectory?: (path: string) => Promise<void>;
     readonly diagnostics?: MinerUDiagnosticSink;
 }
-/** Spawn one fixed local Poppler command without a shell and resolve only after it closes. */
+/** Spawn a fixed local renderer command without a shell; settle only after child close/reaping. */
 export declare const runPdfPageProcess: PdfPageProcessRunner;
 export declare function createPdfPageRenderer(dependencies?: PdfPageRendererDependencies): (input: RenderPdfPageInput) => Promise<RenderedPdfPage>;
 export declare const renderPdfPage: (input: RenderPdfPageInput) => Promise<RenderedPdfPage>;
