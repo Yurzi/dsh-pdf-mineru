@@ -66,6 +66,10 @@ export interface PreparedParseRequest {
 export interface ReadCursorInput {
   /** Opaque continuation token from a previous partial read. */
   readonly cursor?: string
+  /** Exact stable block identifier returned by read_pdf. */
+  readonly block_id?: string
+  /** Case-insensitive literal search within the selected document blocks. */
+  readonly query?: string
 }
 
 export interface ParseRequestInput extends ReadCursorInput {

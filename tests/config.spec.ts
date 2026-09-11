@@ -22,7 +22,7 @@ describe('MinerU config parsing and validation', () => {
     })
     expect(config.defaults).toMatchObject({ model: 'pipeline', parseMethod: 'auto', ocr: false })
     expect(config.retry).toEqual({ maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 10000 })
-    expect(config.output).toEqual({ maxInlineChars: 200000, maxInlineImages: 6 })
+    expect(config.output).toEqual({ maxInlineChars: 12000, maxInlineImages: 6 })
     expect(config.storage.storageRoot).toMatch(/[\\/]cache[\\/]pdf-mineru$/)
     expect(config.storage.retainSources).toBe(false)
   })

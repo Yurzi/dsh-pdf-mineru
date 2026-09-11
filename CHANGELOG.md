@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.0.13
+
+### Added
+
+- Added stable result-bound block IDs, original figure/table labels, literal document search (`query`), and exact block reading (`block_id`).
+- Added local original-page verification (`view: "page"`) using bounded Poppler processes, private streaming snapshots, source SHA-256 checks, cancellation, and cleanup, without Provider upload.
+- Added nested MinerU span normalization preserving inline mathematics, value-free bounded fidelity diagnostics, and explicit per-chunk visual coverage.
+- Added an opt-in offline built-plugin smoke test (`smoke:reader-local`) and model-workflow regression fixtures.
+
+### Changed
+
+- Default read response budget is now 12,000 UTF-16 units; body chunks are capped at 8,000 units, with an additional 48,000-byte JSON/prose ceiling. Explicit larger response configurations no longer expand individual body chunks.
+- Default reading omits exported cache paths and duplicate TOC metadata. Use `focus: "artifacts"` for exports and `focus: "toc"` for a complete resumable outline.
+- **Reading cursor v2:** projection changes invalidate v1 cursors explicitly; restart without a cursor. Continuations are cache-only and bind selected text plus manifest artifact identity; cache eviction never silently triggers a new upload. Parsed cache manifests and Provider cache semantics are unchanged.
+- Distinguished authoritative page metadata from a content-list lower bound and rejected page filtering that would silently discard unlocated evidence.
+- Clarified that text completion does not guarantee OCR fidelity or image attachment coverage.
+
+### Fixed
+
+- Stopped renumbering original figure labels after page selection, and stopped replaying preceding indexed figures on text continuation.
+- Kept complete outlines available instead of silently truncating Markdown fallback headings.
+- Prevented the native renderer from preserving a misleading complete footer after emergency output truncation.
+
 ## 0.0.12
 
 ### Added

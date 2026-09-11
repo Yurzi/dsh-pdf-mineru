@@ -19,7 +19,7 @@ import {
 
 const REQUEST_FIELDS = new Set([
   'file_path', 'pages', 'focus', 'model', 'ocr', 'language', 'formula', 'table', 'artifacts',
-  'inline_images', 'poll_timeout_ms', 'cursor',
+  'inline_images', 'poll_timeout_ms', 'cursor', 'block_id', 'query',
 ])
 
 const SUPPORTED_EXTENSIONS = new Set([

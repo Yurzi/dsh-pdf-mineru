@@ -59,6 +59,8 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 - `src/providers/safe-zip.ts`: bounded ZIP scanner/extractor.
 - `src/storage/*`: validated paths, process lock, ResultRepository, staging sink, and privileged maintenance service.
 - `src/service/mineru-service.ts`: direct-result use-case orchestration and same-process operation coalescing.
+- `src/service/document-index.ts`, `read-delivery.ts`: stable pre-selection block identity, faithful known-span normalization, bounded model projection and cursor-v2 delivery.
+- `src/service/page-renderer.ts`: local original-page verification via bounded Poppler subprocesses and temporary streaming snapshots; never calls a Provider or retains sources.
 - `src/tools.ts`: two defineTool schemas (`read_pdf` and `async_parse_pdf`), native DSH job adaptation, and pure renderers.
 - `src/rpc.ts`, `src/loopback-rpc.ts`, `src/client/*`: loopback config/maintenance RPC, caller-local guarded native transport registration, and Provider-aware settings page.
 - `src/observability.ts`: typed, non-throwing structured diagnostic events.
@@ -78,6 +80,9 @@ pnpm test
 pnpm run build
 git diff --check
 pnpm run verify:gui
+
+# Explicit local-only real-PDF smoke (requires Poppler; no upload).
+pnpm run smoke:reader-local -- /absolute/path/sample.pdf 1
 
 # Explicit live test only; never run by default.
 MINERU_API_KEY=<token> pnpm run smoke:official-v4 -- /absolute/path/sample.pdf

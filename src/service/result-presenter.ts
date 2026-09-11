@@ -1,4 +1,5 @@
 import { open } from 'node:fs/promises'
+import { constants } from 'node:fs'
 import { basename, extname } from 'node:path'
 import { TextDecoder } from 'node:util'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
@@ -6,7 +7,7 @@ import { MinerUError, failure } from '../domain/errors.js'
 import type { MinerUFailure } from '../domain/errors.js'
 import type { FocusKind } from '../domain/request.js'
 
-export type SubmissionSource = 'cache' | 'shared-operation' | 'provider'
+export type SubmissionSource = 'cache' | 'shared-operation' | 'provider' | 'local'
 
 export type ContentStatus = 'complete' | 'partial' | 'not_requested'
 
@@ -26,6 +27,7 @@ export interface ResultFileView {
 
 export interface DocumentHeading {
   readonly level: number
+  readonly block_id?: string
   readonly title: string
   readonly line?: number
   readonly page?: number
@@ -33,6 +35,7 @@ export interface DocumentHeading {
 
 export interface DocumentSummary {
   readonly page_count?: number
+  readonly page_count_source?: 'layout' | 'content-list-lower-bound' | 'pdfinfo'
   readonly table_count?: number
   readonly image_count?: number
   readonly equation_count?: number
@@ -40,6 +43,8 @@ export interface DocumentSummary {
 }
 
 export interface ImageCandidateView {
+  readonly block_id?: string
+  readonly document_label?: string
   readonly path: string
   readonly name: string
   readonly page?: number
@@ -50,6 +55,9 @@ export interface ImageCandidateView {
 }
 
 export interface InlinedImageView {
+  readonly block_id?: string
+  readonly document_label?: string
+  readonly page?: number
   readonly attachment_id: string
   readonly name: string
   readonly media_type: string
@@ -69,7 +77,7 @@ export interface ResultView {
   readonly markdown_content?: string
   readonly content_status: ContentStatus
   readonly markdown_path?: string
-  readonly manifest_path: string
+  readonly manifest_path?: string
   readonly output_limit_chars: number
   readonly inlined_images?: readonly InlinedImageView[]
   readonly ordered_images?: readonly ImageCandidateView[]
@@ -79,6 +87,10 @@ export interface ResultView {
   /** Non-empty exact-text continuation token when partial; null otherwise. */
   readonly cursor: string | null
   readonly warnings?: readonly string[]
+  readonly source_sha256?: string
+  readonly view?: 'content' | 'page'
+  readonly continuation_block?: { readonly block_id: string; readonly page?: number; readonly document_label?: string }
+  readonly visuals?: { readonly listed: number; readonly attached: number; readonly omitted: number; readonly scope: 'chunk' }
 }
 
 /** Parse completion metadata, independent of body output and its character budget. */
@@ -97,6 +109,9 @@ export type ParseDocumentView = ResultView
 
 export interface ContentListBlock {
   readonly type?: string
+  readonly block_id?: string
+  readonly document_label?: string
+  readonly document_order?: number
   readonly page_idx?: number
   readonly text?: string
   readonly content?: string
@@ -151,6 +166,7 @@ export function getRasterMediaType(ext: string): 'image/jpeg' | 'image/webp' | '
 export function formatTocMarkdown(
   headings: readonly DocumentHeading[] | undefined,
   options?: { pageRange?: string },
+  ranges?: ProjectedBlockRange[],
 ): string {
   if (!headings || headings.length === 0) {
     return options?.pageRange
@@ -158,12 +174,23 @@ export function formatTocMarkdown(
       : '*(No headings detected in document outline)*'
   }
   const lines: string[] = ['# Document Outline', '']
+  let nextOffset = '# Document Outline\n\n'.length
   for (const heading of headings) {
     const indent = '  '.repeat(Math.max(0, heading.level - 1))
     const location = heading.page !== undefined
       ? ` (Page ${String(heading.page)})`
       : (heading.line !== undefined ? ` (line ${String(heading.line)})` : '')
-    lines.push(`${indent}- ${heading.title}${location}`)
+    const label = heading.block_id ? ' [' + heading.block_id + ']' : ''
+    const line = `${indent}- ${heading.title}${location}${label}`
+    if (heading.block_id && ranges) {
+      const end = nextOffset + line.length
+      const markerStart = end - label.length + 1
+      const coordinates = { block_id: heading.block_id, ...(heading.page === undefined ? {} : { page: heading.page }) }
+      ranges.push({ ...coordinates, start: nextOffset, locator_end: nextOffset, end: markerStart })
+      ranges.push({ ...coordinates, start: markerStart, locator_end: end, end })
+    }
+    lines.push(line)
+    nextOffset += line.length + 1
   }
   return lines.join('\n')
 }
@@ -186,13 +213,13 @@ export function computeDocumentSummary(
     const page = typeof b.page_idx === 'number' && Number.isSafeInteger(b.page_idx) && b.page_idx >= 0 ? b.page_idx + 1 : undefined
     if (typeof b.text_level === 'number' && b.text_level >= 1 && b.text_level <= 6) {
       const title = String(b.text ?? b.content ?? '').trim().replace(/^#{1,6}\s+/, '')
-      if (title) toc.push({ level: b.text_level, title, ...(page === undefined ? {} : { page }) })
+      if (title) toc.push({ level: b.text_level, title, ...(page === undefined ? {} : { page }), ...(b.block_id ? { block_id: b.block_id } : {}) })
     } else if (b.type === 'title') {
       const title = String(b.text ?? b.content ?? '').trim().replace(/^#{1,6}\s+/, '')
-      if (title) toc.push({ level: 1, title, ...(page === undefined ? {} : { page }) })
+      if (title) toc.push({ level: 1, title, ...(page === undefined ? {} : { page }), ...(b.block_id ? { block_id: b.block_id } : {}) })
     } else if (typeof b.text === 'string' && /^#{1,6}\s+/.test(b.text)) {
       const m = b.text.match(/^(#{1,6})\s+(.+)$/)
-      if (m) toc.push({ level: m[1]!.length, title: m[2]!.trim(), ...(page === undefined ? {} : { page }) })
+      if (m) toc.push({ level: m[1]!.length, title: m[2]!.trim(), ...(page === undefined ? {} : { page }), ...(b.block_id ? { block_id: b.block_id } : {}) })
     }
   }
 
@@ -214,14 +241,26 @@ export function computeDocumentSummary(
   }
 }
 
+export interface ProjectedBlockRange {
+  readonly block_id: string
+  readonly page?: number
+  readonly document_label?: string
+  readonly start: number
+  readonly locator_end: number
+  readonly end: number
+}
+
 export function extractBlocksMarkdown(
   contentList: readonly ContentListBlock[],
   pagesSet: ReadonlySet<number> | undefined,
   focusSet: ReadonlySet<FocusKind>,
   imageArtifacts: readonly ArtifactView[],
-): { text: string; orderedImages: ImageCandidateView[] } {
+): { text: string; orderedImages: ImageCandidateView[]; ranges: ProjectedBlockRange[] } {
   const orderedImages: ImageCandidateView[] = []
   const renderedBlocks: string[] = []
+  const ranges: ProjectedBlockRange[] = []
+  let renderedLength = 0
+  const append = (text: string): void => { renderedLength += text.length + (renderedBlocks.length ? 2 : 0); renderedBlocks.push(text) }
 
   const isAllFocus = focusSet.has('all') || (focusSet.has('text') && focusSet.has('table') && focusSet.has('image'))
 
@@ -235,6 +274,10 @@ export function extractBlocksMarkdown(
       continue
     }
 
+    const rangeStart = renderedLength + (renderedBlocks.length ? 2 : 0)
+    if (block.block_id !== undefined) append(`[${block.block_id}${pageNum === undefined ? '' : ' · Page ' + pageNum}${block.document_label ? ' · ' + block.document_label : ''}]`)
+
+    const locatorEnd = renderedLength
     if (cat === 'image') {
       const rawPath = block.img_path ?? block.image_path ?? block.path
       const reference = rawPath === undefined ? undefined : String(rawPath).replaceAll('\\', '/').replace(/^\.\//, '').replace(/^\/+/, '')
@@ -262,6 +305,8 @@ export function extractBlocksMarkdown(
       const imgIdx = orderedImages.length + 1
       const status = matched === undefined ? 'unavailable' : (mediaType === undefined ? 'unsupported' : 'available')
       orderedImages.push({
+        ...(block.block_id ? { block_id: block.block_id } : {}),
+        ...(block.document_label ? { document_label: block.document_label } : {}),
         path: imgPath,
         name: imgName,
         ...(pageNum !== undefined ? { page: pageNum } : {}),
@@ -270,12 +315,12 @@ export function extractBlocksMarkdown(
         bytes: imgBytes,
         status,
       })
-      let md = mediaType === undefined || imgPath === ''
-        ? `> Figure ${String(imgIdx)} (Page ${String(pageNum)}) unavailable`
-        : `> Figure ${String(imgIdx)} (Page ${String(pageNum)})${caption ? `: ${caption}` : `: ${imgName}`}`
+      const imageLabel = block.document_label ?? (block.block_id ? 'Image' : 'Image ' + String(imgIdx))
+      const pageLabel = pageNum === undefined ? '' : ' (Page ' + String(pageNum) + ')'
+      let md = '> ' + imageLabel + pageLabel + (mediaType === undefined || imgPath === '' ? ' unavailable' : '') + (caption ? ': ' + caption : '')
       const footnote = formatCaption(block.image_footnote ?? block.footnote)
       if (footnote) md += `\n> *${footnote}*`
-      renderedBlocks.push(md)
+      append(md)
     } else if (cat === 'table') {
       const caption = formatCaption(block.table_caption ?? block.caption)
       const body = String(block.table_body ?? block.text ?? block.content ?? '').trim()
@@ -284,38 +329,40 @@ export function extractBlocksMarkdown(
       if (caption) md += `**${caption}**\n\n`
       if (body) md += body
       if (footnote) md += `\n\n*${footnote}*`
-      if (md.trim()) renderedBlocks.push(md.trim())
+      if (md.trim()) append(md.trim())
     } else {
       const lower = (block.type ?? '').toLowerCase()
       if (lower === 'code') {
         const lang = String(block.language ?? '').trim()
         const code = String(block.code ?? block.text ?? block.content ?? '')
         if (code.trim().startsWith('```')) {
-          renderedBlocks.push(code.trim())
+          append(code.trim())
         } else {
-          renderedBlocks.push(`\`\`\`${lang}\n${code}\n\`\`\``)
+          append(`\`\`\`${lang}\n${code}\n\`\`\``)
         }
       } else if (lower === 'equation' || lower === 'interline_equation') {
         const eq = String(block.text ?? block.content ?? '').trim()
         if (eq.startsWith('$$') || eq.startsWith('$')) {
-          renderedBlocks.push(eq)
+          append(eq)
         } else {
-          renderedBlocks.push(`$$\n${eq}\n$$`)
+          append(`$$\n${eq}\n$$`)
         }
       } else {
         const text = String(block.text ?? block.content ?? '').trim()
         const level = typeof block.text_level === 'number' && block.text_level >= 1 && block.text_level <= 6 ? block.text_level : undefined
         if (level !== undefined && !text.startsWith('#')) {
-          renderedBlocks.push(`${'#'.repeat(level)} ${text}`)
+          append(`${'#'.repeat(level)} ${text}`)
         } else if (text) {
-          renderedBlocks.push(text)
+          append(text)
         }
       }
     }
+    if (block.block_id) ranges.push({ block_id: block.block_id, start: rangeStart, locator_end: locatorEnd, end: renderedLength, ...(pageNum === undefined ? {} : { page: pageNum }), ...(block.document_label ? { document_label: block.document_label } : {}) })
   }
 
   return {
     text: renderedBlocks.join('\n\n'),
+    ranges,
     orderedImages,
   }
 }
@@ -423,7 +470,9 @@ const MAX_MARKDOWN_READ_BYTES = 64 * 1024 * 1024
 export async function readMarkdownFile(
   path: string,
   totalBytes: number,
+  signal?: AbortSignal,
 ): Promise<{ text: string; isCompleteFile: boolean }> {
+  signal?.throwIfAborted()
   if (totalBytes > MAX_MARKDOWN_READ_BYTES) {
     throw new MinerUError(failure('RESULT_TOO_LARGE', 'Markdown artifact exceeds the bounded reader limit'))
   }
@@ -431,17 +480,23 @@ export async function readMarkdownFile(
     return { text: '', isCompleteFile: true }
   }
   const maxBytes = totalBytes
-  const handle = await open(path, 'r')
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
   try {
+    const before = await handle.stat()
+    if (!before.isFile() || before.size !== totalBytes) throw new MinerUError(failure('RESULT_DOWNLOAD_FAILED', 'Markdown artifact changed before reading'))
     const buffer = Buffer.alloc(maxBytes)
     let bytesRead = 0
     while (bytesRead < maxBytes) {
+      signal?.throwIfAborted()
       const result = await handle.read(buffer, bytesRead, maxBytes - bytesRead, bytesRead)
       if (result.bytesRead === 0) break
       bytesRead += result.bytesRead
     }
     if (bytesRead !== totalBytes) throw new MinerUError(failure('RESULT_DOWNLOAD_FAILED', 'Markdown artifact changed while it was being read'))
-    const text = new TextDecoder('utf-8').decode(buffer)
+    signal?.throwIfAborted()
+    const after = await handle.stat()
+    if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) throw new MinerUError(failure('RESULT_DOWNLOAD_FAILED', 'Markdown artifact changed during reading'))
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(buffer)
     return { text, isCompleteFile: true }
   } finally {
     await handle.close()
@@ -476,11 +531,6 @@ export function extractMarkdownHeadings(fullText: string): DocumentHeading[] {
       }
     }
   }
-  if (headings.length > 25) {
-    const highLevel = headings.filter(h => h.level <= 3)
-    const selected = highLevel.length > 0 ? highLevel : headings
-    return selected.slice(0, 20)
-  }
   return headings
 }
 
@@ -513,7 +563,7 @@ export function formatResultProse(value: ResultView): string {
     for (const heading of value.toc) {
       const indent = '  '.repeat(Math.max(0, heading.level - 1))
       const location = heading.page !== undefined ? ` (Page ${String(heading.page)})` : (heading.line !== undefined ? ` (line ${String(heading.line)})` : '')
-      lines.push(`${indent}- ${heading.title}${location}`)
+      lines.push(`${indent}- ${heading.title}${location}${heading.block_id ? ' [' + heading.block_id + ']' : ''}`)
     }
     if (typeof value.cursor === 'string' && value.cursor.length > 0) lines.push('', 'Continue with the returned cursor using the same file_path.')
   }
@@ -522,12 +572,12 @@ export function formatResultProse(value: ResultView): string {
   const pagesLabel = value.pages ?? (totalPages !== undefined ? (totalPages > 1 ? `1-${totalPages}` : '1') : undefined)
   const pagesParts: string[] = []
   if (pagesLabel !== undefined) pagesParts.push(`Pages: ${pagesLabel}`)
-  if (totalPages !== undefined) pagesParts.push(`Total Pages: ${String(totalPages)}`)
+  if (totalPages !== undefined) pagesParts.push(`${value.summary?.page_count_source === 'content-list-lower-bound' ? 'Parsed page lower bound' : 'Total Pages'}: ${String(totalPages)}`)
   const pagesInfo = pagesParts.length > 0 ? pagesParts.join(', ') + '. ' : ''
 
   let footer: string
   if (status === 'complete') {
-    footer = '\n---\n[Status: Content complete. ' + pagesInfo + 'Full requested document markdown delivered above.]'
+    footer = '\n---\n[Status: Content complete. ' + pagesInfo + 'Selected parsed text complete across this and preceding chunks; not a guarantee of OCR fidelity or visual coverage.]'
   } else if (status === 'partial') {
     const mdGuidance = typeof value.cursor === 'string' && value.cursor.length > 0
       ? `Continue with read_pdf({ file_path: "<same file_path>", cursor: "${value.cursor}" }); omit pages/focus.`
@@ -536,6 +586,9 @@ export function formatResultProse(value: ResultView): string {
   } else {
     footer = '\n---\n[Status: Markdown content was not requested.' + (pagesParts.length > 0 ? ' ' + pagesParts.join(', ') + '.' : '') + ']'
   }
+  if (value.view === 'page') lines.push('', 'Original PDF page rendered locally; no Provider parsing was performed.')
+  if (value.visuals) lines.push('', `Visuals in this chunk: ${value.visuals.attached}/${value.visuals.listed} attached, ${value.visuals.omitted} not attached.`)
+  if (value.continuation_block) lines.push('', 'Continuing block [' + value.continuation_block.block_id + ']' + (value.continuation_block.page ? ' (Page ' + value.continuation_block.page + ')' : ''))
   lines.push(footer)
   if (value.warnings && value.warnings.length > 0) lines.push('', 'Warnings:', ...value.warnings.map(warning => `- ${warning}`))
 
@@ -544,7 +597,8 @@ export function formatResultProse(value: ResultView): string {
     for (let idx = 0; idx < value.inlined_images.length; idx++) {
       const img = value.inlined_images[idx]!
       const dim = (img.width !== undefined && img.height !== undefined) ? ` (${String(img.width)}x${String(img.height)})` : ''
-      lines.push(`- Figure ${String(img.figure ?? idx + 1)}: ${img.name}${dim}`)
+      const label = value.view === 'page' ? 'Original PDF Page ' + img.page : img.document_label ?? (img.block_id ? 'Image [' + img.block_id + ']' : 'Figure ' + String(img.figure ?? idx + 1))
+      lines.push(`- ${label}: ${img.name}${dim}`)
     }
   }
   if (value.ordered_images && value.ordered_images.length > 0) {
@@ -555,7 +609,9 @@ export function formatResultProse(value: ResultView): string {
       const meta = [pageStr, capStr].filter(Boolean).join(', ')
       const metaStr = meta ? ` (${meta})` : ''
       const status = img.status && img.status !== 'available' ? ` [${img.status}]` : ''
-      lines.push(`Figure ${String(idx + 1)}${metaStr}: ${img.path || 'unavailable'}${status}`)
+      const label = img.document_label ?? (img.block_id ? 'Image' : 'Figure ' + String(idx + 1))
+      const target = img.block_id ? '[' + img.block_id + ']' : img.path || 'unavailable'
+      lines.push(`${label}${metaStr}: ${target}${status}`)
     }
   }
 

@@ -9,7 +9,7 @@ describe('reader repairs', () => {
   it('round-trips a canonical cursor and preserves Unicode-safe offsets', () => {
     const token = cursorForRemainder('mr_result', '1-3', new Set(['text', 'table']), 7)
     const decoded = decodeReadCursor(token)
-    expect(decoded).toMatchObject({ v: 1, rid: 'mr_result', pages: '1-3', focus: ['table', 'text'], off: 7 })
+    expect(decoded).toMatchObject({ v: 2, rid: 'mr_result', pages: '1-3', focus: ['table', 'text'], off: 7 })
     expect(decodeReadCursor(cursorForRemainder('mr_result', undefined, new Set(['text']), 9)).pages).toBe('')
   })
 
@@ -17,7 +17,7 @@ describe('reader repairs', () => {
     const token = cursorForRemainder('mr_result', '1-3', new Set(['text']), 4)
     const altered = token.slice(0, -1) + (token.endsWith('A') ? 'B' : 'A')
     expect(() => decodeReadCursor(altered)).toThrow()
-    const payload = Buffer.from(JSON.stringify({ v: 1, rid: 'mr_result', pages: '3,1', focus: ['text'], off: 4 })).toString('base64url')
+    const payload = Buffer.from(JSON.stringify({ v: 2, rid: 'mr_result', pages: '3,1', focus: ['text'], off: 4 })).toString('base64url')
     expect(() => decodeReadCursor(payload)).toThrow(/canonical/)
   })
 

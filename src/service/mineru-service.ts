@@ -24,12 +24,12 @@ import { SharedOperationRegistry, type SharedOperation, type SharedOutcome } fro
 import type {
   ArtifactView,
   ContentListBlock,
-  ContentStatus,
   DocumentHeading,
   DocumentSummary,
   FailedParseView,
   ImageCandidateView,
   ParseDocumentView,
+  ProjectedBlockRange,
   ParseSummaryView,
   ResultFileView,
   ResultView,
@@ -37,6 +37,7 @@ import type {
 } from './result-presenter.js'
 import {
   computeDocumentSummary,
+  getBlockCategory,
   extractBlocksMarkdown,
   extractMarkdownHeadings,
   fallbackExtractFromMarkdown,
@@ -45,9 +46,12 @@ import {
   formatTocMarkdown,
   readMarkdownFile,
   safeStringSlice,
-  truncateAtCleanBoundary,
 } from './result-presenter.js'
-import { cursorForRemainder, decodeReadCursor, MAX_CURSOR_LENGTH, type ReadCursorPayload } from './read-cursor.js'
+import { decodeReadCursor, type ReadCursorPayload } from './read-cursor.js'
+import { normalizeDocumentBlocks } from './document-index.js'
+import { boundedWarnings, deliverReadChunk, fitsReadBudget } from './read-delivery.js'
+import { renderPdfPage } from './page-renderer.js'
+import { asResultId, createFileId } from '../domain/ids.js'
 
 export * from './result-presenter.js'
 
@@ -62,7 +66,7 @@ const MAX_SYNOPSIS_HEADINGS = 20
 const MAX_SYNOPSIS_TITLE_CHARS = 160
 
 /** Read only a manifest-declared index, with actual file size and short-read checks. */
-async function readContentList(artifact: ArtifactView, maxBytes: number, signal?: AbortSignal): Promise<ContentListBlock[]> {
+async function readJsonArtifact(artifact: ArtifactView, maxBytes: number, signal?: AbortSignal): Promise<unknown> {
   signal?.throwIfAborted()
   if (artifact.bytes > maxBytes) throw new MinerUError(failure('RESULT_TOO_LARGE', 'content-list artifact exceeds the bounded reader limit'))
   const handle = await open(artifact.path, constants.O_RDONLY | constants.O_NOFOLLOW)
@@ -81,19 +85,33 @@ async function readContentList(artifact: ArtifactView, maxBytes: number, signal?
     signal?.throwIfAborted()
     const after = await handle.stat()
     if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) throw new Error('content-list artifact changed during reading')
-    const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(buffer))
-    const container = typeof parsed === 'object' && parsed !== null ? parsed as Record<string, unknown> : undefined
-    const candidate = Array.isArray(parsed) ? parsed : container?.list ?? container?.content_list
-    if (!Array.isArray(candidate)) throw new TypeError('content-list must be an array or contain list/content_list')
-    for (const block of candidate) {
-      if (typeof block !== 'object' || block === null || Array.isArray(block)) throw new TypeError('content-list contains a malformed block')
-      if (block.page_idx !== undefined && (!Number.isSafeInteger(block.page_idx) || block.page_idx < 0)) throw new TypeError('content-list contains an invalid page_idx')
-      if (block.type !== undefined && typeof block.type !== 'string') throw new TypeError('content-list contains an invalid type')
-    }
-    return candidate as ContentListBlock[]
+    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(buffer))
   } finally {
     await handle.close()
   }
+}
+
+async function readContentList(artifact: ArtifactView, maxBytes: number, signal?: AbortSignal): Promise<ContentListBlock[]> {
+  const parsed = await readJsonArtifact(artifact, maxBytes, signal)
+  const container = typeof parsed === 'object' && parsed !== null ? parsed as Record<string, unknown> : undefined
+  const candidate = Array.isArray(parsed) ? parsed : container?.list ?? container?.content_list
+  if (!Array.isArray(candidate)) throw new TypeError('content-list must be an array or contain list/content_list')
+  for (const block of candidate) {
+    if (typeof block !== 'object' || block === null || Array.isArray(block)) throw new TypeError('content-list contains a malformed block')
+    if (block.page_idx !== undefined && (!Number.isSafeInteger(block.page_idx) || block.page_idx < 0)) throw new TypeError('content-list contains an invalid page_idx')
+    if (block.type !== undefined && typeof block.type !== 'string') throw new TypeError('content-list contains an invalid type')
+  }
+  return candidate as ContentListBlock[]
+}
+
+/** A complete contiguous MinerU pdf_info page list is stronger than the last text block's index. */
+async function readLayoutPageCount(artifact: ArtifactView | undefined, signal?: AbortSignal): Promise<number | undefined> {
+  if (!artifact || artifact.bytes > MAX_CONTENT_LIST_BYTES) return undefined
+  const parsed = await readJsonArtifact(artifact, MAX_CONTENT_LIST_BYTES, signal)
+  const pages = typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>).pdf_info : undefined
+  if (!Array.isArray(pages) || pages.length === 0 || pages.length > 99999) return undefined
+  if (!pages.every((page, index) => typeof page === 'object' && page !== null && !Array.isArray(page) && page.page_idx === index)) return undefined
+  return pages.length
 }
 
 export type CredentialResolver = (reference: string, signal: AbortSignal) => Promise<string | undefined>
@@ -234,6 +252,7 @@ export class MinerUService {
     session: ServiceSession,
     input: ParseRequestInput,
     signal: AbortSignal,
+    cacheOnly = false,
   ): Promise<{ readonly pending: PendingFileParse; readonly resolved: ResolvedProvider; readonly compatibility: string }> {
     const resolved = this.options.providers.active()
     const current = this.config()
@@ -259,7 +278,7 @@ export class MinerUService {
     const markdownRequested = input.artifacts === undefined || input.artifacts.includes('markdown')
     const cacheKey = computeCacheKey(prepared.request, file, compatibility)
 
-    const hit = current.storage.cacheEnabled
+    const hit = current.storage.cacheEnabled || cacheOnly
       ? await this.options.results.get(cacheKey, prepared.request.requiredArtifacts, signal)
       : undefined
 
@@ -281,6 +300,7 @@ export class MinerUService {
       return { pending, resolved, compatibility }
     }
 
+    if (cacheOnly) throw new MinerUError(failure('CACHE_EVICTED', 'Cursor result is missing or corrupt; restart without a cursor. Continuation never starts a new Provider parse.'))
     const reservation = this.options.operations.reserve(
       cacheKey,
       resolved.config.id,
@@ -442,17 +462,15 @@ export class MinerUService {
     limit: number,
   ): ResultView {
     let view = candidate
-    let overhead = Math.max(JSON.stringify(view).length, formatResultProse(view).length)
-    if (overhead <= limit) return view
+    if (fitsReadBudget(view)) return view
 
     const strippedFiles: ResultFileView[] = view.files.map(f => ({
       ...f,
       artifacts: [],
-      ...(secondaryArtifacts.length > 0 ? { artifacts_truncated: true } : {}),
+      ...(f.artifacts.length > 0 ? { artifacts_truncated: true } : {}),
     }))
     view = { ...view, files: strippedFiles }
-    overhead = Math.max(JSON.stringify(view).length, formatResultProse(view).length)
-    if (overhead > limit) {
+    if (!fitsReadBudget(view)) {
       throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds configured model output limit'))
     }
     return view
@@ -461,304 +479,124 @@ export class MinerUService {
   private async projectSingle(
     data: Extract<RawParsedItem, { state: 'completed' }>,
     limit: number,
-    cursorOffset = 0,
     cursorPayload?: ReadCursorPayload,
+    input: ParseRequestInput = {},
+    signal?: AbortSignal,
   ): Promise<ResultView> {
-    if (!data.markdownRequested) {
-      const baseFiles: ResultFileView[] = [{
-        file_id: data.fileId,
-        name: data.fileName,
-        artifacts: [...data.secondaryArtifacts],
-      }]
-      const candidate: ResultView = {
-        state: 'completed',
-        source: data.item.source,
-        cache_hit: data.item.source === 'cache',
-        result_id: data.manifest.id,
-        files: baseFiles,
-        content_status: 'not_requested',
-        cursor: null,
-        manifest_path: data.manifestPath,
-        output_limit_chars: limit,
-      }
-      return this.fitSingleCandidate(candidate, data.secondaryArtifacts, limit)
-    }
-
-    const raw = await readMarkdownFile(data.markdownPath!, data.markdownBytes ?? 0)
-    if (!Number.isSafeInteger(cursorOffset) || cursorOffset < 0) {
-      throw new MinerUError(failure('INVALID_REQUEST', 'Cursor offset is invalid; start over without a cursor'))
-    }
-    const markdownArtifact: ArtifactView = {
-      kind: 'markdown',
-      path: data.markdownPath!,
-      bytes: data.markdownBytes ?? 0,
-    }
-
-    const contentListArtifact = data.secondaryArtifacts.find(a => a.kind === 'content-list')
-    let contentList: ContentListBlock[] | undefined
-    if (contentListArtifact) {
-      try {
-        contentList = await readContentList(contentListArtifact, MAX_CONTENT_LIST_BYTES)
-      } catch (error) {
+    signal?.throwIfAborted()
+    const blockId = cursorPayload?.block ?? input.block_id
+    const query = cursorPayload?.query ?? input.query
+    const focusSet = normalizeFocusSelection(data.inputFocus)
+    const rawPagesSet = normalizePageSelection(data.inputPages)
+    const artifactsRequested = focusSet.has('artifacts')
+    const markdownArtifact: ArtifactView | undefined = data.markdownPath === undefined ? undefined : { kind: 'markdown', path: data.markdownPath, bytes: data.markdownBytes ?? 0 }
+    const artifact = data.secondaryArtifacts.find(a => a.kind === 'content-list')
+    let rawBlocks: ContentListBlock[] = []
+    if (artifact) {
+      try { rawBlocks = await readContentList(artifact, MAX_CONTENT_LIST_BYTES, signal) }
+      catch (error) {
+        signal?.throwIfAborted()
         if (error instanceof MinerUError) throw error
         throw new MinerUError(failure('INVALID_REQUEST', 'Malformed content-list artifact; cannot provide a reliable selection'), { cause: error })
       }
     }
-
-    const rawPagesSet = normalizePageSelection(data.inputPages)
-    const focusSet = normalizeFocusSelection(data.inputFocus)
-    const artifactsRequested = focusSet.has('artifacts') || (data.inputArtifacts !== undefined && data.inputArtifacts.some(k => k !== 'markdown'))
-
-    let docSummary: DocumentSummary | undefined
-    let toc: readonly DocumentHeading[] | undefined
-    let pagesSet: Set<number> | undefined = rawPagesSet
-    let pagesLabel: string | undefined
-    const warnings: string[] = []
-
-    if (contentList && contentList.length > 0) {
-      docSummary = computeDocumentSummary(contentList, raw.text)
-      toc = docSummary.toc
-      if (rawPagesSet !== undefined && docSummary.page_count === undefined) {
-        throw new MinerUError(failure('INVALID_REQUEST', '[SELECTION_UNAVAILABLE] The content-list has no usable page coordinates; start over without pages'))
-      }
-      const narrowed = narrowPageSelection(rawPagesSet, docSummary.page_count)
-      if (narrowed.fullyOutOfRange) {
-        throw new MinerUError(failure('INVALID_REQUEST', formatPageOutOfRangeMessage(docSummary.page_count)))
-      }
-      if (narrowed.outOfRange.length > 0) warnings.push(`Some requested pages are outside the document range: ${narrowed.outOfRange.join(', ')}`)
-      pagesSet = narrowed.pagesSet
-      pagesLabel = rawPagesSet === undefined ? undefined : narrowed.pagesLabel
-    } else {
-      const selectionNeedsCoordinates = rawPagesSet !== undefined || (!focusSet.has('all') && (focusSet.has('text') || focusSet.has('table') || focusSet.has('image')))
-      if (selectionNeedsCoordinates) {
-        throw new MinerUError(failure('INVALID_REQUEST', '[SELECTION_UNAVAILABLE] The result has no usable content-list page/type mapping; start over with a result that includes content-list'))
-      }
-      docSummary = { table_count: 0, image_count: 0, equation_count: 0 }
-      pagesSet = undefined
-      pagesLabel = undefined
+    const warningOrders = rawPagesSet === undefined && blockId === undefined ? undefined : new Set(rawBlocks.flatMap((block, index) =>
+      (rawPagesSet === undefined || typeof block.page_idx === 'number' && rawPagesSet.has(block.page_idx + 1)) && (blockId === undefined || blockId === data.manifest.id + ':b' + (index + 1)) ? [index + 1] : []))
+    const normalized = normalizeDocumentBlocks(rawBlocks, data.manifest.id, warningOrders)
+    const blocks = normalized.blocks
+    const summary = blocks.length ? computeDocumentSummary(blocks) : undefined
+    const { toc: outline, ...counts } = summary ?? {}
+    const warnings = [...normalized.warnings]
+    let physicalPageCount: number | undefined
+    try { physicalPageCount = await readLayoutPageCount(data.secondaryArtifacts.find(artifact => artifact.kind === 'layout'), signal) }
+    catch { signal?.throwIfAborted(); warnings.push('[PAGE_COUNT_UNAVAILABLE] Layout page metadata could not be read reliably; use original page view to verify physical bounds.') }
+    if (physicalPageCount !== undefined && (summary?.page_count ?? 0) > physicalPageCount) {
+      warnings.push('[PAGE_MAPPING_CONFLICT] Content blocks exceed layout page metadata; physical bounds are not reliable.')
+      physicalPageCount = undefined
     }
-
-    if (focusSet.size === 1 && focusSet.has('artifacts')) {
-      const baseFiles: ResultFileView[] = [{
-        file_id: data.fileId,
-        name: data.fileName,
-        artifacts: [markdownArtifact, ...data.secondaryArtifacts],
-        ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}),
-      }]
-      const candidate: ResultView = {
-        state: 'completed',
-        source: data.item.source,
-        cache_hit: data.item.source === 'cache',
-        result_id: data.manifest.id,
-        files: baseFiles,
-        content_status: 'not_requested',
-        cursor: null,
-        ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}),
-        manifest_path: data.manifestPath,
-        output_limit_chars: limit,
-        ...(docSummary !== undefined ? { summary: docSummary } : {}),
-        ...(pagesLabel !== undefined ? { pages: pagesLabel } : {}),
-      }
-      return this.fitSingleCandidate(candidate, data.secondaryArtifacts, limit)
+    if (physicalPageCount !== undefined) counts.page_count = physicalPageCount
+    if (counts.page_count !== undefined) counts.page_count_source = physicalPageCount === undefined ? 'content-list-lower-bound' : 'layout'
+    if (rawPagesSet !== undefined && blocks.some(block => block.page_idx === undefined && (focusSet.has('all') || focusSet.has(getBlockCategory(block.type)) || focusSet.has('toc') && block.text_level !== undefined))) throw new MinerUError(failure('INVALID_REQUEST', '[SELECTION_UNAVAILABLE] Some selected content has no page coordinates; read without pages or use block_id/original page view'))
+    if (rawPagesSet !== undefined && summary?.page_count === undefined) throw new MinerUError(failure('INVALID_REQUEST', '[SELECTION_UNAVAILABLE] No reliable physical page coordinates are available'))
+    const narrowed = narrowPageSelection(rawPagesSet, physicalPageCount)
+    if (narrowed.fullyOutOfRange) throw new MinerUError(failure('INVALID_REQUEST', formatPageOutOfRangeMessage(physicalPageCount)))
+    if (narrowed.outOfRange.length) warnings.push('Some requested pages are outside the document range: ' + narrowed.outOfRange.slice(0, 20).join(', '))
+    const pagesLabel = rawPagesSet === undefined ? undefined : narrowed.pagesLabel
+    const pagesSet = narrowed.pagesSet
+    if (rawPagesSet !== undefined && physicalPageCount === undefined) warnings.push('[PAGE_COUNT_LOWER_BOUND] Physical page count is unknown; parsed page_count is a lower bound. An empty selection is not proof that the requested page is blank or absent.')
+    const artifactList = artifactsRequested ? [...(markdownArtifact ? [markdownArtifact] : []), ...data.secondaryArtifacts] : []
+    const base: ResultView = {
+      state: 'completed', source: data.item.source, cache_hit: data.item.source === 'cache', result_id: data.manifest.id,
+      files: [{ file_id: data.fileId, name: data.fileName, artifacts: artifactList.slice(0, 20), ...(artifactList.length > 20 ? { artifacts_truncated: true } : {}) }],
+      content_status: 'not_requested', cursor: null, output_limit_chars: limit,
+      source_sha256: data.item.prepared.request.files[0]!.sha256,
+      ...(artifactsRequested ? { manifest_path: data.manifestPath, ...(data.markdownPath ? { markdown_path: data.markdownPath } : {}) } : {}),
+      ...(summary ? { summary: counts } : {}),
+      ...(pagesLabel ? { pages: pagesLabel } : {}),
+      ...(warnings.length ? { warnings: boundedWarnings(warnings) } : {}),
     }
-
-    const imageArtifacts = data.secondaryArtifacts.filter(a => a.kind === 'images')
-
-    let fullSourceText = ''
-    let orderedImages: ImageCandidateView[] = []
-
-    if (contentList && contentList.length > 0) {
-      const extracted = extractBlocksMarkdown(contentList, pagesSet, focusSet, imageArtifacts)
-      fullSourceText = extracted.text
-      orderedImages = extracted.orderedImages
-    } else {
-      let rawText = raw.text
-      const fallback = fallbackExtractFromMarkdown(rawText, imageArtifacts)
-      fullSourceText = fallback.text
-      orderedImages = fallback.orderedImages
-      if (!focusSet.has('all') && !focusSet.has('image')) {
-        orderedImages = []
-      }
-      docSummary = fallback.summary
-      toc = fallback.summary.toc
-    }
-
-    if (focusSet.has('toc')) {
-      const filteredToc = (pagesSet !== undefined && toc !== undefined)
-        ? toc.filter(h => h.page !== undefined ? pagesSet.has(h.page) : true)
-        : toc
-      const tocMd = formatTocMarkdown(filteredToc, { pageRange: pagesLabel })
-      const isTocOnly = !focusSet.has('all') && !focusSet.has('text') && !focusSet.has('table') && !focusSet.has('image')
-
-      if (isTocOnly) {
-        fullSourceText = tocMd
-        orderedImages = []
-      } else {
-        fullSourceText = fullSourceText.trim().length > 0
-          ? `${tocMd}\n\n---\n\n${fullSourceText}`
-          : tocMd
-      }
-      toc = filteredToc
-    }
-
-    const skeleton: ResultView = {
-      state: 'completed',
-      source: data.item.source,
-      cache_hit: data.item.source === 'cache',
-      result_id: data.manifest.id,
-      files: [{
-        file_id: data.fileId,
-        name: data.fileName,
-        artifacts: [markdownArtifact],
-        ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}),
-      }],
-      content_status: 'complete',
-      cursor: null,
-      ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}),
-      manifest_path: data.manifestPath,
-      output_limit_chars: limit,
-      markdown_content: '',
-      ordered_images: orderedImages,
-      ...(docSummary !== undefined ? { summary: docSummary } : {}),
-      ...(toc !== undefined ? { toc } : {}),
-      ...(pagesLabel !== undefined ? { pages: pagesLabel } : {}),
-    }
-
-    let overhead = Math.max(JSON.stringify(skeleton).length, formatResultProse(skeleton).length)
-    // Reserve room for the opaque continuation token and its actionable footer.
-    if (fullSourceText.length > Math.max(0, limit - overhead)) overhead += MAX_CURSOR_LENGTH + 256
-    let baseArtifacts: ArtifactView[] = [markdownArtifact]
-    let baseArtifactsTruncated = false
-
-    if (overhead > limit) {
-      const strippedSkeleton: ResultView = {
-        ...skeleton,
-        files: [{ file_id: data.fileId, name: data.fileName, artifacts: [], artifacts_truncated: true, ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}) }],
-      }
-      overhead = Math.max(JSON.stringify(strippedSkeleton).length, formatResultProse(strippedSkeleton).length)
-      if (overhead > limit) {
-        throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds configured model output limit'))
-      }
-      baseArtifacts = []
-      baseArtifactsTruncated = true
-    }
-
-    const avail = Math.max(0, limit - overhead)
-    const textBudget = Math.floor(avail / 1.05)
-
-    let contentStatus: ContentStatus
-    let content: string
-    let nextCursor: string | undefined
-    let artifactsTruncated = baseArtifactsTruncated
-    const sourceOffset = cursorPayload?.off ?? cursorOffset
-    if (sourceOffset > fullSourceText.length) throw new MinerUError(failure('INVALID_REQUEST', 'Cursor does not match the published result; start over without a cursor'))
-    if (sourceOffset > 0 && (fullSourceText.charCodeAt(sourceOffset - 1) >= 0xD800 && fullSourceText.charCodeAt(sourceOffset - 1) <= 0xDBFF || fullSourceText.charCodeAt(sourceOffset) >= 0xDC00 && fullSourceText.charCodeAt(sourceOffset) <= 0xDFFF)) {
-      throw new MinerUError(failure('INVALID_REQUEST', 'Cursor splits a Unicode character; start over without a cursor'))
-    }
-    const remainingText = fullSourceText.slice(sourceOffset)
-
-    if (remainingText.length <= textBudget) {
-      contentStatus = 'complete'
-      content = remainingText
-    } else {
-      contentStatus = 'partial'
-      const cut = truncateAtCleanBoundary(remainingText, textBudget)
-      content = cut.text
-      const nextOffset = sourceOffset + cut.text.length
-      if (nextOffset <= sourceOffset) throw new MinerUError(failure('RESULT_TOO_LARGE', 'Output limit cannot make progress through the document'))
-      nextCursor = cursorForRemainder(data.manifest.id, pagesLabel, focusSet, nextOffset)
-      if (artifactsRequested && data.secondaryArtifacts.length > 0) {
-        artifactsTruncated = true
-      }
-      if (!toc || toc.length === 0) {
-        toc = extractMarkdownHeadings(fullSourceText)
-      }
-    }
-
-    let finalArtifacts: ArtifactView[] = baseArtifacts
-    if (artifactsRequested && contentStatus === 'complete' && !baseArtifactsTruncated && data.secondaryArtifacts.length > 0) {
-      const withSecondary = [markdownArtifact, ...data.secondaryArtifacts]
-      const testView: ResultView = {
-        state: 'completed',
-        source: data.item.source,
-        cache_hit: data.item.source === 'cache',
-        result_id: data.manifest.id,
-        files: [{ file_id: data.fileId, name: data.fileName, artifacts: withSecondary, ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}) }],
-        content_status: contentStatus,
-        cursor: null,
-        ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}),
-        manifest_path: data.manifestPath,
-        output_limit_chars: limit,
-        markdown_content: content,
-        ordered_images: orderedImages,
-        ...(docSummary !== undefined ? { summary: docSummary } : {}),
-      }
-      if (JSON.stringify(testView).length <= limit && formatResultProse(testView).length <= limit) {
-        finalArtifacts = withSecondary
-      } else {
-        artifactsTruncated = true
-      }
-    }
-
-    let view: ResultView = {
-      state: 'completed',
-      source: data.item.source,
-      cache_hit: data.item.source === 'cache',
-      result_id: data.manifest.id,
-      files: [{
-        file_id: data.fileId,
-        name: data.fileName,
-        artifacts: finalArtifacts,
-        ...(artifactsTruncated ? { artifacts_truncated: true } : {}),
-        ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}),
-      }],
-      content_status: contentStatus,
-      ...(data.markdownPath !== undefined ? { markdown_path: data.markdownPath } : {}),
-      cursor: nextCursor ?? null,
-      ...(warnings.length > 0 ? { warnings } : {}),
-      manifest_path: data.manifestPath,
-      output_limit_chars: limit,
-      markdown_content: content,
-      ordered_images: orderedImages,
-      ...(docSummary !== undefined ? { summary: docSummary } : {}),
-      ...((contentStatus === 'partial' || contentStatus === 'complete') && toc !== undefined ? { toc } : {}),
-      ...(pagesLabel !== undefined ? { pages: pagesLabel } : {}),
-    }
-
-    while (JSON.stringify(view).length > limit || formatResultProse(view).length > limit) {
-      if (view.files[0]?.artifacts.length && view.files[0].artifacts.length > 0) {
-        view = {
-          ...view,
-          files: [{ ...view.files[0]!, artifacts: [], ...(artifactsRequested ? { artifacts_truncated: true } : {}) }],
+    if (focusSet.size === 1 && artifactsRequested || !data.markdownRequested) return this.fitSingleCandidate(base, data.secondaryArtifacts, limit)
+    let fullText = ''
+    let images: readonly ImageCandidateView[] = []
+    let ranges: readonly ProjectedBlockRange[] = []
+    if (blocks.length) {
+      const selected = blocks.filter(block => {
+        const page = typeof block.page_idx === 'number' ? block.page_idx + 1 : undefined
+        return (pagesSet === undefined || page !== undefined && pagesSet.has(page)) && (focusSet.has('all') || focusSet.has(getBlockCategory(block.type)))
+      })
+      if (blockId !== undefined && !blocks.some(block => block.block_id === blockId)) throw new MinerUError(failure('INVALID_REQUEST', '[BLOCK_NOT_FOUND] This block does not belong to the current parsed result; search again'))
+      const matching = blockId === undefined ? selected : selected.filter(block => block.block_id === blockId)
+      if (blockId !== undefined && matching.length === 0) throw new MinerUError(failure('INVALID_REQUEST', '[BLOCK_NOT_FOUND] Block is outside the requested pages/focus'))
+      const imageArtifacts = data.secondaryArtifacts.filter(a => a.kind === 'images')
+      if (query !== undefined) {
+        const escaped = [...query].map(character => '\\.^$*+?()[]{}|'.includes(character) ? '\\' + character : character).join('')
+        const literal = new RegExp(escaped, 'iu')
+        const matches: string[] = []
+        const matchRanges: ProjectedBlockRange[] = []
+        let matchLength = 0
+        for (const block of matching) {
+          signal?.throwIfAborted()
+          const projected = extractBlocksMarkdown([block], undefined, new Set(['all']), imageArtifacts).text
+          const locationEnd = projected.indexOf(']') + 1
+          const body = projected.slice(locationEnd).trim()
+          const at = literal.exec(body)?.index
+          if (at === undefined) continue
+          let snippetStart = Math.max(0, at - 80)
+          if (snippetStart > 0 && /[\uDC00-\uDFFF]/.test(body[snippetStart]!)) snippetStart--
+          const snippet = safeStringSlice(body.slice(snippetStart), 360).replace(/\s+/g, ' ')
+          const match = projected.slice(0, locationEnd) + '\n' + snippet
+          const start = matchLength + (matches.length ? 2 : 0)
+          matchLength = start + match.length
+          matches.push(match)
+          matchRanges.push({ block_id: block.block_id, start, locator_end: start + locationEnd, end: matchLength, ...(typeof block.page_idx === 'number' ? { page: block.page_idx + 1 } : {}) })
         }
-      } else if (view.summary !== undefined || (view.ordered_images !== undefined && view.ordered_images.length > 0)) {
-        const { summary: _s, ordered_images: _o, ...rest } = view
-        view = rest
-      } else if (view.markdown_content && view.markdown_content.length > 0) {
-        const excess = Math.max(JSON.stringify(view).length - limit, formatResultProse(view).length - limit, 10)
-        const targetLen = Math.max(0, view.markdown_content.length - excess)
-        const cut = truncateAtCleanBoundary(remainingText, targetLen)
-        const activeToc = view.toc ?? (docSummary?.toc ?? extractMarkdownHeadings(fullSourceText))
-        view = {
-          ...view,
-          content_status: 'partial',
-          markdown_content: cut.text,
-          toc: activeToc,
-          cursor: cursorForRemainder(data.manifest.id, pagesLabel, focusSet, sourceOffset + cut.text.length),
-        }
-      } else if (view.toc && view.toc.length > 0) {
-        const nextToc = view.toc.slice(0, Math.max(0, Math.floor(view.toc.length / 2)))
-        const { toc: _t, ...rest } = view
-        view = {
-          ...rest,
-          ...(nextToc.length > 0 ? { toc: nextToc } : {}),
-        }
+        fullText = matches.length ? matches.join('\n\n') : 'No literal matches in the selected parsed blocks.'
+        ranges = matchRanges
       } else {
-        throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds configured model output limit'))
+        const projected = extractBlocksMarkdown(matching, undefined, new Set(['all']), imageArtifacts)
+        fullText = projected.text
+        images = projected.orderedImages
+        ranges = projected.ranges
       }
+      if (focusSet.has('toc')) {
+        const headings = (outline ?? []).filter(heading => pagesSet === undefined || heading.page !== undefined && pagesSet.has(heading.page))
+        const tocRanges: ProjectedBlockRange[] = []
+        const tocText = formatTocMarkdown(headings, { pageRange: pagesLabel }, tocRanges)
+        if (fullText) ranges = ranges.map(range => ({ ...range, start: range.start + tocText.length + 2, locator_end: range.locator_end + tocText.length + 2, end: range.end + tocText.length + 2 }))
+        ranges = [...tocRanges, ...ranges]
+        fullText = fullText ? tocText + '\n\n' + fullText : tocText
+      }
+    } else {
+      if (blockId !== undefined || query !== undefined || rawPagesSet !== undefined || !focusSet.has('all') && !focusSet.has('toc')) throw new MinerUError(failure('INVALID_REQUEST', '[SELECTION_UNAVAILABLE] No content-list mapping; use unfiltered reading or original page view'))
+      const raw = await readMarkdownFile(data.markdownPath!, data.markdownBytes ?? 0, signal)
+      const fallback = fallbackExtractFromMarkdown(raw.text, data.secondaryArtifacts.filter(a => a.kind === 'images'))
+      fullText = focusSet.has('toc') && !focusSet.has('all') ? formatTocMarkdown(extractMarkdownHeadings(raw.text)) : fallback.text
+      images = focusSet.has('toc') && !focusSet.has('all') ? [] : fallback.orderedImages
+      warnings.push('[LOCATION_UNAVAILABLE] Reading Markdown fallback; page/block coordinates are unavailable.')
     }
-
-    return view
+    return deliverReadChunk({ base: { ...base, ...(warnings.length ? { warnings: boundedWarnings(warnings) } : {}) }, text: fullText, focus: focusSet, images, ranges, cursor: cursorPayload, signal, identity: JSON.stringify(data.manifest.files),
+      selection: { ...(blockId ? { block: blockId } : {}), ...(query ? { query } : {}) },
+    })
   }
 
   private createWaitSignal(signal: AbortSignal, pollTimeoutMs: number | null | undefined): {
@@ -797,10 +635,16 @@ export class MinerUService {
     return this.projectSummary(data, signal)
   }
 
+  /** Local original-page verification; never invokes a Provider or persists a source. */
+  async previewPage(session: ServiceSession, input: { file_path: string; page: number; expectedSha256?: string }, signal: AbortSignal) {
+    const page = await renderPdfPage({ ...input, cwd: session.header.cwd, maxFileBytes: this.config().limits.maxFileBytes, signal })
+    return { ...page, result_id: asResultId('mr_page_' + page.sha256.slice(0, 32) + '_' + page.page), file_id: createFileId(page.sha256), output_limit_chars: this.config().output.maxInlineChars }
+  }
+
   /** Read selected content from a published result. */
   async parseDocument(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal, pollTimeoutMs?: number | null): Promise<ResultView> {
     const { data, cursor, limit } = await this.resolveParsedResult(session, input, signal, pollTimeoutMs)
-    return this.projectSingle(data, limit, cursor?.off ?? 0, cursor)
+    return this.projectSingle(data, limit, cursor, input, signal)
   }
 
   private async projectSummary(data: Extract<RawParsedItem, { state: 'completed' }>, signal: AbortSignal): Promise<ParseSummaryView> {
@@ -844,6 +688,14 @@ export class MinerUService {
     signal: AbortSignal,
     pollTimeoutMs?: number | null,
   ): Promise<{ data: Extract<RawParsedItem, { state: 'completed' }>; cursor?: ReadCursorPayload; limit: number }> {
+    if (input.query !== undefined && (typeof input.query !== 'string' || input.query.trim() === '' || input.query.length > 256)) throw new MinerUError(failure('INVALID_REQUEST', 'query must contain 1–256 characters'))
+    if (input.block_id !== undefined && (typeof input.block_id !== 'string' || input.block_id.length > 160 || !/^mr_[a-zA-Z0-9_-]+:b[1-9][0-9]*$/.test(input.block_id))) throw new MinerUError(failure('INVALID_REQUEST', 'block_id must be an exact ID returned by read_pdf'))
+    if (input.query !== undefined && input.block_id !== undefined) throw new MinerUError(failure('INVALID_REQUEST', 'query and block_id cannot be combined'))
+    if (input.query !== undefined || input.block_id !== undefined) {
+      let focus: ReadonlySet<FocusKind>
+      try { focus = normalizeFocusSelection(input.focus) } catch (error) { throw new MinerUError(failure('INVALID_REQUEST', 'Invalid focus'), { cause: error }) }
+      if (focus.has('toc') || focus.has('artifacts')) throw new MinerUError(failure('INVALID_REQUEST', 'query/block_id cannot use toc or artifacts focus'))
+    }
     let cursorPayload: ReadCursorPayload | undefined
     if (input.cursor !== undefined) {
       try {
@@ -851,14 +703,14 @@ export class MinerUService {
       } catch (error) {
         throw new MinerUError(failure('INVALID_REQUEST', error instanceof Error ? error.message : 'Cursor is malformed; start over without a cursor'), { cause: error })
       }
-      if (input.pages !== undefined || input.focus !== undefined) {
-        throw new MinerUError(failure('INVALID_REQUEST', 'pages and focus must be omitted when cursor is provided'))
+      if (input.pages !== undefined || input.focus !== undefined || input.block_id !== undefined || input.query !== undefined) {
+        throw new MinerUError(failure('INVALID_REQUEST', 'pages and focus must be omitted when cursor is provided, as must block_id and query'))
       }
     }
     const effectiveInput: ParseRequestInput = cursorPayload === undefined
       ? input
       : { ...input, pages: cursorPayload.pages === '' ? undefined : cursorPayload.pages, focus: cursorPayload.focus }
-    const { pending } = await this.prepare(session, effectiveInput, signal)
+    const { pending } = await this.prepare(session, effectiveInput, signal, cursorPayload !== undefined)
     const wait = this.createWaitSignal(signal, pollTimeoutMs)
     let outcome: SharedOutcome
     try {

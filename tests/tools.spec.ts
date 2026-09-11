@@ -500,7 +500,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       expect(rendered[0]?.text).toContain('# Document: sync.pdf')
       expect(rendered[0]?.text).not.toContain('MinerU Parse Result')
       expect(rendered[0]?.text).toContain('Status: Content complete.')
-      expect(rendered[0]?.text).toContain('Full requested document markdown delivered above.')
+      expect(rendered[0]?.text).toContain('Selected parsed text complete across this and preceding chunks; not a guarantee of OCR fidelity or visual coverage.')
       expect(rendered[0]?.text).not.toContain('/cache/sync/manifest.json')
     })
 
@@ -1138,7 +1138,8 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       }
       const rendered = renderResult(resultData)
       expect(rendered[0]?.text.length).toBeLessThanOrEqual(150)
-      expect(rendered[0]?.text).toContain('[Output truncated to limit]')
+      expect(rendered[0]?.text).toContain('[RESULT_TOO_LARGE]')
+      expect(rendered[0]?.text).not.toContain('Content complete')
     })
 
     it('makes structured artifact truncation explicit in rendered prose', () => {
@@ -1195,7 +1196,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       }
       const rendered = renderResult(resultData)
       expect(rendered[0]?.text).toContain('Artifacts: layout (200 bytes): /cache/doc/layout.json, images (800 bytes): /cache/doc/images')
-      expect(rendered[0]?.text).toContain('Status: Content complete. Full requested document markdown delivered above.')
+      expect(rendered[0]?.text).toContain('Status: Content complete. Selected parsed text complete across this and preceding chunks; not a guarantee of OCR fidelity or visual coverage.')
       expect(rendered[0]?.text).not.toContain('/cache/doc/manifest.json')
     })
     it('renders clean message when markdown was not requested and does NOT claim complete delivery', () => {
@@ -1487,7 +1488,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const rendered = renderResult(resultData)
       const text = rendered[0]?.text ?? ''
       expect(text).not.toContain('Document Outline')
-      expect(text).toContain('Status: Content complete. Full requested document markdown delivered above.')
+      expect(text).toContain('Status: Content complete. Selected parsed text complete across this and preceding chunks; not a guarantee of OCR fidelity or visual coverage.')
     })
   })
 

@@ -16,6 +16,9 @@ export interface ParsedToolInput {
     readonly input: ParseRequestInput;
     readonly pollTimeoutMs?: number;
     readonly inline_images?: boolean;
+    readonly view?: 'page';
+    readonly page?: number;
+    readonly expected_sha256?: string;
 }
 export declare function parseReadInput(args: unknown): ParsedToolInput;
 export declare function renderResult(value: ResultView): ContentBlock[];

@@ -1,5 +1,6 @@
 import type { MinerUConfig, ProviderConfig } from '../config.js';
 import type { MinerUProviderId } from '../domain/errors.js';
+import type { MinerUResultId } from '../domain/ids.js';
 import type { ParseRequestInput } from '../domain/request.js';
 import { ProviderRegistry } from '../providers/registry.js';
 import type { ResultRepository } from '../storage/result-repository.js';
@@ -54,6 +55,24 @@ export declare class MinerUService {
     private createWaitSignal;
     /** Ensure publication and return a bounded synopsis, never a body projection. */
     ensureParsed(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal): Promise<ParseSummaryView>;
+    /** Local original-page verification; never invokes a Provider or persists a source. */
+    previewPage(session: ServiceSession, input: {
+        file_path: string;
+        page: number;
+        expectedSha256?: string;
+    }, signal: AbortSignal): Promise<{
+        result_id: MinerUResultId;
+        file_id: import("../domain/ids.js").MinerUFileId;
+        output_limit_chars: number;
+        name: string;
+        page: number;
+        page_count: number;
+        sha256: string;
+        data: Uint8Array;
+        media_type: "image/png";
+        width?: number;
+        height?: number;
+    }>;
     /** Read selected content from a published result. */
     parseDocument(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal, pollTimeoutMs?: number | null): Promise<ResultView>;
     private projectSummary;

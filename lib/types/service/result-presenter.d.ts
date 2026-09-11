@@ -1,7 +1,7 @@
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment';
 import type { MinerUFailure } from '../domain/errors.js';
 import type { FocusKind } from '../domain/request.js';
-export type SubmissionSource = 'cache' | 'shared-operation' | 'provider';
+export type SubmissionSource = 'cache' | 'shared-operation' | 'provider' | 'local';
 export type ContentStatus = 'complete' | 'partial' | 'not_requested';
 export interface ArtifactView {
     readonly kind: string;
@@ -17,18 +17,22 @@ export interface ResultFileView {
 }
 export interface DocumentHeading {
     readonly level: number;
+    readonly block_id?: string;
     readonly title: string;
     readonly line?: number;
     readonly page?: number;
 }
 export interface DocumentSummary {
     readonly page_count?: number;
+    readonly page_count_source?: 'layout' | 'content-list-lower-bound' | 'pdfinfo';
     readonly table_count?: number;
     readonly image_count?: number;
     readonly equation_count?: number;
     readonly toc?: readonly DocumentHeading[];
 }
 export interface ImageCandidateView {
+    readonly block_id?: string;
+    readonly document_label?: string;
     readonly path: string;
     readonly name: string;
     readonly page?: number;
@@ -38,6 +42,9 @@ export interface ImageCandidateView {
     readonly status?: 'available' | 'unavailable' | 'unsupported' | 'failed' | 'omitted';
 }
 export interface InlinedImageView {
+    readonly block_id?: string;
+    readonly document_label?: string;
+    readonly page?: number;
     readonly attachment_id: string;
     readonly name: string;
     readonly media_type: string;
@@ -56,7 +63,7 @@ export interface ResultView {
     readonly markdown_content?: string;
     readonly content_status: ContentStatus;
     readonly markdown_path?: string;
-    readonly manifest_path: string;
+    readonly manifest_path?: string;
     readonly output_limit_chars: number;
     readonly inlined_images?: readonly InlinedImageView[];
     readonly ordered_images?: readonly ImageCandidateView[];
@@ -66,6 +73,19 @@ export interface ResultView {
     /** Non-empty exact-text continuation token when partial; null otherwise. */
     readonly cursor: string | null;
     readonly warnings?: readonly string[];
+    readonly source_sha256?: string;
+    readonly view?: 'content' | 'page';
+    readonly continuation_block?: {
+        readonly block_id: string;
+        readonly page?: number;
+        readonly document_label?: string;
+    };
+    readonly visuals?: {
+        readonly listed: number;
+        readonly attached: number;
+        readonly omitted: number;
+        readonly scope: 'chunk';
+    };
 }
 /** Parse completion metadata, independent of body output and its character budget. */
 export type ParseSummaryView = Pick<ResultView, 'state' | 'source' | 'cache_hit' | 'result_id' | 'files' | 'content_status' | 'manifest_path' | 'summary' | 'toc' | 'warnings'>;
@@ -79,6 +99,9 @@ export interface FailedParseView {
 export type ParseDocumentView = ResultView;
 export interface ContentListBlock {
     readonly type?: string;
+    readonly block_id?: string;
+    readonly document_label?: string;
+    readonly document_order?: number;
     readonly page_idx?: number;
     readonly text?: string;
     readonly content?: string;
@@ -102,11 +125,20 @@ export declare function formatCaption(caption: unknown): string;
 export declare function getRasterMediaType(ext: string): 'image/jpeg' | 'image/webp' | 'image/gif' | 'image/png' | undefined;
 export declare function formatTocMarkdown(headings: readonly DocumentHeading[] | undefined, options?: {
     pageRange?: string;
-}): string;
+}, ranges?: ProjectedBlockRange[]): string;
 export declare function computeDocumentSummary(contentList: readonly ContentListBlock[], fallbackFullText?: string): DocumentSummary;
+export interface ProjectedBlockRange {
+    readonly block_id: string;
+    readonly page?: number;
+    readonly document_label?: string;
+    readonly start: number;
+    readonly locator_end: number;
+    readonly end: number;
+}
 export declare function extractBlocksMarkdown(contentList: readonly ContentListBlock[], pagesSet: ReadonlySet<number> | undefined, focusSet: ReadonlySet<FocusKind>, imageArtifacts: readonly ArtifactView[]): {
     text: string;
     orderedImages: ImageCandidateView[];
+    ranges: ProjectedBlockRange[];
 };
 export declare function fallbackExtractFromMarkdown(fullMarkdownText: string, imageArtifacts: readonly ArtifactView[]): {
     text: string;
@@ -119,7 +151,7 @@ export declare function truncateAtCleanBoundary(fullText: string, maxChars: numb
     truncated: boolean;
     resumeLine?: number;
 };
-export declare function readMarkdownFile(path: string, totalBytes: number): Promise<{
+export declare function readMarkdownFile(path: string, totalBytes: number, signal?: AbortSignal): Promise<{
     text: string;
     isCompleteFile: boolean;
 }>;

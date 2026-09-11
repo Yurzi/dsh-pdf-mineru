@@ -125,7 +125,7 @@ export const DEFAULT_RETRY_CONFIG: RetryConfig = {
 }
 
 export const DEFAULT_OUTPUT_CONFIG: OutputConfig = {
-  maxInlineChars: 200000,
+  maxInlineChars: 12000,
   maxInlineImages: 6,
 }
 

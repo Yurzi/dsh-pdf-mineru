@@ -1,6 +1,6 @@
 {
   "name": "dsh-pdf-mineru",
-  "version": "0.0.12",
+  "version": "0.0.13",
   "description": "Provider-independent DSH document parsing powered by MinerU, with native background jobs, immutable results, and safe request coalescing.",
   "keywords": ["dsh-plugin"],
   "license": "MIT",
@@ -37,7 +37,9 @@
     "bundle": "pnpm run build",
     "watch": "tsdown --config tsdown.config.ts --watch",
     "verify:gui": "node scripts/verify-current-gui.mjs",
-    "smoke:official-v4": "node scripts/smoke-official-v4.mjs"
+    "smoke:official-v4": "node scripts/smoke-official-v4.mjs",
+    "smoke:reader-local": "node scripts/smoke-reader-local.mjs",
+    "smoke:reader-cache": "node scripts/smoke-reader-cache.mjs"
   },
   "dependencies": { "yauzl": "^3.4.0" },
   "peerDependencies": {

@@ -4,6 +4,7 @@ import { constants } from 'node:fs'
 import { basename, extname } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { fitsReadBudget, boundedWarnings } from './service/read-delivery.js'
 import type { JobOutcome, JobRegistry } from '@deepseek-ai/dsh-jobs'
 import type { AttachmentStore, ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
 import type { ObjectValueSchemaSpec, ParameterSchemaSpec, ToolRunContext, ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
@@ -53,13 +54,16 @@ const artifactViewSchema = {
 const inlinedImageViewSchema = {
   type: 'object',
   properties: {
+    block_id: { type: 'string' },
+    document_label: { type: 'string' },
+    page: { type: 'integer' },
     attachment_id: { type: 'string', required: true },
     name: { type: 'string', required: true },
     media_type: { type: 'string', required: true },
     width: { type: 'integer' },
     height: { type: 'integer' },
     bytes: { type: 'integer' },
-    figure: { type: 'integer' },
+    figure: { type: 'integer', description: 'Attachment selection index only; use document_label for the original paper figure number.' },
   },
   additionalProperties: false,
 } satisfies ObjectValueSchemaSpec
@@ -67,6 +71,8 @@ const inlinedImageViewSchema = {
 const imageCandidateViewSchema = {
   type: 'object',
   properties: {
+    block_id: { type: 'string' },
+    document_label: { type: 'string' },
     path: { type: 'string', required: true },
     name: { type: 'string', required: true },
     page: { type: 'integer' },
@@ -81,6 +87,7 @@ const imageCandidateViewSchema = {
 const documentHeadingSchema = {
   type: 'object',
   properties: {
+    block_id: { type: 'string' },
     level: { type: 'integer', required: true },
     title: { type: 'string', required: true },
     line: { type: 'integer' },
@@ -93,6 +100,7 @@ const documentSummarySchema = {
   type: 'object',
   properties: {
     page_count: { type: 'integer' },
+    page_count_source: { type: 'string', enum: ['layout', 'content-list-lower-bound', 'pdfinfo'] },
     table_count: { type: 'integer' },
     image_count: { type: 'integer' },
     equation_count: { type: 'integer' },
@@ -115,7 +123,7 @@ const resultViewSchema = {
   type: 'object',
   properties: {
     state: { type: 'string', enum: ['completed'], required: true },
-    source: { type: 'string', enum: ['cache', 'shared-operation', 'provider'], required: true },
+    source: { type: 'string', enum: ['cache', 'shared-operation', 'provider', 'local'], required: true },
     cache_hit: { type: 'boolean', required: true }, result_id: { type: 'string', required: true },
     files: { type: 'array', items: resultFileViewSchema, required: true },
     markdown_content: { type: 'string' },
@@ -127,7 +135,11 @@ const resultViewSchema = {
       description: 'Non-empty continuation token when content_status is partial; null otherwise. Stop reading when null.',
     },
     warnings: { type: 'array', items: { type: 'string' } },
-    manifest_path: { type: 'string', required: true },
+    manifest_path: { type: 'string' },
+    source_sha256: { type: 'string' },
+    continuation_block: { type: 'object', properties: { block_id: { type: 'string', required: true }, page: { type: 'integer' }, document_label: { type: 'string' } }, additionalProperties: false },
+    view: { type: 'string', enum: ['content', 'page'] },
+    visuals: { type: 'object', properties: { listed: { type: 'integer', required: true }, attached: { type: 'integer', required: true }, omitted: { type: 'integer', required: true }, scope: { type: 'string', enum: ['chunk'], required: true } }, additionalProperties: false },
     output_limit_chars: { type: 'integer', required: true },
     inlined_images: { type: 'array', items: inlinedImageViewSchema },
     ordered_images: { type: 'array', items: imageCandidateViewSchema },
@@ -142,7 +154,7 @@ const failedParseViewSchema = {
   type: 'object',
   properties: {
     state: { type: 'string', enum: ['failed'] },
-    source: { type: 'string', enum: ['cache', 'shared-operation', 'provider'] },
+    source: { type: 'string', enum: ['cache', 'shared-operation', 'provider', 'local'] },
     file_id: { type: 'string' }, name: { type: 'string' }, failure: failureSchema,
   },
   additionalProperties: false,
@@ -170,6 +182,10 @@ const readPdfParameters: ParameterSchemaSpec = {
     description: 'Path of the local PDF document to read.',
     required: true,
   },
+  view: { type: 'string', enum: ['content', 'page'], description: 'content (default) reads parsed blocks; page renders one original PDF page locally without invoking a Provider. Requires exactly one page and an image-capable model.' },
+  block_id: { type: 'string', description: 'Read one exact stable block ID from a prior result; IDs are bound to that parsed result. Cannot combine with query or cursor.' },
+  query: { type: 'string', description: 'Case-insensitive literal search (1–256 characters) in selected parsed blocks. Returns bounded snippets and block IDs, not the full matching blocks. Use block_id to read a hit.' },
+  expected_sha256: { type: 'string', description: 'Optional source_sha256 from a parsed result. In page view, reject changed sources before rendering.' },
   pages: {
     oneOf: [
       { type: 'integer', description: 'Single 1-based page number, e.g. 3' },
@@ -205,47 +221,51 @@ const MAX_POLL_TIMEOUT_MS = 24 * 60 * 60 * 1000
 function clampRenderText(rendered: string, limit = DEFAULT_RENDER_LIMIT): string {
   if (!Number.isSafeInteger(limit) || limit <= 0) return ''
   if (rendered.length <= limit) return rendered
-  const suffix = '\n\n[Output truncated to limit]'
-  if (suffix.length >= limit) return suffix.slice(0, limit)
-  const footerStart = rendered.lastIndexOf('\n---\n')
-  if (footerStart >= 0) {
-    const footer = rendered.slice(footerStart)
-    if (footer.length < limit) return rendered.slice(0, limit - footer.length - suffix.length) + suffix + footer
-  }
-  return rendered.slice(0, limit - suffix.length) + suffix
+  // Never preserve a "complete" footer after slicing away its evidence.
+  return '[RESULT_TOO_LARGE] Reader output could not be delivered intact; narrow the request or increase the output budget.'.slice(0, limit)
 }
 
 function fitPostImageBudget(value: ResultView): ResultView {
-  const limit = value.output_limit_chars
   let fitted = value
-  const fits = (): boolean => JSON.stringify(fitted).length <= limit && formatResultProse(fitted).length <= limit
-  if (fits()) return fitted
-  const { ordered_images: _o, ...withoutImages } = fitted
-  fitted = withoutImages
-  if (fits()) return fitted
-  const { summary: _s, toc: _t, ...withoutSummaryOrToc } = fitted
-  fitted = withoutSummaryOrToc
-  if (fits()) return fitted
-  throw new MinerUError(failure('RESULT_TOO_LARGE', 'Image attachment metadata exceeds the configured output limit'))
+  const warn = (message: string): void => { fitted = { ...fitted, warnings: boundedWarnings([message, ...(fitted.warnings ?? [])]) } }
+  if (fitsReadBudget(fitted)) return fitted
+  if (fitted.ordered_images?.length) {
+    const removed = fitted.ordered_images.length
+    const attached = fitted.inlined_images?.length ?? 0
+    const { ordered_images: _ordered, ...rest } = fitted
+    fitted = { ...rest, visuals: { listed: attached, attached, omitted: 0, scope: 'chunk' } }
+    warn('[VISUAL_METADATA_SHORTENED] Removed ' + removed + ' image candidate records to fit; ' + attached + ' attachments remain. Use block IDs to inspect omitted candidates.')
+    if (fitsReadBudget(fitted)) return fitted
+  }
+  if (fitted.summary !== undefined || fitted.toc !== undefined) {
+    const { summary: _summary, toc: _toc, ...rest } = fitted
+    fitted = rest
+    warn('[SUMMARY_SHORTENED] Summary metadata was omitted to fit the response; request a narrower selection.')
+    if (fitsReadBudget(fitted)) return fitted
+  }
+  if (fitted.files.some(file => file.artifacts.length > 0)) {
+    fitted = { ...fitted, files: fitted.files.map(file => ({ ...file, artifacts: [], ...(file.artifacts.length ? { artifacts_truncated: true } : {}) })) }
+    warn('[ARTIFACT_METADATA_SHORTENED] Artifact records were omitted to fit the response; use focus: artifacts separately.')
+    if (fitsReadBudget(fitted)) return fitted
+  }
+  throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds the output budget; narrow the selection or increase maxInlineChars'))
 }
 
 function parsePollTimeout(value: unknown): number | undefined {
   if (value === undefined) return undefined
-  if (!Number.isSafeInteger(value) || (value as number) <= 0 || (value as number) > MAX_POLL_TIMEOUT_MS) {
-    throw new MinerUError(failure('INVALID_REQUEST', 'poll_timeout_ms must be a positive integer no greater than ' + String(MAX_POLL_TIMEOUT_MS)))
-  }
-  return value as number
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > 86_400_000) throw new MinerUError(failure('INVALID_REQUEST', 'poll_timeout_ms must be an integer from 1 to 86400000'))
+  return value
 }
 
 function requireAgent(exec: ToolRunContext): NonNullable<ToolRunContext['agent']> {
   const agent = exec.agent
-  if (agent === undefined) {
+  if (agent === undefined || agent.session == null) {
     throw new MinerUError(failure('UNAUTHENTICATED_SESSION', 'MinerU operations require an authenticated agent session (UNAUTHENTICATED_SESSION)'))
   }
   return agent
 }
 
-const READ_PARAMETER_FIELDS = new Set(['file_path', 'pages', 'focus', 'inline_images', 'poll_timeout_ms', 'cursor'])
+const READ_PARAMETER_FIELDS = new Set(['file_path', 'pages', 'focus', 'inline_images', 'poll_timeout_ms', 'cursor', 'block_id', 'query', 'view', 'expected_sha256'])
 const ASYNC_PARAMETER_FIELDS = new Set(['file_path'])
 
 function assertAllowedParameters(args: Record<string, unknown>, allowed: ReadonlySet<string>): void {
@@ -281,6 +301,9 @@ export interface ParsedToolInput {
   readonly input: ParseRequestInput
   readonly pollTimeoutMs?: number
   readonly inline_images?: boolean
+  readonly view?: 'page'
+  readonly page?: number
+  readonly expected_sha256?: string
 }
 
 export function parseReadInput(args: unknown): ParsedToolInput {
@@ -292,6 +315,20 @@ export function parseReadInput(args: unknown): ParsedToolInput {
   const filePath = extractFilePath(obj)
   const pollTimeoutMs = parsePollTimeout(obj.poll_timeout_ms)
 
+  if (obj.view !== undefined && obj.view !== 'content' && obj.view !== 'page') throw new MinerUError(failure('INVALID_REQUEST', 'view must be content or page'))
+  if (obj.view === 'page') {
+    for (const key of ['focus', 'cursor', 'query', 'block_id', 'inline_images', 'poll_timeout_ms']) if (obj[key] !== undefined) throw new MinerUError(failure('INVALID_REQUEST', 'page view accepts only file_path, pages, and optional expected_sha256'))
+    let selected: Set<number> | undefined
+    try { selected = normalizePageSelection(obj.pages) } catch { throw new MinerUError(failure('INVALID_REQUEST', 'page view requires exactly one positive physical page')) }
+    if (selected === undefined || selected.size !== 1) throw new MinerUError(failure('INVALID_REQUEST', 'page view requires exactly one physical page in pages'))
+    if (obj.expected_sha256 !== undefined && (typeof obj.expected_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(obj.expected_sha256))) throw new MinerUError(failure('INVALID_REQUEST', 'expected_sha256 must be a lowercase SHA-256 digest'))
+    return { input: { file_path: filePath }, view: 'page', page: [...selected][0]!, ...(typeof obj.expected_sha256 === 'string' ? { expected_sha256: obj.expected_sha256 } : {}) }
+  }
+  if (obj.expected_sha256 !== undefined) throw new MinerUError(failure('INVALID_REQUEST', 'expected_sha256 is only supported in page view'))
+  if (obj.block_id !== undefined && (typeof obj.block_id !== 'string' || obj.block_id.length > 160 || !/^mr_[a-zA-Z0-9_-]+:b[1-9][0-9]*$/.test(obj.block_id))) throw new MinerUError(failure('INVALID_REQUEST', 'block_id must be an exact ID returned by read_pdf'))
+  if (obj.query !== undefined && (typeof obj.query !== 'string' || obj.query.trim() === '' || obj.query.length > 256)) throw new MinerUError(failure('INVALID_REQUEST', 'query must contain 1–256 characters'))
+  if (obj.block_id !== undefined && obj.query !== undefined) throw new MinerUError(failure('INVALID_REQUEST', 'block_id and query cannot be combined'))
+  if ((obj.query !== undefined || obj.block_id !== undefined) && [...normalizeFocusSelection(obj.focus)].some(f => f === 'toc' || f === 'artifacts')) throw new MinerUError(failure('INVALID_REQUEST', 'query/block_id cannot be combined with toc or artifacts focus'))
   let inline_images: boolean | undefined
   if (obj.inline_images !== undefined) {
     if (typeof obj.inline_images !== 'boolean') {
@@ -304,7 +341,7 @@ export function parseReadInput(args: unknown): ParsedToolInput {
   if (obj.cursor !== undefined) {
     if (typeof obj.cursor !== 'string' || obj.cursor.trim() === '') throw new MinerUError(failure('INVALID_REQUEST', 'cursor must be a non-empty string'))
     cursor = obj.cursor.trim()
-    if (obj.pages !== undefined || obj.focus !== undefined) throw new MinerUError(failure('INVALID_REQUEST', 'pages and focus must be omitted when cursor is provided'))
+    if (obj.pages !== undefined || obj.focus !== undefined || obj.block_id !== undefined || obj.query !== undefined) throw new MinerUError(failure('INVALID_REQUEST', 'pages and focus must be omitted when cursor is provided, as must block_id and query'))
   }
 
   let pages: PageSelection | undefined
@@ -334,6 +371,8 @@ export function parseReadInput(args: unknown): ParsedToolInput {
       ...(focus !== undefined ? { focus } : {}),
       ...(inline_images !== undefined ? { inline_images } : {}),
       ...(cursor !== undefined ? { cursor } : {}),
+      ...(typeof obj.block_id === 'string' ? { block_id: obj.block_id } : {}),
+      ...(typeof obj.query === 'string' ? { query: obj.query.trim() } : {}),
     },
     ...(pollTimeoutMs !== undefined ? { pollTimeoutMs } : {}),
     ...(inline_images !== undefined ? { inline_images } : {}),
@@ -480,6 +519,9 @@ async function inlineImagesForSingleResult(
       statuses[item.index] = { ...statuses[item.index]!, status: 'available' }
       inlined.push({
         attachment_id: String(ref.attachmentId), name: ref.name ?? item.name, media_type: ref.mediaType, figure: item.index + 1,
+        ...(statuses[item.index]!.block_id ? { block_id: statuses[item.index]!.block_id } : {}),
+        ...(statuses[item.index]!.document_label ? { document_label: statuses[item.index]!.document_label } : {}),
+        ...(statuses[item.index]!.page === undefined ? {} : { page: statuses[item.index]!.page }),
         ...(ref.width !== undefined ? { width: ref.width } : {}),
         ...(ref.height !== undefined ? { height: ref.height } : {}),
         ...(ref.bytes !== undefined ? { bytes: ref.bytes } : {}),
@@ -584,7 +626,7 @@ export function registerTools(
 
   disposers.push(ctx.tools.register(defineTool({
     name: 'read_pdf',
-    description: 'Read and extract structured content from PDF documents synchronously. Supports page selection and content focus. Requested Markdown is returned in markdown_content. The output cursor is always present: a non-empty string when content_status is partial, null when complete or not_requested. Continue only when partial, using the unchanged cursor with the same file_path and no pages/focus. Complete means the current selection has been fully delivered across this read and any preceding chunks; stop rather than passing null back.',
+    description: 'Read PDF evidence in bounded chunks with physical pages and stable block IDs. Start with focus: toc or a short query; use block_id to read a search hit. markdown_content contains selected parsed text; partial requires continuing with the unchanged cursor and same file_path only (no pages/focus/block_id/query). The cursor is null when complete or not_requested. Continue only when partial; stop rather than passing null back. Complete ends that text selection, not a guarantee of OCR fidelity or visual coverage; check warnings and visuals. Use view: page with one page number to inspect the original PDF locally without Provider upload, optionally checking source_sha256 via expected_sha256. Use focus: artifacts only for exported cache paths. Output in run_code should preserve markdown_content and cursor, rather than dumping large/debug objects.',
     parameters: readPdfParameters,
     output: {
       schema: parseOutputSchema,
@@ -595,7 +637,7 @@ export function registerTools(
           result_id: single.result_id,
           source: single.source,
           cache_hit: single.cache_hit,
-          manifest_path: single.manifest_path,
+          ...(single.manifest_path === undefined ? {} : { manifest_path: single.manifest_path }),
           files: single.files.map(f => ({
             file_id: f.file_id,
             name: f.name,
@@ -656,10 +698,29 @@ export function registerTools(
     isConcurrencySafe: () => true,
     execute: async (args: unknown, exec: ToolRunContext) => {
       const agent = requireAgent(exec)
-      const { input, pollTimeoutMs, inline_images } = parseReadInput(args)
+      const parsed = parseReadInput(args)
+      const { input, pollTimeoutMs, inline_images } = parsed
       const { maxInlineImages } = getOutputConfig()
       const supportsImage = await checkCallingModelSupportsImage(exec, ctx)
       const attachments = ctx.get('attachments') as AttachmentStore | undefined
+      if (parsed.view === 'page') {
+        if (maxInlineImages === 0) throw new MinerUError(failure('UNSUPPORTED_OPTION', 'Original page view requires output.maxInlineImages greater than zero'))
+        if (!supportsImage || attachments === undefined) throw new MinerUError(failure('UNSUPPORTED_OPTION', 'Original page view requires an image-capable model and attachment support'))
+        const page = await getService().previewPage(agent.session, { file_path: input.file_path!, page: parsed.page!, ...(parsed.expected_sha256 ? { expectedSha256: parsed.expected_sha256 } : {}) }, exec.signal)
+        exec.signal.throwIfAborted()
+        const ref = await attachments.saveImage({ data: page.data, mediaType: page.media_type, name: 'page-' + page.page + '.png' })
+        exec.signal.throwIfAborted()
+        if (!Number.isSafeInteger(ref.bytes) || ref.bytes < 0 || ref.bytes > MAX_INLINE_IMAGE_SINGLE_BYTES) throw new MinerUError(failure('RESULT_TOO_LARGE', 'Rendered page attachment exceeds the image limit'))
+        const value: ResultView = {
+          state: 'completed', source: 'local', cache_hit: false, result_id: page.result_id, view: 'page',
+          files: [{ file_id: page.file_id, name: page.name, artifacts: [] }],
+          content_status: 'not_requested', cursor: null, output_limit_chars: page.output_limit_chars,
+          source_sha256: page.sha256, pages: String(page.page), summary: { page_count: page.page_count, page_count_source: 'pdfinfo' },
+          inlined_images: [{ attachment_id: String(ref.attachmentId), name: ref.name ?? 'page-' + page.page + '.png', media_type: ref.mediaType, bytes: ref.bytes, page: page.page, ...(ref.width === undefined ? {} : { width: ref.width }), ...(ref.height === undefined ? {} : { height: ref.height }) }],
+          visuals: { listed: 1, attached: 1, omitted: 0, scope: 'chunk' },
+        }
+        return fitPostImageBudget(value) as MutableJsonView<ResultView>
+      }
       const focusSet = normalizeFocusSelection(input.focus)
       const focusIncludesImages = focusSet.has('all') || focusSet.has('image')
       const shouldInline = inline_images !== false && focusIncludesImages && supportsImage && attachments !== undefined
@@ -669,7 +730,12 @@ export function registerTools(
         const processed = shouldInline && attachments
           ? await inlineImagesForSingleResult(rawResult, attachments, maxInlineImages, exec.signal)
           : rawResult
-        return fitPostImageBudget(processed) as MutableJsonView<ResultView>
+        const listed = processed.ordered_images?.length ?? 0
+        const attached = processed.inlined_images?.length ?? 0
+        const value: ResultView = listed ? { ...processed, visuals: { listed, attached, omitted: listed - attached, scope: 'chunk' },
+          ...(listed > attached ? { warnings: [...(processed.warnings ?? []), '[VISUALS_NOT_ATTACHED] Some listed images were not attached; use block_id or original page view to inspect them.'] } : {}),
+        } : processed
+        return fitPostImageBudget(value) as MutableJsonView<ResultView>
       }, exec.signal)
     },
   })) as () => void)

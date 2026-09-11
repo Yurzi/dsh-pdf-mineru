@@ -111,13 +111,17 @@ Agent 会自动根据文档长度和指令意图，智能选择同步返回或�
 `read_pdf` 直接返回阅读结果。`async_parse_pdf` 立即返回原生 `job_id`，完成后通过 `job_output` 提供英文摘要文本，不返回相同的正文结构。阅读结果字段如下：
 
 - `markdown_content`：提取的正文 Markdown 文本。
-- `content_status`：正文交付状态：
+- `content_status`：**所选解析文本**的交付状态（query 模式指检索摘要，不是命中文本全文）：
   - `complete`：本次选择已读完；若本次是续读，表示剩余正文已全部提供。
-  - `partial`：因输出预算分段，返回 `cursor`。下一次使用相同 `file_path` 与原样 `cursor`，不要再次传 `pages`／`focus`；逐次拼接 `markdown_content` 即为同一选择的完整正文。
+  - `partial`：因输出预算分段，返回 `cursor`。下一次使用相同 `file_path` 与原样 `cursor`，不要再次传 `pages`／`focus`／`block_id`／`query`；逐次拼接 `markdown_content` 即为同一选择的完整正文。
   - `not_requested`：只请求了产物列表等不包含正文的结果。
 - `cursor`：必定存在的 `string | null` 字段。仅 `partial` 时为非空续读 token；`complete`／`not_requested` 时显式为 `null`，此时应停止续读。输入参数仍只接受非空字符串，不接受 `null`，也不会将 `null` 静默解释为重新读取。
-- `markdown_path` 是完整原始 Markdown 产物，`manifest_path` 是结果清单。筛选重建的文本不与原始文件行号对应，故不再返回误导性的 `read_offset_line`。
-- `output.maxInlineChars`：单次阅读响应的字符预算（默认 200,000 个 UTF-16 code units），约束 JSON 和 Native 英文文本各自的大小，包括元信息、续读 token 与状态说明。
+- 默认不返回缓存路径和重复目录；仅 `focus: "artifacts"`（或包含此 focus）时返回 `markdown_path`、`manifest_path` 和产物清单。`full.md` 仍可用于全文导出，不是原页的替代品。
+- 正文块带有 `[mr_…:bN · Page N · 原文标签]` 定位标记，ID 在页码筛选前分配；可用 `block_id` 精确读取。`document_label` 是从原始 caption 保守提取的标签，不与附件顺序混用。
+- `summary.page_count_source` 区分 layout/pdfinfo 的页数和 content-list 推得的页数下界；缺少可靠坐标时按页阅读会明确告警或拒绝，而不是静默丢块。
+- `source_sha256` 是源文件摘要；原页复核时可传为 `expected_sha256`，阻止把已变化的文件当成同一份文献。
+- `visuals` 单独报告当前正文分块的图像候选数、实际附件数及未附图像数；文字 `complete` **不代表 OCR 无损，也不代表全部图片已经展示**。
+- `output.maxInlineChars`：单次阅读响应的字符预算（默认 12,000 个 UTF-16 code units），约束 JSON 和 Native 英文文本各自的大小，包括元信息、续读 token 与状态说明。正文另有 8,000 UTF-16 单元硬上限，JSON/Native 文本各自最多 48,000 UTF-8 字节，以降低 DSH 对象打印省略正文的风险；这不是对任意外层程序输出方式的绝对保证。
 - `output.maxInlineImages`：单次 `read_pdf` 响应的内联图片数量预算（默认 6，可配置为 0–100；0 表示全局禁用）；图片仍受单图与总字节安全上限约束。
 
 Cursor 是无签名、无服务端状态的读取定位 token，不是授权凭证。源文件仍须存在并保持不变；解析配置、结果身份或选择不匹配时需要重新开始。完全越界页码会明确报错，部分越界给出警告；没有可靠页码／类型映射时，不会假装完成不支持的筛选。
@@ -126,6 +130,33 @@ Cursor 是无签名、无服务端状态的读取定位 token，不是授权凭�
 
 图片的读取预算与规范化后附件预算分别核算。部分读取后失败、读取后 stat 失败、close 失败均不能退还已消耗的读取字节；附件实际字节未知或无效时不回退使用源文件大小。
 
+### 面向模型的证据阅读流程
+
+1. 用 `focus: "toc"` 或 `query: "表4"` 定位；检索是字面匹配，不是向量检索。
+2. 用返回的 `block_id` 读取完整块，或按物理页码与 focus 阅读。表格保留原始 HTML、多级表头和脚注，不自动换算数值。
+3. 若 `partial`，只携带同一 `file_path` 和原样 `cursor` 继续，直至 `cursor: null`。
+4. 对有歧义的数字、公式和图表，用 `view: "page", pages: 8` 看原页；可附 `expected_sha256`。
+5. 遇到质量警告，不要把解析缺失直接当作论文缺失。支持的嵌套行/行内公式会被重建；不认识的结构、相互冲突的文本表示会给出有界诊断；少量明确的中文空值槽会标为“疑似缺失”，但不猜填数字。
+
+原页模式需要 PATH 中有 **Poppler 的 pdfinfo 与 pdftoppm**、图像模型和附件服务，且图片预算大于0。仅做本地单页渲染，使用临时私有快照，完成/失败/取消后清理，不保留 PDF 源文件。并发最多2，单次总运行时间45秒，单页保留纵横比、长边最多1600像素、PNG最多8 MiB；这不是完整操作系统级的 PDF 解析器隔离沙箱；不可信 PDF 建议在受限容器/宿主中处理。缺少依赖、源变化、越界或不支持图片时明确报错。
+
+升级到本轮阅读实现后，**旧 v1 游标会明确失效**，请不带 cursor 重新开始；已发布的解析缓存无需迁移。当前 v2 游标绑定新的文本投影、解析产物摘要及检索/块选择；续读只访问已发布缓存，缓存丢失时明确报错，不会重新上传或解析。跨块读取长段落/目录项时，`continuation_block` 保留来源定位。
+
+建议在 `run_code` 中输出必要字段而非整份调试对象。例如只返回 `markdown_content`、`content_status`、`cursor` 和 `warnings`。小分块可避开常见的对象字符串省略，但任意额外日志或外层总预算仍可能导致超限。
+
+### 离线真实文档验收（开发者）
+
+```sh
+pnpm run build
+# 通用原页验证：禁止网络访问，校验页码与源文件变化保护。
+pnpm run smoke:reader-local -- /absolute/path/sample.pdf 1
+# 原审稿论文案例回放：从已存在且通过哈希校验的 MinerU 缓存读取，无新上传。
+# 此脚本的表4/图7断言针对 rx033 论文；PDF 和缓存不随仓库分发。
+pnpm run smoke:reader-cache -- /absolute/path/rx033.pdf /absolute/path/manifest.json
+```
+
+源码构建不会自动替换已经运行的 DSH 工具定义；使用新参数前需要让宿主重新加载插件。GUI 验证使用现有 DSH Web shell 的隔离当前 bundle，不启动替代服务器，也不表示后端工具已热更新。
+
 ### 常用解析参数（均可通过自然语言告知 Agent）
 
 | 参数 | 类型 | 适用工具 | 作用说明 |
@@ -133,7 +164,11 @@ Cursor 是无签名、无服务端状态的读取定位 token，不是授权凭�
 | `file_path` | `string` | 全部 | 待解析/读取的本地文件路径（必填） |
 | `pages` | `number` / `string` / `number[]` | `read_pdf` | 1-based 页码选择，支持单页（如 `3`）、数组（如 `[1, 2, 5]`）或范围字符串（如 `"1-3, 5"`） |
 | `focus` | `string` / `string[]` | `read_pdf` | `all`（默认）、`text`、`table`、`image`、`toc` 或 `artifacts` |
-| `cursor` | `string` | `read_pdf` | 原样传回上一条部分阅读响应的 token；与 `pages`／`focus` 互斥，仍须传同一 `file_path` |
+| `cursor` | `string` | `read_pdf` | 原样传回上一条部分阅读响应的 token；与 `pages`／`focus`／`block_id`／`query` 互斥，仍须传同一 `file_path` |
+| `block_id` | `string` | `read_pdf` | 原样使用此前返回的稳定块 ID；与 `query`、`cursor` 互斥 |
+| `query` | `string` | `read_pdf` | 1–256 字符、不区分大小写的字面检索；返回上下文摘要与块 ID，再用 `block_id` 读全文 |
+| `view` | `"content"` / `"page"` | `read_pdf` | 默认解析文本；page 模式只接受一页 `pages`，本地渲染原页，不调用 Provider |
+| `expected_sha256` | `string` | `read_pdf` | 仅 page 模式；可选的源文件 SHA-256，通常来自此前结果的 `source_sha256` |
 | `inline_images` | `boolean` | `read_pdf` | 是否直接内联多模态图表（模型路由支持图片时默认开启） |
 | `poll_timeout_ms` | `number` | `read_pdf` | 最大同步等待超时毫秒数 |
 
@@ -229,7 +264,7 @@ storage:
   storageRoot: /absolute/path/to/dsh/cache/pdf-mineru  # 默认在 $DSH_HOME/cache/pdf-mineru
   cacheEnabled: true
 output:
-  maxInlineChars: 200000  # 单次响应最大内联字符预算（UTF-16 字符）
+  maxInlineChars: 12000   # 单次响应预算；正文每块另限 8000 UTF-16 单元
   maxInlineImages: 6      # 单次 read_pdf 响应最多内联图片数（0–100）
 limits:
   maxFileBytes: 209715200  # 200 MB

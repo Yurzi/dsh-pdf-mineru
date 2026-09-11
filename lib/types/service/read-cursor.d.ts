@@ -1,6 +1,6 @@
 import { type FocusKind } from '../domain/request.js';
 /** Cursor payload version. Bump only with an explicit compatibility rule. */
-export declare const READ_CURSOR_VERSION: 1;
+export declare const READ_CURSOR_VERSION: 2;
 /** Hard cap on the encoded cursor length (base64url JSON). */
 export declare const MAX_CURSOR_LENGTH: 2048;
 /** Hard cap on encoded canonical selection complexity (pages + focus tokens). */
@@ -15,6 +15,9 @@ export interface ReadCursorPayload {
     readonly focus: readonly FocusKind[];
     /** UTF-16 offset into the exact projected selection text. */
     readonly off: number;
+    readonly block?: string;
+    readonly query?: string;
+    readonly projection?: string;
 }
 export interface ResolvedSelection {
     readonly pages: ReadonlySet<number> | undefined;
@@ -29,4 +32,8 @@ export declare function selectionFromCursor(payload: ReadCursorPayload): Resolve
 /** Canonical pages label for cursor binding ('' means full selection). */
 export declare function canonicalSelectionKey(pagesLabel: string | undefined, focus: ReadonlySet<FocusKind>): string;
 /** Create a cursor for the remainder of projected text starting at offset. */
-export declare function cursorForRemainder(resultId: string, pagesLabel: string | undefined, focus: ReadonlySet<FocusKind>, offset: number): string;
+export declare function cursorForRemainder(resultId: string, pagesLabel: string | undefined, focus: ReadonlySet<FocusKind>, offset: number, selection?: {
+    block?: string;
+    query?: string;
+    projection?: string;
+}): string;

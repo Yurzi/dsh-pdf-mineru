@@ -312,7 +312,7 @@ describe('MinerUService bounded parse synopsis', () => {
     expect(result.summary).toBeUndefined()
     expect(formatSingleSummaryProse(result)).toContain('synopsis budget')
     const read = await h.service.parseDocument(session('read-index'), { file_path: h.file, focus: 'text' }, new AbortController().signal, null)
-    expect(read.markdown_content).toMatch(/^x+/)
+    expect(read.markdown_content).toMatch(/^\[mr_[^\]]+:b1 · Page 1\]\n\nx+/)
     expect(read.content_status).toBe('partial')
     expect(h.provider.submitCount).toBe(1)
   })
@@ -567,7 +567,7 @@ describe('MinerUService direct parsing', () => {
       '😀'.repeat(1600) + ' first end',
       '第二段 "quoted" \\ path\n' + '🧪界'.repeat(1200) + ' final end',
     ]
-    const expectedText = selectedBlocks.join('\n\n')
+    let expectedText = ''
     h.provider.markdown = 'UNSELECTED raw Markdown must not leak into continuation'
     h.provider.extraArtifactsByFileName.set('input.pdf', [{
       kind: 'content-list',
@@ -603,6 +603,7 @@ describe('MinerUService direct parsing', () => {
       for (let attempt = 0; attempt < 100; attempt++) {
         const view = await readTool.execute(args, exec) as ResultView
         resultId ??= view.result_id
+        expectedText ||= `[${resultId}:b2 · Page 2]\n\n${selectedBlocks[0]}\n\n[${resultId}:b4 · Page 3]\n\n${selectedBlocks[1]}`
         expect(view.result_id).toBe(resultId)
         expect(view.pages).toBe('2-3')
         expect(view.source).toBe(attempt === 0 ? 'provider' : 'cache')
@@ -682,7 +683,7 @@ describe('MinerUService direct parsing', () => {
         .rejects.toThrow(/pages and focus must be omitted/)
     }
     // Even a structurally valid token cannot resume halfway through a surrogate pair.
-    const splitCharacter = cursorForRemainder(first.result_id, undefined, new Set(['all']), 1)
+    const splitCharacter = cursorForRemainder(first.result_id, undefined, new Set(['all']), 1, { projection: decodeReadCursor(first.cursor!).projection })
     await expect(h.service.parseDocument(owner, { file_path: h.file, cursor: splitCharacter }, signal, null))
       .rejects.toThrow(/splits a Unicode character/)
     expect(h.provider.submitCount).toBe(1)
@@ -844,7 +845,7 @@ describe('MinerUService direct parsing', () => {
       expect(headings[24]).toEqual({ level: 2, title: 'Section 25', line: 25 })
     })
 
-    it('filters to high-level headings (levels 1-3, max 20) when headings > 25', () => {
+    it('preserves all heading levels for resumable outline delivery', () => {
       const lines: string[] = []
       // 10 H1, 10 H2, 10 H4 -> total 30
       for (let i = 1; i <= 10; i++) lines.push(`# Title ${i}`)
@@ -852,30 +853,30 @@ describe('MinerUService direct parsing', () => {
       for (let i = 1; i <= 10; i++) lines.push(`#### LowLevel ${i}`)
 
       const headings = extractMarkdownHeadings(lines.join('\n'))
-      expect(headings).toHaveLength(20)
-      expect(headings.every(h => h.level <= 3)).toBe(true)
+      expect(headings).toHaveLength(30)
+      expect(headings.filter(h => h.level === 4)).toHaveLength(10)
       expect(headings[0]!.title).toBe('Title 1')
       expect(headings[19]!.title).toBe('Subtitle 10')
     })
 
-    it('caps high-level headings to max 20 when there are > 20 high-level headings', () => {
+    it('preserves high-level headings beyond the old summary cap', () => {
       const lines: string[] = []
       // 30 H1 headings
       for (let i = 1; i <= 30; i++) lines.push(`# Title ${i}`)
 
       const headings = extractMarkdownHeadings(lines.join('\n'))
-      expect(headings).toHaveLength(20)
+      expect(headings).toHaveLength(30)
       expect(headings[0]!.title).toBe('Title 1')
       expect(headings[19]!.title).toBe('Title 20')
     })
 
-    it('falls back to first 20 headings when all > 25 headings are low-level', () => {
+    it('preserves low-level headings beyond the old summary cap', () => {
       const lines: string[] = []
       // 30 H4 headings
       for (let i = 1; i <= 30; i++) lines.push(`#### LowLevel ${i}`)
 
       const headings = extractMarkdownHeadings(lines.join('\n'))
-      expect(headings).toHaveLength(20)
+      expect(headings).toHaveLength(30)
       expect(headings[0]!.title).toBe('LowLevel 1')
       expect(headings[19]!.title).toBe('LowLevel 20')
     })
@@ -901,8 +902,9 @@ describe('MinerUService direct parsing', () => {
 
     expect(parsed.state).toBe('completed')
     expect(parsed.markdown_content).toContain('Essential Text')
-    expect(parsed.files[0]?.artifacts).toHaveLength(1)
-    expect(parsed.files[0]?.artifacts[0]?.kind).toBe('markdown')
+    expect(parsed.files[0]?.artifacts).toEqual([])
+    expect(parsed.markdown_path).toBeUndefined()
+    expect(parsed.manifest_path).toBeUndefined()
     expect(parsed.files[0]?.artifacts_truncated).toBeUndefined()
     const rendered = renderResult(parsed)
     expect(rendered[0]?.text).not.toContain('Artifacts:')
@@ -1002,7 +1004,7 @@ describe('MinerUService direct parsing', () => {
     expect(parsed.content_status).toBe('partial')
   })
 
-  it('computes and populates toc on partial content when document has headings', async () => {
+  it('omits repeated toc on partial reads and provides it on demand', async () => {
     const h = await harness()
     h.provider.complete = true
     const mdWithHeadings = [
@@ -1026,20 +1028,21 @@ describe('MinerUService direct parsing', () => {
 
     expect(parsed.state).toBe('completed')
     expect(parsed.content_status).toBe('partial')
-    expect(parsed.toc).toBeDefined()
-    expect(parsed.toc!.length).toBeGreaterThanOrEqual(4)
-    expect(parsed.toc![0]).toEqual({ level: 1, title: 'Document Title', line: 1 })
-    expect(parsed.toc![1]).toEqual({ level: 2, title: 'Chapter 1: Foundations', line: 3 })
-    expect(parsed.toc![2]).toEqual({ level: 2, title: 'Chapter 2: Methods', line: 5 })
-    expect(parsed.toc![3]).toEqual({ level: 3, title: 'Section 2.1: Details', line: 7 })
+    expect(parsed.toc).toBeUndefined()
+    const outline = await h.service.parseDocument(session('session-toc-partial'), { file_path: h.file, focus: 'toc' }, new AbortController().signal, null)
+    expect(outline.markdown_content).toContain('Document Title')
+    expect(outline.markdown_content).toContain('Chapter 1: Foundations')
+    expect(outline.markdown_content).toContain('Chapter 2: Methods')
+    expect(outline.markdown_content).toContain('Section 2.1: Details')
 
     const rendered = renderResult(parsed)
     const text = rendered[0]?.text ?? ''
-    expect(text).toContain('Document Outline:')
-    expect(text).toContain('- Document Title (line 1)')
-    expect(text).toContain('  - Chapter 1: Foundations (line 3)')
-    expect(text).toContain('  - Chapter 2: Methods (line 5)')
-    expect(text).toContain('    - Section 2.1: Details (line 7)')
+    expect(text).not.toContain('Document Outline:')
+    const outlineText = renderResult(outline)[0]?.text ?? ''
+    expect(outlineText).toContain('- Document Title (line 1)')
+    expect(outlineText).toContain('  - Chapter 1: Foundations (line 3)')
+    expect(outlineText).toContain('  - Chapter 2: Methods (line 5)')
+    expect(outlineText).toContain('    - Section 2.1: Details (line 7)')
     expect(text).not.toContain('starting from the given line offset')
   })
 
@@ -1102,12 +1105,9 @@ describe('MinerUService direct parsing', () => {
       expect(parsed.markdown_content).toContain('  - Section 1 (Page 2)')
       expect(parsed.markdown_content).toContain('  - Section 2 (Page 3)')
       expect(parsed.markdown_content).not.toContain('Some long paragraph text')
-      expect(parsed.ordered_images).toEqual([])
-      expect(parsed.toc).toEqual([
-        { level: 1, title: 'Overview', page: 1 },
-        { level: 2, title: 'Section 1', page: 2 },
-        { level: 2, title: 'Section 2', page: 3 },
-      ])
+      expect(parsed.ordered_images).toBeUndefined()
+      expect(parsed.toc).toBeUndefined()
+      expect(parsed.summary?.toc).toBeUndefined()
 
       const rendered = renderResult(parsed)
       const renderedText = rendered[0]?.text ?? ''
@@ -1139,9 +1139,7 @@ describe('MinerUService direct parsing', () => {
       expect(parsed.markdown_content).toContain('  - Section 1.1 (Page 2)')
       expect(parsed.markdown_content).not.toContain('Chapter 1 (Page 1)')
       expect(parsed.markdown_content).not.toContain('Chapter 2 (Page 3)')
-      expect(parsed.toc).toEqual([
-        { level: 2, title: 'Section 1.1', page: 2 },
-      ])
+      expect(parsed.toc).toBeUndefined()
     })
 
     it('combines outline and text when multiple focus items are given', async () => {
@@ -1218,7 +1216,7 @@ describe('MinerUService direct parsing', () => {
       expect(page2Result.ordered_images![0]?.status).toBe('unavailable')
       expect(page2Result.ordered_images![0]?.page).toBe(2)
       expect(page2Result.ordered_images![0]?.caption).toBe('Figure 2 on Page 2')
-      expect(page2Result.markdown_content).toContain('Figure 1 (Page 2) unavailable')
+      expect(page2Result.markdown_content).toContain('Figure 2 (Page 2) unavailable')
       expect(page2Result.markdown_content).not.toContain('Figure 1 on Page 1')
 
       // 2. Reading page 3 only returns zero images
@@ -1228,7 +1226,7 @@ describe('MinerUService direct parsing', () => {
         new AbortController().signal,
         null,
       ))
-      expect(page3Result.ordered_images).toHaveLength(0)
+      expect(page3Result.ordered_images).toBeUndefined()
       expect(page3Result.markdown_content).not.toContain('Attached Image')
     })
 
@@ -1245,6 +1243,8 @@ describe('MinerUService direct parsing', () => {
         { kind: 'content-list', content: JSON.stringify(contentList) },
         { kind: 'images', content: 'fake-png-data' },
       ])
+
+      h.provider.extraArtifactsByFileName.get('input.pdf')!.push({ kind: 'layout', content: JSON.stringify({ pdf_info: [{ page_idx: 0 }, { page_idx: 1 }, { page_idx: 2 }] }) })
 
       // 1. Calling pages: '50-60' on a 3-page document is an explicit error reporting valid range
       await expect(h.service.parseDocument(
@@ -1268,7 +1268,7 @@ describe('MinerUService direct parsing', () => {
       expect(inBoundsResult.markdown_content).toContain('Page 2 text content')
       expect(inBoundsResult.markdown_content).not.toContain('Page 3 text content')
       const inBoundsRendered = renderResult(inBoundsResult)[0]?.text ?? ''
-      expect(inBoundsRendered).toContain('Status: Content complete. Pages: 1-2, Total Pages: 3. Full requested document markdown delivered above.')
+      expect(inBoundsRendered).toContain('Status: Content complete. Pages: 1-2, Total Pages: 3. Selected parsed text complete across this and preceding chunks; not a guarantee of OCR fidelity or visual coverage.')
 
       // 3. Calling without pages shows Pages: 1-3, Total Pages: 3
       const allResult = asResult(await h.service.parseDocument(
@@ -1282,7 +1282,7 @@ describe('MinerUService direct parsing', () => {
       expect(isJsonValue(allResult)).toBe(true)
       expect(snapshotJsonValue(allResult)).toBeDefined()
       const allRendered = renderResult(allResult)[0]?.text ?? ''
-      expect(allRendered).toContain('Status: Content complete. Pages: 1-3, Total Pages: 3. Full requested document markdown delivered above.')
+      expect(allRendered).toContain('Status: Content complete. Pages: 1-3, Total Pages: 3. Selected parsed text complete across this and preceding chunks; not a guarantee of OCR fidelity or visual coverage.')
     })
   })
 })
