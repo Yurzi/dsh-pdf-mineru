@@ -60,6 +60,8 @@ export type MineruKey =
   | 'field.maxZipCompressionRatio'
   | 'action.save'
   | 'action.saved'
+  | 'action.resetDefaults'
+  | 'action.resetSection'
   | 'action.test'
   | 'action.testing'
   | 'action.clearApiKey'
@@ -190,6 +192,8 @@ export const en: Record<MineruKey, string> = {
 
   'action.save': 'Save Configuration',
   'action.saved': 'Saved',
+  'action.resetDefaults': 'Reset to Defaults',
+  'action.resetSection': 'Reset',
   'action.test': 'Test Active Provider',
   'action.testing': 'Testing…',
   'action.clearApiKey': 'Clear API Key',
@@ -320,6 +324,8 @@ export const zh: Record<MineruKey, string> = {
 
   'action.save': '保存配置',
   'action.saved': '已保存',
+  'action.resetDefaults': '恢复默认配置',
+  'action.resetSection': '重置',
   'action.test': '测试当前 Provider 连接',
   'action.testing': '测试中…',
   'action.clearApiKey': '清除 API Key',

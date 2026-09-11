@@ -364,3 +364,159 @@ export function parseConfigWithMigration(value: unknown): ParsedMinerUConfig {
 export function parseConfig(value: unknown): MinerUConfig {
   return parseConfigInput(value, false).config
 }
+
+function deepEqualJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+    return a.every((entry, index) => deepEqualJson(entry, b[index]))
+  }
+  const left = a as Record<string, unknown>
+  const right = b as Record<string, unknown>
+  const keys = Object.keys(left)
+  if (keys.length !== Object.keys(right).length) return false
+  return keys.every(key => Object.hasOwn(right, key) && deepEqualJson(left[key], right[key]))
+}
+
+function pruneObjectSection(
+  nextSection: Record<string, unknown>,
+  baseSection: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const sectionDiff: Record<string, unknown> = {}
+  const allKeys = new Set([...Object.keys(nextSection), ...Object.keys(baseSection)])
+  for (const key of allKeys) {
+    if (!deepEqualJson(nextSection[key], baseSection[key])) {
+      sectionDiff[key] = nextSection[key]
+    }
+  }
+  return Object.keys(sectionDiff).length > 0 ? sectionDiff : undefined
+}
+
+export function pruneConfigToDiff(
+  next: MinerUConfig,
+  base: MinerUConfig = defaultMinerUConfig(),
+): Record<string, unknown> {
+  const diff: Record<string, unknown> = {}
+
+  if (next.activeProvider !== base.activeProvider) {
+    diff.activeProvider = next.activeProvider
+  }
+
+  if (!deepEqualJson(next.providers, base.providers)) {
+    diff.providers = next.providers
+  }
+
+  if (!deepEqualJson(next.defaults, base.defaults)) {
+    diff.defaults = next.defaults
+  }
+
+  const plainSections = ['storage', 'polling', 'retry', 'output', 'limits'] as const
+  for (const section of plainSections) {
+    const sectionDiff = pruneObjectSection(
+      next[section] as unknown as Record<string, unknown>,
+      base[section] as unknown as Record<string, unknown>,
+    )
+    if (sectionDiff !== undefined) {
+      diff[section] = sectionDiff
+    }
+  }
+
+  if (Object.keys(diff).length === 0) {
+    return {}
+  }
+
+  return {
+    schemaVersion: next.schemaVersion,
+    ...diff,
+  }
+}
+
+export function detectBloatedSettingsOps(
+  userSection: Record<string, unknown>,
+  base: MinerUConfig = defaultMinerUConfig(),
+): Array<{ op: 'unset'; path: string[] }> {
+  if (typeof userSection !== 'object' || userSection === null || Array.isArray(userSection)) {
+    return []
+  }
+
+  const ops: Array<{ op: 'unset'; path: string[] }> = []
+
+  const plainSections = ['limits', 'polling', 'retry', 'storage'] as const
+  for (const section of plainSections) {
+    const userVal = userSection[section]
+    if (typeof userVal === 'object' && userVal !== null && !Array.isArray(userVal)) {
+      if (deepEqualJson(userVal, base[section])) {
+        ops.push({ op: 'unset', path: [section] })
+      } else {
+        const userObj = userVal as Record<string, unknown>
+        const baseObj = base[section] as unknown as Record<string, unknown>
+        for (const key of Object.keys(userObj)) {
+          if (deepEqualJson(userObj[key], baseObj[key])) {
+            ops.push({ op: 'unset', path: [section, key] })
+          }
+        }
+      }
+    }
+  }
+
+  const outputVal = userSection.output
+  if (deepEqualJson(outputVal, base.output)) {
+    ops.push({ op: 'unset', path: ['output'] })
+  } else if (typeof outputVal === 'object' && outputVal !== null && !Array.isArray(outputVal)) {
+    const outputObj = outputVal as Record<string, unknown>
+    const baseOutputObj = base.output as unknown as Record<string, unknown>
+    for (const key of Object.keys(outputObj)) {
+      if (deepEqualJson(outputObj[key], baseOutputObj[key])) {
+        ops.push({ op: 'unset', path: ['output', key] })
+      }
+    }
+  }
+
+  if (deepEqualJson(userSection.defaults, base.defaults)) {
+    ops.push({ op: 'unset', path: ['defaults'] })
+  }
+
+  if (deepEqualJson(userSection.providers, base.providers)) {
+    ops.push({ op: 'unset', path: ['providers'] })
+  }
+
+  if (Object.hasOwn(userSection, 'activeProvider') && userSection.activeProvider === base.activeProvider) {
+    ops.push({ op: 'unset', path: ['activeProvider'] })
+  }
+
+  const remainingKeys = new Set(
+    Object.keys(userSection).filter(k => {
+      if (k === 'schemaVersion') return false
+      const val = userSection[k]
+      if (typeof val === 'object' && val !== null && !Array.isArray(val) && Object.keys(val).length === 0) {
+        return false
+      }
+      return true
+    }),
+  )
+
+  for (const op of ops) {
+    if (op.path.length === 1) {
+      remainingKeys.delete(op.path[0]!)
+    } else if (op.path.length === 2) {
+      const parentKey = op.path[0]!
+      const parentVal = userSection[parentKey]
+      if (typeof parentVal === 'object' && parentVal !== null && !Array.isArray(parentVal)) {
+        const parentKeys = Object.keys(parentVal as Record<string, unknown>)
+        const unsetKeys = ops
+          .filter(o => o.path.length === 2 && o.path[0] === parentKey)
+          .map(o => o.path[1]!)
+        if (parentKeys.every(k => unsetKeys.includes(k))) {
+          remainingKeys.delete(parentKey)
+        }
+      }
+    }
+  }
+
+  if (remainingKeys.size === 0 && Object.hasOwn(userSection, 'schemaVersion')) {
+    ops.push({ op: 'unset', path: ['schemaVersion'] })
+  }
+
+  return ops
+}

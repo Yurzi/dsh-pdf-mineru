@@ -1,9 +1,12 @@
 import z from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
 import {
+  defaultMinerUConfig,
+  detectBloatedSettingsOps,
   MINERU_CONFIG_SCHEMA_VERSION,
   parseConfig,
   parseConfigWithMigration,
+  pruneConfigToDiff,
   type MinerUConfig,
   type ProviderConfig,
 } from './config.js'
@@ -104,6 +107,7 @@ interface SettingsService {
       | { readonly op: 'unset'; readonly path: readonly string[] }
     )[],
   ): Promise<void>
+  describe?(options?: { redactSecrets?: boolean }): Array<{ ns: string; user?: unknown }>
 }
 
 interface CredentialService {
@@ -184,6 +188,20 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
   if (storedConfig.migrated) {
     await persistMigration()
   }
+  const pruneLegacyBloatedSettings = async (): Promise<void> => {
+    try {
+      const descriptor = settings.describe?.()?.find(d => d.ns === 'dsh-pdf-mineru')
+      const user = descriptor?.user
+      if (typeof user !== 'object' || user === null || Array.isArray(user)) return
+      const ops = detectBloatedSettingsOps(user as Record<string, unknown>, defaultMinerUConfig())
+      if (ops.length > 0) {
+        await settings.mutate('dsh-pdf-mineru', ops)
+      }
+    } catch {
+      ctx.logger?.warn('dsh-pdf-mineru: could not prune legacy bloated settings')
+    }
+  }
+  await pruneLegacyBloatedSettings()
   fixedStorageRoot = persistedConfig.storage.storageRoot
   fixedLimits = { ...persistedConfig.limits }
   ctx.effect(
@@ -241,7 +259,8 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
         getConfig: () => persistedConfig,
         setConfig: async value => {
           const next = validateRuntimeConfig(value)
-          await settingsScope.replace(asObject(next))
+          const sparse = pruneConfigToDiff(next, defaultMinerUConfig())
+          await settingsScope.replace(sparse)
           persistedConfig = next
           return next
         },

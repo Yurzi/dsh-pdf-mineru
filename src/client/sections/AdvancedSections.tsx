@@ -1,7 +1,7 @@
 import type { Dispatch, SetStateAction } from 'react'
 import { MAX_INLINE_IMAGE_BUDGET, MIN_INLINE_IMAGE_BUDGET, type MinerUConfig } from '../../config/pure.js'
 import type { MineruKey } from '../locales.js'
-import { updateConfigSection } from '../helpers.js'
+import { resetConfigSection, updateConfigSection } from '../helpers.js'
 import { NumericInput } from '../NumericInput.js'
 import css from '../SettingsPage.module.css'
 
@@ -20,7 +20,16 @@ export function AdvancedSections({
     <>
       {/* 3. Storage & Cache */}
       <div className={css.editorGroup}>
-        <h3 className={css.groupTitle}>{t('section.storage')}</h3>
+        <div className={css.groupHeader}>
+          <h3 className={css.groupTitle}>{t('section.storage')}</h3>
+          <button
+            type="button"
+            className={css.resetButton}
+            onClick={() => setDraft(prev => (prev === null ? prev : resetConfigSection(prev, 'storage')))}
+          >
+            {t('action.resetSection')}
+          </button>
+        </div>
 
         <div className={css.row}>
           <label className={css.field}>
@@ -59,7 +68,16 @@ export function AdvancedSections({
 
       {/* 5. Polling & Timeouts */}
       <div className={css.editorGroup}>
-        <h3 className={css.groupTitle}>{t('section.polling')}</h3>
+        <div className={css.groupHeader}>
+          <h3 className={css.groupTitle}>{t('section.polling')}</h3>
+          <button
+            type="button"
+            className={css.resetButton}
+            onClick={() => setDraft(prev => (prev === null ? prev : resetConfigSection(prev, 'polling')))}
+          >
+            {t('action.resetSection')}
+          </button>
+        </div>
 
         <div className={css.row}>
           <label className={css.field}>
@@ -108,7 +126,16 @@ export function AdvancedSections({
 
       {/* 6. Retry Policy */}
       <div className={css.editorGroup}>
-        <h3 className={css.groupTitle}>{t('section.retry')}</h3>
+        <div className={css.groupHeader}>
+          <h3 className={css.groupTitle}>{t('section.retry')}</h3>
+          <button
+            type="button"
+            className={css.resetButton}
+            onClick={() => setDraft(prev => (prev === null ? prev : resetConfigSection(prev, 'retry')))}
+          >
+            {t('action.resetSection')}
+          </button>
+        </div>
 
         <div className={css.row}>
           <label className={css.field}>
@@ -148,7 +175,16 @@ export function AdvancedSections({
 
       {/* 7. Output Limits */}
       <div className={css.editorGroup}>
-        <h3 className={css.groupTitle}>{t('section.output')}</h3>
+        <div className={css.groupHeader}>
+          <h3 className={css.groupTitle}>{t('section.output')}</h3>
+          <button
+            type="button"
+            className={css.resetButton}
+            onClick={() => setDraft(prev => (prev === null ? prev : resetConfigSection(prev, 'output')))}
+          >
+            {t('action.resetSection')}
+          </button>
+        </div>
 
         <div className={css.row}>
           <label className={css.field}>

@@ -11,6 +11,8 @@ import {
   credentialReference,
   describeCredential,
   ensureProviderProfiles,
+  resetConfigSection,
+  resetToDefaultConfig,
   storeCredential,
   type CredentialClient,
   type CredentialView,
@@ -29,6 +31,8 @@ export {
   ensureProviderProfiles,
   normalizeProviderDefaults,
   patchActiveProvider,
+  resetConfigSection,
+  resetToDefaultConfig,
   storeCredential,
   updateConfigSection,
   type CredentialClient,
@@ -201,6 +205,13 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
     setDraft(next)
   }, [draft])
 
+  const handleResetDefaults = useCallback(() => {
+    if (draft === null) return
+    const next = resetToDefaultConfig(draft)
+    setDraft(next)
+    setTxtToAutoNotice(false)
+  }, [draft])
+
   if (loading || draft === null) {
     return (
       <section className={css.section}>
@@ -246,6 +257,14 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
           onClick={() => void testActiveProvider()}
         >
           {testState.status === 'testing' ? t('action.testing') : t('action.test')}
+        </button>
+        <button
+          type="button"
+          className={css.secondaryButton}
+          disabled={saving || credentialBusy}
+          onClick={handleResetDefaults}
+        >
+          {t('action.resetDefaults')}
         </button>
       </div>
 

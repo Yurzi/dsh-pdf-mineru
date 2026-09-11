@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest'
 import {
   defaultMinerUConfig,
   defaultProviderConfig,
+  detectBloatedSettingsOps,
   parseConfig,
   parseConfigWithMigration,
   providerById,
+  pruneConfigToDiff,
 } from '../src/config.js'
 import { asProviderConfigId } from '../src/domain/ids.js'
 
@@ -264,5 +266,225 @@ describe('MinerU config parsing and validation', () => {
       ...base,
       retry: { maxAttempts: 3, baseDelayMs: 2000, maxDelayMs: 1000 },
     })).toThrow(/cannot exceed/)
+  })
+})
+describe('pruneConfigToDiff', () => {
+  it('returns an empty object for a completely default config', () => {
+    const base = defaultMinerUConfig()
+    expect(pruneConfigToDiff(base, base)).toEqual({})
+    expect(pruneConfigToDiff(base)).toEqual({})
+  })
+
+  it('includes only activeProvider when only activeProvider is modified', () => {
+    const base = defaultMinerUConfig()
+    const next = { ...base, activeProvider: asProviderConfigId('mp_official') }
+    expect(pruneConfigToDiff(next, base)).toEqual({
+      schemaVersion: 2,
+      activeProvider: 'mp_official',
+    })
+  })
+
+  it('includes entire defaults when only defaults are modified', () => {
+    const base = defaultMinerUConfig()
+    const next = { ...base, defaults: { ...base.defaults, model: 'vlm' as const } }
+    expect(pruneConfigToDiff(next, base)).toEqual({
+      schemaVersion: 2,
+      defaults: next.defaults,
+    })
+  })
+
+  it('prunes partial modification in output and omits unchanged properties', () => {
+    const base = defaultMinerUConfig()
+    const next = { ...base, output: { ...base.output, maxInlineImages: 10 } }
+    expect(pruneConfigToDiff(next, base)).toEqual({
+      schemaVersion: 2,
+      output: { maxInlineImages: 10 },
+    })
+  })
+
+  it('prunes partial modification in retry and omits unchanged properties', () => {
+    const base = defaultMinerUConfig()
+    const next = { ...base, retry: { ...base.retry, maxAttempts: 5 } }
+    expect(pruneConfigToDiff(next, base)).toEqual({
+      schemaVersion: 2,
+      retry: { maxAttempts: 5 },
+    })
+  })
+
+  it('prunes partial modifications across storage, polling, and limits', () => {
+    const base = defaultMinerUConfig()
+    const next = {
+      ...base,
+      storage: { ...base.storage, stagingTtlMs: 12345 },
+      polling: { ...base.polling, pollIntervalMs: 1500 },
+      limits: { ...base.limits, maxFileBytes: 100 * 1024 * 1024 },
+    }
+    expect(pruneConfigToDiff(next, base)).toEqual({
+      schemaVersion: 2,
+      storage: { stagingTtlMs: 12345 },
+      polling: { pollIntervalMs: 1500 },
+      limits: { maxFileBytes: 100 * 1024 * 1024 },
+    })
+  })
+
+  it('retains providers array when providers are modified', () => {
+    const base = defaultMinerUConfig()
+    const modifiedProvider = {
+      ...base.providers[0]!,
+      baseURL: 'http://localhost:19000',
+    }
+    const next = {
+      ...base,
+      providers: [modifiedProvider, base.providers[1]!],
+    }
+    expect(pruneConfigToDiff(next, base)).toEqual({
+      schemaVersion: 2,
+      providers: next.providers,
+    })
+  })
+
+  it('omits providers array when providers are unchanged', () => {
+    const base = defaultMinerUConfig()
+    const next = { ...base, output: { ...base.output, maxInlineImages: 8 } }
+    const pruned = pruneConfigToDiff(next, base)
+    expect(pruned).not.toHaveProperty('providers')
+    expect(pruned).toEqual({
+      schemaVersion: 2,
+      output: { maxInlineImages: 8 },
+    })
+  })
+
+  it('resolves back to the original next config when merging base with the pruned diff', () => {
+    const base = defaultMinerUConfig()
+    const next = {
+      ...base,
+      activeProvider: asProviderConfigId('mp_official'),
+      defaults: { ...base.defaults, model: 'vlm' as const, ocr: true, parseMethod: 'ocr' as const },
+      output: { ...base.output, maxInlineImages: 10 },
+      retry: { ...base.retry, maxAttempts: 5 },
+      polling: { ...base.polling, pollIntervalMs: 3000 },
+      storage: { ...base.storage, stagingTtlMs: 12 * 60 * 60 * 1000 },
+      limits: { ...base.limits, maxFileBytes: 50 * 1024 * 1024 },
+    }
+
+    const pruned = pruneConfigToDiff(next, base)
+
+    // Simulate DSH mergeLayers: plain objects shallow-merged, arrays and primitives replaced wholesale
+    const merged = {
+      ...base,
+      ...pruned,
+      storage: { ...base.storage, ...(pruned.storage as object | undefined) },
+      polling: { ...base.polling, ...(pruned.polling as object | undefined) },
+      retry: { ...base.retry, ...(pruned.retry as object | undefined) },
+      output: { ...base.output, ...(pruned.output as object | undefined) },
+      limits: { ...base.limits, ...(pruned.limits as object | undefined) },
+    }
+
+    const resolved = parseConfig(merged)
+    expect(resolved).toEqual(next)
+  })
+})
+
+describe('detectBloatedSettingsOps', () => {
+  it('detects bloated settings ops for completely bloated defaults and unsets schemaVersion', () => {
+    const base = defaultMinerUConfig()
+    const bloatedUserSection: Record<string, unknown> = {
+      schemaVersion: base.schemaVersion,
+      activeProvider: base.activeProvider,
+      providers: base.providers,
+      defaults: base.defaults,
+      storage: base.storage,
+      polling: base.polling,
+      retry: base.retry,
+      output: base.output,
+      limits: base.limits,
+    }
+    const ops = detectBloatedSettingsOps(bloatedUserSection, base)
+    expect(ops).toEqual([
+      { op: 'unset', path: ['limits'] },
+      { op: 'unset', path: ['polling'] },
+      { op: 'unset', path: ['retry'] },
+      { op: 'unset', path: ['storage'] },
+      { op: 'unset', path: ['output'] },
+      { op: 'unset', path: ['defaults'] },
+      { op: 'unset', path: ['providers'] },
+      { op: 'unset', path: ['activeProvider'] },
+      { op: 'unset', path: ['schemaVersion'] },
+    ])
+  })
+
+  it('unsets bloated sections while preserving custom activeProvider and output.maxInlineImages', () => {
+    const base = defaultMinerUConfig()
+    const userSection: Record<string, unknown> = {
+      schemaVersion: base.schemaVersion,
+      activeProvider: 'mp_official',
+      providers: base.providers,
+      defaults: base.defaults,
+      limits: base.limits,
+      polling: base.polling,
+      retry: base.retry,
+      output: {
+        maxInlineChars: base.output.maxInlineChars,
+        maxInlineImages: 10,
+      },
+    }
+    const ops = detectBloatedSettingsOps(userSection, base)
+    expect(ops).toEqual([
+      { op: 'unset', path: ['limits'] },
+      { op: 'unset', path: ['polling'] },
+      { op: 'unset', path: ['retry'] },
+      { op: 'unset', path: ['output', 'maxInlineChars'] },
+      { op: 'unset', path: ['defaults'] },
+      { op: 'unset', path: ['providers'] },
+    ])
+    expect(ops.some(op => op.path[0] === 'activeProvider')).toBe(false)
+    expect(ops.some(op => op.path[0] === 'output' && op.path[1] === 'maxInlineImages')).toBe(false)
+    expect(ops.some(op => op.path[0] === 'schemaVersion')).toBe(false)
+  })
+
+  it('produces 0 ops for a clean sparse user section', () => {
+    const base = defaultMinerUConfig()
+    const sparse = { activeProvider: 'mp_official' }
+    const ops = detectBloatedSettingsOps(sparse, base)
+    expect(ops).toEqual([])
+  })
+
+  it('unsets only default sub-keys when a sub-section is partially customized', () => {
+    const base = defaultMinerUConfig()
+    const userSection: Record<string, unknown> = {
+      storage: {
+        storageRoot: '/custom/storage/root',
+        cacheEnabled: base.storage.cacheEnabled,
+        retainSources: base.storage.retainSources,
+        stagingTtlMs: base.storage.stagingTtlMs,
+      },
+    }
+    const ops = detectBloatedSettingsOps(userSection, base)
+    expect(ops).toEqual([
+      { op: 'unset', path: ['storage', 'cacheEnabled'] },
+      { op: 'unset', path: ['storage', 'retainSources'] },
+      { op: 'unset', path: ['storage', 'stagingTtlMs'] },
+    ])
+    expect(ops.some(op => op.path[0] === 'storage' && op.path[1] === 'storageRoot')).toBe(false)
+    expect(ops.some(op => op.path[0] === 'schemaVersion')).toBe(false)
+  })
+
+  it('does not unset defaults or individual default fields if defaults are customized', () => {
+    const base = defaultMinerUConfig()
+    const userSection: Record<string, unknown> = {
+      defaults: {
+        ...base.defaults,
+        model: 'vlm',
+      },
+    }
+    const ops = detectBloatedSettingsOps(userSection, base)
+    expect(ops).toEqual([])
+  })
+
+  it('returns empty array for non-object or null input', () => {
+    expect(detectBloatedSettingsOps(null as unknown as Record<string, unknown>)).toEqual([])
+    expect(detectBloatedSettingsOps(undefined as unknown as Record<string, unknown>)).toEqual([])
+    expect(detectBloatedSettingsOps('invalid' as unknown as Record<string, unknown>)).toEqual([])
+    expect(detectBloatedSettingsOps([] as unknown as Record<string, unknown>)).toEqual([])
   })
 })

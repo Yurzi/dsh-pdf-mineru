@@ -1,5 +1,10 @@
 import type { ClientConnectionRpc, RpcResult } from '@deepseek-ai/dsh-client-connection/client'
 import {
+  DEFAULT_OUTPUT_CONFIG,
+  DEFAULT_PARSE_DEFAULTS,
+  DEFAULT_POLLING_CONFIG,
+  DEFAULT_RETRY_CONFIG,
+  DEFAULT_STORAGE_OPTIONS,
   defaultProviderConfig,
   type MinerUConfig,
   type ProviderConfig,
@@ -117,4 +122,77 @@ export async function storeCredential(
 export async function clearCredential(credentials: CredentialClient, reference: string): Promise<void> {
   const result = await credentials.unset(reference)
   if (!result.ok) throw new Error(result.error.message)
+}
+
+export function resetConfigSection<K extends keyof MinerUConfig>(
+  config: MinerUConfig,
+  section: K,
+): MinerUConfig {
+  switch (section) {
+    case 'defaults': {
+      const active = config.providers.find(p => p.id === config.activeProvider) ?? config.providers[0]
+      const next: MinerUConfig = {
+        ...config,
+        defaults: { ...DEFAULT_PARSE_DEFAULTS },
+      }
+      return active !== undefined ? normalizeProviderDefaults(next, active) : next
+    }
+    case 'polling':
+      return {
+        ...config,
+        polling: { ...DEFAULT_POLLING_CONFIG },
+      }
+    case 'retry':
+      return {
+        ...config,
+        retry: { ...DEFAULT_RETRY_CONFIG },
+      }
+    case 'output':
+      return {
+        ...config,
+        output: { ...DEFAULT_OUTPUT_CONFIG },
+      }
+    case 'storage':
+      return {
+        ...config,
+        storage: {
+          ...config.storage,
+          cacheEnabled: DEFAULT_STORAGE_OPTIONS.cacheEnabled,
+          stagingTtlMs: DEFAULT_STORAGE_OPTIONS.stagingTtlMs,
+          retainSources: DEFAULT_STORAGE_OPTIONS.retainSources,
+        },
+      }
+    case 'providers': {
+      const providers = config.providers.map(p => ({
+        ...defaultProviderConfig(p.type),
+        id: p.id,
+      } as ProviderConfig))
+      const active = providers.find(p => p.id === config.activeProvider) ?? providers[0]
+      const next: MinerUConfig = { ...config, providers }
+      return active !== undefined ? normalizeProviderDefaults(next, active) : next
+    }
+    default:
+      return config
+  }
+}
+
+export function resetToDefaultConfig(current: MinerUConfig): MinerUConfig {
+  const selfHosted = defaultProviderConfig('self-hosted-v2')
+  const official = defaultProviderConfig('official-v4')
+  return {
+    schemaVersion: current.schemaVersion,
+    activeProvider: selfHosted.id,
+    providers: [selfHosted, official],
+    defaults: { ...DEFAULT_PARSE_DEFAULTS },
+    storage: {
+      ...current.storage,
+      cacheEnabled: DEFAULT_STORAGE_OPTIONS.cacheEnabled,
+      stagingTtlMs: DEFAULT_STORAGE_OPTIONS.stagingTtlMs,
+      retainSources: DEFAULT_STORAGE_OPTIONS.retainSources,
+    },
+    polling: { ...DEFAULT_POLLING_CONFIG },
+    retry: { ...DEFAULT_RETRY_CONFIG },
+    output: { ...DEFAULT_OUTPUT_CONFIG },
+    limits: current.limits,
+  }
 }

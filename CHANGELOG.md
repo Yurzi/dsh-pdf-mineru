@@ -2,6 +2,12 @@
 
 ## 0.0.12
 
+### Added
+
+- Pruned default configuration values on save via `pruneConfigToDiff` so that unchanged defaults are not written to `settings.yaml`, preventing user configuration bloat.
+- Added automatic startup slimming via `detectBloatedSettingsOps` and `settings.mutate` to clean up legacy bloated default entries from existing `settings.yaml` files.
+- Added page-level "Reset to Defaults" and section-level "Reset" controls in the Web settings UI to easily restore default values.
+
 ### Changed
 
 - Raised the minimum supported DSH version to `0.1.5-rc.2` and aligned DSH runtime peers, development dependencies, and the lockfile with that release. Node.js requirements, Provider configuration, cache formats, and tool arguments are unchanged.

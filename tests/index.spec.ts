@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ConnectionRpcHandler } from '@deepseek-ai/dsh-client-connection'
-import { defaultMinerUConfig, parseConfig } from '../src/config.js'
+import { defaultMinerUConfig, parseConfig, pruneConfigToDiff } from '../src/config.js'
 import { ProcessLock, ResultRepository } from '../src/storage/index.js'
 
 vi.mock('@deepseek-ai/dsh-tools', () => ({ defineTool: (definition: unknown) => definition }))
@@ -29,18 +29,23 @@ interface FakeRuntime {
   }
   readonly settingsReplace: ReturnType<typeof vi.fn>
   readonly settingsMutate: ReturnType<typeof vi.fn>
+  readonly settingsDescribe?: ReturnType<typeof vi.fn>
 }
 
 function fakeContext(
   config: ReturnType<typeof defaultMinerUConfig>,
   failToolRegistration = false,
   storedConfig: unknown = config,
+  describeUser?: unknown,
 ): FakeRuntime {
   const definitions: unknown[] = []
   const effects: Array<() => void | Promise<void>> = []
   const rpc: FakeRuntime['rpc'] = { registered: false, disposeCount: 0 }
   const settingsReplace = vi.fn((_section: object) => Promise.resolve())
   const settingsMutate = vi.fn((_namespace: string, _operations: readonly unknown[]) => Promise.resolve())
+  const settingsDescribe = describeUser !== undefined
+    ? vi.fn(() => [{ ns: 'dsh-pdf-mineru', user: describeUser }])
+    : undefined
   let resolvedConfig = storedConfig
   const scope = {
     get: () => resolvedConfig,
@@ -71,6 +76,7 @@ function fakeContext(
     get: (name: string) => name === 'settings'
       ? {
           mutate: settingsMutate,
+          ...(settingsDescribe !== undefined ? { describe: settingsDescribe } : {}),
           register: (_namespace: string, schema: unknown, options: { validate(value: unknown): void }) => {
             resolvedConfig = (schema as (value: unknown) => unknown)(storedConfig)
             options.validate(resolvedConfig)
@@ -91,7 +97,7 @@ function fakeContext(
     },
     logger: { info: () => undefined, warn: () => undefined, error: () => undefined, debug: () => undefined },
   }
-  return { ctx: value as unknown as Context, definitions, effects, rpc, settingsReplace, settingsMutate }
+  return { ctx: value as unknown as Context, definitions, effects, rpc, settingsReplace, settingsMutate, settingsDescribe }
 }
 
 function cancellableContext(config: ReturnType<typeof defaultMinerUConfig>): FakeRuntime & { disposeContext(): Promise<void> } {
@@ -231,7 +237,12 @@ describe('plugin composition lifecycle', () => {
     ) as { ok: boolean; value?: { config: typeof next } }
     expect(response).toMatchObject({ ok: true, value: { config: next } })
     expect(runtime.settingsReplace).toHaveBeenCalledOnce()
-    expect(runtime.settingsReplace).toHaveBeenCalledWith(next)
+    expect(runtime.settingsReplace).toHaveBeenCalledWith(pruneConfigToDiff(next, defaultMinerUConfig()))
+    expect(runtime.settingsReplace).toHaveBeenCalledWith({
+      schemaVersion: 2,
+      storage: { storageRoot: storedConfig.storage.storageRoot },
+      output: { maxInlineChars: 234567, maxInlineImages: 9 },
+    })
 
     const changedLimits = { ...next, limits: { ...next.limits, maxZipEntryBytes: next.limits.maxZipEntryBytes + 1 } }
     const rejected = await runtime.rpc.handler?.(
@@ -316,5 +327,50 @@ describe('plugin composition lifecycle', () => {
     expect(runtime2.definitions).toHaveLength(2)
     await dispose1()
     await dispose2()
+  })
+
+  it('slims legacy bloated settings on startup when settings.describe returns a bloated user section', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mineru-index-slimming-'))
+    roots.push(root)
+    const base = defaultMinerUConfig()
+    const entryConfig = { ...base, storage: { ...base.storage, storageRoot: join(root, 'store') } }
+    const bloatedUser = { ...defaultMinerUConfig() }
+    const runtime = fakeContext(entryConfig, false, entryConfig, bloatedUser)
+    const { apply } = await import('../src/index.js')
+
+    const dispose = await apply(runtime.ctx, entryConfig)
+
+    expect(runtime.settingsDescribe).toHaveBeenCalled()
+    expect(runtime.settingsMutate).toHaveBeenCalledOnce()
+    expect(runtime.settingsMutate).toHaveBeenCalledWith('dsh-pdf-mineru', [
+      { op: 'unset', path: ['limits'] },
+      { op: 'unset', path: ['polling'] },
+      { op: 'unset', path: ['retry'] },
+      { op: 'unset', path: ['storage'] },
+      { op: 'unset', path: ['output'] },
+      { op: 'unset', path: ['defaults'] },
+      { op: 'unset', path: ['providers'] },
+      { op: 'unset', path: ['activeProvider'] },
+      { op: 'unset', path: ['schemaVersion'] },
+    ])
+
+    await dispose()
+  })
+
+  it('handles settings mutation failure gracefully during slimming migration', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mineru-index-slimming-fail-'))
+    roots.push(root)
+    const base = defaultMinerUConfig()
+    const entryConfig = { ...base, storage: { ...base.storage, storageRoot: join(root, 'store') } }
+    const bloatedUser = { ...defaultMinerUConfig() }
+    const runtime = fakeContext(entryConfig, false, entryConfig, bloatedUser)
+    runtime.settingsMutate.mockRejectedValueOnce(new Error('mutation failed'))
+    const warnSpy = vi.spyOn(runtime.ctx.logger, 'warn')
+    const { apply } = await import('../src/index.js')
+
+    const dispose = await apply(runtime.ctx, entryConfig)
+
+    expect(warnSpy).toHaveBeenCalledWith('dsh-pdf-mineru: could not prune legacy bloated settings')
+    await dispose()
   })
 })

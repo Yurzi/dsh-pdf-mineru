@@ -21,3 +21,5 @@ export declare function credentialReference(provider: ProviderConfig | undefined
 export declare function describeCredential(credentials: CredentialClient, reference: string): Promise<CredentialView>;
 export declare function storeCredential(credentials: CredentialClient, reference: string, value: string): Promise<void>;
 export declare function clearCredential(credentials: CredentialClient, reference: string): Promise<void>;
+export declare function resetConfigSection<K extends keyof MinerUConfig>(config: MinerUConfig, section: K): MinerUConfig;
+export declare function resetToDefaultConfig(current: MinerUConfig): MinerUConfig;

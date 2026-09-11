@@ -2,7 +2,7 @@ import type { Dispatch, SetStateAction } from 'react'
 import type { MinerUConfig, ProviderConfig } from '../../config/pure.js'
 import type { MinerUModel, ParseMethod } from '../../domain/request.js'
 import type { MineruKey } from '../locales.js'
-import { updateConfigSection } from '../helpers.js'
+import { resetConfigSection, updateConfigSection } from '../helpers.js'
 import css from '../SettingsPage.module.css'
 
 export interface DefaultsSectionProps {
@@ -24,7 +24,16 @@ export function DefaultsSection({
 }: DefaultsSectionProps) {
   return (
     <div className={css.editorGroup}>
-      <h3 className={css.groupTitle}>{t('section.defaults')}</h3>
+      <div className={css.groupHeader}>
+        <h3 className={css.groupTitle}>{t('section.defaults')}</h3>
+        <button
+          type="button"
+          className={css.resetButton}
+          onClick={() => setDraft(prev => (prev === null ? prev : resetConfigSection(prev, 'defaults')))}
+        >
+          {t('action.resetSection')}
+        </button>
+      </div>
 
       {txtToAutoNotice && (
         <div className={css.error} style={{
