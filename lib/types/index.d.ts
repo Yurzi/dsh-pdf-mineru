@@ -1,5 +1,5 @@
 import z from '@deepseek-ai/schemastery';
-import type { Context } from 'cordis';
+import type { Context } from '@deepseek-ai/cordis';
 export declare const name = "dsh-pdf-mineru";
 export declare const inject: string[];
 export declare const Config: z<unknown>;

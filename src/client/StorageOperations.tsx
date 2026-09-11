@@ -46,9 +46,9 @@ export function formatBytes(bytes: number, saturated = false): string {
 async function callMaintenance<T>(
   rpc: ClientConnectionRpc, endpoint: string, payload: unknown = {},
 ): Promise<T> {
-  const result = await rpc.call<T>('/dsh-pdf-mineru-api', endpoint, payload)
+  const result = await rpc.call('/dsh-pdf-mineru-api', endpoint, payload)
   if (!result.ok) throw new Error(result.error.message)
-  return result.value
+  return result.value as T
 }
 
 function isPartialArea(area: StorageAreaStatistics): boolean {

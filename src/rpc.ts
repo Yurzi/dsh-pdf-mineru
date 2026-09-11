@@ -12,7 +12,9 @@
  *   - Errors sanitized via sanitizeDiagnostic and mapped to allowlisted actionable error codes.
  */
 
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
+import type { ConnectionRpcResult } from '@deepseek-ai/dsh-client-connection'
+import { registerLoopbackRpc } from './loopback-rpc.js'
 import type { MinerUConfig } from './config.js'
 import { parseConfig } from './config.js'
 import { MinerUError, type MinerUErrorCode, sanitizeDiagnostic } from './domain/errors.js'
@@ -27,9 +29,7 @@ export interface MineruRpcDeps {
     'getStatistics' | 'scanIntegrity' | 'listQuarantine' | 'cleanupQuarantine' | 'gcDryRun' | 'clearCache'>
 }
 
-export type RpcResult<T> =
-  | { readonly ok: true; readonly value: T }
-  | { readonly ok: false; readonly error: { readonly code: string; readonly message: string } }
+export type RpcResult<T> = ConnectionRpcResult<T>
 
 export const RPC_CHANNEL = '/dsh-pdf-mineru-api'
 
@@ -90,7 +90,7 @@ function optionalBoolean(payload: Record<string, unknown>, key: string, fallback
 function fail<T = unknown>(message: string, code = 'mineru/internal'): RpcResult<T> {
   return {
     ok: false,
-    error: { code, message: sanitizeDiagnostic(message) },
+    error: { code, message: sanitizeDiagnostic(message), details: {} },
   }
 }
 
@@ -123,18 +123,8 @@ export function mapRpcError(err: unknown): { code: string; message: string } {
 
 export function registerRpc(ctx: Context, deps: MineruRpcDeps): () => void | Promise<void> {
   ctx.logger?.info('dsh-pdf-mineru: registering RPC channel /dsh-pdf-mineru-api')
-  const connection = ctx.connection as {
-    readonly rpc: {
-      readonly handle: (
-        channel: '/dsh-pdf-mineru-api',
-        handler: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<RpcResult<unknown>>,
-        options: { readonly authority: 'trusted-host' | 'loopback' },
-      ) => unknown
-    }
-  }
-
-  const dispose = connection.rpc.handle(
-    RPC_CHANNEL,
+  return registerLoopbackRpc(
+    ctx, RPC_CHANNEL,
     async (endpoint: string, payload: unknown, signal: AbortSignal): Promise<RpcResult<unknown>> => {
       try {
         switch (endpoint) {
@@ -253,12 +243,8 @@ export function registerRpc(ctx: Context, deps: MineruRpcDeps): () => void | Pro
         }
       } catch (err: unknown) {
         const { code, message } = mapRpcError(err)
-        return { ok: false, error: { code, message } }
+        return { ok: false, error: { code, message, details: {} } }
       }
     },
-    { authority: 'loopback' },
   )
-  return typeof dispose === 'function'
-    ? () => (dispose as () => void | Promise<void>)()
-    : () => undefined
 }

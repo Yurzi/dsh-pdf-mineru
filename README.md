@@ -12,7 +12,7 @@
   <a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin"></a>
   <a href="https://www.npmjs.com/package/dsh-pdf-mineru"><img src="https://img.shields.io/npm/v/dsh-pdf-mineru?style=flat-square&amp;label=npm&amp;color=CB3837" alt="npm version"></a>
   <a href="./package.json"><img src="https://img.shields.io/badge/Node.js-%3E%3D22.19.0-339933?style=flat-square&amp;logo=nodedotjs&amp;logoColor=white" alt="Node.js 22.19.0 or newer"></a>
-  <img src="https://img.shields.io/badge/DSH-%3E%3D0.1.2--rc.1%20(RC%20only)-111827?style=flat-square" alt="DSH >=0.1.2-rc.1 (RC only)">
+  <img src="https://img.shields.io/badge/DSH-%3E%3D0.1.5--rc.2%20(RC%20only)-111827?style=flat-square" alt="DSH >=0.1.5-rc.2 (RC only)">
   <img src="https://img.shields.io/badge/MinerU-Official%20v4%20%7C%20Self--hosted%20v2-2563EB?style=flat-square" alt="MinerU v2 and v4">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-2EA44F?style=flat-square" alt="MIT License"></a>
 </p>
@@ -38,9 +38,11 @@
 ### 0. 环境要求与版本兼容说明
 
 > ⚠️ **重要版本声明与环境要求**：
-> - **最低支持的 DSH 版本**：`>= 0.1.2-rc.1`。
+> - **最低支持的 DSH 版本**：`>= 0.1.5-rc.2`。
 > - **仅支持 RC 版本**：本插件**只会对 DeepSeek Harness 的 RC（Release Candidate）版本及后续正式发布版本进行官方支持**。由于早期 `alpha` 测试版本包含较多实验性且剧烈变动的内部 API，本插件不再对 `alpha` 等非稳定测试版本提供兼容与维护支持。
 > - **运行环境要求**：Node.js `^22.19.0 || >=24.0.0`，包管理器推荐 `pnpm@11+`。
+
+本次适配从插件 `0.0.12` 起以 DSH `v0.1.5-rc.2` 为基线。升级前请先升级宿主；现有 Provider 配置、缓存格式与工具参数无需因本次 DSH 适配而迁移。Web 设置与维护 RPC 仅在 `connection` 和 `webServer` 同时可用时注册；无 WebServer 的宿主仍可使用两个模型工具，但不提供这些 HTTP RPC。
 
 ### 1. 安装插件
 

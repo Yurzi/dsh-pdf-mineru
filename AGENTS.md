@@ -60,7 +60,7 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 - `src/storage/*`: validated paths, process lock, ResultRepository, staging sink, and privileged maintenance service.
 - `src/service/mineru-service.ts`: direct-result use-case orchestration and same-process operation coalescing.
 - `src/tools.ts`: two defineTool schemas (`read_pdf` and `async_parse_pdf`), native DSH job adaptation, and pure renderers.
-- `src/rpc.ts`, `src/client/*`: loopback config/maintenance RPC and Provider-aware settings page.
+- `src/rpc.ts`, `src/loopback-rpc.ts`, `src/client/*`: loopback config/maintenance RPC, caller-local guarded native transport registration, and Provider-aware settings page.
 - `src/observability.ts`: typed, non-throwing structured diagnostic events.
 - `scripts/smoke-official-v4.mjs`: explicit live smoke through the built plugin tool chain.
 - `scripts/verify-current-gui.mjs`: isolated current-bundle verification in the existing DSH Web shell.

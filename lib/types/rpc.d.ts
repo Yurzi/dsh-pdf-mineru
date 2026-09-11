@@ -11,7 +11,8 @@
  *   - Credential values and tokens are never returned or leaked in responses/errors.
  *   - Errors sanitized via sanitizeDiagnostic and mapped to allowlisted actionable error codes.
  */
-import type { Context } from 'cordis';
+import type { Context } from '@deepseek-ai/cordis';
+import type { ConnectionRpcResult } from '@deepseek-ai/dsh-client-connection';
 import type { MinerUConfig } from './config.js';
 import type { ProbeView } from './service/mineru-service.js';
 import type { StorageMaintenanceService } from './storage/maintenance-service.js';
@@ -21,16 +22,7 @@ export interface MineruRpcDeps {
     readonly probe: (providerDraft: unknown | undefined, signal: AbortSignal) => Promise<ProbeView>;
     readonly maintenance: Pick<StorageMaintenanceService, 'getStatistics' | 'scanIntegrity' | 'listQuarantine' | 'cleanupQuarantine' | 'gcDryRun' | 'clearCache'>;
 }
-export type RpcResult<T> = {
-    readonly ok: true;
-    readonly value: T;
-} | {
-    readonly ok: false;
-    readonly error: {
-        readonly code: string;
-        readonly message: string;
-    };
-};
+export type RpcResult<T> = ConnectionRpcResult<T>;
 export declare const RPC_CHANNEL = "/dsh-pdf-mineru-api";
 export declare function mapRpcError(err: unknown): {
     code: string;

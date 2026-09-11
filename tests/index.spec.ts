@@ -2,11 +2,16 @@ import { mkdtemp, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
+import type { ConnectionRpcHandler } from '@deepseek-ai/dsh-client-connection'
 import { defaultMinerUConfig, parseConfig } from '../src/config.js'
 import { ProcessLock, ResultRepository } from '../src/storage/index.js'
 
 vi.mock('@deepseek-ai/dsh-tools', () => ({ defineTool: (definition: unknown) => definition }))
+// The real scoped transport, trust fence, and route lifecycle have integration coverage.
+vi.mock('../src/loopback-rpc.js', () => ({
+  registerLoopbackRpc: (ctx: Context, channel: string, handler: ConnectionRpcHandler) => ctx.connection.rpc.handle(channel, handler),
+}))
 
 const roots: string[] = []
 afterEach(async () => {
@@ -18,7 +23,7 @@ interface FakeRuntime {
   readonly definitions: unknown[]
   readonly effects: Array<() => void | Promise<void>>
   readonly rpc: {
-    authority?: string
+    registered?: boolean
     disposeCount: number
     handler?: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>
   }
@@ -33,7 +38,7 @@ function fakeContext(
 ): FakeRuntime {
   const definitions: unknown[] = []
   const effects: Array<() => void | Promise<void>> = []
-  const rpc: FakeRuntime['rpc'] = { authority: undefined, disposeCount: 0 }
+  const rpc: FakeRuntime['rpc'] = { registered: false, disposeCount: 0 }
   const settingsReplace = vi.fn((_section: object) => Promise.resolve())
   const settingsMutate = vi.fn((_namespace: string, _operations: readonly unknown[]) => Promise.resolve())
   let resolvedConfig = storedConfig
@@ -56,9 +61,8 @@ function fakeContext(
         handle: (
           _channel: string,
           handler: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>,
-          options: { authority: string },
         ) => {
-          rpc.authority = options.authority
+          rpc.registered = true
           rpc.handler = handler
           return () => { rpc.disposeCount++ }
         },
@@ -185,7 +189,7 @@ describe('plugin composition lifecycle', () => {
     expect(name).toBe('dsh-pdf-mineru')
     const dispose = await apply(runtime.ctx, config)
     expect(runtime.definitions).toHaveLength(2)
-    expect(runtime.rpc.authority).toBe('loopback')
+    expect(runtime.rpc.registered).toBe(true)
     expect(await stat(config.storage.storageRoot)).toBeDefined()
     expect(runtime.effects.length).toBeGreaterThan(0)
 

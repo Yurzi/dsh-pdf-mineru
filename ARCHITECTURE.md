@@ -165,6 +165,8 @@ Self-hosted v2 使用 multipart POST /tasks、GET /tasks/{taskId} 与结果端�
 
 ## 8. 运维与验证
 
+以 DSH `v0.1.5-rc.2` 为最低宿主基线，不保留 `v0.1.2-rc.1` 兼容分支。RPC 在 `connection` 与 `webServer` 同时可用的注入作用域注册；缺少任一服务时不影响两个模型工具。`registerLoopbackRpc` 使用调用方局部 Context 元数据提供带 Host 回环检查的路由注册器，解决 Cordis 服务 getter 将依赖查找指向 Connection 提供方的问题；不修改全局服务。原生 Connection 继续负责认证、Origin 检查、消息封装和取消，插件不依赖已不受支持的 `authority` 参数。错误封装遵循 rc.2 的 `code`、`message`、`details` 契约。
+
 运维 RPC 保持 loopback-only，不暴露任意路径读取。完整性扫描和 quarantine cleanup 默认只读／dry-run；隔离、缓存清除、实际清理都要求显式确认。GC 只提供预览。无法证明遍历完整、安全、无活跃使用者时，不执行破坏性计划。
 
 统计的大小和逻辑数量来自同一次条目／深度／时间有界遍历；无效条目也消耗遍历预算。根及祖先符号链接不被跟随，只读检查不为了初始化而写入锁文件。complete/truncated/depthLimitCount 贯通响应，GUI 将不完整总量标为下界。

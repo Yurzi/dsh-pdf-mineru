@@ -12,7 +12,7 @@ export interface CredentialView {
   readonly writable: boolean
 }
 
-/** Current `ctx.remote.credentials` face in DSH 0.1.2. */
+/** Narrow `ctx.remote.credentials` face used with DSH 0.1.5-rc.2. */
 export interface CredentialClient {
   describe(refs: string[]): Promise<RpcResult<Readonly<Record<string, CredentialView>>>>
   set(ref: string, value: string): Promise<RpcResult<void>>

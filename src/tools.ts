@@ -2,11 +2,13 @@
 import { open } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import { basename, extname } from 'node:path'
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { JobOutcome, JobRegistry } from '@deepseek-ai/dsh-jobs'
 import type { AttachmentStore, ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
-import type { ContentBlock, JsonValue, ObjectValueSchemaSpec, ParameterSchemaSpec, ToolRunContext, ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
+import type { ObjectValueSchemaSpec, ParameterSchemaSpec, ToolRunContext, ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
+import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { MinerUError, failure, toMinerUFailure } from './domain/errors.js'
 import type { FocusKind, PageSelection, ParseRequestInput } from './domain/request.js'
 import { normalizeFocusSelection, normalizePageSelection } from './domain/request.js'
@@ -32,7 +34,7 @@ declare module '@deepseek-ai/dsh-jobs' {
   }
 }
 
-const failureSchema: ObjectValueSchemaSpec = {
+const failureSchema = {
   type: 'object',
   properties: {
     code: { type: 'string' }, message: { type: 'string' }, retryable: { type: 'boolean' },
@@ -40,15 +42,15 @@ const failureSchema: ObjectValueSchemaSpec = {
     providerCode: { type: 'string' }, traceId: { type: 'string' }, fileId: { type: 'string' },
   },
   additionalProperties: false,
-}
+} satisfies ObjectValueSchemaSpec
 
-const artifactViewSchema: ObjectValueSchemaSpec = {
+const artifactViewSchema = {
   type: 'object',
   properties: { kind: { type: 'string', required: true }, path: { type: 'string', required: true }, bytes: { type: 'integer', required: true } },
   additionalProperties: false,
-}
+} satisfies ObjectValueSchemaSpec
 
-const inlinedImageViewSchema: ObjectValueSchemaSpec = {
+const inlinedImageViewSchema = {
   type: 'object',
   properties: {
     attachment_id: { type: 'string', required: true },
@@ -60,9 +62,9 @@ const inlinedImageViewSchema: ObjectValueSchemaSpec = {
     figure: { type: 'integer' },
   },
   additionalProperties: false,
-}
+} satisfies ObjectValueSchemaSpec
 
-const imageCandidateViewSchema: ObjectValueSchemaSpec = {
+const imageCandidateViewSchema = {
   type: 'object',
   properties: {
     path: { type: 'string', required: true },
@@ -74,9 +76,9 @@ const imageCandidateViewSchema: ObjectValueSchemaSpec = {
     status: { type: 'string', enum: ['available', 'unavailable', 'unsupported', 'failed', 'omitted'] },
   },
   additionalProperties: false,
-}
+} satisfies ObjectValueSchemaSpec
 
-const documentHeadingSchema: ObjectValueSchemaSpec = {
+const documentHeadingSchema = {
   type: 'object',
   properties: {
     level: { type: 'integer', required: true },
@@ -85,9 +87,9 @@ const documentHeadingSchema: ObjectValueSchemaSpec = {
     page: { type: 'integer' },
   },
   additionalProperties: false,
-}
+} satisfies ObjectValueSchemaSpec
 
-const documentSummarySchema: ObjectValueSchemaSpec = {
+const documentSummarySchema = {
   type: 'object',
   properties: {
     page_count: { type: 'integer' },
@@ -97,9 +99,9 @@ const documentSummarySchema: ObjectValueSchemaSpec = {
     toc: { type: 'array', items: documentHeadingSchema },
   },
   additionalProperties: false,
-}
+} satisfies ObjectValueSchemaSpec
 
-const resultFileViewSchema: ObjectValueSchemaSpec = {
+const resultFileViewSchema = {
   type: 'object',
   properties: {
     file_id: { type: 'string', required: true }, name: { type: 'string', required: true },
@@ -107,9 +109,9 @@ const resultFileViewSchema: ObjectValueSchemaSpec = {
     markdown_path: { type: 'string' },
   },
   additionalProperties: false,
-}
+} satisfies ObjectValueSchemaSpec
 
-const resultViewSchema: ObjectValueSchemaSpec = {
+const resultViewSchema = {
   type: 'object',
   properties: {
     state: { type: 'string', enum: ['completed'], required: true },
@@ -130,9 +132,9 @@ const resultViewSchema: ObjectValueSchemaSpec = {
     pages: { type: 'string' },
   },
   additionalProperties: false,
-}
+} satisfies ObjectValueSchemaSpec
 
-const failedParseViewSchema: ObjectValueSchemaSpec = {
+const failedParseViewSchema = {
   type: 'object',
   properties: {
     state: { type: 'string', enum: ['failed'] },
@@ -140,9 +142,15 @@ const failedParseViewSchema: ObjectValueSchemaSpec = {
     file_id: { type: 'string' }, name: { type: 'string' }, failure: failureSchema,
   },
   additionalProperties: false,
-}
+} satisfies ObjectValueSchemaSpec
 
-const parseOutputSchema: ValueSchemaSpec = resultViewSchema
+const parseOutputSchema = resultViewSchema
+
+// DSH's schema inference uses mutable JSON arrays. Domain views stay readonly;
+// this type-only boundary does not mutate them (the tool runtime snapshots output).
+type MutableJsonView<T> = T extends readonly (infer Item)[]
+  ? MutableJsonView<Item>[]
+  : T extends object ? { -readonly [Key in keyof T]: MutableJsonView<T[Key]> } : T
 
 const asyncParseParameters: ParameterSchemaSpec = {
   file_path: {
@@ -486,9 +494,9 @@ async function inlineImagesForSingleResult(
 }
 
 async function checkCallingModelSupportsImage(exec: ToolRunContext, ctx: Context): Promise<boolean> {
-  const routed = (exec.agent?.session as any)?.requestHeader?.()?.config
-  const provider = routed?.provider ?? (exec.agent as any)?.options?.provider
-  const model = routed?.model ?? (exec.agent as any)?.options?.model
+  const routed = exec.agent?.session?.requestHeader?.()?.config
+  const provider = routed?.provider ?? exec.agent?.options?.provider
+  const model = routed?.model ?? exec.agent?.options?.model
   const llm = ctx.get('llm') as { resolveModelInfo?: (p: string, m: string, s?: AbortSignal) => Promise<{ inputModalities?: readonly string[] }> } | undefined
   if (provider && model && llm && typeof llm.resolveModelInfo === 'function') {
     try {
@@ -657,7 +665,7 @@ export function registerTools(
         const processed = shouldInline && attachments
           ? await inlineImagesForSingleResult(rawResult, attachments, maxInlineImages, exec.signal)
           : rawResult
-        return fitPostImageBudget(processed)
+        return fitPostImageBudget(processed) as MutableJsonView<ResultView>
       }, exec.signal)
     },
   })) as () => void)

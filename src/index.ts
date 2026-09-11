@@ -1,5 +1,5 @@
 import z from '@deepseek-ai/schemastery'
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import {
   MINERU_CONFIG_SCHEMA_VERSION,
   parseConfig,
@@ -233,7 +233,10 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
 
     toolDisposer = registerTools(ctx, () => service, accessGate, () => runtimeConfig().output)
 
-    ctx.inject(['connection'], (connectionCtx: Context) => {
+    // Since DSH 0.1.5, connection no longer requires a WebServer. HTTP RPC
+    // registration accesses the caller's webServer, so declare it explicitly.
+    // Keep this optional scope separate: headless hosts still get both tools.
+    ctx.inject(['connection', 'webServer'], (connectionCtx: Context) => {
       return registerRpc(connectionCtx, {
         getConfig: () => persistedConfig,
         setConfig: async value => {

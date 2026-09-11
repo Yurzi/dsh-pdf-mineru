@@ -1,5 +1,5 @@
-import type { Context } from 'cordis';
-import type { ContentBlock } from '@deepseek-ai/dsh-tools';
+import type { Context } from '@deepseek-ai/cordis';
+import type { ContentBlock } from '@deepseek-ai/dsh-llm';
 import type { ParseRequestInput } from './domain/request.js';
 import { type OutputConfig } from './config/pure.js';
 import type { StorageAccessGate } from './storage/access-gate.js';

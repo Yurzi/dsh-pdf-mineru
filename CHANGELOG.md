@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.0.12
+
+### Changed
+
+- Raised the minimum supported DSH version to `0.1.5-rc.2` and aligned DSH runtime peers, development dependencies, and the lockfile with that release. Node.js requirements, Provider configuration, cache formats, and tool arguments are unchanged.
+- Use typed live Agent/session route access for image-capability detection, retaining request-header precedence, Agent-option fallback, and conservative handling of unavailable model metadata.
+- Replace obsolete Host, Tool, and Connection ambient declarations with published types; align client RPC calls and tool schema inference with the rc.2 contracts.
+
+### Fixed
+
+- Explicitly inject both `connection` and `webServer` for RPC registration now that Connection no longer requires WebServer. Headless hosts retain both model tools without attempting HTTP route registration.
+- Use a caller-local guarded route registrar to handle Cordis service-getter dependency scoping and enforce loopback-only RPC access independently of the unsupported `authority` argument, while retaining native Connection authentication and response handling.
+- Include required empty `details` in RPC error envelopes so rc.2 clients retain actionable MinerU errors instead of rejecting the wire response.
+
 ## 0.0.11
 
 ### Added

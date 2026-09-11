@@ -1,4 +1,4 @@
-import { writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
@@ -106,6 +106,58 @@ function createMockExec(hasAgent = true, signal = new AbortController().signal):
         header: { id: 'session_001', cwd: '/workspace' },
       },
     },
+  }
+}
+
+type ModelRoute = Pick<NonNullable<ToolRunContext['agent']>['options'], 'provider' | 'model'>
+
+interface CallingRouteFixture {
+  readonly requestHeader?: () => { config?: ModelRoute } | undefined
+  readonly options?: ModelRoute
+}
+
+async function createCallingRouteFixture(route: CallingRouteFixture, signal = new AbortController().signal) {
+  const directory = await mkdtemp(join(tmpdir(), 'mineru-calling-route-'))
+  const path = join(directory, 'figure.png')
+  await writeFile(path, Buffer.from('fake-png-data'))
+  const view: ResultView = {
+    state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_route',
+    files: [{ file_id: 'mf_route', name: 'paper.pdf', artifacts: [] }],
+    content_status: 'complete', manifest_path: '/cache/manifest.json', output_limit_chars: 20_000,
+    ordered_images: [{ path, name: 'figure.png', media_type: 'image/png', bytes: 13 }],
+  }
+  const resolveModelInfo = vi.fn(async (_provider: string, model: string, _signal?: AbortSignal): Promise<{ inputModalities?: readonly string[] } | undefined> => ({
+    inputModalities: model === 'text-model' ? ['text'] : ['text', 'image'],
+  }))
+  const saveImage = vi.fn(async () => ({ attachmentId: 'att_route', mediaType: 'image/png', name: 'figure.png', bytes: 13 }))
+  const parseDocument = vi.fn(async (_session: unknown, _input: unknown, callerSignal?: AbortSignal) => {
+    callerSignal?.throwIfAborted()
+    return view
+  })
+  const services: Record<string, unknown> = { llm: { resolveModelInfo }, attachments: { saveImage } }
+  const registeredTools: DefineToolOptions[] = []
+  const ctx = {
+    tools: { register: (definition: DefineToolOptions) => { registeredTools.push(definition); return vi.fn() } },
+    get: (name: string) => services[name],
+  } as unknown as Context
+  const dispose = registerTools(ctx, () => ({ parseDocument }) as unknown as MinerUService)
+  const base = createMockExec(true, signal)
+  const exec = {
+    ...base,
+    agent: {
+      ...base.agent,
+      ...(route.options === undefined ? {} : { options: route.options }),
+      session: {
+        ...base.agent!.session,
+        ...(route.requestHeader === undefined ? {} : { requestHeader: route.requestHeader }),
+      },
+    },
+  } as ToolRunContext
+  const tool = registeredTools.find(item => item.name === 'read_pdf')!
+  return {
+    exec, view, resolveModelInfo, saveImage, parseDocument, services,
+    execute: () => tool.execute({ file_path: '/paper.pdf', focus: 'image', inline_images: true }, exec) as Promise<ResultView>,
+    cleanup: async () => { await dispose(); await rm(directory, { recursive: true, force: true }) },
   }
 }
 
@@ -547,6 +599,115 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         exec.signal,
         undefined,
       )
+    })
+
+    describe('calling model image capability', () => {
+      const imageOptions = { provider: 'options-provider', model: 'image-model' }
+      const cases: { name: string; route: CallingRouteFixture; expectedRoute?: [string, string]; inline: boolean }[] = [
+        {
+          name: 'routed image model overrides text-only options',
+          route: { requestHeader: () => ({ config: { provider: 'routed-provider', model: 'image-model' } }), options: { ...imageOptions, model: 'text-model' } },
+          expectedRoute: ['routed-provider', 'image-model'], inline: true,
+        },
+        {
+          name: 'routed text-only model overrides image-capable options',
+          route: { requestHeader: () => ({ config: { provider: 'routed-provider', model: 'text-model' } }), options: imageOptions },
+          expectedRoute: ['routed-provider', 'text-model'], inline: false,
+        },
+        {
+          name: 'absent requestHeader method falls back to options',
+          route: { options: imageOptions }, expectedRoute: ['options-provider', 'image-model'], inline: true,
+        },
+        {
+          name: 'absent request header falls back to options',
+          route: { requestHeader: () => undefined, options: imageOptions }, expectedRoute: ['options-provider', 'image-model'], inline: true,
+        },
+        {
+          name: 'absent header config falls back to options',
+          route: { requestHeader: () => ({}), options: imageOptions }, expectedRoute: ['options-provider', 'image-model'], inline: true,
+        },
+        {
+          name: 'missing routed model falls back independently',
+          route: { requestHeader: () => ({ config: { provider: 'routed-provider' } }), options: imageOptions },
+          expectedRoute: ['routed-provider', 'image-model'], inline: true,
+        },
+        {
+          name: 'missing routed provider falls back independently',
+          route: { requestHeader: () => ({ config: { model: 'text-model' } }), options: imageOptions },
+          expectedRoute: ['options-provider', 'text-model'], inline: false,
+        },
+        {
+          name: 'complete routed config works without options',
+          route: { requestHeader: () => ({ config: { provider: 'routed-provider', model: 'image-model' } }) },
+          expectedRoute: ['routed-provider', 'image-model'], inline: true,
+        },
+        { name: 'absent header and options fail closed', route: {}, inline: false },
+        { name: 'absent config and options fail closed', route: { requestHeader: () => ({}) }, inline: false },
+        { name: 'missing provider fails closed', route: { options: { model: 'image-model' } }, inline: false },
+        { name: 'missing model fails closed', route: { options: { provider: 'options-provider' } }, inline: false },
+        {
+          name: 'empty routed model does not fall back to options',
+          route: { requestHeader: () => ({ config: { model: '' } }), options: imageOptions }, inline: false,
+        },
+      ]
+
+      it.each(cases)('$name', async ({ route, expectedRoute, inline }) => {
+        const fixture = await createCallingRouteFixture(route)
+        try {
+          const result = await fixture.execute()
+          if (expectedRoute) {
+            expect(fixture.resolveModelInfo).toHaveBeenCalledExactlyOnceWith(...expectedRoute, fixture.exec.signal)
+          } else {
+            expect(fixture.resolveModelInfo).not.toHaveBeenCalled()
+          }
+          expect(fixture.parseDocument).toHaveBeenCalledExactlyOnceWith(fixture.exec.agent!.session, { file_path: '/paper.pdf', focus: 'image', inline_images: true }, fixture.exec.signal, undefined)
+          expect(fixture.saveImage).toHaveBeenCalledTimes(inline ? 1 : 0)
+          if (inline) {
+            expect(result.inlined_images).toHaveLength(1)
+            expect(renderResult(result).map(block => block.type)).toEqual(['text', 'image'])
+          } else {
+            expect(result.inlined_images).toBeUndefined()
+            expect(result.ordered_images).toEqual(fixture.view.ordered_images)
+            expect(renderResult(result).map(block => block.type)).toEqual(['text'])
+          }
+        } finally { await fixture.cleanup() }
+      })
+
+      it.each(['missing llm', 'missing resolver', 'missing model info', 'missing modalities', 'resolver rejection'] as const)(
+        'fails closed for %s even when inline_images is explicitly true', async mode => {
+          const fixture = await createCallingRouteFixture({ options: imageOptions })
+          try {
+            if (mode === 'missing llm') delete fixture.services.llm
+            else if (mode === 'missing resolver') fixture.services.llm = {}
+            else if (mode === 'missing model info') fixture.resolveModelInfo.mockResolvedValue(undefined)
+            else if (mode === 'missing modalities') fixture.resolveModelInfo.mockResolvedValue({})
+            else fixture.resolveModelInfo.mockRejectedValue(new Error('resolver unavailable'))
+            const result = await fixture.execute()
+            expect(fixture.resolveModelInfo).toHaveBeenCalledTimes(mode === 'missing llm' || mode === 'missing resolver' ? 0 : 1)
+            expect(fixture.parseDocument).toHaveBeenCalledOnce()
+            expect(fixture.saveImage).not.toHaveBeenCalled()
+            expect(result.inlined_images).toBeUndefined()
+            expect(result.ordered_images).toEqual(fixture.view.ordered_images)
+          } finally { await fixture.cleanup() }
+        },
+      )
+
+      it('preserves caller cancellation through model resolver failure and the parse waiter', async () => {
+        const controller = new AbortController()
+        const reason = new Error('caller cancelled during model resolution')
+        const fixture = await createCallingRouteFixture({ options: imageOptions }, controller.signal)
+        try {
+          fixture.resolveModelInfo.mockImplementation(async (_provider, _model, signal) => {
+            controller.abort(reason)
+            signal!.throwIfAborted()
+            return undefined
+          })
+          await expect(fixture.execute()).rejects.toBe(reason)
+          expect(fixture.resolveModelInfo).toHaveBeenCalledExactlyOnceWith('options-provider', 'image-model', controller.signal)
+          expect(fixture.parseDocument).toHaveBeenCalledExactlyOnceWith(fixture.exec.agent!.session, { file_path: '/paper.pdf', focus: 'image', inline_images: true }, controller.signal, undefined)
+          expect(fixture.saveImage).not.toHaveBeenCalled()
+        } finally { await fixture.cleanup() }
+      })
     })
 
     it('does not inline images when focus does not include image modality', async () => {

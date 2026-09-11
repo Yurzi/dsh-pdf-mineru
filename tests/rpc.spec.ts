@@ -15,7 +15,13 @@ vi.mock('react', () => ({
   useEffect: vi.fn(),
   useCallback: vi.fn((fn: unknown) => fn),
 }))
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
+import { rpcErrorSchema } from '@deepseek-ai/dsh-client-connection'
+
+// Transport trust and lifecycle are exercised against real rc.2 in host-compatibility.spec.ts.
+vi.mock('../src/loopback-rpc.js', () => ({
+  registerLoopbackRpc: (ctx: Context, channel: string, handler: RpcHandler) => ctx.connection.rpc.handle(channel, handler),
+}))
 import { defaultMinerUConfig, type MinerUConfig, type OfficialV4Config, type SelfHostedV2Config } from '../src/config.js'
 import { asProviderConfigId } from '../src/domain/ids.js'
 import { failure, MinerUError } from '../src/domain/errors.js'
@@ -48,14 +54,13 @@ interface MockContext {
   }
 }
 
-function createMockContext(): { ctx: Context; getHandler: () => RpcHandler; getOptions: () => { authority: string } } {
+function createMockContext(): { ctx: Context; getHandler: () => RpcHandler; getHandle: () => ReturnType<typeof vi.fn> } {
   let capturedHandler!: RpcHandler
-  let capturedOptions!: { authority: string }
 
-  const handleMock = vi.fn((channel: string, handler: RpcHandler, options: { authority: string }) => {
+  const handleMock = vi.fn((channel: string, handler: RpcHandler) => {
     expect(channel).toBe(RPC_CHANNEL)
     capturedHandler = handler
-    capturedOptions = options
+    return async () => undefined
   })
 
   const ctx = {
@@ -72,7 +77,7 @@ function createMockContext(): { ctx: Context; getHandler: () => RpcHandler; getO
   return {
     ctx,
     getHandler: () => capturedHandler,
-    getOptions: () => capturedOptions,
+    getHandle: () => handleMock,
   }
 }
 
@@ -90,9 +95,9 @@ function maintenanceDeps(): Pick<MineruRpcDeps, 'maintenance'> {
 }
 
 describe('MinerU RPC (registerRpc)', () => {
-  it('registers on /dsh-pdf-mineru-api channel with loopback authority', () => {
+  it('registers on /dsh-pdf-mineru-api using the rc.2 two-argument RPC contract', () => {
     expect(RPC_CHANNEL).toBe('/dsh-pdf-mineru-api')
-    const { ctx, getOptions } = createMockContext()
+    const { ctx, getHandle } = createMockContext()
     const deps: MineruRpcDeps = {
       ...maintenanceDeps(),
       getConfig: vi.fn(() => defaultMinerUConfig()),
@@ -106,7 +111,7 @@ describe('MinerU RPC (registerRpc)', () => {
     }
 
     registerRpc(ctx, deps)
-    expect(getOptions().authority).toBe('loopback')
+    expect(getHandle()).toHaveBeenCalledWith(RPC_CHANNEL, expect.any(Function))
   })
 
   it('handles mineru/config.get by returning current MinerUConfig', async () => {
@@ -385,11 +390,14 @@ describe('MinerU RPC (registerRpc)', () => {
     const handler = getHandler()
 
     const res = await handler('mineru/probe', {}, new AbortController().signal)
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(rpcErrorSchema.safeParse(res.error).success).toBe(true)
     expect(res).toEqual({
       ok: false,
       error: {
         code: 'mineru/storage-locked',
         message: 'Storage directory is currently locked by another process',
+        details: {},
       },
     })
   })
