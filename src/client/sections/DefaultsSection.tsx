@@ -2,7 +2,7 @@ import type { Dispatch, SetStateAction } from 'react'
 import type { MinerUConfig, ProviderConfig } from '../../config/pure.js'
 import type { MinerUModel, ParseMethod } from '../../domain/request.js'
 import type { MineruKey } from '../locales.js'
-import { resetConfigSection, updateConfigSection } from '../helpers.js'
+import { updateConfigSection } from '../helpers.js'
 import css from '../SettingsPage.module.css'
 
 export interface DefaultsSectionProps {
@@ -23,29 +23,18 @@ export function DefaultsSection({
   t,
 }: DefaultsSectionProps) {
   return (
-    <div className={css.editorGroup}>
-      <div className={css.groupHeader}>
-        <h3 className={css.groupTitle}>{t('section.defaults')}</h3>
-        <button
-          type="button"
-          className={css.resetButton}
-          onClick={() => setDraft(prev => (prev === null ? prev : resetConfigSection(prev, 'defaults')))}
-        >
-          {t('action.resetSection')}
-        </button>
-      </div>
-
+    <div className={css.sectionInner}>
       {txtToAutoNotice && (
-        <div className={css.error} style={{
-          borderColor: 'var(--dsw-alias-state-warning-primary, #d97706)',
-          backgroundColor: 'var(--dsw-alias-state-warning-tertiary, rgba(217, 119, 6, 0.12))',
-          color: 'var(--dsw-alias-state-warning-primary, #d97706)',
-        }}>
+        <div
+          className={css.warningNotice}
+          role="alert"
+        >
           <span>{t('notice.officialTxtToAuto')}</span>
           <button
             type="button"
-            className={css.errorDismiss}
+            className={css.noticeDismiss}
             onClick={onDismissTxtNotice}
+            aria-label={t('action.dismiss')}
           >×</button>
         </div>
       )}
@@ -55,6 +44,7 @@ export function DefaultsSection({
           <span className={css.fieldLabel}>{t('field.defaultModel')}</span>
           <select
             className={css.select}
+            aria-label={t('field.defaultModel')}
             value={draft.defaults.model}
             onChange={e => setDraft(prev => prev === null ? prev : updateConfigSection(prev, 'defaults', { model: e.target.value as MinerUModel }))}
           >
@@ -68,6 +58,7 @@ export function DefaultsSection({
           <span className={css.fieldLabel}>{t('field.defaultParseMethod')}</span>
           <select
             className={css.select}
+            aria-label={t('field.defaultParseMethod')}
             value={draft.defaults.parseMethod}
             onChange={e => setDraft(prev => prev === null ? prev : updateConfigSection(prev, 'defaults', { parseMethod: e.target.value as ParseMethod, ocr: e.target.value === 'ocr' }))}
           >
@@ -81,6 +72,7 @@ export function DefaultsSection({
           <span className={css.fieldLabel}>{t('field.defaultLang')}</span>
           <input
             className={css.input}
+            aria-label={t('field.defaultLang')}
             value={draft.defaults.language}
             onChange={e => setDraft(prev => prev === null ? prev : updateConfigSection(prev, 'defaults', { language: e.target.value }))}
           />

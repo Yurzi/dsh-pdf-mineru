@@ -10,10 +10,14 @@ import type {
   StorageStatistics,
 } from '../storage/maintenance-service.js'
 import type { MineruKey } from './locales.js'
+import { DisclosureCard } from './DisclosureCard.js'
+import { WrenchIcon } from './icons.js'
 import css from './SettingsPage.module.css'
 
 export interface StorageOperationsProps {
   readonly rpc: ClientConnectionRpc
+  readonly open?: boolean
+  readonly onToggle?: () => void
   readonly t: (key: MineruKey) => string
 }
 
@@ -66,7 +70,11 @@ function AreaMetric({ label, area }: { readonly label: string; readonly area: St
   )
 }
 
-export function StorageOperations({ rpc, t }: StorageOperationsProps) {
+export function StorageOperations({ rpc, open = true, onToggle, t }: StorageOperationsProps) {
+  const [internalOpen, setInternalOpen] = useState(true)
+  const isCardOpen = onToggle !== undefined ? open : internalOpen
+  const handleToggle = onToggle !== undefined ? onToggle : () => setInternalOpen(prev => !prev)
+
   const [state, setState] = useState<MaintenanceState>({})
   const [selected, setSelected] = useState<readonly string[]>([])
   const [confirmingDelete, setConfirmingDelete] = useState(false)
@@ -189,8 +197,27 @@ export function StorageOperations({ rpc, t }: StorageOperationsProps) {
   const allSelected = quarantineEntries.length > 0 && selected.length === quarantineEntries.length
 
   return (
-    <div className={css.editorGroup}>
-      <h3 className={css.groupTitle}>{t('section.operations')}</h3>
+    <DisclosureCard
+      id="operations"
+      title={t('section.operations')}
+      subtitle={t('section.operations.desc')}
+      icon={<WrenchIcon size={16} />}
+      open={isCardOpen}
+      onToggle={handleToggle}
+      toggleTitle={isCardOpen ? t('action.collapse') : t('action.expand')}
+      badge={
+        busy ? (
+          <span className={`${css.cardBadge} ${css.badgeInfo} ${css.badgePulse}`}>
+            <span className={css.badgeDot} aria-hidden="true" />
+            {t('action.running')}
+          </span>
+        ) : (
+          <span className={`${css.cardBadge} ${css.badgeNeutral}`}>
+            {t('badge.maintenance')}
+          </span>
+        )
+      }
+    >
       <div className={css.operationToolbar}>
         <button type="button" className={css.secondaryButton} disabled={busy} onClick={() => void refreshStats()}>
           {state.busy === 'stats' ? t('action.running') : t('action.storageStats')}
@@ -202,8 +229,10 @@ export function StorageOperations({ rpc, t }: StorageOperationsProps) {
           {state.busy === 'gc' ? t('action.running') : t('action.gcPreview')}
         </button>
         <button
-          type="button" className={confirmingCacheClear ? css.dangerButton : css.secondaryButton}
-          disabled={busy} onClick={() => void clearCache()}
+          type="button"
+          className={confirmingCacheClear ? css.dangerButton : css.secondaryButton}
+          disabled={busy}
+          onClick={() => void clearCache()}
         >
           {state.busy === 'cache-clear-preview' || state.busy === 'cache-clear-delete'
             ? t('action.running')
@@ -219,7 +248,11 @@ export function StorageOperations({ rpc, t }: StorageOperationsProps) {
       {state.stats !== undefined && (
         <div className={css.operationResult}>
           <div className={css.resultTitle}>{t('action.storageStats')}</div>
-          <div className={css.metricHeaders}><span /> <span>{t('ops.bytes')}</span><span>{t('ops.entries')}</span></div>
+          <div className={css.metricHeaders}>
+            <span />
+            <span>{t('ops.bytes')}</span>
+            <span>{t('ops.entries')}</span>
+          </div>
           <dl className={css.metrics}>
             <AreaMetric label={t('ops.results')} area={state.stats.publishedResults} />
             <AreaMetric label={t('ops.staging')} area={state.stats.staging} />
@@ -289,8 +322,10 @@ export function StorageOperations({ rpc, t }: StorageOperationsProps) {
                       <tr key={entry.id}>
                         <td>
                           <input
-                            type="checkbox" aria-label={entry.id}
-                            checked={selected.includes(entry.id)} onChange={() => toggleSelected(entry.id)}
+                            type="checkbox"
+                            aria-label={entry.id}
+                            checked={selected.includes(entry.id)}
+                            onChange={() => toggleSelected(entry.id)}
                           />
                         </td>
                         <td><code title={entry.id}>{entry.id}</code></td>
@@ -303,14 +338,18 @@ export function StorageOperations({ rpc, t }: StorageOperationsProps) {
               </div>
               <div className={css.operationToolbar}>
                 <button
-                  type="button" className={css.secondaryButton}
-                  disabled={busy || selected.length === 0} onClick={() => void previewCleanup()}
+                  type="button"
+                  className={css.secondaryButton}
+                  disabled={busy || selected.length === 0}
+                  onClick={() => void previewCleanup()}
                 >
                   {state.busy === 'cleanup-preview' ? t('action.running') : t('action.cleanupPreview')}
                 </button>
                 <button
-                  type="button" className={confirmingDelete ? css.dangerButton : css.secondaryButton}
-                  disabled={busy || selected.length === 0} onClick={() => void deleteSelected()}
+                  type="button"
+                  className={confirmingDelete ? css.dangerButton : css.secondaryButton}
+                  disabled={busy || selected.length === 0}
+                  onClick={() => void deleteSelected()}
                 >
                   {state.busy === 'cleanup-delete'
                     ? t('action.running')
@@ -331,6 +370,6 @@ export function StorageOperations({ rpc, t }: StorageOperationsProps) {
           </div>
         </div>
       )}
-    </div>
+    </DisclosureCard>
   )
 }

@@ -1,5 +1,7 @@
 export interface NumericInputProps {
     readonly className?: string;
+    readonly id?: string;
+    readonly ariaLabel?: string;
     readonly value: number;
     readonly min?: number;
     readonly max?: number;
@@ -18,4 +20,4 @@ export declare function clampNumericDraft(draft: string, fallback: number, min?:
     value: number;
     changed: boolean;
 };
-export declare function NumericInput({ className, value, min, max, step, disabled, placeholder, title, onChange, }: NumericInputProps): import("react").JSX.Element;
+export declare function NumericInput({ className, id, ariaLabel, value, min, max, step, disabled, placeholder, title, onChange, }: NumericInputProps): import("react").JSX.Element;

@@ -11,6 +11,37 @@ export type MineruKey =
   | 'section.output'
   | 'section.limits'
   | 'section.limits.restartHint'
+  | 'section.provider.desc'
+  | 'section.defaults.desc'
+  | 'section.storage.desc'
+  | 'section.operations.desc'
+  | 'section.polling.desc'
+  | 'section.retry.desc'
+  | 'section.output.desc'
+  | 'section.limits.desc'
+  | 'action.retryLoad'
+  | 'badge.selfHosted'
+  | 'badge.official'
+  | 'action.expandAll'
+  | 'action.collapseAll'
+  | 'action.expand'
+  | 'action.collapse'
+  | 'action.dismiss'
+  | 'unit.attempts'
+  | 'unit.chars'
+  | 'unit.images'
+  | 'unit.ms'
+  | 'unit.seconds'
+  | 'unit.fileLimit'
+  | 'badge.configured'
+  | 'badge.notConfigured'
+  | 'badge.healthy'
+  | 'badge.unhealthy'
+  | 'badge.testing'
+  | 'badge.cacheOn'
+  | 'badge.cacheOff'
+  | 'badge.readOnly'
+  | 'badge.maintenance'
   | 'notice.officialTxtToAuto'
   | 'field.activeProvider'
   | 'field.baseURL'
@@ -135,6 +166,37 @@ export const en: Record<MineruKey, string> = {
   'section.output': 'Output Limits',
   'section.limits': 'Security & Payload Limits',
   'section.limits.restartHint': 'Security and payload limits are initialized at plugin startup. Changes require restarting the plugin.',
+  'section.provider.desc': 'Provider profile, service endpoint, protocol version, and credential management',
+  'section.defaults.desc': 'Default extraction model, parse method, language, and formula/table switches',
+  'section.storage.desc': 'Content-addressed cache root, global caching toggle, and staging cleanup TTL',
+  'section.operations.desc': 'Storage statistics, cache verification, garbage collection preview, and quarantine',
+  'section.polling.desc': 'Status polling interval, sync tool timeout, and operation deadlines',
+  'section.retry.desc': 'Bounded exponential backoff, maximum attempts, and delay limits',
+  'section.output.desc': 'Inline model projection character budget and visual attachment limits',
+  'section.limits.desc': 'System payload limits, safe decompression ratios, and zip bounds (startup configured)',
+  'action.retryLoad': 'Retry Loading',
+  'badge.selfHosted': 'Self-hosted (v2)',
+  'badge.official': 'Official cloud (v4)',
+  'action.expandAll': 'Expand All',
+  'action.collapseAll': 'Collapse All',
+  'action.expand': 'Expand card',
+  'action.collapse': 'Collapse card',
+  'action.dismiss': 'Dismiss',
+  'unit.attempts': 'attempts',
+  'unit.chars': 'chars',
+  'unit.images': 'images',
+  'unit.ms': 'ms',
+  'unit.seconds': 's',
+  'unit.fileLimit': 'file limit',
+  'badge.configured': 'Configured',
+  'badge.notConfigured': 'Not Configured',
+  'badge.healthy': 'Healthy',
+  'badge.unhealthy': 'Unhealthy',
+  'badge.testing': 'Testing…',
+  'badge.cacheOn': 'Cache ON',
+  'badge.cacheOff': 'Cache OFF',
+  'badge.readOnly': 'Read-only',
+  'badge.maintenance': 'Preview & confirm',
   'notice.officialTxtToAuto': 'Official v4 provider does not support txt extraction mode; parse method was automatically adjusted to auto.',
 
   'field.activeProvider': 'Active Provider',
@@ -267,6 +329,37 @@ export const zh: Record<MineruKey, string> = {
   'section.output': '模型输出限制',
   'section.limits': '安全与资源上限',
   'section.limits.restartHint': '安全与有效载荷上限在插件启动时初始化并绑定存储仓，修改需要重启插件后生效。',
+  'section.provider.desc': 'Provider 配置文件、服务端点、协议版本与认证凭据管理',
+  'section.defaults.desc': '默认解析模型、提取方式、目标语言与公式表格开关',
+  'section.storage.desc': '内容寻址缓存根目录、全局缓存开关与暂存区清理 TTL',
+  'section.operations.desc': '存储统计、缓存完整性校验、GC 预览清理与隔离区管理',
+  'section.polling.desc': '状态轮询间隔、同步等待超时与单进程共享操作时限',
+  'section.retry.desc': '指数退避重试策略、最大尝试次数与延迟上下限',
+  'section.output.desc': '单次模型响应字符上限与内联图片配额',
+  'section.limits.desc': '系统有效载荷上限、安全解压比与 ZIP 边界保护（启动时绑定）',
+  'action.retryLoad': '重新加载',
+  'badge.selfHosted': '自托管 (v2)',
+  'badge.official': '官方云 (v4)',
+  'action.expandAll': '展开全部',
+  'action.collapseAll': '折叠全部',
+  'action.expand': '展开卡片',
+  'action.collapse': '折叠卡片',
+  'action.dismiss': '关闭提示',
+  'unit.attempts': '次尝试',
+  'unit.chars': '字符',
+  'unit.images': '张图片',
+  'unit.ms': 'ms',
+  'unit.seconds': '秒',
+  'unit.fileLimit': '文件上限',
+  'badge.configured': '已配置凭据',
+  'badge.notConfigured': '未配置凭据',
+  'badge.healthy': '连接正常',
+  'badge.unhealthy': '状态异常',
+  'badge.testing': '测试中…',
+  'badge.cacheOn': '已开启缓存',
+  'badge.cacheOff': '已关闭缓存',
+  'badge.readOnly': '只读',
+  'badge.maintenance': '预览后确认',
   'notice.officialTxtToAuto': '官方 v4 Provider 不支持 txt 纯文本提取模式，解析方式已自动调整为 auto。',
 
   'field.activeProvider': '当前激活的 Provider',

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.0
+
+### Added
+
+- Added eight accessible settings cards with configuration summaries, expand/collapse-all controls, native keyboard-navigable Provider selection, and bilingual labels. Collapsed panels remain mounted to preserve form drafts.
+- Added browser regressions for keyboard navigation, disclosure state, draft preservation, load-error recovery, immutable security limits, dark/light themes, and narrow-pane overflow, plus bilingual dictionary coverage.
+
+### Changed
+
+- Redesigned the MinerU settings page with DSH theme-aware cards, lightweight SVG icons, clearer action hierarchy, and progressive disclosure for advanced configuration. Narrow settings panes use compact layouts, and reduced-motion preferences are respected.
+- Refreshed setup instructions and the settings preview to match the current configuration page. Existing Provider, credential, numeric validation, storage-maintenance, reader cursor v3, and index v2 contracts remain unchanged.
+
+### Fixed
+
+- Show configuration load failures with an explicit retry action instead of leaving the page in an ambiguous loading state.
+- Display restart-only security limits as disabled controls rather than accepting edits that the running host cannot save. Preserve explicit preview/confirmation boundaries for destructive maintenance operations.
+
 ## 0.0.15
 
 ### Added

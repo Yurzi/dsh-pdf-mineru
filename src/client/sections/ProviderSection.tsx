@@ -4,6 +4,7 @@ import type { MinerUModel } from '../../domain/request.js'
 import type { MineruKey } from '../locales.js'
 import type { CredentialView } from '../helpers.js'
 import { patchActiveProvider } from '../helpers.js'
+import { KeyIcon } from '../icons.js'
 import css from '../SettingsPage.module.css'
 
 export interface ProviderSectionProps {
@@ -59,31 +60,51 @@ export function ProviderSection({
   }
 
   return (
-    <div className={css.editorGroup}>
-      <h3 className={css.groupTitle}>{t('section.provider')}</h3>
-
-      <div className={css.row}>
-        <label className={css.field}>
-          <span className={css.fieldLabel}>{t('field.activeProvider')}</span>
-          <select
-            className={css.select}
-            value={draft.activeProvider}
-            onChange={event => onActivateProvider(event.target.value)}
-          >
-            {draft.providers.map(provider => (
-              <option key={provider.id} value={provider.id}>
-                {t(provider.type === 'self-hosted-v2' ? 'provider.type.selfHosted' : 'provider.type.official')} — {provider.id}
-              </option>
-            ))}
-          </select>
-        </label>
+    <div className={css.sectionInner}>
+      {/* Native Radio Group for Provider Profile */}
+      <div className={css.field}>
+        <span className={css.fieldLabel} id="provider-radiogroup-label">
+          {t('field.activeProvider')}
+        </span>
+        <div
+          className={css.providerRadios}
+          role="radiogroup"
+          aria-labelledby="provider-radiogroup-label"
+        >
+          {draft.providers.map(provider => {
+            const isActive = provider.id === draft.activeProvider
+            const isSelfHosted = provider.type === 'self-hosted-v2'
+            const providerTitle = t(isSelfHosted ? 'provider.type.selfHosted' : 'provider.type.official')
+            return (
+              <label
+                key={provider.id}
+                className={`${css.providerRadioPill} ${isActive ? css.providerRadioPillActive : ''}`}
+              >
+                <input
+                  type="radio"
+                  name="mineru-active-provider"
+                  value={provider.id}
+                  checked={isActive}
+                  aria-label={`${providerTitle} — ${provider.id}`}
+                  className={css.providerRadioInput}
+                  onChange={() => onActivateProvider(provider.id)}
+                />
+                <span className={css.providerPillDot} aria-hidden="true" />
+                <span className={css.providerPillTitle}>{providerTitle}</span>
+                <span className={css.providerPillBadge}>{provider.id}</span>
+              </label>
+            )
+          })}
+        </div>
       </div>
 
+      {/* Endpoint and Credential Reference */}
       <div className={css.row}>
         <label className={css.field}>
           <span className={css.fieldLabel}>{t('field.baseURL')}</span>
           <input
             className={css.input}
+            aria-label={t('field.baseURL')}
             value={activeProvider.baseURL}
             placeholder={t('field.baseURL.placeholder')}
             onChange={e => setDraft(prev => prev === null ? prev : patchActiveProvider(prev, { baseURL: e.target.value }))}
@@ -94,6 +115,7 @@ export function ProviderSection({
           <span className={css.fieldLabel}>{t('field.apiKeyEnv')}</span>
           <input
             className={css.input}
+            aria-label={t('field.apiKeyEnv')}
             value={activeProvider.apiKeyEnv ?? ''}
             placeholder={t('field.apiKeyEnv.placeholder')}
             onChange={e => setDraft(prev => prev === null ? prev : patchActiveProvider(prev, { apiKeyEnv: e.target.value || undefined }))}
@@ -102,19 +124,37 @@ export function ProviderSection({
         </label>
       </div>
 
+      {/* API Key Input and Status */}
       <div className={css.field}>
-        <span className={css.fieldLabel}>{t('field.apiKey')}</span>
+        <div className={css.fieldLabelRow}>
+          <span className={css.fieldLabel}>{t('field.apiKey')}</span>
+          {credentialStateReady && credentialView && (
+            <span
+              className={`${css.inlineBadge} ${
+                credentialView.configured ? css.badgeOk : css.badgeWarn
+              }`}
+            >
+              <span className={css.badgeDot} aria-hidden="true" />
+              {credentialView.configured ? t('badge.configured') : t('badge.notConfigured')}
+            </span>
+          )}
+        </div>
         <div className={css.credentialInputRow}>
-          <input
-            className={css.input}
-            type="password"
-            autoComplete="off"
-            aria-label={t('field.apiKey')}
-            value={apiKeyDraft}
-            placeholder={credentialPlaceholder}
-            disabled={credentialInputDisabled}
-            onChange={event => setApiKeyDraft(event.target.value)}
-          />
+          <div className={css.inputWithIcon}>
+            <span className={css.inputIcon} aria-hidden="true">
+              <KeyIcon size={14} />
+            </span>
+            <input
+              className={`${css.input} ${css.inputPaddedLeft}`}
+              type="password"
+              autoComplete="off"
+              aria-label={t('field.apiKey')}
+              value={apiKeyDraft}
+              placeholder={credentialPlaceholder}
+              disabled={credentialInputDisabled}
+              onChange={event => setApiKeyDraft(event.target.value)}
+            />
+          </div>
           <button
             type="button"
             className={css.secondaryButton}
@@ -124,6 +164,11 @@ export function ProviderSection({
             {credentialBusy ? t('action.clearingApiKey') : t('action.clearApiKey')}
           </button>
         </div>
+        {credentialLocked && (
+          <p className={css.fieldHint} role="status">
+            {t('credential.readOnly')}
+          </p>
+        )}
         <span className={css.fieldHint}>
           {credentialStatus === 'loading'
             ? t('credential.loading')
@@ -139,8 +184,9 @@ export function ProviderSection({
         </span>
       </div>
 
+      {/* Provider-specific Options */}
       {activeProvider.type === 'self-hosted-v2' && (
-        <>
+        <div className={css.providerSubgroup}>
           <div className={css.row}>
             <label className={css.checkboxField}>
               <input
@@ -157,6 +203,7 @@ export function ProviderSection({
               <span className={css.fieldLabel}>{t('field.modelMap.pipeline')}</span>
               <input
                 className={css.input}
+                aria-label={t('field.modelMap.pipeline')}
                 list="mineru-modelmap-pipeline-options"
                 placeholder={t('field.modelMap.pipeline.placeholder')}
                 value={(activeProvider as SelfHostedV2Config).modelMap.pipeline}
@@ -188,6 +235,7 @@ export function ProviderSection({
               <span className={css.fieldLabel}>{t('field.modelMap.vlm')}</span>
               <input
                 className={css.input}
+                aria-label={t('field.modelMap.vlm')}
                 list="mineru-modelmap-vlm-options"
                 placeholder={t('field.modelMap.vlm.placeholder')}
                 value={(activeProvider as SelfHostedV2Config).modelMap.vlm}
@@ -222,24 +270,26 @@ export function ProviderSection({
               <span className={css.fieldHint}>{t('field.modelMap.vlm.hint')}</span>
             </div>
           </div>
-        </>
+        </div>
       )}
 
       {activeProvider.type === 'official-v4' && (
-        <div className={css.field}>
-          <span className={css.fieldLabel}>{t('field.officialModels')}</span>
-          <div className={css.checkboxGroup}>
-            {(['pipeline', 'vlm'] as const).map(m => (
-              <label key={m} className={css.checkboxOption}>
-                <input
-                  type="checkbox"
-                  checked={(activeProvider as OfficialV4Config).models.includes(m)}
-                  disabled={draft.defaults.model === m}
-                  onChange={() => toggleOfficialModel(m)}
-                />
-                <span>{t(m === 'pipeline' ? 'model.pipeline' : 'model.vlm')}</span>
-              </label>
-            ))}
+        <div className={css.providerSubgroup}>
+          <div className={css.field}>
+            <span className={css.fieldLabel}>{t('field.officialModels')}</span>
+            <div className={css.checkboxGroup}>
+              {(['pipeline', 'vlm'] as const).map(m => (
+                <label key={m} className={css.checkboxOption}>
+                  <input
+                    type="checkbox"
+                    checked={(activeProvider as OfficialV4Config).models.includes(m)}
+                    disabled={draft.defaults.model === m}
+                    onChange={() => toggleOfficialModel(m)}
+                  />
+                  <span>{t(m === 'pipeline' ? 'model.pipeline' : 'model.vlm')}</span>
+                </label>
+              ))}
+            </div>
           </div>
         </div>
       )}

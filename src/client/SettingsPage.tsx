@@ -21,6 +21,14 @@ import { ProviderSection } from './sections/ProviderSection.js'
 import { DefaultsSection } from './sections/DefaultsSection.js'
 import { AdvancedSections } from './sections/AdvancedSections.js'
 import { StorageOperations } from './StorageOperations.js'
+import { DisclosureCard } from './DisclosureCard.js'
+import {
+  ActivityIcon,
+  CheckIcon,
+  RotateCcwIcon,
+  ServerIcon,
+  SlidersIcon,
+} from './icons.js'
 import css from './SettingsPage.module.css'
 
 export {
@@ -73,6 +81,49 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
     view?: ProbeView
     error?: string
   }>({ status: 'idle' })
+
+  // Individual card disclosure states
+  const [cardsOpen, setCardsOpen] = useState<Record<string, boolean>>({
+    provider: true,
+    defaults: true,
+    storage: true,
+    polling: false,
+    retry: false,
+    output: false,
+    limits: false,
+    operations: true,
+  })
+
+  const toggleCard = useCallback((cardId: string) => {
+    setCardsOpen(prev => ({ ...prev, [cardId]: !prev[cardId] }))
+  }, [])
+
+  const allOpen = Object.values(cardsOpen).every(Boolean)
+  const toggleAllCards = useCallback(() => {
+    if (allOpen) {
+      setCardsOpen({
+        provider: false,
+        defaults: false,
+        storage: false,
+        polling: false,
+        retry: false,
+        output: false,
+        limits: false,
+        operations: false,
+      })
+    } else {
+      setCardsOpen({
+        provider: true,
+        defaults: true,
+        storage: true,
+        polling: true,
+        retry: true,
+        output: true,
+        limits: true,
+        operations: true,
+      })
+    }
+  }, [allOpen])
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -212,11 +263,46 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
     setTxtToAutoNotice(false)
   }, [draft])
 
-  if (loading || draft === null) {
+  if (loading) {
     return (
       <section className={css.section}>
-        <h2 className={css.title}>{t('page.title')}</h2>
+        <div className={css.headerArea}>
+          <h2 className={css.title}>{t('page.title')}</h2>
+          <p className={css.intro}>{t('page.intro')}</p>
+        </div>
         <div className={css.loading}>…</div>
+      </section>
+    )
+  }
+
+  if (draft === null) {
+    return (
+      <section className={css.section}>
+        <div className={css.headerArea}>
+          <h2 className={css.title}>{t('page.title')}</h2>
+          <p className={css.intro}>{t('page.intro')}</p>
+        </div>
+        {error !== undefined && (
+          <div className={css.error} role="alert">
+            <span>{error}</span>
+            <button
+              type="button"
+              className={css.errorDismiss}
+              onClick={() => setError(undefined)}
+              aria-label={t('action.dismiss')}
+            >×</button>
+          </div>
+        )}
+        <div className={css.actionBar}>
+          <button
+            type="button"
+            className={css.secondaryButton}
+            onClick={() => void refresh()}
+          >
+            <ActivityIcon size={14} />
+            <span>{t('action.retryLoad')}</span>
+          </button>
+        </div>
       </section>
     )
   }
@@ -232,41 +318,72 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
 
   return (
     <section className={css.section}>
-      <h2 className={css.title}>{t('page.title')}</h2>
+      {/* Header Area */}
+      <div className={css.headerArea}>
+        <div className={css.headerTitles}>
+          <h2 className={css.title}>{t('page.title')}</h2>
+          <p className={css.intro}>{t('page.intro')}</p>
+        </div>
+
+        {/* Action Bar */}
+        <div className={css.actionBar}>
+          <button
+            type="button"
+            className={css.primaryButton}
+            disabled={saving || credentialBusy}
+            onClick={() => void save()}
+          >
+            {saving ? (
+              <span>…</span>
+            ) : saved ? (
+              <>
+                <CheckIcon size={14} />
+                <span>{t('action.saved')}</span>
+              </>
+            ) : (
+              <span>{t('action.save')}</span>
+            )}
+          </button>
+          <button
+            type="button"
+            className={css.secondaryButton}
+            disabled={testState.status === 'testing'}
+            onClick={() => void testActiveProvider()}
+          >
+            <ActivityIcon size={14} />
+            <span>{testState.status === 'testing' ? t('action.testing') : t('action.test')}</span>
+          </button>
+          <button
+            type="button"
+            className={css.secondaryButton}
+            disabled={saving || credentialBusy}
+            onClick={handleResetDefaults}
+          >
+            <RotateCcwIcon size={13} />
+            <span>{t('action.resetDefaults')}</span>
+          </button>
+          <button
+            type="button"
+            className={css.textButton}
+            onClick={toggleAllCards}
+            title={allOpen ? t('action.collapseAll') : t('action.expandAll')}
+          >
+            {allOpen ? t('action.collapseAll') : t('action.expandAll')}
+          </button>
+        </div>
+      </div>
+
       {error !== undefined && (
-        <div className={css.error}>
+        <div className={css.error} role="alert">
           <span>{error}</span>
-          <button type="button" className={css.errorDismiss} onClick={() => setError(undefined)}>×</button>
+          <button
+            type="button"
+            className={css.errorDismiss}
+            onClick={() => setError(undefined)}
+            aria-label={t('action.dismiss')}
+          >×</button>
         </div>
       )}
-
-      {/* Action Bar */}
-      <div className={css.actionBar}>
-        <button
-          type="button"
-          className={css.primaryButton}
-          disabled={saving || credentialBusy}
-          onClick={() => void save()}
-        >
-          {saving ? '…' : saved ? t('action.saved') : t('action.save')}
-        </button>
-        <button
-          type="button"
-          className={css.secondaryButton}
-          disabled={testState.status === 'testing'}
-          onClick={() => void testActiveProvider()}
-        >
-          {testState.status === 'testing' ? t('action.testing') : t('action.test')}
-        </button>
-        <button
-          type="button"
-          className={css.secondaryButton}
-          disabled={saving || credentialBusy}
-          onClick={handleResetDefaults}
-        >
-          {t('action.resetDefaults')}
-        </button>
-      </div>
 
       {/* Test Connection Result Box */}
       {testState.status !== 'idle' && (
@@ -278,18 +395,31 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
                 ? css.testResultError
                 : css.testResultTesting
           }`}
+          role="status"
         >
-          {testState.status === 'testing' && <span>{t('action.testing')}</span>}
+          {testState.status === 'testing' && (
+            <div className={css.testHeader}>
+              <span className={css.badgePulseDot} aria-hidden="true" />
+              <span>{t('action.testing')}</span>
+            </div>
+          )}
           {testState.status === 'error' && (
             <>
               <div className={css.testHeader}>{t('test.error')}</div>
-              <div>{testState.error}</div>
+              <div className={css.testDetails}>{testState.error}</div>
             </>
           )}
           {(testState.status === 'healthy' || testState.status === 'unhealthy') && testState.view && (
             <>
               <div className={css.testHeader}>
-                {testState.status === 'healthy' ? t('test.healthy') : t('test.unhealthy')} — {testState.view.provider}
+                {testState.status === 'healthy' ? (
+                  <CheckIcon size={15} />
+                ) : (
+                  <span className={css.badgeDot} />
+                )}
+                <span>
+                  {testState.status === 'healthy' ? t('test.healthy') : t('test.unhealthy')} — {testState.view.provider}
+                </span>
               </div>
               <div className={css.testDetails}>
                 <div>Auth: {testState.view.authentication} | Protocol: {testState.view.protocol_version}{testState.view.server_version ? ` | Server: v${testState.view.server_version}` : ''}</div>
@@ -303,45 +433,117 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
         </div>
       )}
 
-      {/* 1. Provider Settings */}
-      <ProviderSection
-        draft={draft}
-        setDraft={setDraft}
-        activeProvider={activeProvider}
-        activeCredentialRef={activeCredentialRef}
-        apiKeyDraft={apiKeyDraft}
-        setApiKeyDraft={setApiKeyDraft}
-        credentialStateReady={credentialStateReady}
-        credentialView={credentialView}
-        credentialLocked={credentialLocked}
-        credentialInputDisabled={credentialInputDisabled}
-        credentialPlaceholder={credentialPlaceholder}
-        credentialBusy={credentialBusy}
-        credentialStatus={credentialState.status}
-        credentialError={credentialState.error}
-        onClearCredential={() => void clearStoredCredential()}
-        onActivateProvider={handleActivateProvider}
-        t={t}
-      />
+      {/* Card List */}
+      <div className={css.cardList}>
+        {/* 1. Provider Settings */}
+        <DisclosureCard
+          id="provider"
+          title={t('section.provider')}
+          subtitle={t('section.provider.desc')}
+          icon={<ServerIcon size={16} />}
+          open={cardsOpen.provider ?? true}
+          onToggle={() => toggleCard('provider')}
+          toggleTitle={cardsOpen.provider ? t('action.collapse') : t('action.expand')}
+          badge={
+            <div className={css.cardBadgeGroup}>
+              <span className={`${css.cardBadge} ${css.badgeInfo}`}>
+                {t(activeProvider.type === 'self-hosted-v2' ? 'badge.selfHosted' : 'badge.official')}
+              </span>
+              <span
+                className={`${css.cardBadge} ${
+                  credentialState.status === 'loading'
+                    ? css.badgeNeutral
+                    : credentialView?.configured
+                      ? css.badgeOk
+                      : css.badgeWarn
+                }`}
+              >
+                <span className={css.badgeDot} aria-hidden="true" />
+                {credentialState.status === 'loading'
+                  ? t('credential.loading')
+                  : credentialView?.configured
+                    ? t('badge.configured')
+                    : t('badge.notConfigured')}
+              </span>
+            </div>
+          }
+        >
+          <ProviderSection
+            draft={draft}
+            setDraft={setDraft}
+            activeProvider={activeProvider}
+            activeCredentialRef={activeCredentialRef}
+            apiKeyDraft={apiKeyDraft}
+            setApiKeyDraft={setApiKeyDraft}
+            credentialStateReady={credentialStateReady}
+            credentialView={credentialView}
+            credentialLocked={credentialLocked}
+            credentialInputDisabled={credentialInputDisabled}
+            credentialPlaceholder={credentialPlaceholder}
+            credentialBusy={credentialBusy}
+            credentialStatus={credentialState.status}
+            credentialError={credentialState.error}
+            onClearCredential={() => void clearStoredCredential()}
+            onActivateProvider={handleActivateProvider}
+            t={t}
+          />
+        </DisclosureCard>
 
-      {/* 2. Defaults */}
-      <DefaultsSection
-        draft={draft}
-        setDraft={setDraft}
-        activeProvider={activeProvider}
-        txtToAutoNotice={txtToAutoNotice}
-        onDismissTxtNotice={() => setTxtToAutoNotice(false)}
-        t={t}
-      />
+        {/* 2. Defaults */}
+        <DisclosureCard
+          id="defaults"
+          title={t('section.defaults')}
+          subtitle={t('section.defaults.desc')}
+          icon={<SlidersIcon size={16} />}
+          open={cardsOpen.defaults ?? true}
+          onToggle={() => toggleCard('defaults')}
+          toggleTitle={cardsOpen.defaults ? t('action.collapse') : t('action.expand')}
+          badge={
+            <div className={css.cardBadgeGroup}>
+              <span className={`${css.cardBadge} ${css.badgeNeutral}`}>
+                {draft.defaults.model.toUpperCase()} · {draft.defaults.parseMethod} · {draft.defaults.language}
+              </span>
+            </div>
+          }
+          action={
+            <button
+              type="button"
+              className={css.resetButton}
+              title={t('action.resetSection')}
+              onClick={() => setDraft(prev => (prev === null ? prev : resetConfigSection(prev, 'defaults')))}
+            >
+              <RotateCcwIcon size={11} className={css.resetIcon} />
+              <span>{t('action.resetSection')}</span>
+            </button>
+          }
+        >
+          <DefaultsSection
+            draft={draft}
+            setDraft={setDraft}
+            activeProvider={activeProvider}
+            txtToAutoNotice={txtToAutoNotice}
+            onDismissTxtNotice={() => setTxtToAutoNotice(false)}
+            t={t}
+          />
+        </DisclosureCard>
 
-      {/* 3, 5, 6, 7, 8. Storage, Polling, Retry, Output, Limits */}
-      <AdvancedSections
-        draft={draft}
-        setDraft={setDraft}
-        t={t}
-      />
+        {/* 3, 4, 5, 6, 7. Storage, Polling, Retry, Output, Limits */}
+        <AdvancedSections
+          draft={draft}
+          setDraft={setDraft}
+          cardsOpen={cardsOpen}
+          onToggleCard={toggleCard}
+          t={t}
+        />
 
-      <StorageOperations rpc={rpc} t={t} />
+        {/* 8. Storage Operations */}
+        <StorageOperations
+          rpc={rpc}
+          open={cardsOpen.operations ?? true}
+          onToggle={() => toggleCard('operations')}
+          t={t}
+        />
+      </div>
     </section>
   )
 }

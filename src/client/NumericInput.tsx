@@ -2,6 +2,8 @@ import { useEffect, useState, type ChangeEvent, type FocusEvent } from 'react'
 
 export interface NumericInputProps {
   readonly className?: string
+  readonly id?: string
+  readonly ariaLabel?: string
   readonly value: number
   readonly min?: number
   readonly max?: number
@@ -52,6 +54,8 @@ export function clampNumericDraft(
 
 export function NumericInput({
   className,
+  id,
+  ariaLabel,
   value,
   min,
   max,
@@ -87,6 +91,8 @@ export function NumericInput({
   return (
     <input
       type="number"
+      id={id}
+      aria-label={ariaLabel}
       className={className}
       value={draft}
       min={min}

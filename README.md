@@ -66,7 +66,9 @@ PDF.js 包解压约34.8 MB，Canvas JS 约0.13 MB，Linux x64 glibc 二进制约
 
 ### 2. 配置与连接
 
-打开 DSH 界面中的 **Settings → Plugins → MinerU**，根据您的使用场景选择 Provider：
+打开 DSH 界面中的 **Settings → MinerU**，根据您的使用场景选择 Provider。设置页按卡片分组，高级配置按需展开；修改后点击 **Save Configuration / 保存配置** 生效。连接测试使用当前草稿，缓存清理仍需先预览再确认。
+
+0.1.0 的设置页包含 Provider、解析默认值、存储与缓存、轮询、重试、输出限制、安全上限和存储维护八张卡片。支持全部展开／折叠，折叠不会丢失表单草稿；启动时固定的安全上限只读展示，需修改宿主配置并重启。界面沿用 DSH 深浅色主题，并支持键盘导航和紧凑布局。
 
 <p align="center">
   <img src="./docs/assets/mineru-settings-preview.webp" width="780" alt="dsh-pdf-mineru 在 DSH Settings 中的设置界面">
@@ -127,7 +129,7 @@ Agent 会自动根据文档长度和指令意图，智能选择同步返回或�
 
 - 默认响应预算12,000个UTF-16单元、正文每块最多8,000；JSON和Native文本各最多48,000字节。默认不重复返回缓存路径；导出用focus: artifacts。
 - `inline_images` 首次省略默认true，续读省略继承，显式布尔值覆盖；模型能力和图像预算始终构成上限。
-- **0.0.14起使用v3游标，0.0.15保持该协议及索引v2；旧v1/v2游标需重新开始，解析缓存无需迁移。** 续读不会在缓存丢失时偷偷重新上传。
+- **0.0.14起使用v3游标，0.1.0保持该协议及索引v2；旧v1/v2游标需重新开始，解析缓存无需迁移。** 续读不会在缓存丢失时偷偷重新上传。
 - 原页模式优先使用 PATH 中的 Poppler（pdfinfo/pdftoppm），命令缺失或明确不可执行时自动回退到 PDF.js + Node Canvas 子进程；仍需图像模型、附件服务及大于0的图像预算。结果以 `renderer: "poppler" | "pdfjs"` 标明后端，不会上传PDF或要求模型重新调用。它是本地有界执行，不是OS级隔离沙箱。
 
 字段语义、完整示例、来源/索引版本、预算、安全边界、错误恢复和离线验收见 **[PDF阅读指南](docs/model-reading.md)**。更新插件后需要让宿主重新加载工具定义；只构建源码或刷新Web页面不等于后端已重载。
@@ -192,7 +194,7 @@ flowchart LR
 
 ## 🛠️ 设置与配置参考
 
-推荐直接在 **DSH Web GUI (Settings → Plugins → MinerU)** 中进行可视化调整。若需要直接编辑配置文件（`cordis.patch.yml`），可参考以下常用配置：
+推荐直接在 **DSH Web GUI (Settings → MinerU)** 中进行可视化调整。若需要直接编辑配置文件（`cordis.patch.yml`），可参考以下常用配置：
 
 <details>
 <summary><strong>📋 点击展开：YAML 配置示例</strong></summary>
@@ -284,7 +286,7 @@ limits:
 <summary><strong>Q: 解析结果保存在哪里？如何清理缓存？</strong></summary>
 
 解析结果按源文件内容、解析语义及 Provider 兼容标识寻址，默认存放在 `$DSH_HOME/cache/pdf-mineru/results/`。启用缓存复用时，后续阅读可复用已发布结果；同进程并发请求合并，但不同进程仍可能分别提交上游解析，不保证跨进程只计费一次。`storage.cacheEnabled=false` 仅禁用解析前的缓存复用，结果仍会不可变发布，不等同于清空缓存或强制覆盖已有结果。
-您可以在 **Settings → Plugins → MinerU** 的运维区域中：
+您可以在 **Settings → MinerU** 的运维区域中：
 - 点击 **Verify Cache** 检查缓存完整性；
 - 点击 **Clear Cache** 预览，再显式确认清除。破坏性维护在存在活跃读取或解析时拒绝执行，不会为了清理而取消它们。
 </details>

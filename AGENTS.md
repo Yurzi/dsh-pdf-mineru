@@ -73,7 +73,7 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 - `src/service/page-renderer.ts`: local original-page verification via Poppler-first/PDF.js-fallback subprocesses and temporary streaming snapshots; owns the shared deadline, semaphore and cleanup, never calls a Provider or retains sources.
 - `src/service/pdfjs-backend.ts`, `pdfjs-worker.mjs`: fixed Node subprocess protocol, package-local resources and bounded Canvas rendering. Do not import heavy PDF/native dependencies into the host bundle or execute PDF scripting/network actions.
 - `src/tools.ts`: two defineTool schemas (`read_pdf` and `async_parse_pdf`), native DSH job adaptation, and pure renderers.
-- `src/rpc.ts`, `src/loopback-rpc.ts`, `src/client/*`: loopback config/maintenance RPC, caller-local guarded native transport registration, and Provider-aware settings page.
+- `src/rpc.ts`, `src/loopback-rpc.ts`, `src/client/*`: loopback config/maintenance RPC, caller-local guarded native transport registration, and Provider-aware settings cards. Presentation changes must preserve draft state across disclosure, bilingual labels, DSH theme tokens, keyboard access, and maintenance preview/confirmation boundaries.
 - `src/observability.ts`: typed, non-throwing structured diagnostic events.
 - `scripts/smoke-reader-cache.mjs`: explicit offline replay of the known rx033 review PDF and existing cached manifest through the built reader/tool chain; rejects network fetches, not a fresh extraction or generic arbitrary-PDF smoke.
 - `scripts/smoke-reader-local.mjs`: explicit full-tool-chain local page smoke, automatic backend or forced missing-Poppler path, no upload.
