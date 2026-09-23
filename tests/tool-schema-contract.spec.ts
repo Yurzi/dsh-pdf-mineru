@@ -21,17 +21,26 @@ function definitions(): Map<string, ToolDefinition> {
 }
 
 describe('real DSH schema compilation', () => {
-  it.each(['read_pdf', 'async_parse_pdf'])('%s requires file_path before entering its body', async name => {
+  it.each(['read_pdf', 'async_parse_pdf'])('%s exposes optional source fields and enforces exactly one at runtime', async name => {
     const tool = definitions().get(name)!
-    expect(tool.parameters.required).toContain('file_path')
-    const exec: ToolRunContext = { callId: 'schema-check', name, arguments: {}, signal: new AbortController().signal }
-    await expect(tool.execute({}, exec)).rejects.toBeInstanceOf(ToolArgsError)
+    expect(tool.parameters.required ?? []).not.toContain('file_path')
+    expect(tool.parameters.required ?? []).not.toContain('attachment_id')
+    for (const source of [{ file_path: '/source.pdf' }, { attachment_id: 'sha256:12345678' }]) {
+      expect(validateJsonSchemaValue(tool.parameters, source, 'args')).toEqual([])
+    }
+    const exec = { callId: 'schema-check', name, arguments: {}, signal: new AbortController().signal, agent: { session: {} } } as unknown as ToolRunContext
+    for (const args of [{}, { file_path: '/source.pdf', attachment_id: 'sha256:12345678' }]) {
+      await expect(tool.execute(args, exec)).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
+    }
+    expect(jsonSchemaToTs(tool.parameters)).toContain('file_path?: string')
+    expect(jsonSchemaToTs(tool.parameters)).toContain('attachment_id?: string')
+    await expect(tool.execute({ attachment_id: '12345678', unexpected: true }, exec)).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
   })
 
   it('declares cursor as optional and rejects empty successful output values', () => {
     const tool = definitions().get('read_pdf')!
     expect(tool.parameters.properties?.cursor).toMatchObject({ type: 'string' })
-    expect(tool.parameters.required).not.toContain('cursor')
+    expect(tool.parameters.required ?? []).not.toContain('cursor')
     expect(validateJsonSchemaValue(tool.output.schema, {}, 'value').length).toBeGreaterThan(0)
   })
 

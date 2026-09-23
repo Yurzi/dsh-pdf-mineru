@@ -1,10 +1,23 @@
 # 面向模型的 PDF 阅读指南
 
-适用于 dsh-pdf-mineru 0.1.0：索引版本2、阅读协议/游标版本3。安装与Provider配置见[README](../README.md)，实现和安全约束见[ARCHITECTURE](../ARCHITECTURE.md)，历史变化见[CHANGELOG](../CHANGELOG.md)。
+适用于 dsh-pdf-mineru 0.1.1：索引版本2、阅读协议/游标版本3。安装与Provider配置见[README](../README.md)，实现和安全约束见[ARCHITECTURE](../ARCHITECTURE.md)，历史变化见[CHANGELOG](../CHANGELOG.md)。
 
 ## 1. 推荐工作流
 
 正常阅读应在 `read_pdf` 内完成“定位 → 精读 → 续读 → 原页核对”，无需先找缓存文件或执行 shell。以下是工具参数示例，替换文件路径和返回的块 ID 后使用。
+
+### 选择本地文件或会话附件
+
+`read_pdf`（content、cursor、page）和 `async_parse_pdf` 均接受 `file_path` 或 `attachment_id`，两者互斥。schema 中两个字段均可选，运行时必须且只能提供一个。下文的 `file_path` 示例也可替换为 `attachment_id`：
+
+```json
+{"attachment_id":"<当前可见附件的完整内容ID或唯一摘要前缀>","focus":"toc"}
+```
+
+- 接受完整 `sha256:<64位十六进制摘要>`，或 8–64 位十六进制摘要前缀；`sha256:` 前缀可省略。多个不同内容 ID 匹配时明确拒绝，需补长前缀或使用完整 ID；同一内容 ID 的重复引用不算歧义。
+- 仅在当前会话 `deriveMessages()` 的可见消息中递归查找文件及嵌套工具结果引用，不查全局存储，也不恢复已压缩移出的引用。找不到时请重新提供可见附件或使用已有本地路径，不猜测附件路径。
+- 匹配到的真实引用原样交给 DSH `fileHostPath`。DSH 拥有存储文件；缺少本地路径能力时返回 `UNSUPPORTED_OPTION`，不把附件流另存为临时文件。现有源文件校验、缓存和 Provider 行为不变；附件 ID 不是新增的完整性保证。
+- 续读必须原样传回 cursor，调用方应保持同一来源选择器（字段及值），不同时传两个来源；附件续读仍要求引用当前可见、源文件可用。这是调用约定，游标不绑定选择器字符串，运行时仍按既有结果／投影身份校验。
 
 ### 定位目录或关键字
 
@@ -40,7 +53,7 @@
 {"file_path":"paper.pdf","cursor":"<上一响应的原样cursor>"}
 ```
 
-- `partial`：必须继续；保持同一文件，只传游标，不重复 pages/focus/block_id/query。
+- `partial`：必须继续；保持同一来源选择器（`file_path` 或 `attachment_id`）并传回游标，不重复 pages/focus/block_id/query。
 - `complete`：本次选择的解析文本已交付完成；此前各块的 `markdown_content` 应顺序拼接。query 模式的“选择”是检索摘要。
 - `not_requested`：当前请求不要求正文，例如仅导出产物清单。
 - `cursor` 总是存在，结束时为 `null`；此时停止，不将 null 再作为输入。
@@ -52,7 +65,7 @@
 {"file_path":"paper.pdf","view":"page","pages":7,"expected_sha256":"<此前返回的source_sha256>"}
 ```
 
-`expected_sha256` 可省略；提供时会拒绝已变化的源文件。page模式仅接受 file_path、单页pages及可选expected_sha256，不接受文本选择或呈现参数。原页结果为 `source: "local"`，不调用Provider。仅原页响应包含 `renderer: "poppler"` 或 `"pdfjs"`；Native展示同一标识，普通文本不添加该字段。成功自动回退不会先返回一次依赖错误。
+`expected_sha256` 可省略；提供时会拒绝已变化的源文件。page模式仅接受一个来源选择器（file_path 或 attachment_id）、单页pages及可选expected_sha256，不接受文本选择或呈现参数。原页结果为 `source: "local"`，不调用Provider。仅原页响应包含 `renderer: "poppler"` 或 `"pdfjs"`；Native展示同一标识，普通文本不添加该字段。成功自动回退不会先返回一次依赖错误。
 
 ## 2. 图像呈现设置
 
@@ -96,7 +109,7 @@ Web 设置页中展开输出配置卡片可调整内联图像预算，修改后�
 
 ### 升级规则
 
-0.0.14起使用游标v3，0.1.0保持游标v3及索引v2；旧v1/v2 token明确过期，需要不带cursor重新读取。**解析缓存无需迁移或重新上传。**
+0.0.14起使用游标v3，0.1.1保持游标v3及索引v2；旧v1/v2 token明确过期，需要不带cursor重新读取。**解析缓存无需迁移或重新上传。**
 
 游标是有界、无签名、无服务端会话状态的定位token，不是授权凭证。它绑定结果、文本投影、产物摘要、索引/阅读版本及选择。源文件仍须存在并保持一致。
 
@@ -142,7 +155,7 @@ PDF.js重型解析与Canvas只在固定Node子进程运行；取消/超时会终
 
 ## 7. 开发者验收
 
-默认测试使用fixture/mock：
+默认测试使用fixture/mock，附件来源应覆盖：恰好一个来源字段、完整 ID／前缀边界、嵌套工具结果引用、同内容去重与歧义拒绝、当前可见范围、真实引用原样传给 fileHostPath、无路径能力的 UNSUPPORTED_OPTION，以及 content／cursor／page／后台入口；不得依赖全局存储扫描或流落盘：
 
 ```sh
 pnpm run build

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1
+
+### Added
+
+- Accept `attachment_id` as an alternative to `file_path` in `read_pdf` content, cursor and page requests and in `async_parse_pdf`. Both source fields are optional in schemas; exactly one is required at runtime, and callers should retain the same source selector on continuation; existing cursor identity validation is unchanged.
+- Resolve full SHA-256 content IDs or unique 8–64 hexadecimal digest prefixes (optionally `sha256:`-prefixed) from current-session visible file and nested tool-result refs. Reject ambiguous matches and pass the exact matched ref to DSH `fileHostPath`; compacted-out refs are not searched.
+
+DSH retains ownership of stored files. Hosts without local-path capability return `UNSUPPORTED_OPTION`; no stream materialization, new integrity checks, storage migration or Provider changes are introduced.
+
 ## 0.1.0
 
 ### Added

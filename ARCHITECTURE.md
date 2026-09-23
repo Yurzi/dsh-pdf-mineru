@@ -26,6 +26,7 @@ loopback RPC → StorageMaintenanceService
 | 位置 | 职责 |
 | --- | --- |
 | `src/tools.ts` | 两个工具的 schema、DSH owner/job 适配、模型能力判断、受限附件与最终输出 |
+| `src/adapters/dsh-document-source.ts` | 当前可见附件引用选择与 `fileHostPath` 薄适配，不复制文件或承担存储职责 |
 | `src/service/mineru-service.ts` | 固定调用配置、规范化、命中／合并、Provider 编排、解析发布与阅读入口 |
 | `src/service/document-index.ts` | 选择前建立稳定 block ID、物理页坐标、已知 span 的忠实规范化、原文标签和诊断 |
 | `src/service/read-delivery.ts`、`read-cursor.ts` | 有界正文投影、cursor-v3、交付 block 范围内的诊断／公式核验建议和元数据裁剪 |
@@ -53,11 +54,13 @@ Provider 不注册工具、不取得 DSH Session、不选择缓存目录、不�
 
 ## 3. 工具与阅读契约
 
-两个工具都要求真实 `exec.agent.session`，并在 schema 中声明 file_path 必填。工具参数只关注阅读，不暴露 model/ocr/backend 等底层解析设置。
+两个工具都要求真实 `exec.agent.session`。`file_path` 与 `attachment_id` 在 schema 中均可选，运行时必须且只能提供一个；这一规则覆盖正文、cursor 续读、原页及后台解析。工具参数只关注阅读，不暴露 model/ocr/backend 等底层解析设置。
 
-- `read_pdf`：直接返回选择投影，不创建插件任务。当前参数为 `file_path`、`view`、`pages`、`focus`、`block_id`、`query`、`expected_sha256`、`inline_images`、`poll_timeout_ms`、`cursor`。
+附件解析属于工具边界：从当前会话的 `deriveMessages()` 可见消息递归收集 file／tool-result 文件引用（不恢复已压缩移出的引用），按内容 ID 匹配完整 `sha256:<64hex>` 或 8–64 位十六进制摘要前缀（可带 `sha256:`）。重复引用同一内容 ID 不构成歧义；匹配多个不同内容 ID 时明确报错。将匹配到的真实原始引用原样传给 `fileHostPath`，不凭摘要重建引用、不猜存储路径、不扫描全局附件库。宿主无本地路径能力时返回 `UNSUPPORTED_OPTION`，不增加流落盘回退。DSH 拥有附件存储；插件只把解析出的路径交给现有源文件流程，不增加完整性、存储或 Provider 协议。
+
+- `read_pdf`：直接返回选择投影，不创建插件任务。当前参数为 `file_path`、`attachment_id`、`view`、`pages`、`focus`、`block_id`、`query`、`expected_sha256`、`inline_images`、`poll_timeout_ms`、`cursor`。
   - `view: content`（默认）读取解析块；`pages` 是从 1 开始的物理页，`focus` 支持 all/text/table/image/toc/artifacts。`query` 是 1–256 字符、不区分大小写的字面搜索，返回有界片段和 ID；`block_id` 精确读取同一解析结果的稳定 block。两者互斥，也不能与 toc/artifacts focus 组合。
-  - `view: page` 只接受 `file_path`、恰好一页的 `pages` 和可选 `expected_sha256`；哈希必须为 64 个小写十六进制字符的 SHA-256，取自先前结果的 `source_sha256`。此参数不用于 content 模式。页面模式要求支持图片的模型且 maxInlineImages > 0，不接受 focus/cursor/query/block_id/inline_images/poll_timeout_ms。
+  - `view: page` 只接受一个来源选择器（`file_path` 或 `attachment_id`）、恰好一页的 `pages` 和可选 `expected_sha256`；哈希必须为 64 个小写十六进制字符的 SHA-256，取自先前结果的 `source_sha256`。此参数不用于 content 模式。页面模式要求支持图片的模型且 maxInlineImages > 0，不接受 focus/cursor/query/block_id/inline_images/poll_timeout_ms。
 - `async_parse_pdf`：调用 `ctx.jobs.start(kind: mineru)`，传递精确的 live Agent owner；立即返回 job_id/state。完成后通过非拒绝 final-output Promise 提供摘要文本，而不是伪装为与 read_pdf 相同的正文 JSON。
 - 通用 job_output/job_list/job_kill 负责后台控制；不维护第二套 JobRepository 或专用任务控制工具。
 
@@ -67,10 +70,10 @@ Provider 不注册工具、不取得 DSH Session、不选择缓存目录、不�
 
 `content_status: complete` 只表示所选解析文本（或续读剩余文本）已交付，不保证 OCR 忠实性、原文完整抽取、图片已看过或视觉覆盖完整。`partial` 必须提供能够取得进展的非空 cursor；complete/not_requested 的 cursor 为 null，调用方应停止而不是传回 null。`not_requested` 用于不要求正文的产物列表或原页视图。
 
-Cursor v3 是最长 2048 字符的无签名 base64url JSON，携带 immutable result 身份、规范 pages/focus、可选 block/query、UTF-16 偏移及 inline_images 意图。projection SHA-256 绑定精确投影文本、索引／reader 版本和 manifest 文件／产物身份（含摘要）；变化后拒绝旧偏移。它不是授权凭证，也不是无需源文件的 result_id 读取接口。
+Cursor v3 是最长 2048 字符的无签名 base64url JSON，携带 immutable result 身份、规范 pages/focus、可选 block/query、UTF-16 偏移及 inline_images 意图。projection SHA-256 绑定精确投影文本、索引／reader 版本和 manifest 文件／产物身份（含摘要）；变化后拒绝旧偏移。它不是授权凭证，也不是无需源文件的 result_id 读取接口。保持同一来源选择器是调用方约定；游标不保存或逐字比较 selector，运行时仍校验既有结果／投影身份。
 
-1. 初次使用 file_path + 可选 pages/focus/query/block_id，建议先 toc 或短 query，再精读 block_id。
-2. partial 后原样传回 cursor，保持同一 file_path，不再传 pages/focus/block_id/query。省略 inline_images 继承 cursor 的调用意图；显式布尔值覆盖它，不能把运行时模型能力或附件预算导致的省略写成用户关闭图片。
+1. 初次使用一个来源选择器（file_path 或 attachment_id）+ 可选 pages/focus/query/block_id，建议先 toc 或短 query，再精读 block_id。
+2. partial 后原样传回 cursor，保持同一来源选择器（file_path 或 attachment_id），不再传 pages/focus/block_id/query。省略 inline_images 继承 cursor 的调用意图；显式布尔值覆盖它，不能把运行时模型能力或附件预算导致的省略写成用户关闭图片。
 3. Native 展示必须包含实际 token，不只说“使用返回的 cursor”。
 4. 各次 markdown_content 顺序拼接必须与同一选择的完整文本一致；切分不能拆 Unicode 代理对或生成的 block locator。长块内部续读通过 continuation_block 保留定位。
 5. 默认全选编码为 pages=""，不能在续读中改成显式 1-N，避免丢失无 page_idx 的 block。

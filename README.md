@@ -68,7 +68,7 @@ PDF.js 包解压约34.8 MB，Canvas JS 约0.13 MB，Linux x64 glibc 二进制约
 
 打开 DSH 界面中的 **Settings → MinerU**，根据您的使用场景选择 Provider。设置页按卡片分组，高级配置按需展开；修改后点击 **Save Configuration / 保存配置** 生效。连接测试使用当前草稿，缓存清理仍需先预览再确认。
 
-0.1.0 的设置页包含 Provider、解析默认值、存储与缓存、轮询、重试、输出限制、安全上限和存储维护八张卡片。支持全部展开／折叠，折叠不会丢失表单草稿；启动时固定的安全上限只读展示，需修改宿主配置并重启。界面沿用 DSH 深浅色主题，并支持键盘导航和紧凑布局。
+设置页包含 Provider、解析默认值、存储与缓存、轮询、重试、输出限制、安全上限和存储维护八张卡片。支持全部展开／折叠，折叠不会丢失表单草稿；启动时固定的安全上限只读展示，需修改宿主配置并重启。界面沿用 DSH 深浅色主题，并支持键盘导航和紧凑布局。
 
 <p align="center">
   <img src="./docs/assets/mineru-settings-preview.webp" width="780" alt="dsh-pdf-mineru 在 DSH Settings 中的设置界面">
@@ -122,26 +122,33 @@ Agent 会自动根据文档长度和指令意图，智能选择同步返回或�
 
 1. 用 `focus: "toc"` 看目录，或用 `query: "图 7"` 字面检索。空格有意义，“图7”与“图 7”不同。
 2. 用返回的 `block_id` 精读完整块，或用物理页码与focus选择内容。标题块不代表整节。
-3. `content_status: "partial"` 时，以同一file_path和原样cursor继续，不重复pages/focus/block_id/query；结束时cursor为null。
+3. `content_status: "partial"` 时，以同一来源选择器（`file_path` 或 `attachment_id`）和原样cursor继续，不重复pages/focus/block_id/query；结束时cursor为null。
 4. 对关键公式、数值和图表，用 `view: "page"` 回看原页；可传source_sha256作为expected_sha256。
 
 **complete只表示所选解析文本交付完成，不保证OCR正确或图像全部展示。** 检查当前块的diagnostics、公式verification_hints及visuals；metadata_shortened表示元数据因预算未完整列出。
 
 - 默认响应预算12,000个UTF-16单元、正文每块最多8,000；JSON和Native文本各最多48,000字节。默认不重复返回缓存路径；导出用focus: artifacts。
 - `inline_images` 首次省略默认true，续读省略继承，显式布尔值覆盖；模型能力和图像预算始终构成上限。
-- **0.0.14起使用v3游标，0.1.0保持该协议及索引v2；旧v1/v2游标需重新开始，解析缓存无需迁移。** 续读不会在缓存丢失时偷偷重新上传。
+- **0.0.14起使用v3游标，0.1.1保持该协议及索引v2；旧v1/v2游标需重新开始，解析缓存无需迁移。** 续读不会在缓存丢失时偷偷重新上传。
 - 原页模式优先使用 PATH 中的 Poppler（pdfinfo/pdftoppm），命令缺失或明确不可执行时自动回退到 PDF.js + Node Canvas 子进程；仍需图像模型、附件服务及大于0的图像预算。结果以 `renderer: "poppler" | "pdfjs"` 标明后端，不会上传PDF或要求模型重新调用。它是本地有界执行，不是OS级隔离沙箱。
 
 字段语义、完整示例、来源/索引版本、预算、安全边界、错误恢复和离线验收见 **[PDF阅读指南](docs/model-reading.md)**。更新插件后需要让宿主重新加载工具定义；只构建源码或刷新Web页面不等于后端已重载。
+
+### 文件来源
+
+`read_pdf` 的正文、续读、原页模式及 `async_parse_pdf` 都保留 `file_path`，也可改用互斥的 `attachment_id`，例如 `{"attachment_id":"<当前附件的完整内容ID>","focus":"toc"}`。两个来源字段在 schema 中均可选，但每次调用运行时必须且只能提供一个；调用方续读应保留同一选择器；游标仍按既有结果／投影身份校验，不新增选择器字符串绑定。
+
+附件 ID 可为完整 `sha256:` 加 64 位十六进制摘要，或 8–64 位摘要前缀（可带 `sha256:`）。只匹配当前会话可见消息中的文件及嵌套工具结果引用；已压缩移出的引用不可见。多个不同内容 ID 匹配时拒绝，需提供更长前缀或完整 ID；不会猜测路径或搜索全局附件库。附件仍由 DSH 管理；宿主不提供本地路径能力时返回 `UNSUPPORTED_OPTION`，插件不会将附件流落盘。Provider、缓存和既有完整性校验不变。
 
 ### 常用解析参数（均可通过自然语言告知 Agent）
 
 | 参数 | 类型 | 适用工具 | 作用说明 |
 | --- | --- | --- | --- |
-| `file_path` | `string` | 全部 | 待解析/读取的本地文件路径（必填） |
+| `file_path` | `string` | 全部 | 本地文件路径；与 `attachment_id` 必须且只能选一个 |
+| `attachment_id` | `string` | 全部 | 当前会话可见文件附件的完整内容 ID 或唯一摘要前缀（8–64 位十六进制，可带 `sha256:`） |
 | `pages` | `number` / `string` / `number[]` | `read_pdf` | 1-based 页码选择，支持单页（如 `3`）、数组（如 `[1, 2, 5]`）或范围字符串（如 `"1-3, 5"`） |
 | `focus` | `string` / `string[]` | `read_pdf` | `all`（默认）、`text`、`table`、`image`、`toc` 或 `artifacts` |
-| `cursor` | `string` | `read_pdf` | 原样传回上一条部分阅读响应的 token；与 `pages`／`focus`／`block_id`／`query` 互斥，仍须传同一 `file_path` |
+| `cursor` | `string` | `read_pdf` | 原样传回上一条部分阅读响应的 token；与 `pages`／`focus`／`block_id`／`query` 互斥，仍须传同一来源选择器（`file_path` 或 `attachment_id`） |
 | `block_id` | `string` | `read_pdf` | 原样使用此前返回的稳定块 ID；与 `query`、`cursor` 互斥 |
 | `query` | `string` | `read_pdf` | 1–256 字符、不区分大小写的字面检索；返回上下文摘要与块 ID，再用 `block_id` 读全文 |
 | `view` | `"content"` / `"page"` | `read_pdf` | 默认解析文本；page 模式只接受一页 `pages`，本地渲染原页，不调用 Provider |

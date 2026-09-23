@@ -4,6 +4,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
 import { Context, type Fiber } from '@deepseek-ai/cordis'
+import { AttachmentId, type AttachmentStore } from '@deepseek-ai/dsh-attachment'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { HostConnectionService, serverResponseSchema } from '@deepseek-ai/dsh-client-connection'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as mineru from '../src/index.js'
@@ -36,9 +39,9 @@ async function hostFixture(trustedHosts: readonly string[] = []) {
   const errors: unknown[][] = []
   ctx.logger.exporter({ export: message => { if (message.type === 'error') errors.push(message.args) } })
 
-  const definitions = new Map<string, { name: string }>()
+  const definitions = new Map<string, ToolDefinition>()
   const toolDisposers: Array<ReturnType<typeof vi.fn>> = []
-  const registerTool = vi.fn((definition: { name: string }) => {
+  const registerTool = vi.fn((definition: ToolDefinition) => {
     if (definitions.has(definition.name)) throw new Error('duplicate tool registration')
     definitions.set(definition.name, definition)
     const dispose = vi.fn(() => { definitions.delete(definition.name) })
@@ -134,6 +137,46 @@ async function request(route: Route, options: { host?: string | string[] | null;
 }
 
 describe('installed host compatibility (rc.2 RPC injection)', () => {
+  it.each([false, true])('injects optional sibling attachments (late=%s), clears removed services, and retains tools', async late => {
+    const host = await hostFixture()
+    const message = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'file', attachment: { attachmentId: AttachmentId('sha256:' + 'a'.repeat(64)), name: 'paper.pdf', bytes: 100 } }] })
+    const ref = message.content[0]!.type === 'file' ? message.content[0]!.attachment : undefined
+    const fileHostPath = vi.fn(() => join(host.config.storage.storageRoot, 'absent.pdf'))
+    const provide = () => host.ctx.plugin((owner: Context) => {
+      owner.provide('attachments', { fileHostPath } as unknown as AttachmentStore)
+    })
+    let provider = late ? undefined : provide()
+    if (provider) await provider.await()
+    await host.start()
+    const tool = host.definitions.get('read_pdf')!
+    const exec = { callId: 'attachment-host', name: 'read_pdf', arguments: {}, signal: new AbortController().signal, agent: { session: { header: { id: 'attachment-host', cwd: host.config.storage.storageRoot }, deriveMessages: () => [message] } } } as unknown as ToolRunContext
+    const read = () => tool.execute({ attachment_id: 'aaaaaaaa' }, exec)
+    if (late) {
+      await expect(read()).rejects.toMatchObject({ failure: { code: 'UNSUPPORTED_OPTION' } })
+      provider = provide()
+      await provider.await()
+      await host.settle()
+    }
+    // Real tool -> adapter -> existing normalizer; no Provider request is made.
+    await expect(read()).rejects.toMatchObject({ failure: { code: 'FILE_NOT_FOUND' } })
+    expect(fileHostPath).toHaveBeenCalledOnce()
+    expect(fileHostPath.mock.calls[0]![0]).toBe(ref)
+    host.expectTools()
+    await provider!.dispose()
+    await host.settle()
+    await expect(read()).rejects.toMatchObject({ failure: { code: 'UNSUPPORTED_OPTION' } })
+    expect(fileHostPath).toHaveBeenCalledOnce()
+    await expect(tool.execute({ file_path: 'absent.pdf' }, exec)).rejects.toMatchObject({ failure: { code: 'FILE_NOT_FOUND' } })
+    host.expectTools()
+    const replacement = provide()
+    await replacement.await()
+    await host.settle()
+    await expect(read()).rejects.toMatchObject({ failure: { code: 'FILE_NOT_FOUND' } })
+    expect(fileHostPath).toHaveBeenCalledTimes(2)
+    host.expectTools()
+    expect(host.errors).toEqual([])
+  })
+
   it('loads the real plugin in a strict fiber, serves loopback RPC, and disposes its registrations', async () => {
     const host = await hostFixture()
     host.provideWebServer()

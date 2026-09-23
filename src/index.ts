@@ -1,5 +1,6 @@
 import z from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
+import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import {
   defaultMinerUConfig,
   detectBloatedSettingsOps,
@@ -249,7 +250,14 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
       },
     })
 
-    toolDisposer = registerTools(ctx, () => service, accessGate, () => runtimeConfig().output)
+    // Optional sibling service: retain path tools when it is absent, and clear
+    // the capability when Cordis disposes/replaces the attachment provider.
+    let attachments: AttachmentStore | undefined
+    ctx.inject(['attachments'], attachmentCtx => {
+      attachments = attachmentCtx.attachments
+      return () => { attachments = undefined }
+    })
+    toolDisposer = registerTools(ctx, () => service, accessGate, () => runtimeConfig().output, () => attachments)
 
     // Since DSH 0.1.5, connection no longer requires a WebServer. HTTP RPC
     // registration accesses the caller's webServer, so declare it explicitly.

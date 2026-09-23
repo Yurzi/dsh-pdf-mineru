@@ -6,6 +6,8 @@ import util from 'node:util'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import type { Context } from '@deepseek-ai/cordis'
+import { AttachmentId, type FileAttachmentRef } from '@deepseek-ai/dsh-attachment'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { DefineToolOptions, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { defaultMinerUConfig, type MinerUConfig } from '../src/config.js'
 import { MinerUError, failure } from '../src/domain/errors.js'
@@ -214,6 +216,8 @@ async function createHarness(options: HarnessOptions = {}): Promise<TestHarness>
   const pdfBytes = Buffer.from('%PDF-1.4 model reading integration test\n%EOF')
   await writeFile(file, pdfBytes)
   const fileSha256 = createHash('sha256').update(pdfBytes).digest('hex')
+  const attachment = { attachmentId: AttachmentId('sha256:' + fileSha256), name: 'document.pdf', bytes: pdfBytes.byteLength }
+  const sourceMessage = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'file', attachment }] })
 
   const base = defaultMinerUConfig()
   const config: MinerUConfig = {
@@ -268,7 +272,7 @@ async function createHarness(options: HarnessOptions = {}): Promise<TestHarness>
     },
     get: (name: string) => {
       if (name === 'llm') return { resolveModelInfo }
-      if (name === 'attachments') return options.attachmentSupport === false ? undefined : { saveImage }
+      if (name === 'attachments') return options.attachmentSupport === false ? undefined : { saveImage, fileHostPath: (ref: FileAttachmentRef) => ref.attachmentId === attachment.attachmentId ? file : undefined }
       return undefined
     },
     effect: () => {},
@@ -299,6 +303,7 @@ async function createHarness(options: HarnessOptions = {}): Promise<TestHarness>
         session: {
           id: 'session_reading',
           header: { id: 'session_reading', cwd: root },
+          deriveMessages: () => [sourceMessage],
         },
       },
     }
@@ -340,6 +345,28 @@ const PNG_1X1 = Buffer.from(
 )
 
 describe('read_pdf model reading contract', () => {
+  it('reuses path caching and cache-only continuation through attachment path adaptation', async () => {
+    const h = await createHarness()
+    h.provider.contentList = [{ type: 'text', page_idx: 0, text: 'Attachment integration. ' + 'fill '.repeat(2500) }]
+    const attachment_id = 'sha256:' + h.fileSha256.slice(0, 8)
+    const initial = await h.executeRead({ attachment_id, inline_images: false })
+    expect(initial.content_status).toBe('partial')
+    expect(initial.cursor).toBeTypeOf('string')
+    expect(initial.source_sha256).toBe(h.fileSha256)
+    const byPath = await h.executeRead({ file_path: h.file, inline_images: false })
+    expect(byPath.result_id).toBe(initial.result_id)
+    expect(byPath.cache_hit).toBe(true)
+    expect(byPath.markdown_content).toBe(initial.markdown_content)
+    const next = await h.executeRead({ attachment_id, cursor: initial.cursor })
+    expect(next.cache_hit).toBe(true)
+    expect(next.result_id).toBe(initial.result_id)
+    expect(next.markdown_content!.length).toBeGreaterThan(0)
+    expect(h.provider.submitCount).toBe(1)
+    vi.spyOn(h.results, 'get').mockResolvedValue(undefined)
+    await expect(h.executeRead({ attachment_id, cursor: initial.cursor })).rejects.toMatchObject({ failure: { code: 'CACHE_EVICTED' } })
+    expect(h.provider.submitCount).toBe(1)
+  })
+
   it('returns compact ResultView with files[{file_id, name, artifacts: []}], source_sha256, and omits default paths/repeated toc', async () => {
     const h = await createHarness()
     h.provider.contentList = [

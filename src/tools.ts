@@ -29,6 +29,7 @@ import {
 } from './service/mineru-service.js'
 import { MAX_INLINE_IMAGE_SINGLE_BYTES, MAX_INLINE_IMAGE_TOTAL_BYTES, mediaTypeForExtension } from './service/image-policy.js'
 import { decodeReadCursor } from './service/read-cursor.js'
+import { parseDocumentSource, resolveDocumentPath, type DocumentSource } from './adapters/dsh-document-source.js'
 
 declare module '@deepseek-ai/dsh-jobs' {
   interface JobKindMap {
@@ -174,20 +175,15 @@ type MutableJsonView<T> = T extends readonly (infer Item)[]
   ? MutableJsonView<Item>[]
   : T extends object ? { -readonly [Key in keyof T]: MutableJsonView<T[Key]> } : T
 
-const asyncParseParameters: ParameterSchemaSpec = {
-  file_path: {
-    type: 'string',
-    description: 'Path of the local PDF document to parse.',
-    required: true,
-  },
-}
+const documentSourceParameters = {
+  file_path: { type: 'string', description: 'Path of the local PDF document. Provide exactly one of file_path or attachment_id.' },
+  attachment_id: { type: 'string', description: 'File attachment on the current session surface: full SHA-256 ID or unique 8–64 hex-character digest prefix, with optional sha256: prefix. Uses the DSH host file path; not a URL or filesystem path. Mutually exclusive with file_path.' },
+} satisfies ParameterSchemaSpec
+
+const asyncParseParameters: ParameterSchemaSpec = documentSourceParameters
 
 const readPdfParameters: ParameterSchemaSpec = {
-  file_path: {
-    type: 'string',
-    description: 'Path of the local PDF document to read.',
-    required: true,
-  },
+  ...documentSourceParameters,
   view: { type: 'string', enum: ['content', 'page'], description: 'content (default) reads parsed blocks; page renders one original PDF page locally without invoking a Provider. Requires exactly one page and an image-capable model.' },
   block_id: { type: 'string', description: 'Read one exact stable block ID from a prior result; IDs are bound to that parsed result. Cannot combine with query or cursor.' },
   query: { type: 'string', description: 'Case-insensitive literal search (1–256 characters) in selected parsed blocks. Returns bounded snippets and block IDs, not the full matching blocks. Use block_id to read a hit.' },
@@ -217,7 +213,7 @@ const readPdfParameters: ParameterSchemaSpec = {
   },
   cursor: {
     type: 'string',
-    description: 'Opaque continuation cursor returned by a previous partial read. Pass only a non-empty returned token, unchanged; null means stop, not restart. When provided, file_path is required and pages/focus must be omitted.',
+    description: 'Opaque continuation cursor returned by a previous partial read. Pass only a non-empty returned token, unchanged; null means stop, not restart. When provided, the same source (file_path or attachment_id) is required and pages/focus must be omitted.',
   },
 }
 
@@ -273,8 +269,15 @@ function requireAgent(exec: ToolRunContext): NonNullable<ToolRunContext['agent']
   return agent
 }
 
-const READ_PARAMETER_FIELDS = new Set(['file_path', 'pages', 'focus', 'inline_images', 'poll_timeout_ms', 'cursor', 'block_id', 'query', 'view', 'expected_sha256'])
-const ASYNC_PARAMETER_FIELDS = new Set(['file_path'])
+const READ_PARAMETER_FIELDS = new Set(['file_path', 'attachment_id', 'pages', 'focus', 'inline_images', 'poll_timeout_ms', 'cursor', 'block_id', 'query', 'view', 'expected_sha256'])
+const ASYNC_PARAMETER_FIELDS = new Set(['file_path', 'attachment_id'])
+
+type ToolParseRequestInput = Omit<ParseRequestInput, 'file_path'> & DocumentSource
+
+function resolveToolInput(input: ToolParseRequestInput, agent: NonNullable<ToolRunContext['agent']>, attachments: AttachmentStore | undefined): ParseRequestInput {
+  const { file_path: _path, attachment_id: _id, ...options } = input
+  return { ...options, file_path: resolveDocumentPath(input, agent.session, attachments) }
+}
 
 function assertAllowedParameters(args: Record<string, unknown>, allowed: ReadonlySet<string>): void {
   for (const key of Object.keys(args)) {
@@ -284,29 +287,17 @@ function assertAllowedParameters(args: Record<string, unknown>, allowed: Readonl
   }
 }
 
-function extractFilePath(args: Record<string, unknown>): string {
-  if (typeof args.file_path !== 'string' || args.file_path.trim() === '') {
-    throw new MinerUError(failure('INVALID_REQUEST', 'Local document path (file_path) is required'))
-  }
-  return args.file_path.trim()
-}
-
-export function parseAsyncInput(args: unknown): { readonly input: ParseRequestInput } {
+export function parseAsyncInput(args: unknown): { readonly input: ToolParseRequestInput } {
   if (typeof args !== 'object' || args === null || Array.isArray(args)) {
     throw new MinerUError(failure('INVALID_REQUEST', 'Tool arguments must be an object'))
   }
   const obj = args as Record<string, unknown>
   assertAllowedParameters(obj, ASYNC_PARAMETER_FIELDS)
-  const filePath = extractFilePath(obj)
-  return {
-    input: {
-      file_path: filePath,
-    },
-  }
+  return { input: parseDocumentSource(obj) }
 }
 
 export interface ParsedToolInput {
-  readonly input: ParseRequestInput
+  readonly input: ToolParseRequestInput
   readonly pollTimeoutMs?: number
   readonly inline_images?: boolean
   readonly view?: 'page'
@@ -320,17 +311,17 @@ export function parseReadInput(args: unknown): ParsedToolInput {
   }
   const obj = args as Record<string, unknown>
   assertAllowedParameters(obj, READ_PARAMETER_FIELDS)
-  const filePath = extractFilePath(obj)
+  const source = parseDocumentSource(obj)
   const pollTimeoutMs = parsePollTimeout(obj.poll_timeout_ms)
 
   if (obj.view !== undefined && obj.view !== 'content' && obj.view !== 'page') throw new MinerUError(failure('INVALID_REQUEST', 'view must be content or page'))
   if (obj.view === 'page') {
-    for (const key of ['focus', 'cursor', 'query', 'block_id', 'inline_images', 'poll_timeout_ms']) if (obj[key] !== undefined) throw new MinerUError(failure('INVALID_REQUEST', 'page view accepts only file_path, pages, and optional expected_sha256'))
+    for (const key of ['focus', 'cursor', 'query', 'block_id', 'inline_images', 'poll_timeout_ms']) if (obj[key] !== undefined) throw new MinerUError(failure('INVALID_REQUEST', 'page view accepts only one source (file_path or attachment_id), pages, and optional expected_sha256'))
     let selected: Set<number> | undefined
     try { selected = normalizePageSelection(obj.pages) } catch { throw new MinerUError(failure('INVALID_REQUEST', 'page view requires exactly one positive physical page')) }
     if (selected === undefined || selected.size !== 1) throw new MinerUError(failure('INVALID_REQUEST', 'page view requires exactly one physical page in pages'))
     if (obj.expected_sha256 !== undefined && (typeof obj.expected_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(obj.expected_sha256))) throw new MinerUError(failure('INVALID_REQUEST', 'expected_sha256 must be a lowercase SHA-256 digest'))
-    return { input: { file_path: filePath }, view: 'page', page: [...selected][0]!, ...(typeof obj.expected_sha256 === 'string' ? { expected_sha256: obj.expected_sha256 } : {}) }
+    return { input: source, view: 'page', page: [...selected][0]!, ...(typeof obj.expected_sha256 === 'string' ? { expected_sha256: obj.expected_sha256 } : {}) }
   }
   if (obj.expected_sha256 !== undefined) throw new MinerUError(failure('INVALID_REQUEST', 'expected_sha256 is only supported in page view'))
   if (obj.block_id !== undefined && (typeof obj.block_id !== 'string' || obj.block_id.length > 160 || !/^mr_[a-zA-Z0-9_-]+:b[1-9][0-9]*$/.test(obj.block_id))) throw new MinerUError(failure('INVALID_REQUEST', 'block_id must be an exact ID returned by read_pdf'))
@@ -381,7 +372,7 @@ export function parseReadInput(args: unknown): ParsedToolInput {
   const resolvedInlineImages = inline_images ?? cursorInlineImages ?? true
   return {
     input: {
-      file_path: filePath,
+      ...source,
       ...(pages !== undefined ? { pages } : {}),
       ...(focus !== undefined ? { focus } : {}),
       inline_images: resolvedInlineImages,
@@ -575,6 +566,7 @@ export function registerTools(
   getService: () => MinerUService,
   accessGate?: StorageAccessGate,
   getOutputConfig: () => OutputConfig = () => DEFAULT_OUTPUT_CONFIG,
+  getAttachments: () => AttachmentStore | undefined = () => ctx.get('attachments'),
 ): () => Promise<void> {
   const disposers: Array<() => void> = []
   const backgroundInvocations = new Set<{ readonly controller: AbortController; readonly done: Promise<JobOutcome> }>()
@@ -608,7 +600,8 @@ export function registerTools(
     execute: async (args: unknown, exec: ToolRunContext) => {
       const agent = requireAgent(exec)
       exec.signal.throwIfAborted()
-      const { input } = parseAsyncInput(args)
+      const parsed = parseAsyncInput(args)
+      const input = resolveToolInput(parsed.input, agent, getAttachments())
       const jobs = ctx.get('jobs') as JobRegistry | undefined
       if (jobs === undefined) {
         throw new MinerUError(failure('PROVIDER_UNAVAILABLE', 'Native DSH background jobs are unavailable; load the jobs registry and job tools'))
@@ -641,7 +634,7 @@ export function registerTools(
 
   disposers.push(ctx.tools.register(defineTool({
     name: 'read_pdf',
-    description: 'Read PDF evidence in bounded chunks with physical pages and stable block IDs. Start with focus: toc or a short query; use block_id to read a search hit. markdown_content contains selected parsed text; partial requires continuing with the unchanged cursor and same file_path only (no pages/focus/block_id/query). The cursor is null when complete or not_requested. Continue only when partial; stop rather than passing null back. Complete ends that text selection, not a guarantee of OCR fidelity or visual coverage; check diagnostics and visuals. Diagnostics are scoped to delivered blocks; document/selection notices appear initially. verification_hints recommend original-page checks for formulas, not automatic corrections. provenance separates parsing configuration from index/reader versions; upstream_version null means unknown. Omitted inline_images inherits the cursor intent; an explicit boolean overrides it. metadata_shortened identifies budget-limited metadata. Use view: page with one page number to inspect the original PDF locally without Provider upload, optionally checking source_sha256 via expected_sha256. Use focus: artifacts only for exported cache paths. Output in run_code should preserve markdown_content and cursor, rather than dumping large/debug objects.',
+    description: 'Read PDF evidence in bounded chunks with physical pages and stable block IDs. Start with focus: toc or a short query; use block_id to read a search hit. markdown_content contains selected parsed text; partial requires continuing with the unchanged cursor and same source (file_path or attachment_id) only (no pages/focus/block_id/query). The cursor is null when complete or not_requested. Continue only when partial; stop rather than passing null back. Complete ends that text selection, not a guarantee of OCR fidelity or visual coverage; check diagnostics and visuals. Diagnostics are scoped to delivered blocks; document/selection notices appear initially. verification_hints recommend original-page checks for formulas, not automatic corrections. provenance separates parsing configuration from index/reader versions; upstream_version null means unknown. Omitted inline_images inherits the cursor intent; an explicit boolean overrides it. metadata_shortened identifies budget-limited metadata. Use view: page with one page number to inspect the original PDF locally without Provider upload, optionally checking source_sha256 via expected_sha256. Use focus: artifacts only for exported cache paths. Output in run_code should preserve markdown_content and cursor, rather than dumping large/debug objects.',
     parameters: readPdfParameters,
     output: {
       schema: parseOutputSchema,
@@ -720,10 +713,12 @@ export function registerTools(
     execute: async (args: unknown, exec: ToolRunContext) => {
       const agent = requireAgent(exec)
       const parsed = parseReadInput(args)
-      const { input, pollTimeoutMs, inline_images } = parsed
+      exec.signal.throwIfAborted()
+      const attachments = getAttachments()
+      const input = resolveToolInput(parsed.input, agent, attachments)
+      const { pollTimeoutMs, inline_images } = parsed
       const { maxInlineImages } = getOutputConfig()
       const supportsImage = await checkCallingModelSupportsImage(exec, ctx)
-      const attachments = ctx.get('attachments') as AttachmentStore | undefined
       if (parsed.view === 'page') {
         if (maxInlineImages === 0) throw new MinerUError(failure('UNSUPPORTED_OPTION', 'Original page view requires output.maxInlineImages greater than zero'))
         if (!supportsImage || attachments === undefined) throw new MinerUError(failure('UNSUPPORTED_OPTION', 'Original page view requires an image-capable model and attachment support'))

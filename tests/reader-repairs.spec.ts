@@ -21,7 +21,7 @@ describe('reader repairs', () => {
     expect(() => decodeReadCursor(payload)).toThrow(/canonical/)
   })
 
-  it('requires file_path, rejects unknown arguments, and accepts cursor-only continuation', () => {
+  it('requires one source, rejects unknown arguments, and accepts cursor-only continuation', () => {
     expect(() => parseReadInput({ pages: 1 })).toThrow(/file_path.*required/)
     expect(() => parseReadInput({ file_path: '/tmp/a.pdf', unexpected: true })).toThrow(/Unsupported parameter/)
     expect(parseReadInput({ file_path: '/tmp/a.pdf' }).input).toEqual({ file_path: '/tmp/a.pdf', inline_images: true })

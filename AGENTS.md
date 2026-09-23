@@ -38,6 +38,13 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 - SharedOperation owns the producer AbortController. Waiter cancellation, including native `job_kill`, only stops that invocation's wait.
 - Native job hooks omit `readOutput`, settle with a non-rejecting final-output Promise, and never expose provider refs.
 
+## Source selection
+
+- Preserve `file_path`; add mutually exclusive `attachment_id` to both tools, including content, cursor continuation and page view. Both fields are optional in schemas; runtime requires exactly one. Callers should retain the same selector field and value on continuation; cursor-v3 validates the existing result/projection identity, not selector spelling.
+- Accept full `sha256:<64hex>` content IDs or 8–64 hexadecimal digest prefixes, optionally prefixed with `sha256:`. Match unique content IDs, not reference count; reject ambiguous prefixes.
+- Resolve only real file refs recursively exposed by the current session’s `deriveMessages()`, including nested tool-result refs. Compacted-out refs are outside this visible surface. Pass the exact matched ref to `fileHostPath`; never reconstruct refs or scan global storage.
+- DSH owns stored attachments. Missing host path capability is `UNSUPPORTED_OPTION`; do not materialize streams, infer storage paths, or add integrity/storage/Provider contracts. Feed the resolved path into existing source handling.
+
 ## Reader invariants
 
 - `complete` ends the selected parsed text, not OCR fidelity or visual coverage. Report physical page counts with their source; content-list counts are lower bounds, not proof that later pages do not exist.
@@ -72,6 +79,7 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 - `src/service/document-index.ts`, `read-delivery.ts`: stable pre-selection block identity, faithful known-span normalization, bounded model projection and cursor-v3 delivery with inherited image intent and delivered-block diagnostics.
 - `src/service/page-renderer.ts`: local original-page verification via Poppler-first/PDF.js-fallback subprocesses and temporary streaming snapshots; owns the shared deadline, semaphore and cleanup, never calls a Provider or retains sources.
 - `src/service/pdfjs-backend.ts`, `pdfjs-worker.mjs`: fixed Node subprocess protocol, package-local resources and bounded Canvas rendering. Do not import heavy PDF/native dependencies into the host bundle or execute PDF scripting/network actions.
+- `src/adapters/dsh-document-source.ts`: tool-only source selection and visible DSH file-reference to host-path adaptation; no file copying or storage ownership.
 - `src/tools.ts`: two defineTool schemas (`read_pdf` and `async_parse_pdf`), native DSH job adaptation, and pure renderers.
 - `src/rpc.ts`, `src/loopback-rpc.ts`, `src/client/*`: loopback config/maintenance RPC, caller-local guarded native transport registration, and Provider-aware settings cards. Presentation changes must preserve draft state across disclosure, bilingual labels, DSH theme tokens, keyboard access, and maintenance preview/confirmation boundaries.
 - `src/observability.ts`: typed, non-throwing structured diagnostic events.
