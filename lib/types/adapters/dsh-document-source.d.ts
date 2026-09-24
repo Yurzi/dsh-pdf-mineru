@@ -9,7 +9,8 @@ export type DocumentSource = {
     readonly file_path?: never;
 };
 export declare function parseDocumentSource(args: Readonly<Record<string, unknown>>): DocumentSource;
-/** Resolve only references on the current DSH surface; never scan raw history or storage. */
+/** DSH 0.1.7 exposes tool results as tool-role messages with flat content.
+ * Resolve only that current surface; never scan raw history or storage. */
 export declare function resolveDocumentPath(source: DocumentSource, session: {
     deriveMessages(): readonly Message[];
 }, attachments: Pick<AttachmentStore, 'fileHostPath'> | undefined): string;

@@ -1,13 +1,13 @@
 import z from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
+import { isVolatile } from '@deepseek-ai/cosmokit'
+import type {} from '@deepseek-ai/cordis-plugin-loader'
+import type {} from '@deepseek-ai/dsh-settings'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import {
-  defaultMinerUConfig,
-  detectBloatedSettingsOps,
   MINERU_CONFIG_SCHEMA_VERSION,
   parseConfig,
   parseConfigWithMigration,
-  pruneConfigToDiff,
   type MinerUConfig,
   type ProviderConfig,
 } from './config.js'
@@ -48,11 +48,10 @@ const ProviderSchema = z.union([
 ])
 
 export const Config = z.object({
-  // Settings resolves its schema before invoking our migration-aware validator.
-  // Accept v1 here so persisted Provider-based configurations can reach it.
-  schemaVersion: z.union([z.const(1), z.const(MINERU_CONFIG_SCHEMA_VERSION)]),
-  activeProvider: z.string(),
-  providers: z.array(ProviderSchema),
+  // Provider-based v1 values are normalized in memory; saving writes v2.
+  schemaVersion: z.union([z.const(1), z.const(MINERU_CONFIG_SCHEMA_VERSION)]).volatile(),
+  activeProvider: z.string().volatile(),
+  providers: z.array(ProviderSchema).volatile(),
   defaults: z.object({
     model: z.union(['pipeline', 'vlm']),
     ocr: z.boolean(),
@@ -60,25 +59,25 @@ export const Config = z.object({
     language: z.string(),
     formula: z.boolean(),
     table: z.boolean(),
-  }),
+  }).volatile(),
   storage: z.object({
     storageRoot: z.string(),
-    cacheEnabled: z.boolean(),
+    cacheEnabled: z.boolean().volatile(),
     retainSources: z.const(false),
-    stagingTtlMs: z.number(),
-  }),
+    stagingTtlMs: z.number().volatile(),
+  }).default({}),
   polling: z.object({
     pollIntervalMs: z.number(),
     pollTimeoutMs: z.number(),
     requestTimeoutMs: z.number(),
     operationTimeoutMs: z.number(),
-  }),
+  }).volatile(),
   retry: z.object({
     maxAttempts: z.number(),
     baseDelayMs: z.number(),
     maxDelayMs: z.number(),
-  }),
-  output: z.object({ maxInlineChars: z.number(), maxInlineImages: z.number() }),
+  }).volatile(),
+  output: z.object({ maxInlineChars: z.number(), maxInlineImages: z.number() }).volatile(),
   limits: z.object({
     maxFileBytes: z.number(),
     maxApiResponseBytes: z.number(),
@@ -90,25 +89,36 @@ export const Config = z.object({
   }),
 }) as unknown as z<unknown>
 
-interface SettingsScope {
-  get(): unknown
-  watch(callback: (next: unknown) => void | Promise<void>): () => void
-  replace(section: object): Promise<void>
+// Schemastery 3.18.4 has no .check(). Keep its object schema for native form
+// projection, and validate the complete domain config at the Standard Schema
+// boundary used by Cordis before activation and ConfigEditor persistence.
+Object.defineProperty(Config, '~standard', { value: {
+  // Loader uses the Schemastery vendor to recognize volatile field paths.
+  ...Config['~standard'],
+  validate(value: unknown) {
+    try {
+      parseConfigWithMigration(value)
+      return { value: Config(value) }
+    } catch (error) {
+      return { issues: [{ message: error instanceof Error ? error.message : 'Invalid MinerU configuration' }] }
+    }
+  },
+} satisfies z<unknown>['~standard'] })
+
+function configSnapshot(value: unknown): unknown {
+  if (isVolatile(value)) return configSnapshot(value.get())
+  if (Array.isArray(value)) return value.map(configSnapshot)
+  if (typeof value === 'object' && value !== null) {
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, configSnapshot(child)]))
+  }
+  return value
 }
 
-interface SettingsService {
-  register(
-    namespace: string, schema: unknown,
-    options: { readonly base: object; readonly applies: 'live' | 'restart'; readonly validate: (value: unknown) => void },
-  ): SettingsScope
-  mutate(
-    namespace: string,
-    operations: readonly (
-      | { readonly op: 'set'; readonly path: readonly string[]; readonly value: unknown }
-      | { readonly op: 'unset'; readonly path: readonly string[] }
-    )[],
-  ): Promise<void>
-  describe?(options?: { redactSecrets?: boolean }): Array<{ ns: string; user?: unknown }>
+// SettingsForms accepts only volatile fields. Send complete live values: its
+// replace() resets omitted values to the inherited profile, not package defaults.
+function liveConfig(config: MinerUConfig): object {
+  const { storage, limits: _limits, ...live } = config
+  return { ...live, storage: { cacheEnabled: storage.cacheEnabled, stagingTtlMs: storage.stagingTtlMs } }
 }
 
 interface CredentialService {
@@ -121,10 +131,6 @@ function isInactiveContextError(error: unknown): boolean {
     || error.message === 'cannot create effect on inactive context'
 }
 
-function asObject(value: MinerUConfig): object {
-  return value as unknown as object
-}
-
 function parseDraftProvider(value: unknown, current: MinerUConfig): ProviderConfig {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new TypeError('provider draft must be an object')
   const id = (value as Record<string, unknown>).id
@@ -133,7 +139,10 @@ function parseDraftProvider(value: unknown, current: MinerUConfig): ProviderConf
 }
 
 export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<() => Promise<void>> {
-  let persistedConfig = parseConfigWithMigration(entryConfig).config
+  // Read the fiber's current Config as well as its volatile values: hosts
+  // without HMR may reload the fiber while a settings write is in flight.
+  const runtimeConfig = (): MinerUConfig => parseConfigWithMigration(configSnapshot(ctx.fiber?.config ?? entryConfig)).config
+  const initialConfig = runtimeConfig()
   let fixedStorageRoot: string | undefined
   let fixedLimits: MinerUConfig['limits'] | undefined
   let toolDisposer: (() => Promise<void>) | undefined
@@ -158,63 +167,12 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
     return next
   }
   const validateRuntimeConfig = (value: unknown): MinerUConfig => validateParsedRuntimeConfig(parseConfig(value))
-  const migrateRuntimeConfig = (value: unknown) => {
-    const parsed = parseConfigWithMigration(value)
-    return { ...parsed, config: validateParsedRuntimeConfig(parsed.config) }
-  }
-  const runtimeConfig = (): MinerUConfig => persistedConfig
 
-  // The user layer can retain a storage root from an older bundle default.
-  // Resolve it before fixing the process-wide root and acquiring its lock.
-  const settings = ctx.get('settings') as SettingsService | undefined
+  const settings = ctx.get('settings')
   if (settings === undefined) throw new Error('settings service is unavailable')
-  const persistMigration = async (): Promise<void> => {
-    try {
-      await settings.mutate('dsh-pdf-mineru', [
-        { op: 'set', path: ['schemaVersion'], value: MINERU_CONFIG_SCHEMA_VERSION },
-        { op: 'unset', path: ['defaults', 'artifacts'] },
-        { op: 'unset', path: ['limits', 'maxFilesPerRequest'] },
-      ])
-    } catch {
-      ctx.logger?.warn('dsh-pdf-mineru: migrated v1 settings in memory but could not persist v2')
-    }
-  }
-  const settingsScope = settings.register('dsh-pdf-mineru', Config, {
-    base: asObject(persistedConfig),
-    applies: 'live',
-    validate: value => { migrateRuntimeConfig(value) },
-  })
-  const storedConfig = migrateRuntimeConfig(settingsScope.get())
-  persistedConfig = storedConfig.config
-  if (storedConfig.migrated) {
-    await persistMigration()
-  }
-  const pruneLegacyBloatedSettings = async (): Promise<void> => {
-    try {
-      const descriptor = settings.describe?.()?.find(d => d.ns === 'dsh-pdf-mineru')
-      const user = descriptor?.user
-      if (typeof user !== 'object' || user === null || Array.isArray(user)) return
-      const ops = detectBloatedSettingsOps(user as Record<string, unknown>, defaultMinerUConfig())
-      if (ops.length > 0) {
-        await settings.mutate('dsh-pdf-mineru', ops)
-      }
-    } catch {
-      ctx.logger?.warn('dsh-pdf-mineru: could not prune legacy bloated settings')
-    }
-  }
-  await pruneLegacyBloatedSettings()
-  fixedStorageRoot = persistedConfig.storage.storageRoot
-  fixedLimits = { ...persistedConfig.limits }
-  ctx.effect(
-    () => settingsScope.watch(async next => {
-      const parsed = migrateRuntimeConfig(next)
-      persistedConfig = parsed.config
-      if (parsed.migrated) {
-        await persistMigration()
-      }
-    }),
-    'dsh-pdf-mineru settings watch',
-  )
+  ctx.effect(() => settings.configure({ auto: false }, ctx.fiber), 'dsh-pdf-mineru settings presentation')
+  fixedStorageRoot = initialConfig.storage.storageRoot
+  fixedLimits = { ...initialConfig.limits }
 
   const paths = new StoragePaths(fixedStorageRoot)
   const lock = new ProcessLock(paths)
@@ -226,11 +184,11 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
     operations = operationRegistry
     const accessGate = new StorageAccessGate({ paths, lock })
     const results = new ResultRepository(paths, {
-      maxArtifactBytes: persistedConfig.limits.maxZipEntryBytes,
-      maxJsonValidationBytes: Math.min(persistedConfig.limits.maxZipEntryBytes, 64 * 1024 * 1024),
+      maxArtifactBytes: initialConfig.limits.maxZipEntryBytes,
+      maxJsonValidationBytes: Math.min(initialConfig.limits.maxZipEntryBytes, 64 * 1024 * 1024),
     }, lock)
     await results.cleanupStaging(
-      persistedConfig.storage.stagingTtlMs, operationRegistry.activeOperationIds(), startup.signal,
+      initialConfig.storage.stagingTtlMs, operationRegistry.activeOperationIds(), startup.signal,
     )
     startup.signal.throwIfAborted()
     const maintenance = new StorageMaintenanceService(paths, results, operationRegistry, lock, accessGate)
@@ -264,16 +222,16 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
     // Keep this optional scope separate: headless hosts still get both tools.
     ctx.inject(['connection', 'webServer'], (connectionCtx: Context) => {
       return registerRpc(connectionCtx, {
-        getConfig: () => persistedConfig,
+        getConfig: runtimeConfig,
         setConfig: async value => {
           const next = validateRuntimeConfig(value)
-          const sparse = pruneConfigToDiff(next, defaultMinerUConfig())
-          await settingsScope.replace(sparse)
-          persistedConfig = next
-          return next
+          const namespace = ctx.fiber.entry?.options.id
+          if (namespace === undefined) throw new Error('MinerU configuration requires a Loader profile entry')
+          await settings.replace(namespace, liveConfig(next))
+          return runtimeConfig()
         },
         probe: async (provider, signal) => service.probe(
-          signal, provider === undefined ? undefined : parseDraftProvider(provider, persistedConfig),
+          signal, provider === undefined ? undefined : parseDraftProvider(provider, runtimeConfig()),
         ),
         maintenance,
       })

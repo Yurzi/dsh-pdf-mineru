@@ -412,7 +412,7 @@ function backgroundLabel(input: ParseRequestInput): string {
 
 function nativeSuccessOutcome(value: ParseSummaryView): JobOutcome {
   const output = formatSingleSummaryProse(value)
-  return { status: 'completed', detail: 'completed', output }
+  return { status: 'completed', detail: 'completed', result: output }
 }
 
 interface ImageCandidate {
@@ -608,14 +608,15 @@ export function registerTools(
       }
       const controller = new AbortController()
       const jobId = jobs.start({
-        kind: 'mineru', label: backgroundLabel(input), owner: agent,
-        run: () => {
-          const done = withStorageAccess(() => getService().ensureParsed(agent.session, input, controller.signal), controller.signal)
+        kind: 'mineru', label: backgroundLabel(input), owner: agent.session.id,
+        outputLimitBytes: 48_000,
+        run: job => {
+          const done = withStorageAccess(() => getService().ensureParsed(agent.session, input, controller.signal, phase => job.updateProgress(phase)), controller.signal)
             .then((value): JobOutcome => nativeSuccessOutcome(value))
             .catch((error): JobOutcome => {
               if (controller.signal.aborted) return { status: 'killed', detail: 'cancelled' }
               const normalized = toMinerUFailure(error)
-              return { status: 'failed', detail: normalized.code, output: '[' + normalized.code + '] ' + normalized.message }
+              return { status: 'failed', detail: normalized.code, result: '[' + normalized.code + '] ' + normalized.message }
             })
           const invocation = { controller, done }
           backgroundInvocations.add(invocation)

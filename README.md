@@ -12,7 +12,7 @@
   <a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin"></a>
   <a href="https://www.npmjs.com/package/dsh-pdf-mineru"><img src="https://img.shields.io/npm/v/dsh-pdf-mineru?style=flat-square&amp;label=npm&amp;color=CB3837" alt="npm version"></a>
   <a href="./package.json"><img src="https://img.shields.io/badge/Node.js-%3E%3D22.19.0-339933?style=flat-square&amp;logo=nodedotjs&amp;logoColor=white" alt="Node.js 22.19.0 or newer"></a>
-  <img src="https://img.shields.io/badge/DSH-%3E%3D0.1.5--rc.2%20(RC%20only)-111827?style=flat-square" alt="DSH >=0.1.5-rc.2 (RC only)">
+  <img src="https://img.shields.io/badge/DSH-%3E%3D0.1.7--rc.2%20(RC%20only)-111827?style=flat-square" alt="DSH >=0.1.7-rc.2 (RC only)">
   <img src="https://img.shields.io/badge/MinerU-Official%20v4%20%7C%20Self--hosted%20v2-2563EB?style=flat-square" alt="MinerU v2 and v4">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-2EA44F?style=flat-square" alt="MIT License"></a>
 </p>
@@ -38,11 +38,13 @@
 ### 0. 环境要求与版本兼容说明
 
 > ⚠️ **重要版本声明与环境要求**：
-> - **最低支持的 DSH 版本**：`>= 0.1.5-rc.2`。
+> - **最低支持的 DSH 版本**：`>= 0.1.7-rc.2`。
 > - **仅支持 RC 版本**：本插件**只会对 DeepSeek Harness 的 RC（Release Candidate）版本及后续正式发布版本进行官方支持**。由于早期 `alpha` 测试版本包含较多实验性且剧烈变动的内部 API，本插件不再对 `alpha` 等非稳定测试版本提供兼容与维护支持。
 > - **运行环境要求**：Node.js `^22.19.0 || >=24.0.0`，包管理器推荐 `pnpm@11+`。
 
-本次适配从插件 `0.0.12` 起以 DSH `v0.1.5-rc.2` 为基线。升级前请先升级宿主；现有 Provider 配置、缓存格式与工具参数无需因本次 DSH 适配而迁移。Web 设置与维护 RPC 仅在 `connection` 和 `webServer` 同时可用时注册；无 WebServer 的宿主仍可使用两个模型工具，但不提供这些 HTTP RPC。
+插件 `0.1.3` 起以 DSH `v0.1.7-rc.2` 为基线。升级前请先升级宿主；现有 Provider 配置、缓存格式与工具参数无需因本次 DSH 适配而迁移。Web 设置与维护 RPC 仅在 `connection` 和 `webServer` 同时可用时注册；无 WebServer 的宿主仍可使用两个模型工具，但不提供这些 HTTP RPC。
+
+后台任务使用 0.1.7 的 SessionId 归属与原生 JobRegistry：阶段进度显示为 `preparing`、`waiting-for-parse`、`reading-result`、`summarizing`，不是页数或百分比；缓存命中跳过等待阶段。完成摘要通过原生任务结果交付，通知、空闲唤醒、输出消费与会话归档准入由 DSH 负责。宿主必须为该会话装配任务控制器（如 `tool-jobs`），否则启动会在解析前拒绝。`job_kill` 仍只取消本次等待，不中止其他调用共用的解析生产者。
 
 ### 1. 安装插件
 
@@ -66,13 +68,17 @@ PDF.js 包解压约34.8 MB，Canvas JS 约0.13 MB，Linux x64 glibc 二进制约
 
 ### 2. 配置与连接
 
-打开 DSH 界面中的 **Settings → MinerU**，根据您的使用场景选择 Provider。设置页按卡片分组，高级配置按需展开；修改后点击 **Save Configuration / 保存配置** 生效。连接测试使用当前草稿，缓存清理仍需先预览再确认。
+打开 DSH 界面中的 **Plugins / 插件 → dsh-pdf-mineru**，根据您的使用场景选择 Provider。配置页位于插件 bundle 详情中，不再单独出现在全局 Settings 导航。设置页按卡片分组，高级配置按需展开；修改后点击 **Save Configuration / 保存配置** 生效。连接测试使用当前草稿，缓存清理仍需先预览再确认。
+
+配置由 DSH Loader 的 Config 与 profile patch 管理；可热更新字段使用 `Volatile.get()`，保存后影响后续调用。插件关闭原生自动生成表单，保留显式草稿保存。Provider-based v1 配置在内存中规范化，启动不写回配置；旧 `settings.yaml` 的导入由 DSH 负责。
 
 设置页包含 Provider、解析默认值、存储与缓存、轮询、重试、输出限制、安全上限和存储维护八张卡片。支持全部展开／折叠，折叠不会丢失表单草稿；启动时固定的安全上限只读展示，需修改宿主配置并重启。界面沿用 DSH 深浅色主题，并支持键盘导航和紧凑布局。
 
 <p align="center">
-  <img src="./docs/assets/mineru-settings-preview.webp" width="780" alt="dsh-pdf-mineru 在 DSH Settings 中的设置界面">
+  <img src="./docs/assets/mineru-settings-preview.webp" width="780" alt="MinerU 配置卡片预览（旧版导航，当前入口为 Plugins → dsh-pdf-mineru）">
 </p>
+
+> 上图展示配置卡片；旧版 Settings 导航仅供参考，当前请从 **Plugins / 插件 → dsh-pdf-mineru** 打开。
 
 #### 方案 A：使用 MinerU 官方云（推荐，免部署）
 1. 前往 [MinerU 官网](https://mineru.net) 注册并获取 API Token。
@@ -138,7 +144,7 @@ Agent 会自动根据文档长度和指令意图，智能选择同步返回或�
 
 `read_pdf` 的正文、续读、原页模式及 `async_parse_pdf` 都保留 `file_path`，也可改用互斥的 `attachment_id`，例如 `{"attachment_id":"<当前附件的完整内容ID>","focus":"toc"}`。两个来源字段在 schema 中均可选，但每次调用运行时必须且只能提供一个；调用方续读应保留同一选择器；游标仍按既有结果／投影身份校验，不新增选择器字符串绑定。
 
-附件 ID 可为完整 `sha256:` 加 64 位十六进制摘要，或 8–64 位摘要前缀（可带 `sha256:`）。只匹配当前会话可见消息中的文件及嵌套工具结果引用；已压缩移出的引用不可见。多个不同内容 ID 匹配时拒绝，需提供更长前缀或完整 ID；不会猜测路径或搜索全局附件库。附件仍由 DSH 管理；宿主不提供本地路径能力时返回 `UNSUPPORTED_OPTION`，插件不会将附件流落盘。Provider、缓存和既有完整性校验不变。
+附件 ID 可为完整 `sha256:` 加 64 位十六进制摘要，或 8–64 位摘要前缀（可带 `sha256:`）。只匹配当前会话可见消息中的文件引用（包括独立的 `role: "tool"` 工具结果消息）；已压缩移出的引用不可见。多个不同内容 ID 匹配时拒绝，需提供更长前缀或完整 ID；不会猜测路径或搜索全局附件库。附件仍由 DSH 管理；宿主不提供本地路径能力时返回 `UNSUPPORTED_OPTION`，插件不会将附件流落盘。Provider、缓存和既有完整性校验不变。
 
 ### 常用解析参数（均可通过自然语言告知 Agent）
 
@@ -201,7 +207,7 @@ flowchart LR
 
 ## 🛠️ 设置与配置参考
 
-推荐直接在 **DSH Web GUI (Settings → MinerU)** 中进行可视化调整。若需要直接编辑配置文件（`cordis.patch.yml`），可参考以下常用配置：
+推荐直接在 **DSH Web GUI (Plugins / 插件 → dsh-pdf-mineru)** 中进行可视化调整。若需要直接编辑配置文件（`cordis.patch.yml`），可参考以下常用配置：
 
 <details>
 <summary><strong>📋 点击展开：YAML 配置示例</strong></summary>
@@ -293,7 +299,7 @@ limits:
 <summary><strong>Q: 解析结果保存在哪里？如何清理缓存？</strong></summary>
 
 解析结果按源文件内容、解析语义及 Provider 兼容标识寻址，默认存放在 `$DSH_HOME/cache/pdf-mineru/results/`。启用缓存复用时，后续阅读可复用已发布结果；同进程并发请求合并，但不同进程仍可能分别提交上游解析，不保证跨进程只计费一次。`storage.cacheEnabled=false` 仅禁用解析前的缓存复用，结果仍会不可变发布，不等同于清空缓存或强制覆盖已有结果。
-您可以在 **Settings → MinerU** 的运维区域中：
+您可以在 **Plugins / 插件 → dsh-pdf-mineru** 的运维区域中：
 - 点击 **Verify Cache** 检查缓存完整性；
 - 点击 **Clear Cache** 预览，再显式确认清除。破坏性维护在存在活跃读取或解析时拒绝执行，不会为了清理而取消它们。
 </details>
@@ -323,6 +329,8 @@ pnpm run build
 
 # 4. 在运行中的 DSH Web 中验证前端设置组件
 pnpm run verify:gui
+# 若无关插件阻止 Web shell 启动，可显式限定浏览器 fixture 的排除列表（不修改宿主配置）：
+# DSH_GUI_EXCLUDE_PLUGINS=<unrelated-plugin-id> pnpm run verify:gui
 
 # 5. （可选）本地原页验证，无上传；第二条用空PATH验证PDF.js自动回退
 pnpm run smoke:reader-local -- /path/to/sample.pdf 1 --backend=auto
@@ -331,6 +339,8 @@ pnpm run smoke:reader-local -- /path/to/sample.pdf 1 .vitest-cache/pdfjs --backe
 # 6. （显式选择）使用真实 Token 运行在线解析，会上传文档
 MINERU_API_KEY=<token> pnpm run smoke:official-v4 -- /path/to/sample.pdf
 ```
+
+GUI 验证在现有 Web 地址中注入当前构建，使用浏览器内的配置／凭据／插件清单 fixture，并隔离该测试浏览器的 HMR graph；不修改真实配置、凭据或缓存，也不代表已更新宿主安装的插件。
 
 > 文档入口：[PDF阅读指南](docs/model-reading.md) · [版本记录](CHANGELOG.md)。已完成的阶段性开发报告不作为当前使用契约维护，历史信息可从Git记录查阅。
 

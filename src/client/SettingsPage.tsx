@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
 import type { ClientConnectionRpc, RpcResult } from '@deepseek-ai/dsh-client-connection/client'
 import type { MinerUConfig } from '../config/pure.js'
 import type { ProbeView } from '../service/mineru-service.js'
@@ -52,7 +53,7 @@ export interface MineruSettingsInjected {
   readonly credentials: CredentialClient
 }
 
-type SettingsPageProps = PropsRuntime<'settings.section'> & PropsLocale<'dsh-pdf-mineru'> & MineruSettingsInjected
+type SettingsPageProps = PropsRuntime<'plugins.bundle.config'> & PropsLocale<'dsh-pdf-mineru'> & MineruSettingsInjected
 
 type ConfigGetResult = RpcResult<{ readonly config: MinerUConfig }>
 type ConfigSetResult = RpcResult<{ readonly config: MinerUConfig }>

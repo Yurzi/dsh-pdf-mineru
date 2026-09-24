@@ -58,6 +58,14 @@ import { asResultId, createFileId } from '../domain/ids.js'
 
 export * from './result-presenter.js'
 
+/** Invocation-local progress only; never carries provider refs, paths or credentials. */
+export type ParseProgress = 'preparing' | 'waiting-for-parse' | 'reading-result' | 'summarizing'
+export type ParseProgressListener = (phase: ParseProgress) => void
+
+function reportProgress(listener: ParseProgressListener | undefined, phase: ParseProgress): void {
+  try { listener?.(phase) } catch { /* Observation must not change parse or cancellation outcomes. */ }
+}
+
 export interface ServiceSession {
   readonly header: { readonly id: string; readonly cwd?: string }
 }
@@ -637,9 +645,10 @@ export class MinerUService {
   }
 
   /** Ensure publication and return a bounded synopsis, never a body projection. */
-  async ensureParsed(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal): Promise<ParseSummaryView> {
+  async ensureParsed(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal, onProgress?: ParseProgressListener): Promise<ParseSummaryView> {
     if (input.cursor !== undefined) throw new MinerUError(failure('INVALID_REQUEST', 'A parse summary cannot resume a read cursor; use read_pdf'))
-    const { data } = await this.resolveParsedResult(session, input, signal, null)
+    const { data } = await this.resolveParsedResult(session, input, signal, null, onProgress)
+    reportProgress(onProgress, 'summarizing')
     return this.projectSummary(data, signal)
   }
 
@@ -695,6 +704,7 @@ export class MinerUService {
     input: ParseRequestInput,
     signal: AbortSignal,
     pollTimeoutMs?: number | null,
+    onProgress?: ParseProgressListener,
   ): Promise<{ data: Extract<RawParsedItem, { state: 'completed' }>; cursor?: ReadCursorPayload; limit: number }> {
     if (input.query !== undefined && (typeof input.query !== 'string' || input.query.trim() === '' || input.query.length > 256)) throw new MinerUError(failure('INVALID_REQUEST', 'query must contain 1–256 characters'))
     if (input.block_id !== undefined && (typeof input.block_id !== 'string' || input.block_id.length > 160 || !/^mr_[a-zA-Z0-9_-]+:b[1-9][0-9]*$/.test(input.block_id))) throw new MinerUError(failure('INVALID_REQUEST', 'block_id must be an exact ID returned by read_pdf'))
@@ -718,6 +728,8 @@ export class MinerUService {
     const effectiveInput: ParseRequestInput = cursorPayload === undefined
       ? input
       : { ...input, pages: cursorPayload.pages === '' ? undefined : cursorPayload.pages, focus: cursorPayload.focus }
+    signal.throwIfAborted()
+    reportProgress(onProgress, 'preparing')
     const { pending } = await this.prepare(session, effectiveInput, signal, cursorPayload !== undefined)
     const wait = this.createWaitSignal(signal, pollTimeoutMs)
     let outcome: SharedOutcome
@@ -727,6 +739,7 @@ export class MinerUService {
       } else if (pending.operation === undefined) {
         throw new TypeError('Pending parse has no result or shared operation')
       } else {
+        reportProgress(onProgress, 'waiting-for-parse')
         outcome = await pending.operation.waitForOutcome(wait.signal)
       }
     } catch (error) {
@@ -743,6 +756,7 @@ export class MinerUService {
       throw new MinerUError(outcome.failure ?? failure('REMOTE_PARSE_FAILED', 'Remote parse failed'))
     }
 
+    reportProgress(onProgress, 'reading-result')
     const manifest = await this.options.results.get(
       pending.cacheKey,
       pending.prepared.request.requiredArtifacts,

@@ -18,7 +18,7 @@ vi.mock('react', () => ({
 import type { Context } from '@deepseek-ai/cordis'
 import { rpcErrorSchema } from '@deepseek-ai/dsh-client-connection'
 
-// Transport trust and lifecycle are exercised against real rc.2 in host-compatibility.spec.ts.
+// Transport trust and lifecycle are exercised against real 0.1.7-rc.2 in host-compatibility.spec.ts.
 vi.mock('../src/loopback-rpc.js', () => ({
   registerLoopbackRpc: (ctx: Context, channel: string, handler: RpcHandler) => ctx.connection.rpc.handle(channel, handler),
 }))
@@ -95,7 +95,7 @@ function maintenanceDeps(): Pick<MineruRpcDeps, 'maintenance'> {
 }
 
 describe('MinerU RPC (registerRpc)', () => {
-  it('registers on /dsh-pdf-mineru-api using the rc.2 two-argument RPC contract', () => {
+  it('registers on /dsh-pdf-mineru-api using the 0.1.7-rc.2 two-argument RPC contract', () => {
     expect(RPC_CHANNEL).toBe('/dsh-pdf-mineru-api')
     const { ctx, getHandle } = createMockContext()
     const deps: MineruRpcDeps = {
@@ -443,7 +443,6 @@ describe('Client UI Pure Helpers (SettingsPage)', () => {
       get: (name: string) => name === 'connection' ? { rpc } : undefined,
       locale: {
         register: vi.fn(() => vi.fn()),
-        bind: vi.fn(() => (key: string) => key),
       },
       remote: { credentials },
       slots: { inject: slotInject, register },
@@ -451,17 +450,20 @@ describe('Client UI Pure Helpers (SettingsPage)', () => {
     return { ctx, rpc, credentials, register, slotInject }
   }
 
-  it('registers a dedicated settings section for MinerU configuration and operations', () => {
+  it('registers a package-keyed bundle page for MinerU configuration and operations', () => {
     const { ctx, rpc, credentials, register, slotInject } = clientContext()
     expect(clientInject).toEqual(['slots', 'locale', 'connection', 'remote', 'remote.credentials'])
     applyClient(ctx)
 
-    expect(slotInject).toHaveBeenCalledWith('settings.section', expect.any(Function))
+    expect(slotInject).toHaveBeenCalledExactlyOnceWith('plugins.bundle.config', expect.any(Function))
+    expect(register).toHaveBeenCalledOnce()
     const [options] = register.mock.calls[0]!
     expect(options).toMatchObject({
-      name: 'settings.section', id: 'dsh-pdf-mineru', order: 40, locale: 'dsh-pdf-mineru',
+      name: 'plugins.bundle.config', key: 'dsh-pdf-mineru', locale: 'dsh-pdf-mineru',
     })
-    expect(options.label()).toBe('nav')
+    expect(options).not.toHaveProperty('id')
+    expect(options).not.toHaveProperty('label')
+    expect(options).not.toHaveProperty('order')
     expect(options.inject()).toEqual({ rpc, credentials })
   })
 

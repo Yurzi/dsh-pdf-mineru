@@ -6,5 +6,5 @@ export interface MineruSettingsInjected {
     readonly rpc: ClientConnectionRpc;
     readonly credentials: CredentialClient;
 }
-type SettingsPageProps = PropsRuntime<'settings.section'> & PropsLocale<'dsh-pdf-mineru'> & MineruSettingsInjected;
+type SettingsPageProps = PropsRuntime<'plugins.bundle.config'> & PropsLocale<'dsh-pdf-mineru'> & MineruSettingsInjected;
 export declare function SettingsPage({ rpc, credentials, t }: SettingsPageProps): import("react").JSX.Element;

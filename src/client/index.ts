@@ -1,6 +1,10 @@
-import type { Context as CordisContext } from '@deepseek-ai/cordis'
+import type { Context } from '@deepseek-ai/cordis'
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type {} from '@deepseek-ai/dsh-client-locale/client'
+import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
+import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client'
-import { SettingsPage, type CredentialClient, type MineruSettingsInjected } from './SettingsPage.js'
+import { SettingsPage, type MineruSettingsInjected } from './SettingsPage.js'
 import { en, NS, zh, type MineruKey } from './locales.js'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -9,42 +13,18 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
   }
 }
 
-type SlotOptions = {
-  name: string
-  id: string
-  order?: number
-  label?: () => string
-  locale?: string
-  inject: () => unknown
-}
-
-type ClientContext = CordisContext & {
-  readonly locale: {
-    register(ns: string, dictionaries: Record<string, Record<string, string>>): () => void
-    bind(ns: string): (key: MineruKey) => string
-  }
-  readonly slots: {
-    inject(slotName: string, factory: () => unknown): void
-    register(options: SlotOptions, component: unknown): () => void
-  }
-  readonly remote: { readonly credentials: CredentialClient }
-}
-
 export const inject = ['slots', 'locale', 'connection', 'remote', 'remote.credentials']
 
-export function apply(ctx: ClientContext): void {
+export function apply(ctx: Context): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-pdf-mineru: dictionaries')
 
   const connection = ctx.get('connection') as ConnectionHandle | undefined
   if (connection === undefined) throw new Error('dsh-pdf-mineru: connection service is unavailable')
-  const t = ctx.locale.bind(NS)
   const injected = (): MineruSettingsInjected => ({ rpc: connection.rpc, credentials: ctx.remote.credentials })
 
-  ctx.slots.inject('settings.section', () => ctx.slots.register({
-    name: 'settings.section',
-    id: NS,
-    order: 40,
-    label: () => t('nav'),
+  ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
+    name: 'plugins.bundle.config',
+    key: 'dsh-pdf-mineru',
     locale: NS,
     inject: injected,
   }, SettingsPage))

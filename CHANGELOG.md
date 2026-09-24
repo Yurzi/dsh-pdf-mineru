@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.3
+
+### Changed
+
+- Require DSH >= 0.1.7-rc.2 in engines and runtime peers; pin development SDK packages and workspace release-age exclusions to DSH 0.1.7-rc.2.
+- Align integration tests, package manifests, and loopback RPC comments with DSH 0.1.7-rc.2.
+
+Provider/config/cache formats, cursor v3, index v2, native jobs, and plugin configuration UI are unchanged; existing parsed caches require no migration.
+
+## 0.1.2
+
+### Added
+
+- Report bounded, invocation-local parse phases through the native JobHandle progress surface, with a 48,000-byte model job output limit. Cache hits skip the waiting phase; progress never includes provider refs or sensitive request data.
+- Add integration regressions against the published 0.1.7-rc.1 LocalJobRegistry for owner isolation, controller admission, consume-once final results, progress and kill/owner/plugin teardown, plus TypeScript/Python PTC schema projections.
+- Add GUI boot diagnostics and an explicit browser-fixture-only unrelated-plugin exclusion option without changing the running host profile.
+
+### Changed
+
+- Move the custom MinerU configuration page from the global Settings navigation to its Plugins bundle detail via the public `plugins.bundle.config` slot keyed by `dsh-pdf-mineru`. Preserve draft state, explicit saves, credential handling and maintenance confirmations; align client dependencies and GUI navigation checks with the plugin manager contract.
+- Require DSH >= 0.1.7-rc.1 in engines and runtime peers; pin development SDK packages to that release, align Cordis/Schemastery versions, and replace the retired code-runtime dependency with ptc-runtime.
+- Use SessionId job ownership and JobOutcome.result for both success summaries and failures. Keep lifecycle, output consumption, notification/wakeup and archive admission in the host registry; cancellation still stops only the current shared-operation waiter.
+- Read attachment references from the current first-class tool-role message surface instead of the removed nested tool-result block protocol. Exact reference handoff and visible-session-only access are unchanged.
+- Replace local Client slot/context type shims with published Locale, Connection, Remote and renderer/slot contracts. Preserve explicit draft saving, maintenance confirmation and channel-local loopback restrictions alongside native operator-Peer authentication.
+
+### Fixed
+
+- Fix activation on DSH 0.1.7-rc.1 after removal of settings.register: consume Loader Config volatile references and published SettingsForms types, with automatic forms disabled for the custom draft/confirmation page.
+- Save complete live fields to the actual profile entry id, preserving ordinary restart-only fields and explicit defaults over inherited profile values. Validate the complete domain config before persistence; avoid settings writes during activation.
+- Cover activation, live updates without remount, profile persistence/restart, invalid-write rejection and inherited-default overrides using the published SettingsForms, ConfigEditor and Loader.
+
+Provider/config/cache formats, cursor v3, index v2 and local page rendering are unchanged; existing parsed caches require no migration.
+
 ## 0.1.1
 
 ### Added

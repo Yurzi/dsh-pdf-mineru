@@ -196,7 +196,7 @@ try {
     get(name) {
       if (name === 'settings') {
         return {
-          register() { return { get: () => config, watch: () => noop, replace: async () => undefined } },
+          configure() { return noop },
           mutate: async () => undefined,
         }
       }

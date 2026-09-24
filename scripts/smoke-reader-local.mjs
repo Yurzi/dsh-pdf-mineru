@@ -72,7 +72,7 @@ if (!file || !Number.isSafeInteger(page) || page < 1 || positional.length > 3
   const ctx = {
     tools: { register(definition) { definitions.push(definition); return noop }, schemas() { return [] } },
     get(name) {
-      if (name === 'settings') return { register() { return { get: () => config, watch: () => noop, replace: async () => undefined } }, mutate: async () => undefined }
+      if (name === 'settings') return { configure() { return noop }, mutate: async () => undefined }
       if (name === 'llm') return { resolveModelInfo: async () => ({ inputModalities: ['text', 'image'] }) }
       if (name === 'attachments') return { saveImage: async ({ data, mediaType, name }) => {
         const buffer = Buffer.from(data)

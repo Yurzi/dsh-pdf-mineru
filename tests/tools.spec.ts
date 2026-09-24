@@ -15,7 +15,8 @@ import {
   registerTools,
   renderResult,
 } from '../src/tools.js'
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
+import { JobId, type JobSpec, type JobOutcome, type JobHandle } from '@deepseek-ai/dsh-jobs'
 import type {
   DefineToolOptions,
   ObjectValueSchemaSpec,
@@ -35,21 +36,9 @@ import { StorageAccessGate } from '../src/storage/access-gate.js'
 import { cursorForRemainder } from '../src/service/read-cursor.js'
 import { fitsReadBudget } from '../src/service/read-delivery.js'
 
-interface NativeJobOutcome {
-  readonly status: 'completed' | 'killed' | 'failed'
-  readonly detail?: string
-  readonly output?: string
-}
-
-interface NativeJobStartSpec {
-  readonly kind: string
-  readonly label: string
-  readonly owner: NonNullable<ToolRunContext['agent']>
-  readonly run: () => {
-    readonly cancel: (reason?: string) => void
-    readonly done: Promise<NativeJobOutcome>
-  }
-}
+type NativeJobOutcome = JobOutcome
+type NativeJobStartSpec = JobSpec
+const jobHandle = (): JobHandle => ({ id: JobId('mineru-1'), append: vi.fn(), updateProgress: vi.fn() })
 
 function createMockJobRegistry() {
   let counter = 0
@@ -281,7 +270,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const captured = specs[0]!
       expect(captured.kind).toBe('mineru')
       expect(captured.label).toBe('Parse one.pdf with MinerU')
-      expect(captured.owner).toBe(exec.agent)
+      expect(captured.owner).toBe(exec.agent?.session.id)
       expect(typeof captured.run).toBe('function')
 
       const rendered = submitTool.output.render(inputArgs, result)
@@ -325,19 +314,20 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const inputArgs = { file_path: '/sample.pdf' }
       await submitTool.execute(inputArgs, exec)
 
-      const hooks = specs[0]!.run()
+      const hooks = specs[0]!.run(jobHandle())
       const outcome = await hooks.done
 
       expect(mockService.ensureParsed).toHaveBeenCalledWith(
         exec.agent?.session,
         { file_path: '/sample.pdf' },
         expect.any(AbortSignal),
+        expect.any(Function),
       )
       expect(outcome.status).toBe('completed')
       expect(outcome.detail).toBe('completed')
-      expect(outcome.output).toContain('MinerU Document Parse Summary')
-      expect(outcome.output).toContain('sample.pdf')
-      expect(outcome.output).toContain('read_pdf')
+      expect(outcome.result).toContain('MinerU Document Parse Summary')
+      expect(outcome.result).toContain('sample.pdf')
+      expect(outcome.result).toContain('read_pdf')
     })
 
 
@@ -361,7 +351,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const exec = createMockExec(true)
       await submitTool.execute({ file_path: '/hang.pdf' }, exec)
 
-      const hooks = specs[0]!.run()
+      const hooks = specs[0]!.run(jobHandle())
       hooks.cancel('User requested cancellation')
       const outcome = await hooks.done
 
@@ -384,7 +374,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
 
       await submitTool.execute({ file_path: '/hang.pdf' }, createMockExec(true))
-      const hooks = specs[0]!.run()
+      const hooks = specs[0]!.run(jobHandle())
       await dispose()
 
       await expect(hooks.done).resolves.toMatchObject({ status: 'killed', detail: 'cancelled' })
@@ -405,12 +395,12 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const exec = createMockExec(true)
       await submitTool.execute({ file_path: '/giant.pdf' }, exec)
 
-      const hooks = specs[0]!.run()
+      const hooks = specs[0]!.run(jobHandle())
       const outcome = await hooks.done
 
       expect(outcome.status).toBe('failed')
       expect(outcome.detail).toBe('FILE_TOO_LARGE')
-      expect(outcome.output).toBe('[FILE_TOO_LARGE] Input exceeds limit')
+      expect(outcome.result).toBe('[FILE_TOO_LARGE] Input exceeds limit')
     })
 
     it('projects structured presentation metadata for submitted jobs', () => {
@@ -450,7 +440,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const exec = createMockExec(true)
       await submitTool.execute({ file_path: '/doc.pdf' }, exec)
 
-      const hooks = specs[0]!.run()
+      const hooks = specs[0]!.run(jobHandle())
       const outcome = await hooks.done
 
       expect(outcome.status).toBe('completed')

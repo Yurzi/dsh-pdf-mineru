@@ -56,12 +56,14 @@ Provider 不注册工具、不取得 DSH Session、不选择缓存目录、不�
 
 两个工具都要求真实 `exec.agent.session`。`file_path` 与 `attachment_id` 在 schema 中均可选，运行时必须且只能提供一个；这一规则覆盖正文、cursor 续读、原页及后台解析。工具参数只关注阅读，不暴露 model/ocr/backend 等底层解析设置。
 
-附件解析属于工具边界：从当前会话的 `deriveMessages()` 可见消息递归收集 file／tool-result 文件引用（不恢复已压缩移出的引用），按内容 ID 匹配完整 `sha256:<64hex>` 或 8–64 位十六进制摘要前缀（可带 `sha256:`）。重复引用同一内容 ID 不构成歧义；匹配多个不同内容 ID 时明确报错。将匹配到的真实原始引用原样传给 `fileHostPath`，不凭摘要重建引用、不猜存储路径、不扫描全局附件库。宿主无本地路径能力时返回 `UNSUPPORTED_OPTION`，不增加流落盘回退。DSH 拥有附件存储；插件只把解析出的路径交给现有源文件流程，不增加完整性、存储或 Provider 协议。
+附件解析属于工具边界：从当前会话的 `deriveMessages()` 可见消息收集 `file` 引用，包括 0.1.7 独立 `role: "tool"` 消息的平坦 content；不解析已移除的嵌套 `tool-result` 块（不恢复已压缩移出的引用），按内容 ID 匹配完整 `sha256:<64hex>` 或 8–64 位十六进制摘要前缀（可带 `sha256:`）。重复引用同一内容 ID 不构成歧义；匹配多个不同内容 ID 时明确报错。将匹配到的真实原始引用原样传给 `fileHostPath`，不凭摘要重建引用、不猜存储路径、不扫描全局附件库。宿主无本地路径能力时返回 `UNSUPPORTED_OPTION`，不增加流落盘回退。DSH 拥有附件存储；插件只把解析出的路径交给现有源文件流程，不增加完整性、存储或 Provider 协议。
 
 - `read_pdf`：直接返回选择投影，不创建插件任务。当前参数为 `file_path`、`attachment_id`、`view`、`pages`、`focus`、`block_id`、`query`、`expected_sha256`、`inline_images`、`poll_timeout_ms`、`cursor`。
   - `view: content`（默认）读取解析块；`pages` 是从 1 开始的物理页，`focus` 支持 all/text/table/image/toc/artifacts。`query` 是 1–256 字符、不区分大小写的字面搜索，返回有界片段和 ID；`block_id` 精确读取同一解析结果的稳定 block。两者互斥，也不能与 toc/artifacts focus 组合。
   - `view: page` 只接受一个来源选择器（`file_path` 或 `attachment_id`）、恰好一页的 `pages` 和可选 `expected_sha256`；哈希必须为 64 个小写十六进制字符的 SHA-256，取自先前结果的 `source_sha256`。此参数不用于 content 模式。页面模式要求支持图片的模型且 maxInlineImages > 0，不接受 focus/cursor/query/block_id/inline_images/poll_timeout_ms。
-- `async_parse_pdf`：调用 `ctx.jobs.start(kind: mineru)`，传递精确的 live Agent owner；立即返回 job_id/state。完成后通过非拒绝 final-output Promise 提供摘要文本，而不是伪装为与 read_pdf 相同的正文 JSON。
+- `async_parse_pdf`：调用 `ctx.jobs.start(kind: mineru)`，传递 `agent.session.id`（SessionId）作为 owner，由宿主解析并校验 live Agent；立即返回 job_id/state。完成后通过非拒绝 `done: Promise<JobOutcome>` 的 `result` 字段提供摘要文本，而不是伪装为与 read_pdf 相同的正文 JSON。
+- 通过 `JobHandle.updateProgress` 发布调用级、无敏感数据的有限阶段（preparing / waiting-for-parse / reading-result / summarizing），不把进度重复 append 到输出环、不暴露 Provider refs；观察者异常不会改变解析结果。声明 `outputLimitBytes: 48_000`，宿主负责完整模型任务输出（含状态行）的限额。`result` 由宿主在结算后的首次消费读取中交付，不能依赖反复读取返回同一摘要。
+- 原生 JobRegistry 在 starter 前完成 owner／控制器准入，负责生命周期事件、空闲唤醒与归档准入；插件不维护通知或输出游标副本。
 - 通用 job_output/job_list/job_kill 负责后台控制；不维护第二套 JobRepository 或专用任务控制工具。
 
 后台入口调用 `ensureParsed`，与正文入口 `parseDocument` 只共享规范化、等待及发布结果校验，不再通过 summaryOnly 布尔值让 Markdown 读取器返回虚假的空正文。`ParseSummaryView` 不包含正文／cursor／阅读字符预算字段。摘要只尝试最多 2 MiB 的 content-list，保留最多 20 项大纲及每项 160 个 UTF-16 code units；可选元数据缺失、为空、无效或超限时退化为明确的最小摘要，而仓储完整性错误与取消仍向上传递。
@@ -130,6 +132,10 @@ SharedOperationRegistry 只在同一进程内，按 CacheKey 和 Provider author
 `parseConfig` 是唯一配置解析入口，拒绝旧 flat config、未知 schemaVersion、未知字段和 retainSources=true。parseMethod/ocr 一次性规范化；设置页切换到不支持 txt 的 Provider 时明确提示调整。
 
 storageRoot 与 limits.* 在启动时固定。运行中保存不同值会被拒绝；修改宿主配置并重启才生效。其余允许的 live 更新只影响之后的执行。数字输入保留临时空白／非法草稿，失焦后恢复或收敛，不在每次击键时强行覆盖。
+
+DSH 0.1.7-rc.2 的 `SettingsForms` 不再提供 `register/get/watch`。插件使用发布的 settings 类型，通过 `configure({ auto: false }, ctx.fiber)` 关闭自动表单；Config 为可热更新字段声明 `.volatile()`，每次操作读取 `.get()` 快照。`storageRoot`、`retainSources` 和 `limits` 为普通 Config 字段，不经 settings 表单修改。Cordis 的 Standard Schema 校验入口调用完整领域校验，确保 ConfigEditor 在持久化前拒绝无效配置。自定义 RPC 按当前 `ctx.fiber.entry.options.id` 调用 `settings.replace`，提交完整可热更新值，避免将显式默认值误复位为 profile 继承值；普通字段仍由宿主保留。启动只规范化 Provider-based v1，不执行配置写回或旧设置瘦身，避免激活期间触发 Loader 重载；旧 settings 文档由 DSH 导入。
+
+客户端通过上游 `plugins.bundle.config` keyed slot 注册配置页，key 为 npm 包名 `dsh-pdf-mineru`；入口位于 Plugins 的 bundle 详情页，不再注册 `settings.section`。使用 `dsh-client-ui-plugin-manager/client` 的公开类型与 slot 声明生命周期，不在运行时导入管理器组件；bundle 页面只提供 `view: page`，不依赖可选的通用 `form`。配置读写与维护仍由现有 loopback RPC 和显式保存流程负责。
 
 设置页的卡片与渐进展开仅属于呈现层，沿用同一份配置草稿和显式保存入口；折叠不重置字段。样式使用 DSH 主题变量，不改变 Provider、凭据与维护 RPC 的职责。
 
@@ -201,7 +207,7 @@ Self-hosted v2 使用 multipart POST /tasks、GET /tasks/{taskId} 与结果端�
 
 ## 8. 运维与验证
 
-以 DSH `v0.1.5-rc.2` 为最低宿主基线，不保留 `v0.1.2-rc.1` 兼容分支。RPC 在 `connection` 与 `webServer` 同时可用的注入作用域注册；缺少任一服务时不影响两个模型工具。`registerLoopbackRpc` 使用调用方局部 Context 元数据提供带 Host 回环检查的路由注册器，解决 Cordis 服务 getter 将依赖查找指向 Connection 提供方的问题；不修改全局服务。原生 Connection 继续负责认证、Origin 检查、消息封装和取消，插件不依赖已不受支持的 `authority` 参数。错误封装遵循 rc.2 的 `code`、`message`、`details` 契约。
+以 DSH `v0.1.7-rc.2` 为最低宿主基线，不保留旧 JobSpec／嵌套工具消息兼容分支。开发 SDK 固定为该精确版本，peer 下限与 engines.dsh 同步；PTC 使用已更名的 `dsh-ptc-runtime`，仍由宿主生成 SDK、执行调度与处理多模态保留。客户端使用发布的 Locale／Connection／Remote／SlotRegistry 与 slot props 类型，不以本地模块声明覆盖上游契约。Provider-aware 草稿设置与破坏性维护确认继续由插件页面负责，不改成自动保存。RPC 在 `connection` 与 `webServer` 同时可用的注入作用域注册；缺少任一服务时不影响两个模型工具。`registerLoopbackRpc` 使用调用方局部 Context 元数据提供带 Host 回环检查的路由注册器，解决 Cordis 服务 getter 将依赖查找指向 Connection 提供方的问题；不修改全局服务。原生 Connection 继续负责认证、Origin 检查、消息封装和取消，插件不依赖已不受支持的 `authority` 参数。原生 RPC 的 operator PeerScope 由 Connection 认证并传递，不取代本插件的回环维护边界。错误封装遵循 0.1.7 的 `code`、`message`、`details` 契约。
 
 运维 RPC 保持 loopback-only，不暴露任意路径读取。完整性扫描和 quarantine cleanup 默认只读／dry-run；隔离、缓存清除、实际清理都要求显式确认。GC 只提供预览。无法证明遍历完整、安全、无活跃使用者时，不执行破坏性计划。
 
@@ -217,7 +223,7 @@ pnpm run verify:gui
 
 默认全部使用 fixture/mock。关键回归包括真实子进程互斥及崩溃回收、reader 对抗 clear/quarantine、活跃 producer 与取消、源／产物路径安全、cursor 实际拼接、Native token、图片实际预算、严格 SDK schema 和 Provider 协议边界。
 
-GUI 脚本在既有 DSH Web shell 注入当前构建 bundle，使用隔离 RPC／凭据 fixture，检查桌面／移动布局、配置与维护交互；不是对真实 Provider 的在线验收。截图保存在忽略目录 `.vitest-cache/gui/`。后端部署需遵守统一重启要求，不以开启另一个 Vite server 代替现有 GUI 更新。
+GUI 脚本在既有 DSH Web shell 注入当前构建 bundle，使用隔离 RPC／凭据和插件清单 fixture，从 Plugins bundle 详情进入配置并检查全局 Settings 无重复入口、桌面／移动布局、配置与维护交互。测试浏览器对 `/plugins/events` 返回 204，防止初始 HMR graph 恢复宿主版本／依赖并在编辑草稿时重挂载；不改变宿主或其他浏览器的热更新。验证不是对真实 Provider 的在线验收，也不验证线上 HMR 部署。截图保存在忽略目录 `.vitest-cache/gui/`。后端部署需遵守统一重启要求，不以开启另一个 Vite server 代替现有 GUI 更新。
 
 ### 有意保留的限制
 

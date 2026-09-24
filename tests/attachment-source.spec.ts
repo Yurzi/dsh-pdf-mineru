@@ -1,31 +1,31 @@
 import { describe, expect, it, vi } from 'vitest'
 import { AttachmentId, type FileAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import { createUserMessage, ToolCallId, type ContentBlock } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, createMessage, ToolCallId, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import { parseDocumentSource, resolveDocumentPath } from '../src/adapters/dsh-document-source.js'
 import { parseAsyncInput, parseReadInput } from '../src/tools.js'
 
 const first: FileAttachmentRef = { attachmentId: AttachmentId('sha256:12345678' + 'a'.repeat(56)), name: 'paper.pdf', bytes: 42 }
 const second: FileAttachmentRef = { attachmentId: AttachmentId('sha256:12345678' + 'b'.repeat(56)), name: 'other.pdf', bytes: 43 }
 const file = (attachment: FileAttachmentRef): ContentBlock => ({ type: 'file', attachment })
-const nested = (content: ContentBlock[]): ContentBlock => ({ type: 'tool-result', toolCallId: ToolCallId('nested'), content, isError: false })
+const toolMessage = (content: ContentBlock[]) => createMessage({ role: 'tool', source: { kind: 'tool', callId: ToolCallId('parse') }, toolCallId: ToolCallId('parse'), content, isError: false })
 const session = (...content: ContentBlock[]) => ({ deriveMessages: () => [createUserMessage({ content, source: { kind: 'user' } })] })
 
 describe('DSH attachment source adapter', () => {
   it.each([String(first.attachmentId), String(first.attachmentId).slice(7), 'sha256:12345678', '12345678', '12345678A'])('resolves %s from structured visible file references', selector => {
-    const messages = session(nested([nested([file(first)])])).deriveMessages()
+    const messages = [toolMessage([file(first)])]
     const visibleRef = messages[0]!.content[0]!
     const fileHostPath = vi.fn(() => '/dsh-owned/paper.pdf')
     expect(resolveDocumentPath(parseDocumentSource({ attachment_id: selector }), { deriveMessages: () => messages }, { fileHostPath })).toBe('/dsh-owned/paper.pdf')
     expect(fileHostPath).toHaveBeenCalledOnce()
     expect(fileHostPath.mock.calls[0]![0]).toEqual(first)
     // The upstream reference object itself is handed off, not reconstructed.
-    if (visibleRef.type !== 'tool-result' || visibleRef.content[0]?.type !== 'tool-result' || visibleRef.content[0].content[0]?.type !== 'file') throw new Error('bad fixture')
-    expect(fileHostPath.mock.calls[0]![0]).toBe(visibleRef.content[0].content[0].attachment)
+    if (visibleRef.type !== 'file') throw new Error('bad fixture')
+    expect(fileHostPath.mock.calls[0]![0]).toBe(visibleRef.attachment)
   })
 
   it('deduplicates repeated and renamed references by content ID', () => {
     const fileHostPath = vi.fn(() => '/dsh-owned/paper.pdf')
-    expect(resolveDocumentPath({ attachment_id: '12345678' }, session(file(first), nested([file(first), file({ ...first, name: 'renamed.pdf' })])), { fileHostPath })).toBe('/dsh-owned/paper.pdf')
+    expect(resolveDocumentPath({ attachment_id: '12345678' }, { deriveMessages: () => [...session(file(first)).deriveMessages(), toolMessage([file(first), file({ ...first, name: 'renamed.pdf' })])] }, { fileHostPath })).toBe('/dsh-owned/paper.pdf')
     expect(fileHostPath).toHaveBeenCalledOnce()
   })
 

@@ -21,14 +21,14 @@ function isLoopbackAuthority(host: string | string[] | undefined): boolean {
 }
 
 /**
- * Retain channel-local loopback policy on rc.2, whose native rpc.handle no longer
+ * Retain channel-local loopback policy on 0.1.7-rc.2, whose native rpc.handle no longer
  * accepts an authority option. Only this caller's route registration is wrapped;
  * the real Connection still owns authentication, envelopes, and cancellation.
  */
 export function registerLoopbackRpc(ctx: Context, channel: string, handler: ConnectionRpcHandler): () => Promise<void> {
   // Read through the injected service before extending the caller. Cordis 4's
   // service getter shadows dependency lookup to the Connection provider, which
-  // need not inject webServer on rc.2. A local Context metadata override makes
+  // need not inject webServer on 0.1.7-rc.2. A local Context metadata override makes
   // the narrow registrar visible there without changing any global service.
   const webServer = (ctx as Context & { webServer: RouteRegistrar }).webServer
   const scoped = ctx.extend({

@@ -276,6 +276,21 @@ afterEach(async () => {
 })
 
 describe('MinerUService bounded parse synopsis', () => {
+  it('reports bounded invocation phases for a producer and skips waiting on a cache hit', async () => {
+    const h = await harness()
+    h.provider.complete = true
+    const phases: string[] = []
+    const input = { file_path: h.file }
+    await h.service.ensureParsed(session('progress'), input, new AbortController().signal, phase => { phases.push(phase) })
+    expect(phases).toEqual(['preparing', 'waiting-for-parse', 'reading-result', 'summarizing'])
+    phases.length = 0
+    await h.service.ensureParsed(session('cached-progress'), input, new AbortController().signal, phase => { phases.push(phase) })
+    expect(phases).toEqual(['preparing', 'reading-result', 'summarizing'])
+    // A failing observer is not a parse failure and cannot restart a Provider.
+    await expect(h.service.ensureParsed(session('throwing-progress'), input, new AbortController().signal, () => { throw new Error('observer failed') })).resolves.toMatchObject({ cache_hit: true })
+    expect(h.provider.submitCount).toBe(1)
+  })
+
   it('publishes oversized Markdown without body projection or the read response budget', async () => {
     const h = await harness()
     h.provider.complete = true

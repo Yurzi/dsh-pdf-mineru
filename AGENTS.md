@@ -32,17 +32,18 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 
 ## Session and concurrency rules
 
-- Every tool requires `exec.agent.session`; pass the exact live Agent as the native DSH background job owner.
+- Every tool requires `exec.agent.session`; native DSH jobs use `agent.session.id` (SessionId) as owner. The registry resolves the registered live Agent, enforces controller admission before starting work, and owns teardown/archive admission.
 - `async_parse_pdf` registers `kind: mineru` with `ctx.jobs.start`; generic `job_output`, `job_list`, and `job_kill` own async control.
 - `read_pdf` returns results directly and never creates a plugin Job.
 - SharedOperation owns the producer AbortController. Waiter cancellation, including native `job_kill`, only stops that invocation's wait.
-- Native job hooks omit `readOutput`, settle with a non-rejecting final-output Promise, and never expose provider refs.
+- Native job hooks settle with a non-rejecting `done: Promise<JobOutcome>`; summaries/errors use `result`, not the removed `output` field or `readOutput`. The host consumes the final result once and owns notifications/wakeups. Set `outputLimitBytes: 48_000`.
+- Invocation-local `ParseProgress` phases go through `JobHandle.updateProgress`, never duplicated ring appends. Progress has no paths, credentials, provider refs or invented percentages; observer failures must not alter parsing or cancellation.
 
 ## Source selection
 
 - Preserve `file_path`; add mutually exclusive `attachment_id` to both tools, including content, cursor continuation and page view. Both fields are optional in schemas; runtime requires exactly one. Callers should retain the same selector field and value on continuation; cursor-v3 validates the existing result/projection identity, not selector spelling.
 - Accept full `sha256:<64hex>` content IDs or 8–64 hexadecimal digest prefixes, optionally prefixed with `sha256:`. Match unique content IDs, not reference count; reject ambiguous prefixes.
-- Resolve only real file refs recursively exposed by the current session’s `deriveMessages()`, including nested tool-result refs. Compacted-out refs are outside this visible surface. Pass the exact matched ref to `fileHostPath`; never reconstruct refs or scan global storage.
+- Resolve only real file refs exposed by the current session’s `deriveMessages()`, including flat content in first-class `role: "tool"` messages. Do not restore the removed nested `tool-result` block protocol. Compacted-out refs are outside this visible surface. Pass the exact matched ref to `fileHostPath`; never reconstruct refs or scan global storage.
 - DSH owns stored attachments. Missing host path capability is `UNSUPPORTED_OPTION`; do not materialize streams, infer storage paths, or add integrity/storage/Provider contracts. Feed the resolved path into existing source handling.
 
 ## Reader invariants
@@ -88,9 +89,11 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 - `scripts/copy-page-worker.mjs`: copies the unbundled ESM worker to lib after build; package.files must retain it. PDF.js resources remain in the production dependency package.
 - `scripts/smoke-reader-package.mjs`: checks an installed pack artifact from an unrelated cwd with an empty PATH.
 - `scripts/smoke-official-v4.mjs`: explicit live smoke through the built plugin tool chain.
-- `scripts/verify-current-gui.mjs`: isolated current-bundle verification in the existing DSH Web shell.
+- `scripts/verify-current-gui.mjs`: isolated current-bundle verification in the existing DSH Web shell, with browser-only RPC/credential/plugin-inventory fixtures and a frozen HMR graph (`/plugins/events` returns 204 only in the test browser). Assert bundle-detail placement and absence from global Settings. Optional `DSH_GUI_EXCLUDE_PLUGINS` is an explicit comma-separated browser-fixture-only exclusion list for unrelated boot blockers; it must be reported, never excludes MinerU, and never changes the host profile.
 
 ## Compatibility
+
+Require DSH >= `0.1.7-rc.2`; keep engines and runtime peers aligned, pin development DSH packages to the exact baseline, and use `dsh-ptc-runtime` rather than the removed `dsh-code-runtime`. Use published Client/SlotRegistry/locale/settings types, not ambient replacements. Register the custom config page only in `plugins.bundle.config`, keyed by package name `dsh-pdf-mineru`, using the public `dsh-client-ui-plugin-manager/client` contract and `slots.inject` declaration lifecycle. Do not restore a duplicate `settings.section` entry or require the optional generic `form` prop. Settings uses Config `.volatile()` references and `settings.configure({ auto: false }, ctx.fiber)`, never the removed register/get/watch scope. Save complete live values through `settings.replace` using the actual Loader entry id; ordinary storageRoot/retainSources/limits fields stay outside form writes. Validate complete domain config at the Standard Schema boundary before persistence. Do not mutate settings during activation; DSH owns legacy document import. Keep the custom draft/confirmation settings flow; native generic forms must not bypass maintenance confirmation or silently auto-save drafts.
 
 Only canonical Provider-based config and current tool arguments are accepted. Do not reintroduce flat-config migration or deprecated tool aliases. Preserve `parseMethod` in cache semantics: `txt` is not equivalent to `auto`. Official v4 rejects `txt` because its `is_ocr` field cannot represent that distinction.
 

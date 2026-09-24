@@ -9,6 +9,9 @@ import { type MinerUDiagnosticSink } from '../observability.js';
 import { SharedOperationRegistry } from './shared-operations.js';
 import type { ParseSummaryView, ResultView } from './result-presenter.js';
 export * from './result-presenter.js';
+/** Invocation-local progress only; never carries provider refs, paths or credentials. */
+export type ParseProgress = 'preparing' | 'waiting-for-parse' | 'reading-result' | 'summarizing';
+export type ParseProgressListener = (phase: ParseProgress) => void;
 export interface ServiceSession {
     readonly header: {
         readonly id: string;
@@ -54,7 +57,7 @@ export declare class MinerUService {
     private projectSingle;
     private createWaitSignal;
     /** Ensure publication and return a bounded synopsis, never a body projection. */
-    ensureParsed(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal): Promise<ParseSummaryView>;
+    ensureParsed(session: ServiceSession, input: ParseRequestInput, signal: AbortSignal, onProgress?: ParseProgressListener): Promise<ParseSummaryView>;
     /** Local original-page verification; never invokes a Provider or persists a source. */
     previewPage(session: ServiceSession, input: {
         file_path: string;

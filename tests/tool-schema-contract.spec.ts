@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import type { Context } from 'cordis'
-import { jsonSchemaToTs, ToolArgsError, validateJsonSchemaValue, type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools'
+import type { Context } from '@deepseek-ai/cordis'
+import { jsonSchemaToTs, jsonSchemaToPy, renderToolsSdkPy, ToolArgsError, validateJsonSchemaValue, type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { registerTools } from '../src/tools.js'
 
 // Deliberately use the real defineTool compiler, unlike the execution mocks.
@@ -67,6 +67,17 @@ describe('real DSH schema compilation', () => {
     expect(outputType).toMatch(/cursor: string \| null/)
     expect(outputType).not.toContain('cursor?:')
     expect(jsonSchemaToTs(tool.parameters)).toContain('cursor?: string')
+  })
+
+  it('projects both tools into the upstream Python PTC SDK without losing source or cursor contracts', () => {
+    const tools = [...definitions().values()]
+    const sdk = renderToolsSdkPy(tools.map(tool => ({ name: tool.name, description: tool.description, parameters: tool.parameters, output: tool.output.schema })))
+    expect(sdk).toContain('async def read_pdf')
+    expect(sdk).toContain('async def async_parse_pdf')
+    expect(sdk).toContain('attachment_id: NotRequired[str]')
+    expect(sdk).toContain('file_path: NotRequired[str]')
+    expect(sdk).toContain('cursor: str | None')
+    expect(jsonSchemaToPy({ oneOf: [{ type: 'string' }, { type: 'null' }] })).toBe('str | None')
   })
 
   it('rejects null input cursor before entering the tool body rather than restarting', async () => {

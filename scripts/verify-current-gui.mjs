@@ -16,9 +16,13 @@ webUrl.hash = ''
 const clientInject = [
   '@deepseek-ai/dsh-client-connection',
   '@deepseek-ai/dsh-client-locale',
-  '@deepseek-ai/dsh-client-ui-settings',
+  '@deepseek-ai/dsh-client-ui-plugin-manager',
   '@deepseek-ai/dsh-api-remotes',
 ]
+
+// Explicit browser-fixture isolation only; never modifies the running host profile.
+const excludedPluginIds = new Set((process.env.DSH_GUI_EXCLUDE_PLUGINS ?? '').split(',').map(id => id.trim()).filter(Boolean))
+if (excludedPluginIds.has('dsh-pdf-mineru')) throw new Error('Cannot exclude the plugin under verification')
 
 function injectCurrentPlugin(html) {
   const assignment = 'globalThis["__DSH_BOOT__"] = '
@@ -33,19 +37,20 @@ function injectCurrentPlugin(html) {
 
   const pluginId = 'dsh-pdf-mineru'
   const pluginUrl = '/plugins/??dsh-pdf-mineru/client.js&rev=workspace-current'
-  const retainedEntries = boot.entries.filter(entry => entry.id !== pluginId)
+  const removedIds = new Set([pluginId, ...excludedPluginIds])
+  const retainedEntries = boot.entries.filter(entry => !removedIds.has(entry.id))
   const retainedById = new Map(retainedEntries.map(entry => [entry.id, entry]))
   const retainedBatches = []
   for (const batch of boot.batches) {
     if (!Array.isArray(batch.entries)) throw new Error('DSH shell boot batch has no entries')
-    if (!batch.entries.includes(pluginId)) {
+    if (!batch.entries.some(id => removedIds.has(id))) {
       retainedBatches.push(batch)
       continue
     }
     // A combo containing the installed MinerU bundle must not remain the
     // initial URL for its neighbours: split those rows onto their single-entry
     // URLs so the stale factory can be preloaded but never executed.
-    for (const id of batch.entries.filter(entryId => entryId !== pluginId)) {
+    for (const id of batch.entries.filter(entryId => !removedIds.has(entryId))) {
       const entry = retainedById.get(id)
       if (entry === undefined) throw new Error(`DSH shell boot batch names unknown entry ${id}`)
       retainedBatches.push({ phase: batch.phase, url: entry.url, rev: entry.rev, entries: [id] })
@@ -205,11 +210,24 @@ function isKnownExternalError(text) {
   return false
 }
 const rpcCalls = []
+const pluginManagerCalls = []
+// rc.1 PluginInventorySnapshot / BundleInfo / PluginInfo, scoped to this browser.
+// The injected client must not depend on MinerU being installed in the live profile.
+const fixturePluginEntry = {
+  entryId: 'gui-fixture:mineru', moduleName: 'dsh-pdf-mineru', enabled: true, fiberPhase: 'active',
+}
+const fixtureBundle = {
+  name: 'dsh-pdf-mineru', enabled: true, installed: true, optional: false, removable: true,
+  description: 'Browser-only MinerU configuration verification fixture',
+  rows: [{ rowId: 'mineru', moduleName: 'dsh-pdf-mineru', entryId: fixturePluginEntry.entryId }],
+  overrides: [],
+}
 let configGetCalls = 0
 let failConfigLoad = true
 const credentialCalls = []
 let credentialConfigured = true
 let bundleIntercepts = 0
+const bundleRequests = []
 page.on('console', message => {
   if (message.type() === 'error') {
     const text = message.text()
@@ -237,7 +255,42 @@ await page.route(
     && url.search.startsWith('??dsh-pdf-mineru/client.js&rev='),
   route => {
     bundleIntercepts++
+    bundleRequests.push({ url: route.request().url(), resourceType: route.request().resourceType() })
     return route.fulfill({ status: 200, contentType: 'text/javascript; charset=utf-8', body: bundle })
+  },
+)
+// Freeze the injected boot graph for this browser only. The live HMR stream's
+// initial graph would restore the installed revision/dependencies (and excluded
+// plugins), remounting the page during draft tests. HTTP 204 stops EventSource
+// reconnects; the host and other browser clients retain their normal HMR stream.
+await page.route(
+  url => url.origin === webUrl.origin && url.pathname === '/plugins/events',
+  route => route.fulfill({ status: 204 }),
+)
+// Never forward manager writes (enable/disable/install/remove) to the live host.
+await page.route(
+  url => url.origin === webUrl.origin
+    && (url.pathname.startsWith('/api/pluginManager/') || url.pathname.startsWith('/api/pluginInventory/')),
+  async route => {
+    const endpoint = new URL(route.request().url()).pathname.slice('/api/'.length)
+    const payloadText = route.request().postData()
+    const envelope = payloadText ? JSON.parse(payloadText) : {}
+    pluginManagerCalls.push(endpoint)
+    let result
+    if (endpoint === 'pluginInventory/list') {
+      result = { ok: true, value: { managementAvailable: true, entries: [fixturePluginEntry], agentPresets: [] } }
+    } else if (endpoint === 'pluginManager/listBundles') {
+      result = { ok: true, value: [fixtureBundle] }
+    } else if (endpoint === 'pluginManager/listPlugins') {
+      result = { ok: true, value: [{ ...fixturePluginEntry, patchId: 'gui-fixture' }] }
+    } else {
+      errors.push('Unexpected plugin manager RPC blocked by browser fixture: ' + endpoint)
+      result = { ok: false, error: { code: 'gateway/not-found', message: endpoint } }
+    }
+    await route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ type: 'server-response', rpcId: envelope.rpcId, result }),
+    })
   },
 )
 await page.route(
@@ -324,10 +377,32 @@ await page.route('**/dsh-pdf-mineru-api/**', async route => {
 
 await page.goto(webUrl.toString(), { waitUntil: 'domcontentloaded', timeout: 30_000 })
 await page.waitForTimeout(1000)
-await page.getByRole('button', { name: 'Settings', exact: true }).click()
-await page.waitForTimeout(300)
-await page.getByRole('button', { name: 'MinerU', exact: true }).click()
-await page.getByRole('alert').filter({ hasText: 'Fixture configuration load failure' }).waitFor({ timeout: 5000 }).catch(async error => {
+await page.getByRole('button', { name: 'Settings', exact: true }).click().catch(async error => {
+  console.error(JSON.stringify({ errors, failedRequests, unrelatedPluginErrors: [...unrelatedPluginErrors], bundleIntercepts, buttons: await page.getByRole('button').allTextContents() }, null, 2))
+  await browser.close()
+  throw error
+})
+const globalSettings = page.getByRole('dialog', { name: 'Settings', exact: true })
+await globalSettings.waitFor({ timeout: 5000 })
+if (await globalSettings.getByRole('navigation').getByRole('button', { name: /MinerU/i }).count() !== 0) {
+  throw new Error('MinerU still appears in global settings navigation')
+}
+if (await globalSettings.getByRole('heading', { name: 'MinerU Configuration', exact: true }).count() !== 0) {
+  throw new Error('MinerU configuration still renders in global settings')
+}
+await page.keyboard.press('Escape')
+await globalSettings.waitFor({ state: 'hidden', timeout: 5000 })
+await page.getByRole('button', { name: 'Plugins', exact: true }).click()
+const bundleCard = page.locator('[data-plugin-package="dsh-pdf-mineru"]')
+await bundleCard.getByRole('button', { name: /^View / }).click().catch(async error => {
+  console.error(JSON.stringify({ errors, failedRequests, pluginManagerCalls, unrelatedPluginErrors: [...unrelatedPluginErrors], bundleIntercepts, buttons: await page.getByRole('button').allTextContents() }, null, 2))
+  await browser.close()
+  throw error
+})
+const bundleDetail = page.locator('[data-plugin-detail="dsh-pdf-mineru"]')
+await bundleDetail.waitFor({ timeout: 5000 })
+const bundleConfig = bundleDetail.locator('section[data-plugin-config]')
+await bundleConfig.getByRole('alert').filter({ hasText: 'Fixture configuration load failure' }).waitFor({ timeout: 5000 }).catch(async error => {
   console.error(JSON.stringify({ configGetCalls, rpcCalls, errors, body: (await page.locator('body').innerText()).slice(-8000) }, null, 2))
   throw error
 })
@@ -337,8 +412,11 @@ await page.waitForTimeout(1500)
 if (await page.getByText('Provider Settings', { exact: true }).count() === 0) {
   console.error(JSON.stringify({ bundleIntercepts, rpcCalls, credentialCalls, errors, body: (await page.locator('body').innerText()).slice(0, 8000) }, null, 2))
 }
-await page.getByText('Provider Settings', { exact: true }).waitFor({ timeout: 10_000 })
-if (bundleIntercepts !== 1) throw new Error(`workspace bundle was fetched ${bundleIntercepts} times during desktop boot`)
+await bundleConfig.getByText('Provider Settings', { exact: true }).waitFor({ timeout: 10_000 })
+if (await bundleConfig.getByRole('heading', { name: 'MinerU Configuration', exact: true }).count() !== 1) {
+  throw new Error('custom MinerU page was not mounted once in its bundle configuration slot')
+}
+if (bundleIntercepts !== 1) throw new Error(`workspace bundle was fetched ${bundleIntercepts} times during desktop boot: ${JSON.stringify(bundleRequests)}`)
 async function openCardFor(control) {
   const card = control.locator('xpath=ancestor::*[@data-card-id][1]')
   const toggle = card.locator('[data-card-toggle]').first()
@@ -400,6 +478,9 @@ await openCardFor(inlineImagesInput)
 if (await inlineImagesInput.inputValue() !== '6') throw new Error('initial inline image budget mismatch')
 await inlineImagesInput.fill('9')
 await credentialInput.fill('gui-verifier-secret')
+if (rpcCalls.some(call => call.endpoint === 'mineru/config.set') || credentialCalls.some(call => call.method !== 'describe')) {
+  throw new Error('bundle configuration auto-saved an unsubmitted draft')
+}
 await page.getByRole('button', { name: 'Save Configuration', exact: true }).click()
 await page.getByRole('button', { name: 'Saved', exact: true }).waitFor({ timeout: 5000 })
 await page.getByText('A credential is configured. Saving with this field blank keeps it unchanged.', { exact: false }).waitFor({ timeout: 5000 })
@@ -453,7 +534,7 @@ await page.getByText('entry_corrupt_1', { exact: true }).waitFor({ timeout: 5000
 await page.getByText('Storage & Cache', { exact: true }).scrollIntoViewIfNeeded()
 await page.screenshot({ path: join(screenshotDir, 'mineru-current-settings-mobile.png'), fullPage: true, animations: 'disabled' })
 const providerHeadingBox = await page.getByText('Provider Settings', { exact: true }).boundingBox()
-const mineruSection = page.getByRole('heading', { name: 'MinerU Configuration', exact: true }).locator('xpath=ancestor::section[1]')
+const mineruSection = bundleConfig.getByRole('heading', { name: 'MinerU Configuration', exact: true }).locator('xpath=ancestor::section[1]')
 const sectionBox = await mineruSection.boundingBox()
 const layoutDiagnostics = await page.evaluate(() => {
   const heading = text => [...document.querySelectorAll('h3')].find(element => element.textContent?.trim() === text)
@@ -576,8 +657,14 @@ console.log(JSON.stringify({
   providerSwitch: true, draftProbe: true, save: true, credentialUi: true, maintenance: true, errors, desktopMetrics, mobileMetrics, sectionBox, providerHeadingBox, layoutDiagnostics, visibleControlBoxes,
   rpcEndpoints: rpcCalls.map(call => call.endpoint),
   credentialCalls,
+  pluginManagerCalls,
+  bundleConfiguration: 'dsh-pdf-mineru',
+  absentFromGlobalSettings: true,
   unrelatedPluginErrors: [...unrelatedPluginErrors],
+  excludedPluginIds: [...excludedPluginIds],
   bundleIntercepts,
+  bundleRequests,
+  hmrIsolated: true,
   screenshots: [
     join(screenshotDir, 'mineru-current-settings-credential-desktop.png'),
     join(screenshotDir, 'mineru-current-settings-desktop.png'),

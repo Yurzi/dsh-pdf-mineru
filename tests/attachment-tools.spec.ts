@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
+import { JobId } from '@deepseek-ai/dsh-jobs'
 import { AttachmentId, type FileAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { createUserMessage, type Message } from '@deepseek-ai/dsh-llm'
 import type { JobRegistry } from '@deepseek-ai/dsh-jobs'
@@ -15,7 +16,7 @@ afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(
 
 function harness(options: { missingStore?: boolean; missingPath?: boolean } = {}) {
   let messages: readonly Message[] = [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'file', attachment: ref }] })]
-  const session = { header: { id: 'attachment-tools', cwd: '/workspace' }, deriveMessages: () => messages }
+  const session = { id: 'attachment-tools', header: { id: 'attachment-tools', cwd: '/workspace' }, deriveMessages: () => messages }
   const exec = { callId: 'attachment-call', name: 'read_pdf', arguments: {}, signal: new AbortController().signal, agent: { options: { provider: 'mock', model: 'vision' }, session } } as unknown as ToolRunContext
   const result: ResultView = { state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_attachment', files: [{ file_id: 'mf_attachment', name: 'paper.pdf', artifacts: [] }], content_status: 'complete', cursor: null, output_limit_chars: 12000 }
   const parseDocument = vi.fn(async () => result)
@@ -79,14 +80,14 @@ describe('attachment input through real compiled tools', () => {
     expect(h.previewPage).toHaveBeenCalledOnce()
   })
 
-  it('maps before native job registration and preserves the exact live owner and path job semantics', async () => {
+  it('maps before native job registration and preserves the live SessionId owner and path job semantics', async () => {
     const h = harness()
     expect(await h.tools.get('async_parse_pdf')!.execute({ attachment_id: 'aaaaaaaa' }, h.exec)).toEqual({ job_id: 'mineru-1', state: 'running' })
-    expect(h.jobSpecs[0]!.owner).toBe(h.exec.agent)
+    expect(h.jobSpecs[0]!.owner).toBe(h.exec.agent?.session.id)
     expect(h.jobSpecs[0]!.label).toBe('Parse paper.pdf with MinerU')
-    const hooks = h.jobSpecs[0]!.run()
+    const hooks = h.jobSpecs[0]!.run({ id: JobId('mineru-1'), append: vi.fn(), updateProgress: vi.fn() })
     expect(await hooks.done).toMatchObject({ status: 'completed' })
-    expect(h.ensureParsed).toHaveBeenCalledWith(h.session, { file_path: hostPath }, expect.any(AbortSignal))
+    expect(h.ensureParsed).toHaveBeenCalledWith(h.session, { file_path: hostPath }, expect.any(AbortSignal), expect.any(Function))
     expect(hooks).not.toHaveProperty('readOutput')
     expect(h.store.fileHostPath).toHaveBeenCalledOnce()
   })

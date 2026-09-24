@@ -23,7 +23,7 @@ describe('package contract', () => {
     expect(injected).toEqual([
       '@deepseek-ai/dsh-client-connection',
       '@deepseek-ai/dsh-client-locale',
-      '@deepseek-ai/dsh-client-ui-settings',
+      '@deepseek-ai/dsh-client-ui-plugin-manager',
       '@deepseek-ai/dsh-api-remotes',
     ])
     for (const name of injected) expect(manifest.peerDependencies).toHaveProperty(name)
@@ -32,17 +32,17 @@ describe('package contract', () => {
     expect(manifest.peerDependencies).not.toHaveProperty('react')
   })
 
-  it('targets DSH rc.2 consistently across engine, peers, and development packages', async () => {
+  it('targets DSH 0.1.7-rc.2 consistently across engine, peers, and development packages', async () => {
     const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
-    expect(manifest.engines.dsh).toBe('>=0.1.5-rc.2')
+    expect(manifest.engines.dsh).toBe('>=0.1.7-rc.2')
     expect(manifest.engines.node).toBe('^22.19.0 || >=24.0.0')
     for (const dependencies of [manifest.peerDependencies, manifest.devDependencies]) {
       const dshPackages = Object.entries(dependencies).filter(([name]) => name.startsWith('@deepseek-ai/dsh-'))
       expect(dshPackages.length).toBeGreaterThan(0)
-      for (const [, range] of dshPackages) expect(range).toBe('^0.1.5-rc.2')
+      for (const [, range] of dshPackages) expect(range).toBe(dependencies === manifest.devDependencies ? '0.1.7-rc.2' : '^0.1.7-rc.2')
     }
     for (const name of manifest.dsh.client.inject) {
-      expect(manifest.devDependencies[name]).toBe('^0.1.5-rc.2')
+      expect(manifest.devDependencies[name]).toBe('0.1.7-rc.2')
     }
   })
 

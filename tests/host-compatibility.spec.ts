@@ -14,7 +14,7 @@ import { defaultMinerUConfig } from '../src/config.js'
 import { RPC_CHANNEL } from '../src/rpc.js'
 
 // Intentionally no module mocks: strict Cordis service tracing and the installed
-// rc.2 connection adapter are the behavior under test, not a fake ctx.inject.
+// 0.1.7-rc.2 connection adapter are the behavior under test, not a fake ctx.inject.
 interface Route {
   kind: string
   path: string
@@ -48,17 +48,13 @@ async function hostFixture(trustedHosts: readonly string[] = []) {
     toolDisposers.push(dispose)
     return dispose
   })
-  const unwatch = vi.fn()
-  const registerSettings = vi.fn(() => ({
-    get: () => config,
-    watch: () => unwatch,
-    replace: vi.fn(async () => undefined),
-  }))
+  const removePresentation = vi.fn()
+  const configureSettings = vi.fn(() => removePresentation)
   const startJob = vi.fn(() => { throw new Error('lifecycle tests must not start jobs') })
   // Provide services through Cordis, never assign properties onto the root:
   // own properties would bypass the strict injected-service lookup.
   ctx.provide('tools', { register: registerTool })
-  ctx.provide('settings', { register: registerSettings, mutate: vi.fn(async () => undefined) })
+  ctx.provide('settings', { configure: configureSettings, replace: vi.fn(async () => undefined) })
   ctx.provide('jobs', { start: startJob })
 
   const routes = new Map<string, Route>()
@@ -105,8 +101,8 @@ async function hostFixture(trustedHosts: readonly string[] = []) {
     expect(startJob).not.toHaveBeenCalled()
   }
   return {
-    ctx, config, errors, definitions, registerTool, toolDisposers, unwatch,
-    registerSettings, routes, registerRoute, routeDisposers, isAuthenticated,
+    ctx, config, errors, definitions, registerTool, toolDisposers, removePresentation,
+    configureSettings, routes, registerRoute, routeDisposers, isAuthenticated,
     provideWebServer, provideConnection, settle, start, expectTools,
   }
 }
@@ -136,7 +132,7 @@ async function request(route: Route, options: { host?: string | string[] | null;
   }
 }
 
-describe('installed host compatibility (rc.2 RPC injection)', () => {
+describe('installed host compatibility (0.1.7-rc.2 RPC injection)', () => {
   it.each([false, true])('injects optional sibling attachments (late=%s), clears removed services, and retains tools', async late => {
     const host = await hostFixture()
     const message = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'file', attachment: { attachmentId: AttachmentId('sha256:' + 'a'.repeat(64)), name: 'paper.pdf', bytes: 100 } }] })
@@ -194,7 +190,7 @@ describe('installed host compatibility (rc.2 RPC injection)', () => {
       type: 'server-response', rpcId: 'fixture-rpc',
       result: { ok: true, value: { config: host.config } },
     })
-    // rc.2 enforces trust inside the connection handler, not a route.authority
+    // 0.1.7-rc.2 enforces trust inside the connection handler, not a route.authority
     // field. With no extra trusted hosts, a non-loopback authority is refused.
     expect(await request(route, { host: 'remote.example:3080' })).toEqual({ status: 403, body: 'forbidden' })
     expect(host.isAuthenticated).toHaveBeenCalledOnce()
@@ -203,7 +199,7 @@ describe('installed host compatibility (rc.2 RPC injection)', () => {
     expect(connection.state).toBe(host.ctx.fiber.state)
     expect(host.routes.size).toBe(0)
     expect(host.definitions.size).toBe(0)
-    expect(host.unwatch).toHaveBeenCalledOnce()
+    expect(host.removePresentation).toHaveBeenCalledOnce()
     for (const dispose of [...host.routeDisposers, ...host.toolDisposers]) expect(dispose).toHaveBeenCalledOnce()
     await plugin.dispose()
     for (const dispose of [...host.routeDisposers, ...host.toolDisposers]) expect(dispose).toHaveBeenCalledOnce()
@@ -283,7 +279,7 @@ describe('installed host compatibility (rc.2 RPC injection)', () => {
     expect(host.errors).toEqual([])
     await plugin.dispose()
     expect(host.definitions.size).toBe(0)
-    expect(host.unwatch).toHaveBeenCalledOnce()
+    expect(host.removePresentation).toHaveBeenCalledOnce()
     for (const dispose of host.toolDisposers) expect(dispose).toHaveBeenCalledOnce()
   })
 
@@ -313,13 +309,13 @@ describe('installed host compatibility (rc.2 RPC injection)', () => {
     expect(host.routeDisposers[0]).toHaveBeenCalledOnce()
     expect(plugin.state).toBe(host.ctx.fiber.state)
     host.expectTools()
-    expect(host.unwatch).not.toHaveBeenCalled()
+    expect(host.removePresentation).not.toHaveBeenCalled()
 
     await provideLate()
     await host.settle()
     expect(host.routes.has(RPC_CHANNEL)).toBe(true)
     expect(host.registerRoute).toHaveBeenCalledTimes(2)
-    expect(host.registerSettings).toHaveBeenCalledOnce()
+    expect(host.configureSettings).toHaveBeenCalledOnce()
     host.expectTools()
     await plugin.dispose()
     expect(host.routes.size).toBe(0)

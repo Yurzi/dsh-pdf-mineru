@@ -26,11 +26,11 @@ export function parseDocumentSource(args: Readonly<Record<string, unknown>>): Do
 function* fileReferences(blocks: readonly ContentBlock[]): Generator<FileAttachmentRef> {
   for (const block of blocks) {
     if (block.type === 'file') yield block.attachment
-    else if (block.type === 'tool-result') yield* fileReferences(block.content)
   }
 }
 
-/** Resolve only references on the current DSH surface; never scan raw history or storage. */
+/** DSH 0.1.7 exposes tool results as tool-role messages with flat content.
+ * Resolve only that current surface; never scan raw history or storage. */
 export function resolveDocumentPath(
   source: DocumentSource,
   session: { deriveMessages(): readonly Message[] },
