@@ -14,7 +14,7 @@ import { defaultMinerUConfig } from '../src/config.js'
 import { RPC_CHANNEL } from '../src/rpc.js'
 
 // Intentionally no module mocks: strict Cordis service tracing and the installed
-// 0.1.7-rc.2 connection adapter are the behavior under test, not a fake ctx.inject.
+// 0.2.0-rc.1 connection adapter are the behavior under test, not a fake ctx.inject.
 interface Route {
   kind: string
   path: string
@@ -132,7 +132,7 @@ async function request(route: Route, options: { host?: string | string[] | null;
   }
 }
 
-describe('installed host compatibility (0.1.7-rc.2 RPC injection)', () => {
+describe('installed host compatibility (0.2.0-rc.1 RPC injection)', () => {
   it.each([false, true])('injects optional sibling attachments (late=%s), clears removed services, and retains tools', async late => {
     const host = await hostFixture()
     const message = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'file', attachment: { attachmentId: AttachmentId('sha256:' + 'a'.repeat(64)), name: 'paper.pdf', bytes: 100 } }] })
@@ -190,7 +190,7 @@ describe('installed host compatibility (0.1.7-rc.2 RPC injection)', () => {
       type: 'server-response', rpcId: 'fixture-rpc',
       result: { ok: true, value: { config: host.config } },
     })
-    // 0.1.7-rc.2 enforces trust inside the connection handler, not a route.authority
+    // 0.2.0-rc.1 enforces trust inside the connection handler, not a route.authority
     // field. With no extra trusted hosts, a non-loopback authority is refused.
     expect(await request(route, { host: 'remote.example:3080' })).toEqual({ status: 403, body: 'forbidden' })
     expect(host.isAuthenticated).toHaveBeenCalledOnce()

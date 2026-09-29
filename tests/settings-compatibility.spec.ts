@@ -23,7 +23,8 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
 })
 
-async function fixture({ legacy = false, hmr = true, sparse = false, plugin = mineru, transport = true }: {
+async function fixture({ legacy = false, hmr = true, sparse = false, entryPatch = false, plugin = mineru, transport = true }: {
+  entryPatch?: boolean
   legacy?: boolean
   hmr?: boolean
   sparse?: boolean
@@ -57,6 +58,9 @@ async function fixture({ legacy = false, hmr = true, sparse = false, plugin = mi
     { id: 'mineru-custom', name: 'cordis:mineru', config: sparse ? { activeProvider: config.activeProvider, providers: config.providers, storage: { storageRoot: config.storage.storageRoot } } : config },
   ] }]))
   await writeFile(join(dir, 'cordis.yml'), '[]\n')
+  if (entryPatch) {
+    await writeFile(join(dir, 'cordis.patch.yml'), JSON.stringify([{ id: 'mineru-custom', disabled: false }]))
+  }
   const profile: ProfileContext = {
     name: 'test', startedBundles: ['test-bundle'], dir, patchPath: join(dir, 'cordis.patch.yml'),
     installAnchor: join(home, 'package.json'), cwd: home, home, overlays: [], telemetryDisabledEnv: undefined,
@@ -115,6 +119,24 @@ it('activates with native settings, saves by entry id, updates without remount a
   await host.ctx.fiber.dispose()
   const restored = await host.start()
   expect(await restored.call('mineru/config.get')).toMatchObject({ ok: true, value: { config: { output: { maxInlineImages: 9 } } } })
+})
+
+it('preserves bundle inheritance when a profile overrides only non-config entry options', async () => {
+  const host = await fixture({ entryPatch: true })
+  const descriptor = host.ctx.settings.describe().find(row => row.ns === 'mineru-custom')!
+  expect(descriptor.value).toMatchObject({ output: { maxInlineImages: 12 } })
+  const inherited = host.ctx.configEditor.configuration().find(row => row.entry === host.entry)!
+  expect(inherited.inherited).toEqual(host.config)
+  expect(inherited.override).toEqual({})
+  expect(await readFile(host.profile.patchPath, 'utf8')).not.toContain('config')
+
+  const next = { ...host.config, output: { ...host.config.output, maxInlineImages: 6 } }
+  expect(await host.call('mineru/config.set', { config: next }))
+    .toMatchObject({ ok: true, value: { config: next } })
+  await host.ctx.fiber.dispose()
+  const restored = await host.start()
+  expect(await restored.call('mineru/config.get'))
+    .toMatchObject({ ok: true, value: { config: next } })
 })
 
 it('rejects invalid domain values and ordinary field writes before persistence', async () => {

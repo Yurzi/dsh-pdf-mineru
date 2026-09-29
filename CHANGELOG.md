@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.4
+
+### Changed
+
+- Raise the minimum DSH host to 0.2.0-rc.1 and runtime DSH peers to ^0.2.0-rc.1; pin development SDK packages and workspace release-age exclusions to the exact new baseline and refresh the lockfile.
+- Align package-contract, native-job and loopback RPC regressions with the published 0.2.0-rc.1 SDK; cover inherited bundle configuration when a profile overrides only non-config entry options.
+- Document the 0.2 compatibility boundary: native jobs, attachment selection, PTC schemas, bundle configuration slots and loopback RPC retain their existing contracts. The plugin does not require the optional schedule bundle or call the changed native-command API.
+
+Provider/config/cache formats, cursor v3, index v2 and tool arguments are unchanged; existing parsed caches require no migration or re-upload. Upgrade the DSH host before installing this plugin version.
+
 ## 0.1.3
 
 ### Changed

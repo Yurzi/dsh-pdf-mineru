@@ -44,7 +44,7 @@ async function harness(ensureParsed: MinerUService['ensureParsed'], controller =
   return { ctx, owner, session, events, submit, dispose }
 }
 
-describe('MinerU with the published 0.1.7-rc.2 job registry', () => {
+describe('MinerU with the published 0.2.0-rc.1 job registry', () => {
   it('delivers progress and a final result once, with owner-fenced reads', async () => {
     const h = await harness(async (_session, _input, _signal, progress) => {
       progress?.('preparing')

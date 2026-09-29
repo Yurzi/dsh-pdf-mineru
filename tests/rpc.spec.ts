@@ -18,7 +18,7 @@ vi.mock('react', () => ({
 import type { Context } from '@deepseek-ai/cordis'
 import { rpcErrorSchema } from '@deepseek-ai/dsh-client-connection'
 
-// Transport trust and lifecycle are exercised against real 0.1.7-rc.2 in host-compatibility.spec.ts.
+// Transport trust and lifecycle are exercised against real 0.2.0-rc.1 in host-compatibility.spec.ts.
 vi.mock('../src/loopback-rpc.js', () => ({
   registerLoopbackRpc: (ctx: Context, channel: string, handler: RpcHandler) => ctx.connection.rpc.handle(channel, handler),
 }))
@@ -95,7 +95,7 @@ function maintenanceDeps(): Pick<MineruRpcDeps, 'maintenance'> {
 }
 
 describe('MinerU RPC (registerRpc)', () => {
-  it('registers on /dsh-pdf-mineru-api using the 0.1.7-rc.2 two-argument RPC contract', () => {
+  it('registers on /dsh-pdf-mineru-api using the 0.2.0-rc.1 two-argument RPC contract', () => {
     expect(RPC_CHANNEL).toBe('/dsh-pdf-mineru-api')
     const { ctx, getHandle } = createMockContext()
     const deps: MineruRpcDeps = {
