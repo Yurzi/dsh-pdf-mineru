@@ -58,6 +58,11 @@ describe('ProviderHttpClient', () => {
       const url = resolveProviderUrl('http://127.0.0.1:8000', '/health')
       expect(url).toBe('http://127.0.0.1:8000/health')
     })
+
+    it('handles empty path', () => {
+      const url = resolveProviderUrl('https://example.com/api', '')
+      expect(url).toBe('https://example.com/api')
+    })
   })
 
   describe('extractErrorMessage', () => {

@@ -24,6 +24,19 @@ import {
   type OfficialV4Config,
 } from '../src/config/pure.js'
 import { asProviderConfigId } from '../src/domain/ids.js'
+import { en, zh } from '../src/client/locales.js'
+
+describe('settings localization', () => {
+  it('provides matching non-empty English and Chinese labels', () => {
+    expect(Object.keys(zh).sort()).toEqual(Object.keys(en).sort())
+    for (const dictionary of [en, zh]) {
+      for (const [key, value] of Object.entries(dictionary)) {
+        expect(value.trim(), key).not.toBe('')
+        expect(value, key).not.toBe(key)
+      }
+    }
+  })
+})
 
 describe('Client helpers and state transitions', () => {
   it('updates nested section in config draft without mutating original', () => {

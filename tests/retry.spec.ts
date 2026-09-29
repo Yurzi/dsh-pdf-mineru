@@ -379,6 +379,22 @@ describe('Retry Utility (src/providers/retry.ts)', () => {
       expect(fn).not.toHaveBeenCalled()
     })
 
+    it('rethrows sleep error when sleep fails without signal abort', async () => {
+      const controller = new AbortController()
+      await expect(
+        executeWithRetry({
+          provider: 'official-v4',
+          operation: 'presigned-put',
+          signal: controller.signal,
+          retryOptions: {
+            maxRetries: 2,
+            sleep: async () => { throw new Error('custom sleep error') },
+          },
+          fn: async () => { throw new MinerUError(failure('UPLOAD_FAILED', 'error', true)) },
+        }),
+      ).rejects.toThrow('custom sleep error')
+    })
+
     it('aborts immediately and throws CANCELLED when caller aborts during backoff delay', async () => {
       const controller = new AbortController()
       let attempts = 0

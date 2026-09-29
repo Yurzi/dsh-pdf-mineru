@@ -12,9 +12,11 @@ vi.mock('@deepseek-ai/dsh-tools', async (importOriginal) => {
 })
 
 import {
+  parseReadInput,
   registerTools,
   renderResult,
 } from '../src/tools.js'
+import { formatResultProse, formatSingleSummaryProse } from '../src/service/result-presenter.js'
 import type { Context } from '@deepseek-ai/cordis'
 import { JobId, type JobSpec, type JobOutcome, type JobHandle } from '@deepseek-ai/dsh-jobs'
 import type {
@@ -1167,6 +1169,22 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       }
     })
 
+    it('requires one source, rejects unknown arguments, and accepts cursor-only continuation', () => {
+      expect(() => parseReadInput({ pages: 1 })).toThrow(/file_path.*required/)
+      expect(() => parseReadInput({ file_path: '/tmp/a.pdf', unexpected: true })).toThrow(/Unsupported parameter/)
+      expect(parseReadInput({ file_path: '/tmp/a.pdf' }).input).toEqual({ file_path: '/tmp/a.pdf', inline_images: true })
+      const cursor = cursorForRemainder('mr_result', undefined, new Set(['all']), 4, { inline_images: false })
+      expect(parseReadInput({ file_path: '/tmp/a.pdf', cursor }).input).toEqual({ file_path: '/tmp/a.pdf', inline_images: false, cursor })
+      expect(parseReadInput({ file_path: '/tmp/a.pdf', cursor, inline_images: true }).input).toEqual({ file_path: '/tmp/a.pdf', inline_images: true, cursor })
+      expect(() => parseReadInput({ file_path: '/tmp/a.pdf', cursor: 'opaque' })).toThrow(/cursor/)
+      for (const cursor of [null, '', '   ']) {
+        expect(() => parseReadInput({ file_path: '/tmp/a.pdf', cursor })).toThrow(/cursor must be a non-empty string/)
+      }
+      for (const selection of [{ pages: 1 }, { focus: 'text' }, { focus: ['text', 'table'] }]) {
+        expect(() => parseReadInput({ file_path: '/tmp/a.pdf', cursor, ...selection })).toThrow(/must be omitted/)
+      }
+    })
+
     it('renders single completed result with preview truncation and limit clamping', () => {
       const resultData: ResultView = {
         state: 'completed',
@@ -1532,6 +1550,35 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
       const text = rendered[0]?.text ?? ''
       expect(text).not.toContain('Document Outline')
       expect(text).toContain('Status: Content complete. Selected parsed text complete across this and preceding chunks; not a guarantee of OCR fidelity or visual coverage.')
+    })
+
+    it('omits unknown heading coordinates from both Native presenters', () => {
+      const toc = [{ level: 1, title: 'Title without a location' }]
+      const view: ResultView = {
+        state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_test',
+        files: [{ file_id: 'mf_test', name: 'document.pdf', artifacts: [] }],
+        content_status: 'partial', markdown_content: 'First chunk',
+        cursor: cursorForRemainder('mr_test', undefined, new Set(['all']), 11),
+        manifest_path: '/cache/m.json', output_limit_chars: 2048,
+        summary: { toc }, toc,
+      }
+      for (const render of [formatResultProse, formatSingleSummaryProse]) {
+        expect(render(view)).toContain('Title without a location')
+        expect(render(view)).not.toMatch(/line undefined|line 0/)
+      }
+    })
+
+    it.each(['complete', 'not_requested'] as const)('does not advertise continuation for %s output with a null cursor', content_status => {
+      const view: ResultView = {
+        state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_test',
+        files: [{ file_id: 'mf_test', name: 'document.pdf', artifacts: [] }],
+        content_status, cursor: null,
+        ...(content_status === 'complete' ? { markdown_content: 'Full selected text' } : {}),
+        manifest_path: '/cache/m.json', output_limit_chars: 2048,
+      }
+      const prose = formatResultProse(view)
+      expect(prose).not.toContain('Continue with')
+      expect(prose).not.toContain('cursor:')
     })
   })
 

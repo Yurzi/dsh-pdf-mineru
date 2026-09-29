@@ -860,40 +860,17 @@ describe('MinerUService direct parsing', () => {
       expect(headings[24]).toEqual({ level: 2, title: 'Section 25', line: 25 })
     })
 
-    it('preserves all heading levels for resumable outline delivery', () => {
+    it('preserves all heading levels beyond old summary caps without truncation', () => {
       const lines: string[] = []
-      // 10 H1, 10 H2, 10 H4 -> total 30
-      for (let i = 1; i <= 10; i++) lines.push(`# Title ${i}`)
+      for (let i = 1; i <= 30; i++) lines.push(`# Title ${i}`)
       for (let i = 1; i <= 10; i++) lines.push(`## Subtitle ${i}`)
       for (let i = 1; i <= 10; i++) lines.push(`#### LowLevel ${i}`)
 
       const headings = extractMarkdownHeadings(lines.join('\n'))
-      expect(headings).toHaveLength(30)
-      expect(headings.filter(h => h.level === 4)).toHaveLength(10)
-      expect(headings[0]!.title).toBe('Title 1')
-      expect(headings[19]!.title).toBe('Subtitle 10')
-    })
-
-    it('preserves high-level headings beyond the old summary cap', () => {
-      const lines: string[] = []
-      // 30 H1 headings
-      for (let i = 1; i <= 30; i++) lines.push(`# Title ${i}`)
-
-      const headings = extractMarkdownHeadings(lines.join('\n'))
-      expect(headings).toHaveLength(30)
+      expect(headings).toHaveLength(50)
       expect(headings[0]!.title).toBe('Title 1')
       expect(headings[19]!.title).toBe('Title 20')
-    })
-
-    it('preserves low-level headings beyond the old summary cap', () => {
-      const lines: string[] = []
-      // 30 H4 headings
-      for (let i = 1; i <= 30; i++) lines.push(`#### LowLevel ${i}`)
-
-      const headings = extractMarkdownHeadings(lines.join('\n'))
-      expect(headings).toHaveLength(30)
-      expect(headings[0]!.title).toBe('LowLevel 1')
-      expect(headings[19]!.title).toBe('LowLevel 20')
+      expect(headings.filter(h => h.level === 4)).toHaveLength(10)
     })
   })
 

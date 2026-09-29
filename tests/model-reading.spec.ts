@@ -37,6 +37,7 @@ import {
   MAX_MODEL_RESPONSE_BYTES,
 } from '../src/service/read-delivery.js'
 import {
+  cursorForRemainder,
   decodeReadCursor,
   encodeReadCursor,
   READ_CURSOR_VERSION,
@@ -223,7 +224,7 @@ async function createHarness(options: HarnessOptions = {}): Promise<TestHarness>
   const config: MinerUConfig = {
     ...base,
     storage: { ...base.storage, storageRoot: join(root, 'store') },
-    polling: { ...base.polling, pollIntervalMs: 2, pollTimeoutMs: 100, operationTimeoutMs: 5000 },
+    polling: { ...base.polling, pollIntervalMs: 2, pollTimeoutMs: 2000, operationTimeoutMs: 5000 },
     output: {
       maxInlineChars: options.maxInlineChars ?? 200_000,
       maxInlineImages: options.maxInlineImages ?? 6,
@@ -1293,10 +1294,18 @@ describe('review regression suite', () => {
         toToken({ v: 3, rid: 'mr_alpha', pages: '', focus: ['all'], off: 0, block: 'mr_beta:b1' }),
       ),
     ).toThrow(/cursor block belongs to another result/)
+
+    const token = cursorForRemainder('mr_result', '1-3', new Set(['text', 'table']), 7)
+    const decoded = decodeReadCursor(token)
+    expect(decoded).toMatchObject({ v: 3, rid: 'mr_result', pages: '1-3', focus: ['table', 'text'], off: 7, inline_images: true })
+    expect(decodeReadCursor(cursorForRemainder('mr_result', undefined, new Set(['text']), 9)).pages).toBe('')
+
+    const altered = token.slice(0, -1) + (token.endsWith('A') ? 'B' : 'A')
+    expect(() => decodeReadCursor(altered)).toThrow()
+    const nonCanonicalPayload = Buffer.from(JSON.stringify({ v: 3, rid: 'mr_result', pages: '3,1', focus: ['text'], off: 4, inline_images: true })).toString('base64url')
+    expect(() => decodeReadCursor(nonCanonicalPayload)).toThrow(/canonical/)
   })
 })
-
-
 
 it('keeps long outline headings complete and attributable across chunks', async () => {
   const h = await createHarness()

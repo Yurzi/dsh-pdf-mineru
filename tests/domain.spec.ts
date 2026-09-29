@@ -5,7 +5,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { asCacheKey, asSessionId, createFileId } from '../src/domain/ids.js'
 import { MinerUError, sanitizeDiagnostic } from '../src/domain/errors.js'
 import { CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, narrowPageSelection, normalizeFocusSelection, normalizePageSelection, type CanonicalParseRequest, type ParseDefaults, type ParseRequestInput } from '../src/domain/request.js'
-import { computeCacheKey } from '../src/domain/cache-key.js'
+import { canonicalJson, computeCacheKey } from '../src/domain/cache-key.js'
+import { formatPageOutOfRangeMessage } from '../src/service/result-presenter.js'
 import { RequestNormalizer, assertSourcesUnchanged, normalizePages } from '../src/service/request-normalizer.js'
 
 const roots: string[] = []
@@ -95,7 +96,31 @@ describe('request normalization', () => {
       outOfRange: [99, 100],
       fullyOutOfRange: true,
     })
+    expect(narrowPageSelection(new Set([50, 60]), 3)).toMatchObject({ pagesSet: new Set(), pagesLabel: '', fullyOutOfRange: true, outOfRange: [50, 60] })
+    expect(narrowPageSelection(new Set([2, 60]), 3)).toMatchObject({ pagesSet: new Set([2]), pagesLabel: '2', fullyOutOfRange: false, outOfRange: [60] })
   })
+
+  it('formats model-facing out-of-range error message with valid page range', () => {
+    expect(formatPageOutOfRangeMessage(3)).toBe(
+      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range (valid: 1-3, total pages: 3)'
+    )
+    expect(formatPageOutOfRangeMessage(1)).toBe(
+      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range (valid: 1, total pages: 1)'
+    )
+    expect(formatPageOutOfRangeMessage(50)).toBe(
+      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range (valid: 1-50, total pages: 50)'
+    )
+    expect(formatPageOutOfRangeMessage(undefined)).toBe(
+      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range'
+    )
+    expect(formatPageOutOfRangeMessage(0)).toBe(
+      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range'
+    )
+    expect(formatPageOutOfRangeMessage(-5)).toBe(
+      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range'
+    )
+  })
+
 
   it('normalizes focus selection for single and array formats', () => {
     expect(normalizeFocusSelection('table')).toEqual(new Set(['table']))
@@ -166,6 +191,36 @@ describe('cache key', () => {
     expect(computeCacheKey(base, base.files[0]!, 'provider:v1', { cacheKey: 2 })).not.toBe(initial)
     expect(computeCacheKey(base, base.files[0]!, 'provider:v1', { result: 2 })).not.toBe(initial)
   })
+
+  it.each([
+    ['auto', '71c1ee24770042d2b931a918ddddbc052d28ac77ecd4a0f061e06787d8b70777'],
+    ['txt', 'ffeaac8ba9e290669abecc4b71a7a1fd6f34cf7fa80d815166f5552dfe916a2d'],
+  ] as const)('preserves the %s golden cache key', (method, expected) => {
+    const file = { fileId: createFileId('a'.repeat(64)), name: 'fixture.pdf', bytes: 10, sha256: 'a'.repeat(64) }
+    const req: CanonicalParseRequest = {
+      schemaVersion: 1, files: [file], requiredArtifacts: ['markdown'],
+      semantics: { model: 'pipeline', ocr: false, parseMethod: method, language: 'ch', formula: true, table: true },
+    }
+    expect(computeCacheKey(req, file, 'self-hosted-v2:golden')).toBe(expected)
+  })
+
+  it('preserves NFC normalization, sorted keys and negative zero', () => {
+    expect(canonicalJson({ z: -0, a: 'e\u0301' })).toBe('{"a":"é","z":0}')
+    expect(canonicalJson({ a: 'é', z: 0 })).toBe(canonicalJson({ z: -0, a: 'e\u0301' }))
+  })
+
+  it('accepts own properties that resemble Object.prototype without dropping them', () => {
+    const value: unknown = JSON.parse('{"__proto__":{"safe":true},"constructor":1,"toString":2}')
+    expect(canonicalJson(value)).toBe('{"__proto__":{"safe":true},"constructor":1,"toString":2}')
+    expect(Object.prototype).not.toHaveProperty('safe')
+  })
+
+  it('still rejects ambiguous normalized keys and non-JSON values', () => {
+    expect(() => canonicalJson({ 'é': 1, 'e\u0301': 2 })).toThrow('collision')
+    expect(() => canonicalJson({ value: undefined })).toThrow('undefined')
+    expect(() => canonicalJson(Infinity)).toThrow('non-finite')
+  })
+
 })
 
 describe('identifier and diagnostic safety', () => {
