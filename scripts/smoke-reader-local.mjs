@@ -82,7 +82,15 @@ if (!file || !Number.isSafeInteger(page) || page < 1 || positional.length > 3
       } }
       return undefined
     },
-    inject: () => noop, effect: () => noop, on: () => noop,
+    // The full apply chain captures attachments through its optional injection,
+    // not ctx.get at tool invocation. Keep Web RPC absent in this offline fixture.
+    inject(dependencies, callback) {
+      if (dependencies.length === 1 && dependencies[0] === 'attachments') {
+        return callback({ attachments: this.get('attachments') })
+      }
+      return noop
+    },
+    effect: () => noop, on: () => noop,
     logger: { debug: noop, info: noop, warn: noop, error: noop },
   }
   const nativeFetch = globalThis.fetch

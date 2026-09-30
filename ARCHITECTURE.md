@@ -133,7 +133,7 @@ SharedOperationRegistry 只在同一进程内，按 CacheKey 和 Provider author
 
 storageRoot 与 limits.* 在启动时固定。运行中保存不同值会被拒绝；修改宿主配置并重启才生效。其余允许的 live 更新只影响之后的执行。数字输入保留临时空白／非法草稿，失焦后恢复或收敛，不在每次击键时强行覆盖。
 
-DSH 0.2.0-rc.1 的 `SettingsForms` 不再提供 `register/get/watch`。插件使用发布的 settings 类型，通过 `configure({ auto: false }, ctx.fiber)` 关闭自动表单；Config 为可热更新字段声明 `.volatile()`，每次操作读取 `.get()` 快照。`storageRoot`、`retainSources` 和 `limits` 为普通 Config 字段，不经 settings 表单修改。Cordis 的 Standard Schema 校验入口调用完整领域校验，确保 ConfigEditor 在持久化前拒绝无效配置。自定义 RPC 按当前 `ctx.fiber.entry.options.id` 调用 `settings.replace`，提交完整可热更新值，避免将显式默认值误复位为 profile 继承值；普通字段仍由宿主保留。启动只规范化 Provider-based v1，不执行配置写回或旧设置瘦身，避免激活期间触发 Loader 重载；旧 settings 文档由 DSH 导入。
+DSH 0.2.0-rc.2 的 `SettingsForms` 不再提供 `register/get/watch`。插件使用发布的 settings 类型，通过 `configure({ auto: false }, ctx.fiber)` 关闭自动表单；Config 为可热更新字段声明 `.volatile()`，每次操作读取 `.get()` 快照。`storageRoot`、`retainSources` 和 `limits` 为普通 Config 字段，不经 settings 表单修改。Cordis 的 Standard Schema 校验入口调用完整领域校验，确保 ConfigEditor 在持久化前拒绝无效配置。自定义 RPC 按当前 `ctx.fiber.entry.options.id` 调用 `settings.replace`，提交完整可热更新值，避免将显式默认值误复位为 profile 继承值；普通字段仍由宿主保留。启动只规范化 Provider-based v1，不执行配置写回或旧设置瘦身，避免激活期间触发 Loader 重载；旧 settings 文档由 DSH 导入。
 
 客户端通过上游 `plugins.bundle.config` keyed slot 注册配置页，key 为 npm 包名 `dsh-pdf-mineru`；入口位于 Plugins 的 bundle 详情页，不再注册 `settings.section`。使用 `dsh-client-ui-plugin-manager/client` 的公开类型与 slot 声明生命周期，不在运行时导入管理器组件；bundle 页面只提供 `view: page`，不依赖可选的通用 `form`。配置读写与维护仍由现有 loopback RPC 和显式保存流程负责。
 
@@ -207,11 +207,12 @@ Self-hosted v2 使用 multipart POST /tasks、GET /tasks/{taskId} 与结果端�
 
 ## 8. 运维与验证
 
-以 DSH `v0.2.0-rc.1` 为最低宿主基线，不保留旧 JobSpec／嵌套工具消息兼容分支。开发 SDK 固定为该精确版本，peer 下限与 engines.dsh 同步；PTC 使用已更名的 `dsh-ptc-runtime`，仍由宿主生成 SDK、执行调度与处理多模态保留。客户端使用发布的 Locale／Connection／Remote／SlotRegistry 与 slot props 类型，不以本地模块声明覆盖上游契约。Provider-aware 草稿设置与破坏性维护确认继续由插件页面负责，不改成自动保存。RPC 在 `connection` 与 `webServer` 同时可用的注入作用域注册；缺少任一服务时不影响两个模型工具。`registerLoopbackRpc` 使用调用方局部 Context 元数据提供带 Host 回环检查的路由注册器，解决 Cordis 服务 getter 将依赖查找指向 Connection 提供方的问题；不修改全局服务。原生 Connection 继续负责认证、Origin 检查、消息封装和取消，插件不依赖已不受支持的 `authority` 参数。原生 RPC 的 operator PeerScope 由 Connection 认证并传递，不取代本插件的回环维护边界。错误封装遵循宿主的 `code`、`message`、`details` 契约。
+以 DSH `v0.2.0-rc.2` 为最低宿主基线，不保留旧 JobSpec／嵌套工具消息兼容分支。开发 SDK 固定为该精确版本，peer 下限与 engines.dsh 同步；PTC 使用已更名的 `dsh-ptc-runtime`，仍由宿主生成 SDK、执行调度与处理多模态保留。客户端使用发布的 Locale／Connection／Remote／SlotRegistry 与 slot props 类型，不以本地模块声明覆盖上游契约。Provider-aware 草稿设置与破坏性维护确认继续由插件页面负责，不改成自动保存。RPC 在 `connection` 与 `webServer` 同时可用的注入作用域注册；缺少任一服务时不影响两个模型工具。`registerLoopbackRpc` 使用调用方局部 Context 元数据提供带 Host 回环检查的路由注册器，解决 Cordis 服务 getter 将依赖查找指向 Connection 提供方的问题；不修改全局服务。原生 Connection 继续负责认证、Origin 检查、消息封装和取消，插件不依赖已不受支持的 `authority` 参数。原生 RPC 的 operator PeerScope 由 Connection 认证并传递，不取代本插件的回环维护边界。错误封装遵循宿主的 `code`、`message`、`details` 契约。
 
-### DSH 0.2 集成边界
+### DSH 0.2.0-rc.2 集成边界
 
-- `0.2.0-rc.1` 保留本插件使用的 Jobs、tools、attachments、Connection、SettingsForms 和 `plugins.bundle.config` 契约；运行时 DSH peers 使用 `^0.2.0-rc.1`，开发依赖固定 `0.2.0-rc.1`。此 peer 范围不承诺兼容未来 0.3，也不自动接受不同版本核心的预发行版。
+- `0.2.0-rc.2` 保留本插件使用的 Jobs、tools、attachments、Connection、SettingsForms 和 `plugins.bundle.config` 契约；运行时 DSH peers 使用 `^0.2.0-rc.2`，开发依赖固定 `0.2.0-rc.2`。此 peer 范围不承诺兼容未来 0.3，也不自动接受不同版本核心的预发行版。
+- rc.2 的限时问答、定时提醒 framing、pi-ai 模型目录和 OpenInAppAction props 变化不要求修改 MinerU：插件不调用问答／定时工具、不绑定 pi-ai 模型 ID、不复用这些变更的 UI props 或自定义 Gateway。图片能力仍读取宿主当前模型描述；不将具体模型 ID 或问答等待行为写入插件协议。Desktop 登录 Shell 环境和 Electron Node 的原生依赖兼容性需在目标平台单独验收，不能由 Linux 构建推断。
 - ConfigEditor 改进未覆盖 config 时的组合配置继承；仍由 `settings.replace` 保存完整 live 值，不在插件中复制宿主继承算法。回归测试覆盖仅修改 entry 非 config 选项、显式默认值覆盖、稀疏配置和重启恢复。
 - 失败 step 的缺失工具结果由宿主 `ToolCallRecovery` 补齐。插件只通过 `defineTool` 返回结果或抛出错误，不写入原始工具会话事件，也不自行重试结果未知的任务。
 - 定时功能从默认 Web bundle 拆出不影响 MinerU：插件不引用 `schedule`／`time-context` 条目，异步完成继续由原生 JobRegistry 与任务控制器负责，无需安装 schedule bundle。

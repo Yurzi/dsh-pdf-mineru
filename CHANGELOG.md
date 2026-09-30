@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.5
+
+### Changed
+
+- Raise the minimum DSH host to 0.2.0-rc.2 and runtime DSH peers to ^0.2.0-rc.2; pin every development DSH SDK package and workspace release-age exclusion to the exact rc.2 baseline and refresh the lockfile. Cordis, Cosmokit and Schemastery retain the unchanged upstream minimum versions.
+- Align package-contract, native-job and loopback RPC regressions with the published rc.2 SDK, and guard workspace release-age exclusions against baseline drift.
+- Document rc.2 compatibility boundaries and the uninstall/reinstall upgrade flow, including Desktop profile initialization and platform-specific native renderer verification.
+
+### Fixed
+
+- Restore the offline local/installed-package page smoke fixture's optional attachment injection, so the complete plugin activation chain can exercise both renderers without weakening capability checks; add a built-bundle regression.
+
+Provider/config/cache formats, cursor v3, index v2, native-job semantics and tool arguments are unchanged; existing parsed caches require no migration or re-upload. Upgrade the DSH host before installing this plugin version.
+
 ## 0.1.4
 
 ### Changed

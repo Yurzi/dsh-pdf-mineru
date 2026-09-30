@@ -1,6 +1,6 @@
 # 面向模型的 PDF 阅读指南
 
-适用于 dsh-pdf-mineru 0.1.4（最低 DSH 0.2.0-rc.1）：索引版本2、阅读协议/游标版本3。安装与Provider配置见[README](../README.md)，实现和安全约束见[ARCHITECTURE](../ARCHITECTURE.md)，历史变化见[CHANGELOG](../CHANGELOG.md)。
+适用于 dsh-pdf-mineru 0.1.5（最低 DSH 0.2.0-rc.2）：索引版本2、阅读协议/游标版本3。安装与Provider配置见[README](../README.md)，实现和安全约束见[ARCHITECTURE](../ARCHITECTURE.md)，历史变化见[CHANGELOG](../CHANGELOG.md)。
 
 ## 1. 推荐工作流
 
@@ -109,7 +109,7 @@
 
 ### 升级规则
 
-0.0.14起使用游标v3，0.1.4保持游标v3及索引v2；旧v1/v2 token明确过期，需要不带cursor重新读取。**解析缓存无需迁移或重新上传。**
+0.0.14起使用游标v3，0.1.5保持游标v3及索引v2；旧v1/v2 token明确过期，需要不带cursor重新读取。**解析缓存无需迁移或重新上传。**
 
 游标是有界、无签名、无服务端会话状态的定位token，不是授权凭证。它绑定结果、文本投影、产物摘要、索引/阅读版本及选择。源文件仍须存在并保持一致。
 
