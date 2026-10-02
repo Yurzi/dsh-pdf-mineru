@@ -62,8 +62,12 @@ export interface ProviderSubmittedFile {
     readonly fileId: MinerUFileId;
     readonly name: string;
 }
+/** Upstream self-hosted dialect selected for one submission. */
+export type SelfHostedProtocol = 'legacy' | 'v1';
 export type ProviderJobRef = {
     readonly provider: 'self-hosted-v2';
+    /** MinerU 4.x speaks the V1 API; earlier servers use the legacy task endpoints. */
+    readonly protocol: SelfHostedProtocol;
     readonly taskId: string;
     readonly files: readonly ProviderSubmittedFile[];
 } | {

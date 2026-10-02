@@ -486,8 +486,9 @@ describe('SelfHostedV2Provider', () => {
 
       // Verify ProviderSubmission structure
       expect(submission.ref.provider).toBe('self-hosted-v2')
-      expect(Object.keys(submission.ref).sort()).toEqual(['files', 'provider', 'taskId'])
+      expect(Object.keys(submission.ref).sort()).toEqual(['files', 'protocol', 'provider', 'taskId'])
       if (submission.ref.provider === 'self-hosted-v2') {
+        expect(submission.ref.protocol).toBe('legacy')
         expect(submission.ref.taskId).toBe('task_abc_123')
         expect(submission.ref.files).toEqual([
           { dataId: `data_${file.fileId}`, fileId: file.fileId, name: 'report.pdf' },

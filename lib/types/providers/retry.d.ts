@@ -1,5 +1,5 @@
 import type { MinerUProviderId } from '../domain/errors.js';
-export type ProviderRetryOperation = 'probe' | 'submit' | 'inspect' | 'collect' | 'api-json' | 'presigned-put' | 'cdn-download';
+export type ProviderRetryOperation = 'probe' | 'submit' | 'inspect' | 'collect' | 'api-json' | 'presigned-put' | 'upload-put' | 'cdn-download' | 'result-download';
 export interface ProviderRetryEvent {
     readonly provider: MinerUProviderId;
     readonly operation: ProviderRetryOperation;

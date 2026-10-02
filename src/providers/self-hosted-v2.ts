@@ -38,10 +38,13 @@ import {
   type ProviderRetryOptions,
   type ProviderSubmission,
   type ProviderSubmittedFile,
+  type SelfHostedProtocol,
   validateProviderCapabilities,
 } from './provider.js'
 import { assertSourcesUnchanged } from '../service/request-normalizer.js'
+import type { SelfHostedTier } from '../config/pure.js'
 import { ProviderHttpClient } from './http-client.js'
+import { SelfHostedV1ApiAdapter, type SelfHostedV1HealthResponse } from './self-hosted-v1-api.js'
 
 export interface SelfHostedV2ProviderConfig {
   readonly id: ProviderConfigId
@@ -49,6 +52,8 @@ export interface SelfHostedV2ProviderConfig {
   readonly baseURL: string
   readonly apiKeyEnv?: string
   readonly modelMap: Readonly<Partial<Record<MinerUModel, string>>>
+  /** MinerU 4.0+ V1 API parse tier; absent keeps the server default. */
+  readonly tier?: SelfHostedTier
   readonly configuredVersion?: string
   readonly allowInsecureHttp?: boolean
 }
@@ -209,6 +214,7 @@ export class SelfHostedV2Provider implements MinerUProvider {
   private readonly parsedBaseUrl: URL
   private readonly retryOptions: ProviderRetryOptions
   private readonly client: ProviderHttpClient
+  private readonly v1Api: SelfHostedV1ApiAdapter
 
   constructor(config: SelfHostedV2ProviderConfig, options?: ProviderOptions) {
     asProviderConfigId(config.id)
@@ -220,6 +226,13 @@ export class SelfHostedV2Provider implements MinerUProvider {
       provider: 'self-hosted-v2',
       defaultRetry: this.retryOptions,
       providerLabel: 'MinerU server',
+    })
+    this.v1Api = new SelfHostedV1ApiAdapter({
+      client: this.client,
+      baseUrl: this.parsedBaseUrl,
+      retry: this.retryOptions,
+      modelMap: config.modelMap,
+      ...(config.tier === undefined ? {} : { tier: config.tier }),
     })
 
     const supportedModels = (['pipeline', 'vlm'] as const).filter(
@@ -239,6 +252,24 @@ export class SelfHostedV2Provider implements MinerUProvider {
     }
   }
 
+  /**
+   * Detection endpoint for the MinerU 4.x V1 API. `/v1/health` is public; when it does not
+   * answer, the endpoint is treated as an earlier self-hosted server using the legacy
+   * task endpoints.
+   */
+  private async detectProtocol(context: ProviderCallContext): Promise<SelfHostedProtocol> {
+    try {
+      await this.v1Api.health(context)
+      return 'v1'
+    } catch (error: unknown) {
+      if (context.signal.aborted) {
+        throw new MinerUError(failure('CANCELLED', 'Protocol detection was cancelled', true))
+      }
+      if (error instanceof MinerUError && error.failure.code === 'CANCELLED') throw error
+      return 'legacy'
+    }
+  }
+
   async compatibilityKey(
     request: CanonicalParseRequest,
     context: ProviderCompatibilityContext,
@@ -255,6 +286,22 @@ export class SelfHostedV2Provider implements MinerUProvider {
   }
 
   async probe(context: ProviderCallContext): Promise<ProviderProbeResult> {
+    // MinerU 4.x answers /v1/health (public). When it does not, the endpoint is an
+    // earlier self-hosted server and the legacy health endpoint decides the result.
+    let health: SelfHostedV1HealthResponse
+    try {
+      health = await this.v1Api.health(context)
+    } catch (error: unknown) {
+      if (context.signal.aborted) {
+        throw new MinerUError(failure('CANCELLED', 'Probe operation was cancelled', true))
+      }
+      if (error instanceof MinerUError && error.failure.code === 'CANCELLED') throw error
+      return await this.probeLegacy(context)
+    }
+    return await this.v1Api.probe(context, health)
+  }
+
+  private async probeLegacy(context: ProviderCallContext): Promise<ProviderProbeResult> {
     try {
       const data = await this.requestJson<SelfHostedHealthResponse>(
         'GET',
@@ -308,6 +355,20 @@ export class SelfHostedV2Provider implements MinerUProvider {
   ): Promise<ProviderSubmission> {
     context.signal.throwIfAborted()
     validateProviderCapabilities(request, this.capabilities)
+
+    const protocol = await this.detectProtocol(context)
+    if (protocol === 'v1') {
+      return await this.v1Api.submit(request, sources, context)
+    }
+    return await this.submitLegacy(request, sources, context)
+  }
+
+  private async submitLegacy(
+    request: CanonicalParseRequest,
+    sources: readonly PreparedSourceFile[],
+    context: ProviderCallContext,
+  ): Promise<ProviderSubmission> {
+    context.signal.throwIfAborted()
 
     const backend = this.config.modelMap[request.semantics.model]
     if (typeof backend !== 'string' || backend.trim() === '') {
@@ -384,6 +445,7 @@ export class SelfHostedV2Provider implements MinerUProvider {
 
     const ref: ProviderJobRef = {
       provider: 'self-hosted-v2',
+      protocol: 'legacy',
       taskId: data.task_id,
       files: submittedFiles,
     }
@@ -409,6 +471,9 @@ export class SelfHostedV2Provider implements MinerUProvider {
     context.signal.throwIfAborted()
     if (ref.provider !== 'self-hosted-v2') {
       throw new MinerUError(failure('INVALID_REQUEST', `Unsupported provider ref "${ref.provider}" for SelfHostedV2Provider`))
+    }
+    if (ref.protocol === 'v1') {
+      return await this.v1Api.inspect(ref, context)
     }
 
     const data = await this.requestJson<SelfHostedTaskSubmitResponse>(
@@ -449,6 +514,9 @@ export class SelfHostedV2Provider implements MinerUProvider {
     context.signal.throwIfAborted()
     if (ref.provider !== 'self-hosted-v2') {
       throw new MinerUError(failure('INVALID_REQUEST', `Unsupported provider ref "${ref.provider}" for SelfHostedV2Provider`))
+    }
+    if (ref.protocol === 'v1') {
+      return await this.v1Api.collect(ref, request, sink, context)
     }
 
     const data = await this.requestJson<SelfHostedTaskResultResponse>(

@@ -34,6 +34,7 @@ const ProviderSchema = z.union([
     baseURL: z.string(),
     apiKeyEnv: z.string().role('credential-ref'),
     modelMap: z.object({ pipeline: z.string(), vlm: z.string() }),
+    tier: z.union(['flash', 'basic', 'standard', 'advanced']),
     configuredVersion: z.string(),
     allowInsecureHttp: z.boolean(),
   }),

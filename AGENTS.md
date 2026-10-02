@@ -72,7 +72,8 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 
 - `src/domain/*`: IDs, requests, provider states, results, failures, strict boundary parsers.
 - `src/providers/provider.ts`, `src/providers/retry.ts`: shared Provider/ArtifactSink contracts and bounded retry policy.
-- `src/providers/self-hosted-v2.ts`: streaming multipart v2 adapter.
+- `src/providers/self-hosted-v2.ts`: self-hosted adapter; detects MinerU 4.x from `GET /v1/health` and otherwise uses the legacy multipart `/tasks` protocol. `provider.tier` selects the V1 parse tier; `modelMap` stays the legacy backend map.
+- `src/providers/self-hosted-v1-api.ts`: MinerU 4.x V1 API adapter (upload sessions, parse jobs, bounded result-archive download, canonical artifact normalization).
 - `src/providers/official-v4.ts`: official API, bare PUT, status, and collection adapter.
 - `src/providers/safe-zip.ts`: bounded ZIP scanner/extractor.
 - `src/storage/*`: validated paths, process lock, ResultRepository, staging sink, and privileged maintenance service.

@@ -12,10 +12,12 @@ import {
   MAX_INLINE_IMAGE_BUDGET,
   MIN_INLINE_IMAGE_BUDGET,
   MINERU_CONFIG_SCHEMA_VERSION,
+  SELF_HOSTED_TIERS,
   defaultProviderConfig,
   type MinerUConfig,
   type OfficialV4Config,
   type ProviderConfig,
+  type SelfHostedTier,
   type SelfHostedV2Config,
 } from './config/pure.js'
 
@@ -56,7 +58,7 @@ const ALLOWED_OFFICIAL_PROVIDER_KEYS = new Set([
   'id', 'type', 'baseURL', 'apiKeyEnv', 'models', 'configuredVersion',
 ])
 const ALLOWED_SELF_HOSTED_PROVIDER_KEYS = new Set([
-  'id', 'type', 'baseURL', 'apiKeyEnv', 'modelMap', 'configuredVersion', 'allowInsecureHttp',
+  'id', 'type', 'baseURL', 'apiKeyEnv', 'modelMap', 'tier', 'configuredVersion', 'allowInsecureHttp',
 ])
 const ALLOWED_MODEL_MAP_KEYS = new Set(['pipeline', 'vlm'])
 const ALLOWED_DEFAULTS_KEYS = new Set(['model', 'ocr', 'parseMethod', 'language', 'formula', 'table'])
@@ -195,12 +197,20 @@ function parseProvider(value: unknown): ProviderConfig {
   const pipeline = text(map.pipeline, '', 'modelMap.pipeline')
   const vlm = text(map.vlm, '', 'modelMap.vlm')
   if (pipeline === vlm) throw new TypeError('provider modelMap backends must be distinct')
+  let tier: SelfHostedTier | undefined
+  if (input.tier !== undefined && input.tier !== null) {
+    if (typeof input.tier !== 'string' || !(SELF_HOSTED_TIERS as readonly string[]).includes(input.tier)) {
+      throw new TypeError(`provider.tier must be one of ${SELF_HOSTED_TIERS.join(', ')}`)
+    }
+    tier = input.tier as SelfHostedTier
+  }
   const selfHosted: SelfHostedV2Config = {
     id,
     type: 'self-hosted-v2',
     baseURL: baseUrl(input.baseURL, 'http://localhost:18000', allowInsecureHttp, 'provider.baseURL'),
     apiKeyEnv: credentialRef(input.apiKeyEnv, undefined, false),
     modelMap: { pipeline, vlm },
+    ...(tier === undefined ? {} : { tier }),
     ...(input.configuredVersion === undefined ? {} : { configuredVersion: text(input.configuredVersion, '', 'configuredVersion') }),
     allowInsecureHttp,
   }
