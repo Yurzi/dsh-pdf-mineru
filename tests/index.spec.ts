@@ -290,6 +290,16 @@ describe('plugin composition lifecycle', () => {
       ...base,
       providers: [{ ...base.providers[0], type: 'unsupported-provider' }],
     })).toThrow()
+
+    const withTier = validate({
+      ...base,
+      providers: [{ ...base.providers[0], tier: 'standard' }, base.providers[1]],
+    }) as unknown as { providers: { get(): typeof base.providers } }
+    expect(withTier.providers.get()[0]).toMatchObject({ tier: 'standard' })
+    expect(() => validate({
+      ...base,
+      providers: [{ ...base.providers[0], tier: 'fastest' }, base.providers[1]],
+    })).toThrow()
   })
 
   it('allows multiple concurrent plugin instances on the same storageRoot without throwing STORAGE_LOCKED', async () => {

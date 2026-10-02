@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Support the MinerU 4.0+ self-hosted V1 API next to the legacy task endpoints: the self-hosted adapter selects the protocol from `GET /v1/health`, then uses `POST /v1/uploads` + service-provided `upload_url` PUT + `POST /v1/uploads/{id}/complete` + `POST /v1/parse/jobs`, polling `GET /v1/parse/jobs/{jobId}` and downloading `GET /v1/files/{fileId}/content`.
+- Add an explicit self-hosted parse tier (`provider.tier`, selectable in the plugin settings page) for the MinerU 4.0+ V1 API; a `modelMap` value that names a tier is still honoured as a fallback so nothing breaks for existing profiles, and the legacy backend map is labelled as a 3.x parameter.
+- Note that MinerU 4.0 removed the language/formula/table request parameters: the V1 API expresses only page range, tier, and OCR mode, so those settings stay server-side while the plugin still keys caches by them.
+
+### Changed
+
+- Canonicalize MinerU 4.x result archives into the existing artifact shapes: `markdown.md`, `middle_json.json`, `structured_content.json`, `model_output.json` and `images/` become the canonical markdown, layout, content-list, model-output and images artifacts, with the V1 `pages[]` page list exposed as `pdf_info[]` and structured content flattened into a content-list array.
+- Send the API key on a V1 upload URL only when it is same-origin with the configured endpoint; retry the byte PUT and result download with a fresh source stream, never the upload/complete/job-creation POSTs.
+
+Provider/config/cache formats, cursor v3, index v2, native-job semantics and tool arguments are unchanged; existing parsed caches require no migration or re-upload. Upgrade `configuredVersion` when a server is upgraded in place to a different MinerU API generation.
+
 ## 0.1.5
 
 ### Changed

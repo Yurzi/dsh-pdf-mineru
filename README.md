@@ -192,16 +192,17 @@ flowchart LR
 - **统一工具分发**：Agent 发起的同步请求（`read_pdf`）直接返回结果，异步长任务（`async_parse_pdf`）交由 DSH 原生 JobRegistry 调度。
 - **缓存复用**：按文件 SHA-256 与解析语义寻址；命中时无需重新提交上游解析，但仍校验本地源文件及产物。
 - **并发请求合并**：同进程内的并发重复请求由 `SharedOperationRegistry` 合并，避免重复向上游提交。
-- **双 Provider 适配**：上游适配自建 FastAPI v2 或官方云 v4，解析产物经校验后原子发布。
+- **双 Provider 适配**：上游适配自建 MinerU（自动识别 4.0+ 的 V1 API 与 3.x 及更早的 `/tasks` 接口）或官方云 v4，解析产物经校验后原子发布。
 
 ## 🔌 Provider 选型对比
 
 | 维度 | 官方云服务 (Official v4) | 本地 / 私有化自建 (Self-hosted v2) |
 | --- | --- | --- |
-| **部署难度** | ⭐ **零门槛**（仅需配置 API Key） | 需自行部署 MinerU FastAPI 服务及模型环境 |
+| **部署难度** | ⭐ **零门槛**（仅需配置 API Key） | 需自行部署 MinerU 服务及模型环境 |
 | **硬件要求** | 无需本地 GPU，云端集群算力支持 | 推荐配备 NVIDIA GPU 显卡 |
 | **数据安全性** | 数据上传至 MinerU 官方云端解析 | 由自建服务的部署位置、网络与安全配置决定 |
-| **支持模型** | 原生支持 `pipeline` 与 `vlm` | 支持 `pipeline`，亦可通过 `modelMap` 映射自建 VLM 引擎 |
+| **上游版本** | 固定官方 v4 接口 | 自动识别：MinerU 4.0+ 走 V1 API（uploads + parse jobs），3.x 及更早走 `/tasks` 接口 |
+| **支持模型** | 原生支持 `pipeline` 与 `vlm` | 支持 `pipeline`，亦可通过 `modelMap` 映射自建 VLM 引擎（3.x）；4.0+ 在设置页选择解析档位 `flash`/`basic`/`standard`/`advanced` |
 | **单文件限制** | 单文件最大 200 MB，最多 200 页 | 取决于自建服务端硬件与配置 |
 | **网络协议** | 强制 HTTPS，安全传输 | 支持 HTTP / HTTPS，本地可配置 `allowInsecureHttp` |
 
@@ -240,7 +241,8 @@ providers:
     type: self-hosted-v2
     baseURL: http://localhost:18000
     allowInsecureHttp: true
-    modelMap:
+    tier: standard            # 仅 MinerU 4.0+（V1 API）；留空使用服务端默认档位
+    modelMap:                 # 仅 MinerU 3.x 及更早的 /tasks 接口
       pipeline: pipeline
       vlm: vlm-engine
 defaults:
@@ -249,6 +251,10 @@ defaults:
   formula: true
   table: true
 ```
+
+> 自托管 Provider 自动识别上游协议：`/v1/health` 可用即 MinerU 4.0+，走 V1 API 并使用 `tier`（`flash` / `basic` / `standard` / `advanced`，留空=服务端默认档位）；否则走旧版 `/tasks`，使用 `modelMap` 中的后端标识，此时 `tier` 被忽略。反向兼容：4.0+ 上 `modelMap` 默认值（`pipeline`、`vlm-engine`）会被忽略，但若其中填的是档位名，则在 `tier` 未设置时作为回退。若在同一地址原地升级 MinerU 大版本，请同时更新 `configuredVersion` 以避免复用旧协议产生的缓存结果。
+>
+> MinerU 4.0 的 V1 API 只接受 `page_range`、`tier` 与 `ocr_mode`：语言、公式、表格开关已从请求参数中移除，与旧版 `/tasks` 接口不同，这些设置需在服务端配置；插件仍按既有语义参与缓存寻址。
 
 ### 3. 存储与限制自定义（可选）
 ```yaml

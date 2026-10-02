@@ -52,6 +52,15 @@ export type MineruKey =
   | 'field.apiKey'
   | 'field.allowInsecureHttp'
   | 'field.configuredVersion'
+  | 'field.tier'
+  | 'field.tier.hint'
+  | 'field.tier.serverDefault'
+  | 'field.tier.opt.flash'
+  | 'field.tier.opt.basic'
+  | 'field.tier.opt.standard'
+  | 'field.tier.opt.advanced'
+  | 'field.legacyParams'
+  | 'field.legacyParams.hint'
   | 'field.modelMap.pipeline'
   | 'field.modelMap.pipeline.hint'
   | 'field.modelMap.pipeline.placeholder'
@@ -175,7 +184,7 @@ export const en: Record<MineruKey, string> = {
   'section.output.desc': 'Inline model projection character budget and visual attachment limits',
   'section.limits.desc': 'System payload limits, safe decompression ratios, and zip bounds (startup configured)',
   'action.retryLoad': 'Retry Loading',
-  'badge.selfHosted': 'Self-hosted (v2)',
+  'badge.selfHosted': 'Self-hosted',
   'badge.official': 'Official cloud (v4)',
   'action.expandAll': 'Expand All',
   'action.collapseAll': 'Collapse All',
@@ -208,11 +217,20 @@ export const en: Record<MineruKey, string> = {
   'field.apiKey': 'API Key',
   'field.allowInsecureHttp': 'Allow Insecure HTTP (Local Only)',
   'field.configuredVersion': 'Server Protocol / Version',
+  'field.tier': 'Parse Tier',
+  'field.tier.hint': 'Applied to MinerU 4.0+ (V1 API) jobs. The server default keeps the tier chosen at server startup; other tiers select a different quality/speed trade-off when the server advertises them.',
+  'field.tier.serverDefault': 'Server default',
+  'field.tier.opt.flash': 'flash (fast local text extraction)',
+  'field.tier.opt.basic': 'basic (local lightweight models)',
+  'field.tier.opt.standard': 'standard (balanced parsing, recommended)',
+  'field.tier.opt.advanced': 'advanced (highest quality for difficult documents)',
+  'field.legacyParams': 'Legacy Parameters (MinerU 3.x and earlier)',
+  'field.legacyParams.hint': 'MinerU 4.0 removed these request parameters. They are sent only to /tasks servers; on 4.0+ they are ignored (a tier value entered here still acts as a fallback when the parse tier above is unset).',
   'field.modelMap.pipeline': 'Pipeline Backend Map',
-  'field.modelMap.pipeline.hint': 'Backend engine identifier sent to the self-hosted MinerU server for pipeline requests. Default and standard value is pipeline.',
+  'field.modelMap.pipeline.hint': 'Upstream selector for pipeline requests. MinerU 3.x and earlier expect a backend engine identifier, normally pipeline; MinerU 4.0+ ignores it unless it names a tier — set the parse tier above instead.',
   'field.modelMap.pipeline.placeholder': 'pipeline',
   'field.modelMap.vlm': 'VLM Backend Map',
-  'field.modelMap.vlm.hint': 'Backend engine identifier sent to the self-hosted MinerU server for VLM requests. Common choices include hybrid-engine (hybrid layout + VLM, recommended) and vlm-engine (pure local VLM).',
+  'field.modelMap.vlm.hint': 'Upstream selector for VLM requests. MinerU 3.x and earlier expect a backend engine identifier such as hybrid-engine (hybrid layout + VLM, recommended) or vlm-engine (pure local VLM); MinerU 4.0+ ignores it unless it names a tier — set the parse tier above instead.',
   'field.modelMap.vlm.placeholder': 'hybrid-engine or vlm-engine',
   'field.modelMap.chip.default': 'default',
   'field.modelMap.chip.recommended': 'recommended',
@@ -302,7 +320,7 @@ export const en: Record<MineruKey, string> = {
   'credential.readOnly': 'This credential comes from a read-only source, such as the process environment, and cannot be changed here.',
   'credential.referenceRequired': 'Set a credential reference before entering an API key.',
 
-  'provider.type.selfHosted': 'Self-Hosted MinerU (v2 API)',
+  'provider.type.selfHosted': 'Self-Hosted MinerU',
   'provider.type.official': 'Official MinerU Cloud (v4 API)',
   'model.pipeline': 'Pipeline (Hallucination-free, multi-language)',
   'model.vlm': 'VLM (Visual Language Model)',
@@ -338,7 +356,7 @@ export const zh: Record<MineruKey, string> = {
   'section.output.desc': '单次模型响应字符上限与内联图片配额',
   'section.limits.desc': '系统有效载荷上限、安全解压比与 ZIP 边界保护（启动时绑定）',
   'action.retryLoad': '重新加载',
-  'badge.selfHosted': '自托管 (v2)',
+  'badge.selfHosted': '自托管',
   'badge.official': '官方云 (v4)',
   'action.expandAll': '展开全部',
   'action.collapseAll': '折叠全部',
@@ -371,11 +389,20 @@ export const zh: Record<MineruKey, string> = {
   'field.apiKey': 'API Key',
   'field.allowInsecureHttp': '允许非加密 HTTP 连接',
   'field.configuredVersion': '服务端协议版本标识',
+  'field.tier': '解析档位',
+  'field.tier.hint': '仅对 MinerU 4.0+（V1 API）生效。选择“服务端默认”时沿用服务端启动时确定的档位；其它档位在服务端支持时用于选择速度／精度取舍。',
+  'field.tier.serverDefault': '服务端默认',
+  'field.tier.opt.flash': 'flash（本地快速文本抽取）',
+  'field.tier.opt.basic': 'basic（本地轻量模型）',
+  'field.tier.opt.standard': 'standard（均衡解析，推荐）',
+  'field.tier.opt.advanced': 'advanced（面向困难文档的最高质量）',
+  'field.legacyParams': '旧版参数（MinerU 3.x 及更早）',
+  'field.legacyParams.hint': 'MinerU 4.0 已移除这些请求参数：仅在连接 /tasks 服务端时下发，4.0+ 服务会忽略它们（此处填写的档位值仍可在上方“解析档位”未设置时作为回退）。',
   'field.modelMap.pipeline': 'Pipeline 模型后端映射',
-  'field.modelMap.pipeline.hint': '自托管 MinerU 服务端在处理 pipeline（规则与 OCR 流水线）解析请求时调用的底层后端标识，默认且通常填写 pipeline。',
+  'field.modelMap.pipeline.hint': '自托管 MinerU 在处理 pipeline（规则与 OCR 流水线）解析请求时使用的上游选择项。MinerU 3.x 及更早填写后端标识，通常为 pipeline；MinerU 4.0+ 会忽略该值（除非它本身是档位名），请改用上方“解析档位”。',
   'field.modelMap.pipeline.placeholder': 'pipeline',
   'field.modelMap.vlm': 'VLM 模型后端映射',
-  'field.modelMap.vlm.hint': '自托管 MinerU 服务端在处理 vlm（视觉大模型）解析请求时调用的底层后端标识。常用项包括 hybrid-engine（混合引擎，高精度低幻觉，推荐）和 vlm-engine（纯本地视觉大模型）。',
+  'field.modelMap.vlm.hint': '自托管 MinerU 在处理 vlm（视觉大模型）解析请求时使用的上游选择项。MinerU 3.x 及更早填写后端标识，常用 hybrid-engine（混合引擎，高精度低幻觉，推荐）和 vlm-engine（纯本地视觉大模型）；MinerU 4.0+ 会忽略该值（除非它本身是档位名），请改用上方“解析档位”。',
   'field.modelMap.vlm.placeholder': 'hybrid-engine 或 vlm-engine',
   'field.modelMap.chip.default': '默认',
   'field.modelMap.chip.recommended': '推荐',
@@ -465,7 +492,7 @@ export const zh: Record<MineruKey, string> = {
   'credential.readOnly': '该凭据来自进程环境变量等只读来源，无法在此修改或清除。',
   'credential.referenceRequired': '请先填写凭据引用名，再输入 API Key。',
 
-  'provider.type.selfHosted': '自托管 MinerU (v2 API)',
+  'provider.type.selfHosted': '自托管 MinerU',
   'provider.type.official': '官方云服务 MinerU (v4 API)',
   'model.pipeline': 'Pipeline（无幻觉，支持多语言 OCR）',
   'model.vlm': 'VLM（视觉大模型）',

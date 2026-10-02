@@ -1,12 +1,17 @@
 import type { MinerUModel, ParseDefaults } from '../domain/request.js';
 import { type ProviderConfigId } from '../domain/ids.js';
 export declare const MINERU_CONFIG_SCHEMA_VERSION: 2;
+/** Parse tiers advertised by the MinerU 4.0+ self-hosted V1 API. */
+export declare const SELF_HOSTED_TIERS: readonly ["flash", "basic", "standard", "advanced"];
+export type SelfHostedTier = typeof SELF_HOSTED_TIERS[number];
 export interface SelfHostedV2Config {
     readonly id: ProviderConfigId;
     readonly type: 'self-hosted-v2';
     readonly baseURL: string;
     readonly apiKeyEnv?: string;
     readonly modelMap: Readonly<Record<MinerUModel, string>>;
+    /** V1 API parse tier; absent keeps the upstream server default. */
+    readonly tier?: SelfHostedTier;
     readonly configuredVersion?: string;
     readonly allowInsecureHttp: boolean;
 }
