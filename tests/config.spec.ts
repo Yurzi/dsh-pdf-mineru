@@ -14,7 +14,7 @@ import { asProviderConfigId } from '../src/domain/ids.js'
 describe('MinerU config parsing and validation', () => {
   it('creates three independent profiles in legacy, official, V1 order', () => {
     const config = defaultMinerUConfig()
-    expect(config.schemaVersion).toBe(2)
+    expect(config.schemaVersion).toBe(3)
     expect(config.activeProvider).toBe('mp_self_hosted')
     expect(config.providers).toHaveLength(3)
     expect(config.providers[0]).toMatchObject({ id: 'mp_self_hosted', type: 'self-hosted-legacy-v2', allowInsecureHttp: true })
@@ -51,8 +51,8 @@ describe('MinerU config parsing and validation', () => {
 
   it('rejects unsupported schemaVersion and accepts the current schemaVersion', () => {
     const base = defaultMinerUConfig()
-    expect(parseConfig({ ...base, schemaVersion: 2 }).schemaVersion).toBe(2)
-    expect(() => parseConfig({ ...base, schemaVersion: 3 })).toThrow(/unsupported schemaVersion/)
+    expect(parseConfig({ ...base, schemaVersion: 3 }).schemaVersion).toBe(3)
+    expect(() => parseConfig({ ...base, schemaVersion: 4 })).toThrow(/unsupported schemaVersion/)
     expect(() => parseConfig({ ...base, schemaVersion: 0 })).toThrow(/unsupported schemaVersion/)
     expect(() => parseConfig({ ...base, schemaVersion: '1' as unknown as number })).toThrow(/unsupported schemaVersion/)
   })
@@ -69,36 +69,25 @@ describe('MinerU config parsing and validation', () => {
     const parsed = parseConfigWithMigration(legacy)
     expect(parsed.migrated).toBe(true)
     expect(parsed.migratedFrom).toBe(1)
-    expect(parsed.config.schemaVersion).toBe(2)
+    expect(parsed.config.schemaVersion).toBe(3)
     expect(parsed.config.defaults).not.toHaveProperty('artifacts')
     expect(parsed.config.limits).not.toHaveProperty('maxFilesPerRequest')
     expect(legacy.defaults.artifacts).toEqual(['markdown', 'layout'])
     expect(legacy.limits.maxFilesPerRequest).toBe(4)
   })
 
-  it('validates removed v1 fields and keeps v2 unknown-field rejection strict', () => {
+  it('repairs obsolete schema-1 values but keeps current-version unknown fields strict', () => {
     const base = defaultMinerUConfig()
-    expect(() => parseConfig({
-      ...base,
-      schemaVersion: 1,
-      defaults: { ...base.defaults, artifacts: ['unknown'] },
-    })).toThrow(/defaults.artifacts contains an unsupported artifact/)
-    expect(() => parseConfig({
-      ...base,
-      schemaVersion: 1,
-      limits: { ...base.limits, maxFilesPerRequest: 0 },
-    })).toThrow(/limits.maxFilesPerRequest must be a positive safe integer/)
-    expect(() => parseConfig({
-      ...base,
-      defaults: { ...base.defaults, artifacts: ['markdown'] },
-    })).toThrow(/defaults contains unsupported property artifacts/)
-    const mergedLegacySettings = parseConfigWithMigration({
-      ...base,
-      defaults: { ...base.defaults, artifacts: ['markdown'] },
-    })
-    expect(mergedLegacySettings.migrated).toBe(true)
-    expect(mergedLegacySettings.migratedFrom).toBeUndefined()
-    expect(mergedLegacySettings.config.defaults).not.toHaveProperty('artifacts')
+    const parsed = parseConfigWithMigration({...base,schemaVersion:1,
+      defaults:{...base.defaults,artifacts:['unknown']},limits:{...base.limits,maxFilesPerRequest:0}})
+    expect(parsed.config.defaults).not.toHaveProperty('artifacts')
+    expect(parsed.config.limits).not.toHaveProperty('maxFilesPerRequest')
+    expect(parsed.defaultedFields).toEqual(expect.arrayContaining(['defaults.artifacts','limits.maxFilesPerRequest']))
+    expect(() => parseConfig({...base,defaults:{...base.defaults,artifacts:['markdown']}})).toThrow(/unsupported property artifacts/)
+    expect(parseConfigWithMigration({...base,defaults:{...base.defaults,artifacts:['markdown']}}).config.defaults).not.toHaveProperty('artifacts')
+    const merged = parseConfigWithMigration({...base,schemaVersion:2,defaults:{...base.defaults,artifacts:['markdown']}})
+    expect(merged.migratedFrom).toBe(2)
+    expect(merged.config.defaults).not.toHaveProperty('artifacts')
   })
 
   it('rejects removed flat configuration fields', () => {
@@ -216,12 +205,13 @@ describe('MinerU config parsing and validation', () => {
     }
   })
 
-  it.each([undefined, null, 1, '', 'unknown', ['self', 'hosted'].join('-'), ['self', 'hosted', 'v2'].join('-')])(
+  it.each([undefined, null, 1, '', 'unknown', ['self', 'hosted'].join('-')])(
     'rejects invalid or removed provider type %s without guessing a protocol', type => {
       const base = defaultMinerUConfig()
       const value = { ...base, providers: [{ ...base.providers[0], type }] }
       expect(() => parseConfig(value)).toThrow(/provider.type/)
-      expect(() => parseConfigWithMigration({ ...value, schemaVersion: 1 })).toThrow(/provider.type/)
+      expect(() => parseConfigWithMigration(value)).toThrow(/provider.type/)
+      expect(parseConfigWithMigration({ ...value, schemaVersion: 1 }).config.providers[0]?.type).toBe('self-hosted-legacy-v2')
     },
   )
 
@@ -394,7 +384,7 @@ describe('pruneConfigToDiff', () => {
     const base = defaultMinerUConfig()
     const next = { ...base, activeProvider: asProviderConfigId('mp_official') }
     expect(pruneConfigToDiff(next, base)).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       activeProvider: 'mp_official',
     })
   })
@@ -403,7 +393,7 @@ describe('pruneConfigToDiff', () => {
     const base = defaultMinerUConfig()
     const next = { ...base, defaults: { ...base.defaults, model: 'vlm' as const } }
     expect(pruneConfigToDiff(next, base)).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       defaults: next.defaults,
     })
   })
@@ -412,7 +402,7 @@ describe('pruneConfigToDiff', () => {
     const base = defaultMinerUConfig()
     const next = { ...base, output: { ...base.output, maxInlineImages: 10 } }
     expect(pruneConfigToDiff(next, base)).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       output: { maxInlineImages: 10 },
     })
   })
@@ -421,7 +411,7 @@ describe('pruneConfigToDiff', () => {
     const base = defaultMinerUConfig()
     const next = { ...base, retry: { ...base.retry, maxAttempts: 5 } }
     expect(pruneConfigToDiff(next, base)).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       retry: { maxAttempts: 5 },
     })
   })
@@ -435,7 +425,7 @@ describe('pruneConfigToDiff', () => {
       limits: { ...base.limits, maxFileBytes: 100 * 1024 * 1024 },
     }
     expect(pruneConfigToDiff(next, base)).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       storage: { stagingTtlMs: 12345 },
       polling: { pollIntervalMs: 1500 },
       limits: { maxFileBytes: 100 * 1024 * 1024 },
@@ -453,7 +443,7 @@ describe('pruneConfigToDiff', () => {
       providers: [modifiedProvider, base.providers[1]!],
     }
     expect(pruneConfigToDiff(next, base)).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       providers: next.providers,
     })
   })
@@ -464,7 +454,7 @@ describe('pruneConfigToDiff', () => {
     const pruned = pruneConfigToDiff(next, base)
     expect(pruned).not.toHaveProperty('providers')
     expect(pruned).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       output: { maxInlineImages: 8 },
     })
   })

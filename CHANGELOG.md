@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 ### Added
 
+- Add configuration schema 3 with ordered 1→2→3 in-memory migrations, safe default filling for historical values, collision-safe IDs and value-free migration metadata. Startup never writes configuration; explicit save persists the complete migrated snapshot through the host ConfigEditor transaction, including repaired non-form fields.
 - Add an explicit `self-hosted-v1` Provider for MinerU 4.x upload sessions, parse jobs and ZIP artifacts, alongside `self-hosted-legacy-v2` and `official-v4`.
 - Add per-profile V1 tier and OCR mode (auto/txt/ocr), and discover deployed tiers/output/source capabilities with health and tiers requests before uploading.
 - Provide three independently editable settings profiles, protocol-specific controls, bilingual guidance, editable deployment cache revision, and stale-probe invalidation without auto-saving drafts.
@@ -13,10 +14,12 @@
 - Standardize source, API identifiers, tests and generated declarations on `self-hosted-v1` / `self-hosted-legacy-v2` with separate Provider implementations. Explicit selection replaces automatic protocol fallback; V1 no longer interprets a legacy backend map as a tier.
 - Reject cross-protocol configuration fields. V1 keeps shared legacy/cloud defaults in drafts but does not apply them to requests or cache semantics. V1 provenance.model is null rather than a claimed pipeline/vlm engine.
 - Normalize MinerU 4.x ZIP entries and structured documents through the existing bounded artifact pipeline, preserving metadata and real asset references.
-- Existing mixed self-hosted profiles require an explicit new type and removal of fields unsupported by that type; no aliases or automatic profile/artifact migration are added. New self-hosted identities re-parse old caches. Schema container version 2, cursor v3, index v2, native jobs and tool arguments remain unchanged.
+- Declare the host ConfigEditor runtime peer used by complete migration saves, aligned with the existing DSH 0.2.0-rc.2 baseline.
+- Historical self-hosted-v2 profiles migrate to self-hosted-legacy-v2 and drop their V1-only tier; users of the former automatic V1 detection must explicitly select V1. Missing configuration versions mean schema 2; unknown future versions remain errors. Configuration advances to schema 3; artifacts, cursor v3, index v2, native jobs and tool arguments are not migrated.
 
 ### Fixed
 
+- Preserve valid coupled retry/ZIP-limit values when other historical fields are invalid, and persist repaired non-form fields atomically on explicit migration save rather than leaving invalid raw values behind.
 - Isolate V1 results by tier and effective OCR mode instead of reusing another tier/mode result; transport retries cover result-body interruption after HTTP 200, while cancellation and byte limits remain terminal.
 - Preserve drafts and maintenance confirmation boundaries when switching protocol-specific forms. Legacy submissions no longer contact a V1 detection endpoint.
 

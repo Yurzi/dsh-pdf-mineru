@@ -69,7 +69,7 @@ function injectCurrentPlugin(html) {
 }
 
 const config = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   activeProvider: 'mp_self_hosted',
   providers: [{
     id: 'mp_self_hosted', type: 'self-hosted-legacy-v2', baseURL: 'http://localhost:18000',

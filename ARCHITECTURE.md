@@ -130,11 +130,15 @@ SharedOperationRegistry 只在同一进程内，按 CacheKey 和 Provider author
 
 每次操作使用配置快照；凭据仍在每次 Provider 调用时从 DSH credentials 或环境变量解析，不缓存密钥。
 
-`parseConfig` 是唯一配置解析入口，拒绝旧 flat config、未知 schemaVersion、未知字段和 retainSources=true。parseMethod/ocr 一次性规范化；设置页切换到不支持 txt 的 Provider 时明确提示调整。
+配置结构当前为 schemaVersion=3，与 API、请求、缓存及游标版本独立。
+- parseConfig 严格校验当前格式；parseConfigWithMigration 是纯内存读取/保存转换入口，通过版本注册表按 1→2→3 顺序执行，缺省版本按 2 处理，未来版本拒绝。
+- 旧版本的缺失/无效值由 src/config/migration-values.ts 补默认，复用 canonical 验证，不扩大 HTTP 授权或保留明文密钥。关联约束字段先独立验证再验证组合，避免无关坏值导致合法参数丢失。未知结构字段、flat config 仍拒绝。
+- 2→3 仅将历史 self-hosted-v2 profile 转为 self-hosted-legacy-v2，并丢弃旧 tier；类型选择不探测网络或猜测档位。迁移结果附版本步骤、字段路径和 profile 元数据，不含原值；重复转换幂等，不修改输入。
+- 最新版本字段仍严格校验。宿主组合基础层残留的 defaults.artifacts / limits.maxFilesPerRequest 仅做内存清理，不是运行时协议别名。parseMethod/ocr 一次性规范化。
 
 storageRoot 与 limits.* 在启动时固定。运行中保存不同值会被拒绝；修改宿主配置并重启才生效。其余允许的 live 更新只影响之后的执行。数字输入保留临时空白／非法草稿，失焦后恢复或收敛，不在每次击键时强行覆盖。
 
-DSH 0.2.0-rc.2 的 `SettingsForms` 不再提供 `register/get/watch`。插件使用发布的 settings 类型，通过 `configure({ auto: false }, ctx.fiber)` 关闭自动表单；Config 为可热更新字段声明 `.volatile()`，每次操作读取 `.get()` 快照。`storageRoot`、`retainSources` 和 `limits` 为普通 Config 字段，不经 settings 表单修改。Cordis 的 Standard Schema 校验入口调用完整领域校验，确保 ConfigEditor 在持久化前拒绝无效配置。自定义 RPC 按当前 `ctx.fiber.entry.options.id` 调用 `settings.replace`，提交完整可热更新值，避免将显式默认值误复位为 profile 继承值；普通字段仍由宿主保留。启动只规范化 Provider-based v1，不执行配置写回或旧设置瘦身，避免激活期间触发 Loader 重载；旧 settings 文档由 DSH 导入。
+DSH 0.2.0-rc.2 的 `SettingsForms` 不再提供 `register/get/watch`。插件使用发布的 settings 类型，通过 `configure({ auto: false }, ctx.fiber)` 关闭自动表单；Config 为可热更新字段声明 `.volatile()`，每次操作读取 `.get()` 快照。`storageRoot`、`retainSources` 和 `limits` 为普通 Config 字段，不经 settings 表单修改。Cordis 的 Standard Schema 校验入口调用完整领域校验，确保 ConfigEditor 在持久化前拒绝无效配置。自定义 RPC 按当前 `ctx.fiber.entry.options.id` 调用 `settings.replace`，提交完整可热更新值，避免将显式默认值误复位为 profile 继承值；普通字段仍由宿主保留。启动及读取只在内存迁移 Provider-based 旧版本，不执行配置写回或旧设置瘦身；Standard Schema 必须将转换结果（而非原旧对象）交给 Config 包装，旧 settings 文档仍由 DSH 导入。显式保存检测原始 entry 是否仍需迁移：若是，通过公开 ConfigEditor.edit 的文件锁、验证、回滚与 Loader 协调事务保存完整 canonical 快照，同时修复原始非 volatile 字段；迁移后普通保存继续 settings.replace。完整保存前仍验证固定 storageRoot/limits 与运行时一致，事务内再次验证当前 entry，不绕过不可变运行时参数限制。
 
 客户端通过上游 `plugins.bundle.config` keyed slot 注册配置页，key 为 npm 包名 `dsh-pdf-mineru`；入口位于 Plugins 的 bundle 详情页，不再注册 `settings.section`。使用 `dsh-client-ui-plugin-manager/client` 的公开类型与 slot 声明生命周期，不在运行时导入管理器组件；bundle 页面只提供 `view: page`，不依赖可选的通用 `form`。配置读写与维护仍由现有 loopback RPC 和显式保存流程负责。
 

@@ -42,7 +42,7 @@
 > - **仅支持 RC 版本**：本插件**只会对 DeepSeek Harness 的 RC（Release Candidate）版本及后续正式发布版本进行官方支持**。由于早期 `alpha` 测试版本包含较多实验性且剧烈变动的内部 API，本插件不再对 `alpha` 等非稳定测试版本提供兼容与维护支持。
 > - **运行环境要求**：Node.js `^22.19.0 || >=24.0.0`，包管理器推荐 `pnpm@11+`。
 
-插件 `0.1.5` 起以 DSH `v0.2.0-rc.2` 为基线。升级前请先升级宿主；现有 Provider 配置、缓存格式与工具参数无需因本次 DSH 适配而迁移。Web 设置与维护 RPC 仅在 `connection` 和 `webServer` 同时可用时注册；无 WebServer 的宿主仍可使用两个模型工具，但不提供这些 HTTP RPC。
+插件 `0.1.5` 起以 DSH `v0.2.0-rc.2` 为基线，当前版本为 `0.2.0`。升级前请先升级宿主；`0.2.0` 将配置升级到 schema 3，旧配置读取时内存迁移、用户显式保存时写入新格式。自托管 Provider 身份变化会导致旧缓存重新解析；工具参数不变。Web 设置与维护 RPC 仅在 `connection` 和 `webServer` 同时可用时注册；无 WebServer 的宿主仍可使用两个模型工具，但不提供这些 HTTP RPC。
 
 后台任务使用 DSH 的 SessionId 归属与原生 JobRegistry：阶段进度显示为 `preparing`、`waiting-for-parse`、`reading-result`、`summarizing`，不是页数或百分比；缓存命中跳过等待阶段。完成摘要通过原生任务结果交付，通知、空闲唤醒、输出消费与会话归档准入由 DSH 负责。宿主必须为该会话装配任务控制器（如 `tool-jobs`），否则启动会在解析前拒绝。`job_kill` 仍只取消本次等待，不中止其他调用共用的解析生产者。
 
@@ -54,7 +54,7 @@
 dsh plugin --profile web add dsh-pdf-mineru
 ```
 
-rc.2 暂不支持已安装插件的自动更新。升级已安装版本时，请先升级 DSH 宿主，再在 Plugins 中卸载旧插件并安装 `dsh-pdf-mineru@0.1.5`；操作前备份 profile 配置，不要执行缓存清除。现有解析缓存无需迁移或重新上传。Desktop profile 需先启动过桌面端，生成 profile 后再使用 CLI 管理插件。
+rc.2 暂不支持已安装插件的自动更新。升级已安装版本时，请先升级 DSH 宿主，再在 Plugins 中卸载旧插件并安装 `dsh-pdf-mineru@0.2.0`；操作前备份 profile 配置，不要执行缓存清除。旧配置在内存中自动迁移，保存后写入 schema 3；旧自托管缓存不再按新 Provider 身份复用，首次读取会重新解析。Desktop profile 需先启动过桌面端，生成 profile 后再使用 CLI 管理插件。
 
 > 本地开发或测试源码时，可使用：`dsh plugin --profile web add link:/absolute/path/to/dsh-pdf-mineru`
 
@@ -218,7 +218,7 @@ flowchart LR
 
 ### 1. 官方云 (Official v4) 推荐配置
 ```yaml
-schemaVersion: 2
+schemaVersion: 3
 activeProvider: mp_official
 providers:
   - id: mp_official
@@ -235,7 +235,7 @@ defaults:
 
 ### 2. 本地私有化 (Self-hosted legacy v2) 推荐配置
 ```yaml
-schemaVersion: 2
+schemaVersion: 3
 activeProvider: mp_self_hosted
 providers:
   - id: mp_self_hosted
@@ -255,7 +255,7 @@ defaults:
 ### 3. MinerU 4.x 自托管（V1 API）配置
 
 ```yaml
-schemaVersion: 2
+schemaVersion: 3
 activeProvider: mp_self_hosted_v1
 providers:
   - id: mp_self_hosted_v1
@@ -270,7 +270,14 @@ providers:
 
 V1 不暴露上游已移除的请求级语言／公式／表格参数。隐藏这些共享默认值不会把它们清空，但它们不影响 V1 请求或缓存；内部占位值不表示服务端关闭相关能力。OCR 的 txt 与 auto 保持不同语义，txt 不保证完全不运行视觉模型。档位切换和 OCR 模式变化会隔离缓存；standard/advanced 可以使用同一模型、不同计算量。
 
-**升级注意：**此前混合型自托管 profile 需手动改为上述明确的类型，并删除不属于该类型的字段；不接受旧 type 别名、不自动迁移保存的配置或产物。原自托管缓存不会被新身份复用，下次读取会重新解析。协议明确后，连接失败不会降级到另一个协议。
+**配置版本与自动迁移：**当前插件配置为 schemaVersion: 3，独立于 MinerU 软件/API 版本及缓存、游标版本。读取旧配置时只在内存中按 **1 → 2 → 3** 转换；未声明版本的 Provider-based 配置按版本 2 处理。启动、配置读取均不自动改写磁盘；用户点击保存后，才通过宿主事务持久化版本 3 的完整迁移结果，后续普通保存仍沿用原生 Settings。
+
+- 1 → 2 移除旧批量/产物默认字段；2 → 3 将 self-hosted-v2 转为 self-hosted-legacy-v2，保留有效 ID、活动选择、地址、凭据引用、backend 映射及其他有效设置，移除 legacy 不支持的 tier。
+- 旧版本缺失或不支持的字段值使用对应默认值修复；重复/无效 ID 采用不冲突的默认 ID。迁移记录只含版本、字段路径和 Provider ID，不记录原始值或密钥。不会因迁移自动开启未经明确授权的 HTTP；缺少授权的 HTTP 默认端点改用 HTTPS，无效凭据引用不会被传给 Provider。
+- 最新版本编辑继续严格校验；未知未来版本和未知结构字段拒绝，防止误降级或吞掉配置。宿主组合基础层中残留的两个已废弃字段仅在内存清除；不恢复旧 flat config。
+- 首次显式保存迁移配置时，完整快照同时保存修复后的非表单字段，避免更新版本号后残留坏值；运行中的 storageRoot/limits 仍不允许改变。保存失败不会提前更新运行时配置。
+
+**接口选择与缓存：**迁移不根据 URL/backend/tier 猜测接口。此前依赖 V1 自动识别的部署需主动选择 self-hosted-v1。原自托管缓存不会被新 Provider 身份复用，配置迁移也不改写解析产物；连接失败不会降级到另一个协议。
 
 **V1 功能边界：**使用本地路径或会话附件，经上传去重、任务轮询及 ZIP 下载后发布到插件自身缓存。已处理 partial/canceled 状态、逐文件错误和素材实际路径；不把服务器资源 ID 当作重启后可恢复的持久化记录。工具仍是单文件；不暴露 URL/inline 来源、callback/Webhook、服务端 DELETE 取消、HTML/DOCX 产物选择或 Doclib。job_kill 只取消本次等待，不中止共享上游任务。read_pdf.pages 是已解析内容的物理页投影，不是完整上游 page_range 语法；原页 view 仅支持 PDF。当前输入白名单仍限于 PDF、常见图片及 doc/docx/ppt/pptx/xls/xlsx；HTML/MHTML、OpenDocument、RTF、EPUB、OFD、CSV/TSV 等上游新增格式尚未开放，HTML 已验证在上传前明确拒绝。不能将四档×所有文件类型视作均已覆盖或验证。
 

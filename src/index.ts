@@ -3,6 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { isVolatile } from '@deepseek-ai/cosmokit'
 import type {} from '@deepseek-ai/cordis-plugin-loader'
 import type {} from '@deepseek-ai/dsh-settings'
+import type {} from '@deepseek-ai/dsh-config-editor'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import {
   MINERU_CONFIG_SCHEMA_VERSION,
@@ -55,8 +56,8 @@ const ProviderSchema = z.union([
 ])
 
 export const Config = z.object({
-  // Provider-based v1 values are normalized in memory; saving writes v2.
-  schemaVersion: z.union([z.const(1), z.const(MINERU_CONFIG_SCHEMA_VERSION)]).volatile(),
+  // Known historical versions are normalized by Standard Schema before activation.
+  schemaVersion: z.union([z.const(1), z.const(2), z.const(MINERU_CONFIG_SCHEMA_VERSION)]).volatile(),
   activeProvider: z.string().volatile(),
   providers: z.array(ProviderSchema).volatile(),
   defaults: z.object({
@@ -104,8 +105,10 @@ Object.defineProperty(Config, '~standard', { value: {
   ...Config['~standard'],
   validate(value: unknown) {
     try {
-      parseConfigWithMigration(value)
-      return { value: Config(value) }
+      const parsed = parseConfigWithMigration(value)
+      // The native union only accepts canonical types; validate and wrap migrated
+      // data, not the original old profile that would still fail its discriminator.
+      return { value: Config(parsed.migrated ? parsed.config : value) }
     } catch (error) {
       return { issues: [{ message: error instanceof Error ? error.message : 'Invalid MinerU configuration' }] }
     }
@@ -234,7 +237,21 @@ export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<()
           const next = validateRuntimeConfig(value)
           const namespace = ctx.fiber.entry?.options.id
           if (namespace === undefined) throw new Error('MinerU configuration requires a Loader profile entry')
-          await settings.replace(namespace, liveConfig(next))
+          const entry = ctx.fiber.entry!
+          const original = entry.options.config
+          if (original !== undefined && parseConfigWithMigration(original).migrated) {
+            // Only an explicit user save enters this branch. Settings.replace keeps
+            // raw ordinary fields, which may still contain invalid pre-migration values.
+            // Persist the entire validated snapshot in one host-owned transaction.
+            const editor = ctx.get('configEditor')
+            if (editor === undefined) throw new Error('Saving a migrated configuration requires the host ConfigEditor')
+            await editor.edit(entry, current => {
+              validateRuntimeConfig(parseConfigWithMigration(current).config)
+              return { ...next }
+            })
+          } else {
+            await settings.replace(namespace, liveConfig(next))
+          }
           return runtimeConfig()
         },
         probe: async (provider, signal) => service.probe(

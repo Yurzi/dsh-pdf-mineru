@@ -11,7 +11,7 @@ const execFileAsync = promisify(execFile)
 describe('package contract', () => {
   it('ships a current configuration bundle without removed v1 fields', async () => {
     const patch = await readFile(new URL('../cordis.patch.yml', import.meta.url), 'utf8')
-    expect(patch).toMatch(/schemaVersion:\s*2/u)
+    expect(patch).toMatch(/schemaVersion:\s*3/u)
     expect(patch).not.toMatch(/^\s+artifacts:/mu)
     expect(patch).not.toMatch(/^\s+maxFilesPerRequest:/mu)
   })

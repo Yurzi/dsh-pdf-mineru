@@ -1,6 +1,8 @@
 # 面向模型的 PDF 阅读指南
 
-适用于 dsh-pdf-mineru 0.1.5（最低 DSH 0.2.0-rc.2）：索引版本2、阅读协议/游标版本3。安装与Provider配置见[README](../README.md)，实现和安全约束见[ARCHITECTURE](../ARCHITECTURE.md)，历史变化见[CHANGELOG](../CHANGELOG.md)。
+适用于 dsh-pdf-mineru 0.2.0（最低 DSH 0.2.0-rc.2）：索引版本2、阅读协议/游标版本3。安装与Provider配置见[README](../README.md)，实现和安全约束见[ARCHITECTURE](../ARCHITECTURE.md)，历史变化见[CHANGELOG](../CHANGELOG.md)。
+
+插件配置使用独立的 schemaVersion=3。旧配置在读取时仅内存迁移，显式保存时才写入新格式；模型无需也不应修改宿主配置来完成迁移。此配置版本不改变工具参数、游标或缓存产物版本，Provider 身份变化仍可能要求重新解析。
 
 ## 1. 推荐工作流
 

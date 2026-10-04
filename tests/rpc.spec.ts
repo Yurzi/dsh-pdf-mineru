@@ -172,7 +172,7 @@ describe('MinerU RPC (registerRpc)', () => {
     expect(flat).toMatchObject({ ok: false, error: { code: 'mineru/invalid-argument' } })
 
     // 3. Invalid or missing config returns failure without persisting defaults
-    const invalidRes = await handler('mineru/config.set', { config: { activeProvider: 'invalid-id' } }, new AbortController().signal)
+    const invalidRes = await handler('mineru/config.set', { config: { ...storedConfig, activeProvider: 'invalid-id' } }, new AbortController().signal)
     expect(invalidRes.ok).toBe(false)
     const callsBeforeMissingConfig = vi.mocked(deps.setConfig).mock.calls.length
     for (const payload of [{}, [], { config: undefined }, { config: null }]) {

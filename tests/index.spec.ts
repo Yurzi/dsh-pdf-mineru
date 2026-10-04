@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import { isVolatile } from '@deepseek-ai/cosmokit'
 import type { ConnectionRpcHandler } from '@deepseek-ai/dsh-client-connection'
-import { defaultMinerUConfig, defaultProviderConfig, parseConfig } from '../src/config.js'
+import { defaultMinerUConfig, defaultProviderConfig, parseConfig, parseConfigWithMigration } from '../src/config.js'
 import { ProcessLock, ResultRepository } from '../src/storage/index.js'
 
 vi.mock('@deepseek-ai/dsh-tools', () => ({ defineTool: (definition: unknown) => definition }))
@@ -224,7 +224,7 @@ describe('plugin composition lifecycle', () => {
     expect(response).toMatchObject({ ok: true, value: { config: next } })
     expect(runtime.settingsReplace).toHaveBeenCalledOnce()
     expect(runtime.settingsReplace).toHaveBeenCalledWith('mineru-custom', {
-      schemaVersion: 2, activeProvider: next.activeProvider, providers: next.providers,
+      schemaVersion: 3, activeProvider: next.activeProvider, providers: next.providers,
       defaults: next.defaults, polling: next.polling, retry: next.retry, output: next.output,
       storage: { cacheEnabled: next.storage.cacheEnabled, stagingTtlMs: next.storage.stagingTtlMs },
     })
@@ -256,7 +256,7 @@ describe('plugin composition lifecycle', () => {
       limits: { ...base.limits, maxFilesPerRequest: 2 },
       storage: { ...base.storage, storageRoot: join(root, 'persisted-user-root') },
     }
-    const expected = parseConfig(legacyStored)
+    const expected = parseConfigWithMigration(legacyStored).config
     const runtime = fakeContext(legacyStored as typeof base)
     const { apply } = await import('../src/index.js')
 
@@ -285,7 +285,7 @@ describe('plugin composition lifecycle', () => {
     delete unauthenticated.configuredVersion
     expect(() => validate({ ...base, providers: [unauthenticated] })).not.toThrow()
     expect(() => validate({ ...base, schemaVersion: 1 })).not.toThrow()
-    expect(() => validate({ ...base, schemaVersion: 3 })).toThrow()
+    expect(() => validate({ ...base, schemaVersion: 4 })).toThrow()
     expect(() => validate({ ...base, storage: { ...base.storage, retainSources: true } })).toThrow()
     expect(() => validate({
       ...base,
@@ -358,7 +358,7 @@ describe('plugin composition lifecycle', () => {
       { ...legacy, allowInsecureHttp: false }, { ...v1, allowInsecureHttp: false },
       { ...v1, baseURL: 'https://user:secret@mineru.example' },
       { ...v1, baseURL: 'https://mineru.example?token=secret' },
-      ...[undefined, null, 1, '', 'unsupported', ['self', 'hosted'].join('-'), ['self', 'hosted', 'v2'].join('-')]
+      ...[undefined, null, 1, '', 'unsupported', ['self', 'hosted'].join('-')]
         .map(type => ({ ...v1, type })),
     ]
     const values = invalidProviders.map(provider => ({ ...base, providers: [provider], activeProvider: (provider as { id: string }).id }))

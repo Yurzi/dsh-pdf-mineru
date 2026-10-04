@@ -4,7 +4,7 @@
     - id: dsh-pdf-mineru
       name: 'dsh-pdf-mineru'
       config:
-        schemaVersion: 2
+        schemaVersion: 3
         activeProvider: mp_self_hosted
         providers:
           - id: mp_self_hosted

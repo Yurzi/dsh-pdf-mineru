@@ -16,7 +16,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { ConnectionRpcResult } from '@deepseek-ai/dsh-client-connection'
 import { registerLoopbackRpc } from './loopback-rpc.js'
 import type { MinerUConfig } from './config.js'
-import { parseConfig } from './config.js'
+import { parseConfig, parseConfigWithMigration } from './config.js'
 import { MinerUError, type MinerUErrorCode, sanitizeDiagnostic } from './domain/errors.js'
 import type { ProbeView } from './service/mineru-service.js'
 import type { StorageMaintenanceService } from './storage/maintenance-service.js'
@@ -138,7 +138,7 @@ export function registerRpc(ctx: Context, deps: MineruRpcDeps): () => void | Pro
             if (!Object.hasOwn(p, 'config') || p.config === undefined || p.config === null) {
               throw new TypeError('payload.config must be a non-null configuration object')
             }
-            const saved = await deps.setConfig(parseConfig(p.config))
+            const saved = await deps.setConfig(parseConfigWithMigration(p.config).config)
             return ok({ config: saved })
           }
 

@@ -2,7 +2,8 @@ import type { MinerUModel, ParseDefaults, ParseMethod } from '../domain/request.
 
 import { asProviderConfigId, type ProviderConfigId } from '../domain/ids.js'
 
-export const MINERU_CONFIG_SCHEMA_VERSION = 2 as const
+/** Plugin configuration version, independent of upstream APIs and cached result schemas. */
+export const MINERU_CONFIG_SCHEMA_VERSION = 3 as const
 
 /** Parse tiers advertised by the MinerU 4.0+ self-hosted V1 API. */
 export const SELF_HOSTED_TIERS = ['flash', 'basic', 'standard', 'advanced'] as const
