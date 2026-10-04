@@ -46,9 +46,9 @@ const validResultManifest: MinerUResultManifest = {
   sourceSha256: SHA256_A,
   request: validCanonicalRequest,
   producer: {
-    providerId: 'self-hosted-v2',
+    providerId: 'self-hosted-legacy-v2',
     providerConfigId: asProviderConfigId('mp_local'),
-    compatibilityKey: 'self-hosted-v2:hash123:3.4.4:pipeline',
+    compatibilityKey: 'self-hosted-legacy-v2:hash123:3.4.4:pipeline',
   },
   files: [
     {

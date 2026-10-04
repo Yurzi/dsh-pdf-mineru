@@ -10,6 +10,7 @@ import {
   type ProviderConfig,
 } from '../config/pure.js'
 import { asProviderConfigId } from '../domain/ids.js'
+import type { MineruKey } from './locales.js'
 
 export interface CredentialView {
   readonly configured: boolean
@@ -24,7 +25,15 @@ export interface CredentialClient {
   unset(ref: string): Promise<RpcResult<void>>
 }
 
-const PROVIDER_TYPES = ['self-hosted-v2', 'official-v4'] as const
+const PROVIDER_TYPES = ['self-hosted-legacy-v2', 'official-v4', 'self-hosted-v1'] as const
+
+export function providerTypeLabelKey(type: ProviderConfig['type']): MineruKey {
+  switch (type) {
+    case 'self-hosted-v1': return 'provider.type.selfHostedV1'
+    case 'self-hosted-legacy-v2': return 'provider.type.selfHosted'
+    case 'official-v4': return 'provider.type.official'
+  }
+}
 
 export function ensureProviderProfiles(config: MinerUConfig): MinerUConfig {
   const providers = [...config.providers]
@@ -130,6 +139,8 @@ export function resetConfigSection<K extends keyof MinerUConfig>(
 ): MinerUConfig {
   switch (section) {
     case 'defaults': {
+      const current = config.providers.find(provider => provider.id === config.activeProvider)
+      if (current?.type === 'self-hosted-v1') return patchActiveProvider(config, { ocrMode: 'auto' })
       const active = config.providers.find(p => p.id === config.activeProvider) ?? config.providers[0]
       const next: MinerUConfig = {
         ...config,
@@ -177,12 +188,12 @@ export function resetConfigSection<K extends keyof MinerUConfig>(
 }
 
 export function resetToDefaultConfig(current: MinerUConfig): MinerUConfig {
-  const selfHosted = defaultProviderConfig('self-hosted-v2')
+  const selfHosted = defaultProviderConfig('self-hosted-legacy-v2')
   const official = defaultProviderConfig('official-v4')
   return {
     schemaVersion: current.schemaVersion,
     activeProvider: selfHosted.id,
-    providers: [selfHosted, official],
+    providers: [selfHosted, official, defaultProviderConfig('self-hosted-v1')],
     defaults: { ...DEFAULT_PARSE_DEFAULTS },
     storage: {
       ...current.storage,

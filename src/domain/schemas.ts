@@ -38,7 +38,7 @@ import type { MinerUProviderId } from './errors.js'
 
 export const VALID_MODELS = new Set<MinerUModel>(['pipeline', 'vlm'])
 export const VALID_PARSE_METHODS = new Set<ParseMethod>(['auto', 'txt', 'ocr'])
-export const VALID_PROVIDERS = new Set<MinerUProviderId>(['self-hosted-v2', 'official-v4'])
+export const VALID_PROVIDERS = new Set<MinerUProviderId>(['self-hosted-v1', 'self-hosted-legacy-v2', 'official-v4'])
 export const VALID_ARTIFACT_KINDS = new Set<ArtifactKind>(ARTIFACT_KINDS)
 
 const SHA256_HEX = /^[a-f0-9]{64}$/

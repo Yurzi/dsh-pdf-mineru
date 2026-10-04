@@ -102,7 +102,7 @@
 首次响应的 `provenance` 区分：
 
 - `provider`、`model`、`parse_method`：该缓存产物的实际解析配置。
-- `upstream_version`：真实上游引擎版本；目前未知时为null。official-v4/self-hosted-v2是接口身份，不是OCR引擎版本。
+- `upstream_version`：真实上游引擎版本；当前未可靠提取时为 null。official-v4/self-hosted-v1/self-hosted-legacy-v2 是接口身份，不是 OCR 引擎版本。V1 使用 tier，不提供 pipeline/vlm 模型选择，因此 provenance.model 为 null；不要由内部规范化占位推断实际引擎。
 - `index_version`、`reader_version`：当前索引与阅读协议版本，不冒充上游版本。
 
 `summary.page_count_source` 区分layout/pdfinfo/pdfjs的页数与content-list推算的页数下界。有权威页数时，完全越界报错、部分越界提示；没有时不把尾部未解析页面误判为不存在。按页筛选若会静默丢掉相关的无坐标块，则拒绝该筛选。
@@ -172,7 +172,7 @@ pnpm run verify:gui
 pnpm run smoke:reader-local -- /absolute/path/sample.pdf 1 .vitest-cache/page-auto --backend=auto
 pnpm run smoke:reader-local -- /absolute/path/sample.pdf 1 .vitest-cache/page-pdfjs --backend=pdfjs
 
-# rx033论文的专用缓存回放，分别传入self-hosted-v2/vlm和official-v4/pipeline的manifest
+# rx033论文的专用缓存回放，分别传入self-hosted-legacy-v2/vlm和official-v4/pipeline的manifest
 pnpm run smoke:reader-cache -- /absolute/path/rx033.pdf /absolute/path/manifest.json
 ```
 

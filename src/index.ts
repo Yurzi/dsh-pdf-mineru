@@ -29,12 +29,18 @@ export const inject = ['tools', 'jobs', 'settings']
 
 const ProviderSchema = z.union([
   z.object({
+    id: z.string(), type: z.const('self-hosted-v1'), baseURL: z.string(),
+    apiKeyEnv: z.string().role('credential-ref'),
+    tier: z.union(['flash', 'basic', 'standard', 'advanced']),
+    ocrMode: z.union(['auto', 'txt', 'ocr']),
+    configuredVersion: z.string(), allowInsecureHttp: z.boolean(),
+  }),
+  z.object({
     id: z.string(),
-    type: z.const('self-hosted-v2'),
+    type: z.const('self-hosted-legacy-v2'),
     baseURL: z.string(),
     apiKeyEnv: z.string().role('credential-ref'),
     modelMap: z.object({ pipeline: z.string(), vlm: z.string() }),
-    tier: z.union(['flash', 'basic', 'standard', 'advanced']),
     configuredVersion: z.string(),
     allowInsecureHttp: z.boolean(),
   }),
@@ -263,7 +269,8 @@ export * from './domain/result.js'
 export { parseMinerUResultManifest } from './domain/schemas.js'
 export * from './domain/errors.js'
 export * from './providers/provider.js'
-export * from './providers/self-hosted-v2.js'
+export * from './providers/self-hosted-legacy-v2.js'
+export * from './providers/self-hosted-v1.js'
 export * from './providers/official-v4.js'
 export * from './providers/http-client.js'
 export * from './service/mineru-service.js'

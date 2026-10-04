@@ -3,8 +3,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
+import { isVolatile } from '@deepseek-ai/cosmokit'
 import type { ConnectionRpcHandler } from '@deepseek-ai/dsh-client-connection'
-import { defaultMinerUConfig, parseConfig } from '../src/config.js'
+import { defaultMinerUConfig, defaultProviderConfig, parseConfig } from '../src/config.js'
 import { ProcessLock, ResultRepository } from '../src/storage/index.js'
 
 vi.mock('@deepseek-ai/dsh-tools', () => ({ defineTool: (definition: unknown) => definition }))
@@ -276,7 +277,7 @@ describe('plugin composition lifecycle', () => {
     const base = defaultMinerUConfig()
     const parsed = validate(base) as unknown as { providers: { get(): typeof base.providers } }
 
-    expect(parsed.providers.get()).toHaveLength(2)
+    expect(parsed.providers.get()).toHaveLength(3)
     expect(parsed.providers.get()[1]).toEqual(base.providers[1])
     expect(parsed.providers.get()[1]).not.toHaveProperty('modelMap')
     const unauthenticated = { ...base.providers[0] } as Record<string, unknown>
@@ -293,13 +294,81 @@ describe('plugin composition lifecycle', () => {
 
     const withTier = validate({
       ...base,
-      providers: [{ ...base.providers[0], tier: 'standard' }, base.providers[1]],
+      providers: [...base.providers.slice(0, 2), { ...base.providers[2], tier: 'standard', ocrMode: 'txt' }],
     }) as unknown as { providers: { get(): typeof base.providers } }
-    expect(withTier.providers.get()[0]).toMatchObject({ tier: 'standard' })
+    expect(withTier.providers.get()[2]).toMatchObject({ type: 'self-hosted-v1', tier: 'standard', ocrMode: 'txt' })
+    expect(withTier.providers.get()[2]).not.toHaveProperty('modelMap')
+    expect(withTier.providers.get()[0]).not.toHaveProperty('tier')
     expect(() => validate({
       ...base,
-      providers: [{ ...base.providers[0], tier: 'fastest' }, base.providers[1]],
+      providers: [...base.providers.slice(0, 2), { ...base.providers[2], tier: 'fastest' }],
     })).toThrow()
+  })
+
+  it('accepts the same three-provider values at Standard Schema and domain boundaries', async () => {
+    const { Config } = await import('../src/index.js')
+    const snapshot = (value: unknown): unknown => {
+      if (isVolatile(value)) return snapshot(value.get())
+      if (Array.isArray(value)) return value.map(snapshot)
+      if (typeof value === 'object' && value !== null) {
+        return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, snapshot(child)]))
+      }
+      return value
+    }
+    const base = defaultMinerUConfig()
+    const values: unknown[] = [base]
+    for (const provider of base.providers) {
+      values.push({ ...base, activeProvider: provider.id, providers: [provider] })
+    }
+    for (const tier of [undefined, 'flash', 'basic', 'standard', 'advanced']) {
+      for (const ocrMode of [undefined, 'auto', 'txt', 'ocr']) {
+        values.push({
+          activeProvider: 'mp_v1',
+          providers: [{ id: 'mp_v1', type: 'self-hosted-v1', allowInsecureHttp: true, tier, ocrMode }],
+          defaults: { model: 'vlm', language: 'ja', formula: true, table: true, parseMethod: 'txt', ocr: false },
+        })
+      }
+    }
+    for (const value of values) {
+      const expected = parseConfig(value)
+      const validated = await Config['~standard'].validate(value)
+      expect(validated.issues).toBeUndefined()
+      if (validated.issues) throw new Error('Expected accepted configuration')
+      expect(parseConfig(snapshot(validated.value))).toEqual(expected)
+    }
+  })
+
+  it('rejects cross-type fields, removed types and unsafe HTTP consistently at Standard Schema', async () => {
+    const { Config } = await import('../src/index.js')
+    const base = defaultMinerUConfig()
+    const legacy = defaultProviderConfig('self-hosted-legacy-v2')
+    const official = defaultProviderConfig('official-v4')
+    const v1 = defaultProviderConfig('self-hosted-v1')
+    const invalidProviders: unknown[] = [
+      { ...legacy, tier: 'standard' }, { ...legacy, ocrMode: 'auto' },
+      { ...legacy, tier: undefined }, { ...legacy, ocrMode: undefined },
+      { ...legacy, models: ['pipeline'] },
+      { ...v1, modelMap: { pipeline: 'pipeline', vlm: 'vlm-engine' } },
+      { ...v1, modelMap: undefined }, { ...v1, models: ['pipeline'] },
+      { ...v1, tier: 'fastest' }, { ...v1, ocrMode: 'text' },
+      { ...v1, parseMethod: 'txt' }, { ...v1, ocr: true },
+      { ...official, tier: 'standard' }, { ...official, ocrMode: 'auto' },
+      { ...official, modelMap: {} }, { ...official, allowInsecureHttp: true },
+      { ...official, baseURL: 'http://mineru.example' },
+      { ...legacy, allowInsecureHttp: false }, { ...v1, allowInsecureHttp: false },
+      { ...v1, baseURL: 'https://user:secret@mineru.example' },
+      { ...v1, baseURL: 'https://mineru.example?token=secret' },
+      ...[undefined, null, 1, '', 'unsupported', ['self', 'hosted'].join('-'), ['self', 'hosted', 'v2'].join('-')]
+        .map(type => ({ ...v1, type })),
+    ]
+    const values = invalidProviders.map(provider => ({ ...base, providers: [provider], activeProvider: (provider as { id: string }).id }))
+    values.push({ ...base, providers: [legacy, { ...v1, id: legacy.id }] })
+    for (const value of values) {
+      expect(() => parseConfig(value)).toThrow()
+      const validated = await Config['~standard'].validate(value)
+      expect(validated.issues?.length).toBeGreaterThan(0)
+      expect(validated).not.toHaveProperty('value')
+    }
   })
 
   it('allows multiple concurrent plugin instances on the same storageRoot without throwing STORAGE_LOCKED', async () => {

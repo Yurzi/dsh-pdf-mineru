@@ -1,5 +1,5 @@
 /**
- * self-hosted-v1-api.ts — MinerU 4.x self-hosted "V1 API" protocol adapter.
+ * self-hosted-v1.ts — MinerU 4.x self-hosted "V1 API" protocol adapter.
  *
  * Wire contract (see scripts/http_api_example.sh in opendatalab/MinerU):
  *   POST /v1/uploads                  create an upload session (deduplicated files are already completed)
@@ -16,12 +16,14 @@
  * canonical artifact shape (layout page list and structured content).
  */
 
+import { createHash } from 'node:crypto'
 import { openAsBlob } from 'node:fs'
 import { Readable } from 'node:stream'
 import type { ReadableStream as NodeWebReadableStream } from 'node:stream/web'
 import type { MinerUFileState, MinerUJobState } from '../domain/job.js'
-import type { MinerUFileId } from '../domain/ids.js'
-import type { CanonicalParseRequest, MinerUModel, PreparedSourceFile } from '../domain/request.js'
+import { asProviderConfigId, type MinerUFileId } from '../domain/ids.js'
+import { SELF_HOSTED_TIERS, type SelfHostedV1Config } from '../config/pure.js'
+import type { CanonicalParseRequest, PreparedSourceFile } from '../domain/request.js'
 import type { ArtifactRef } from '../domain/result.js'
 import {
   MinerUError,
@@ -30,10 +32,14 @@ import {
   toMinerUFailure,
 } from '../domain/errors.js'
 import { assertSourcesUnchanged } from '../service/request-normalizer.js'
-import type { ProviderHttpClient } from './http-client.js'
-import { resolveProviderUrl } from './http-client.js'
+import { ProviderHttpClient, resolveProviderUrl, validateSelfHostedBaseURL } from './http-client.js'
 import { extractSafeZip } from './safe-zip.js'
 import {
+  type MinerUProvider,
+  type ProviderCapabilities,
+  type ProviderCompatibilityContext,
+  type ProviderOptions,
+  validateProviderCapabilities,
   type ArtifactInput,
   type ArtifactSink,
   type ArtifactWriteOptions,
@@ -57,26 +63,6 @@ import {
 
 /** The only output format the plugin consumes; it carries every canonical artifact. */
 export const SELF_HOSTED_V1_ARCHIVE_FORMAT = 'zip'
-
-/** Tiers advertised by the MinerU V1 API; other modelMap values fall back to the server default. */
-export const SELF_HOSTED_V1_TIERS: ReadonlySet<string> = new Set(['flash', 'basic', 'standard', 'advanced'])
-
-/**
- * Effective V1 parse tier: an explicitly configured tier wins; otherwise a modelMap value that
- * names a tier is honoured, and anything else keeps the server default tier. Shared with the
- * provider compatibility key so the cached result identity matches the submitted request.
- */
-export function resolveSelfHostedTier(
-  tier: string | undefined,
-  modelMap: Readonly<Partial<Record<MinerUModel, string>>>,
-  model: MinerUModel,
-): string | undefined {
-  if (typeof tier === 'string' && SELF_HOSTED_V1_TIERS.has(tier)) return tier
-  const configured = modelMap[model]
-  if (typeof configured !== 'string') return undefined
-  const candidate = configured.trim().toLowerCase()
-  return SELF_HOSTED_V1_TIERS.has(candidate) ? candidate : undefined
-}
 
 const EXTENSION_MIME_TYPES: Readonly<Record<string, string>> = {
   '.pdf': 'application/pdf',
@@ -143,22 +129,21 @@ export interface SelfHostedV1JobResponse {
   readonly progress?: { readonly completed?: number; readonly failed?: number; readonly total?: number } | null
 }
 
-export interface SelfHostedV1ApiAdapterOptions {
+interface SelfHostedV1AdapterOptions {
   readonly client: ProviderHttpClient
   readonly baseUrl: URL
   readonly retry: ProviderRetryOptions
-  readonly modelMap: Readonly<Partial<Record<MinerUModel, string>>>
   /** Explicit V1 parse tier; absent keeps the upstream server default. */
   readonly tier?: string
 }
 
 function uploadFailed(message: string, retryable = false, details: { fileId?: MinerUFileId } = {}): MinerUError {
-  return new MinerUError(failure('UPLOAD_FAILED', message, retryable, { provider: 'self-hosted-v2', ...details }))
+  return new MinerUError(failure('UPLOAD_FAILED', message, retryable, { provider: 'self-hosted-v1', ...details }))
 }
 
 function archiveInvalid(message: string, fileId?: MinerUFileId): MinerUError {
   return new MinerUError(failure('REMOTE_PARSE_FAILED', message, false, {
-    provider: 'self-hosted-v2',
+    provider: 'self-hosted-v1',
     ...(fileId === undefined ? {} : { fileId }),
   }))
 }
@@ -190,7 +175,7 @@ export function isInsecureCrossOriginUpload(target: URL, baseUrl: URL): boolean 
  */
 export function mapSelfHostedV1JobState(rawStatus: unknown): MinerUJobState {
   if (typeof rawStatus !== 'string') {
-    throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Missing job status from MinerU server response', false, { provider: 'self-hosted-v2' }))
+    throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Missing job status from MinerU server response', false, { provider: 'self-hosted-v1' }))
   }
   switch (rawStatus.toLowerCase()) {
     case 'queued':
@@ -208,7 +193,7 @@ export function mapSelfHostedV1JobState(rawStatus: unknown): MinerUJobState {
     case 'cancelled':
       return 'failed'
     default:
-      throw new MinerUError(failure('REMOTE_PARSE_FAILED', `Unknown remote job status: "${sanitizeDiagnostic(rawStatus)}"`, false, { provider: 'self-hosted-v2' }))
+      throw new MinerUError(failure('REMOTE_PARSE_FAILED', `Unknown remote job status: "${sanitizeDiagnostic(rawStatus)}"`, false, { provider: 'self-hosted-v1' }))
   }
 }
 
@@ -224,7 +209,7 @@ function optionalSelfHostedV1JobState(rawStatus: unknown): MinerUJobState | unde
 /** Maps a MinerU V1 per-file status to the plugin's file state. */
 export function mapSelfHostedV1FileState(rawStatus: unknown): MinerUFileState {
   if (typeof rawStatus !== 'string') {
-    throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Missing file status from MinerU server response', false, { provider: 'self-hosted-v2' }))
+    throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Missing file status from MinerU server response', false, { provider: 'self-hosted-v1' }))
   }
   switch (rawStatus.toLowerCase()) {
     case 'queued':
@@ -240,7 +225,7 @@ export function mapSelfHostedV1FileState(rawStatus: unknown): MinerUFileState {
     case 'cancelled':
       return 'failed'
     default:
-      throw new MinerUError(failure('REMOTE_PARSE_FAILED', `Unknown remote file status: "${sanitizeDiagnostic(rawStatus)}"`, false, { provider: 'self-hosted-v2' }))
+      throw new MinerUError(failure('REMOTE_PARSE_FAILED', `Unknown remote file status: "${sanitizeDiagnostic(rawStatus)}"`, false, { provider: 'self-hosted-v1' }))
   }
 }
 
@@ -276,7 +261,7 @@ async function readArtifactInputText(input: ArtifactInput, maxBytes: number | un
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array)
       totalBytes += buffer.byteLength
       if (maxBytes !== undefined && totalBytes > maxBytes) {
-        throw new MinerUError(failure('RESULT_TOO_LARGE', `Artifact input exceeded byte limit of ${String(maxBytes)} bytes`, false, { provider: 'self-hosted-v2' }))
+        throw new MinerUError(failure('RESULT_TOO_LARGE', `Artifact input exceeded byte limit of ${String(maxBytes)} bytes`, false, { provider: 'self-hosted-v1' }))
       }
       chunks.push(buffer)
     }
@@ -433,11 +418,48 @@ function canonicalizingSink(sink: ArtifactSink): ArtifactSink {
   }
 }
 
-export class SelfHostedV1ApiAdapter {
-  private readonly options: SelfHostedV1ApiAdapterOptions
+export class SelfHostedV1Provider implements MinerUProvider {
+  readonly id = 'self-hosted-v1' as const
+  readonly config: SelfHostedV1Config
+  readonly capabilities: ProviderCapabilities = {
+    models: ['pipeline'], parseMethods: ['auto', 'txt', 'ocr'], supportsOcr: true,
+    supportsLanguage: false, supportsFormula: false, supportsTable: false,
+    supportsPageRanges: true, supportedArtifacts: ['markdown', 'layout', 'model-output', 'content-list', 'images'],
+    maxFilesPerSubmission: 10,
+  }
+  private readonly options: SelfHostedV1AdapterOptions
 
-  constructor(options: SelfHostedV1ApiAdapterOptions) {
-    this.options = options
+  constructor(config: SelfHostedV1Config, options?: ProviderOptions) {
+    asProviderConfigId(config.id)
+    if (config.tier !== undefined && !SELF_HOSTED_TIERS.includes(config.tier)) throw new MinerUError(failure('INVALID_REQUEST', 'Invalid V1 parse tier'))
+    if (!['auto', 'txt', 'ocr'].includes(config.ocrMode)) throw new MinerUError(failure('INVALID_REQUEST', 'Invalid V1 OCR mode'))
+    this.config = config
+    const baseUrl = validateSelfHostedBaseURL(config.baseURL, config.allowInsecureHttp)
+    const retry = options?.retry ?? {}
+    this.options = { baseUrl, retry, tier: config.tier,
+      client: new ProviderHttpClient({ baseURL: baseUrl, provider: this.id, defaultRetry: retry }) }
+  }
+
+  async compatibilityKey(_request: CanonicalParseRequest, context: ProviderCompatibilityContext): Promise<string> {
+    const { origin, pathname } = this.options.baseUrl
+    const hash = createHash('sha256').update(JSON.stringify({
+      originAndPath: origin + pathname.replace(/\/+$/, ''),
+      configuredVersion: context.configuredVersion ?? this.config.configuredVersion ?? 'v1',
+      tier: this.config.tier ?? null,
+    }), 'utf8').digest('hex').slice(0, 24)
+    return 'self-hosted-v1:' + hash
+  }
+
+  async probe(context: ProviderCallContext): Promise<ProviderProbeResult> {
+    try {
+      return await this.probeHealth(context, await this.health(context))
+    } catch (error) {
+      if (context.signal.aborted) throw new MinerUError(failure('CANCELLED', 'Probe operation was cancelled', true))
+      const reason = toMinerUFailure(error)
+      return { available: false, provider: this.id, protocolVersion: 'v1',
+        authentication: reason.code === 'AUTHENTICATION_FAILED' ? 'invalid' : context.credential ? 'unknown' : 'not-configured',
+        diagnostics: sanitizeDiagnostic(reason.message, [context.credential ?? '']) }
+    }
   }
 
   /** Cheap protocol probe: answers whether the configured endpoint speaks the V1 API. */
@@ -452,53 +474,41 @@ export class SelfHostedV1ApiAdapter {
       { operation: 'probe', retry: true },
     )
     if (!isSelfHostedV1Health(health)) {
-      throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Endpoint did not answer the MinerU 4.x V1 health document', false, { provider: 'self-hosted-v2' }))
+      throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Endpoint did not answer the MinerU 4.x V1 health document', false, { provider: 'self-hosted-v1' }))
     }
     return health
   }
 
-  async probe(context: ProviderCallContext, health: SelfHostedV1HealthResponse): Promise<ProviderProbeResult> {
-    const isHealthy = health.status === undefined || health.status === 'ok' || health.status === 'healthy'
-    const hasCredential = typeof context.credential === 'string' && context.credential.trim() !== ''
-    let authentication: ProviderProbeResult['authentication'] = hasCredential ? 'unknown' : 'not-configured'
-    let queue: ProviderProbeResult['queue']
-    let diagnostics: string | undefined
+  private async discoverDeployment(context: ProviderCallContext, health: SelfHostedV1HealthResponse) {
+    const response = await this.requestJson<{ readonly data?: readonly { readonly id?: unknown }[] }>(
+      'GET', '/v1/tiers', undefined, {}, context, [200], { operation: 'probe', retry: true },
+    )
+    if (!Array.isArray(response?.data)) throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Invalid V1 tiers response', false, { provider: this.id }))
+    const availableTiers = [...new Set(response.data.map(item => item?.id).filter((id): id is string => typeof id === 'string' && (SELF_HOSTED_TIERS as readonly string[]).includes(id)))]
+    const outputFormats = Array.isArray(health.features?.output_formats)
+      ? [...new Set(health.features.output_formats.filter(value => ['markdown', 'middle_json', 'structured_content', 'zip'].includes(value)))] : []
+    const sourceTypes = Array.isArray(health.features?.sources)
+      ? [...new Set(health.features.sources.filter(value => ['file_id', 'url', 'inline'].includes(value)))] : []
+    return { availableTiers, outputFormats, sourceTypes }
+  }
 
-    // /v1/health is public; /v1/usage is the cheapest authenticated endpoint, so it both
-    // validates the credential and reports the server concurrency limit.
-    if (hasCredential) {
-      try {
-        const usage = await this.requestJson<SelfHostedV1UsageResponse>(
-          'GET',
-          '/v1/usage',
-          undefined,
-          {},
-          context,
-          [200],
-          { operation: 'probe', retry: true },
-        )
-        authentication = 'valid'
-        if (typeof usage?.limits?.max_concurrent_jobs === 'number') {
-          queue = { maxConcurrent: usage.limits.max_concurrent_jobs }
-        }
-      } catch (error: unknown) {
-        if (context.signal.aborted) {
-          throw new MinerUError(failure('CANCELLED', 'Probe operation was cancelled', true))
-        }
-        const probeFailure = toMinerUFailure(error)
-        if (probeFailure.code === 'AUTHENTICATION_FAILED') authentication = 'invalid'
-        else diagnostics = sanitizeDiagnostic(probeFailure.message)
-      }
-    }
+  private deploymentIssue(deployment: { availableTiers: readonly string[]; outputFormats: readonly string[]; sourceTypes: readonly string[] }): string | undefined {
+    if (!deployment.outputFormats.includes('zip')) return 'This V1 deployment does not advertise the required zip output'
+    if (!deployment.sourceTypes.includes('file_id')) return 'This V1 deployment does not advertise uploaded file_id sources'
+    if (deployment.availableTiers.length === 0) return 'This V1 deployment advertises no supported parse tiers'
+    if (this.config.tier !== undefined && !deployment.availableTiers.includes(this.config.tier)) return 'The configured V1 tier is not available on this deployment'
+    return undefined
+  }
 
+  private async probeHealth(context: ProviderCallContext, health: SelfHostedV1HealthResponse): Promise<ProviderProbeResult> {
+    const deployment = await this.discoverDeployment(context, health)
+    const healthy = health.status === undefined || health.status === 'ok' || health.status === 'healthy'
+    const diagnostics = healthy ? this.deploymentIssue(deployment) : 'Server reported unhealthy status'
     return {
-      available: isHealthy,
-      provider: 'self-hosted-v2',
-      authentication,
-      protocolVersion: 'v1',
+      available: healthy && diagnostics === undefined, provider: this.id, protocolVersion: 'v1',
+      authentication: context.credential?.trim() ? 'valid' : 'not-configured',
       ...(typeof health.version === 'string' ? { serverVersion: health.version } : {}),
-      ...(queue === undefined ? {} : { queue }),
-      ...(isHealthy ? {} : { diagnostics: diagnostics ?? 'Server reported unhealthy status' }),
+      ...deployment, ...(diagnostics === undefined ? {} : { diagnostics }),
     }
   }
 
@@ -508,10 +518,17 @@ export class SelfHostedV1ApiAdapter {
     context: ProviderCallContext,
   ): Promise<ProviderSubmission> {
     context.signal.throwIfAborted()
+    validateProviderCapabilities(request, this.capabilities)
     if (sources.length !== request.files.length) {
       throw new MinerUError(failure('INVALID_REQUEST', 'Prepared source files count does not match request files count'))
     }
     await assertSourcesUnchanged(sources, context.signal)
+    const health = await this.health(context)
+    if (health.status !== undefined && health.status !== 'ok' && health.status !== 'healthy') {
+      throw new MinerUError(failure('PROVIDER_UNAVAILABLE', 'V1 server reported unhealthy status', true, { provider: this.id }))
+    }
+    const issue = this.deploymentIssue(await this.discoverDeployment(context, health))
+    if (issue !== undefined) throw new MinerUError(failure('UNSUPPORTED_OPTION', issue, false, { provider: this.id }))
 
     const upstreamFileIds: string[] = []
     for (let index = 0; index < sources.length; index++) {
@@ -520,7 +537,7 @@ export class SelfHostedV1ApiAdapter {
     }
 
     const pageRange = request.semantics.pages?.trim()
-    const tier = this.resolveTier(request.semantics.model)
+    const tier = this.config.tier
     const payload = {
       files: upstreamFileIds.map(fileId => ({
         source: { type: 'file_id', file_id: fileId },
@@ -542,7 +559,7 @@ export class SelfHostedV1ApiAdapter {
     )
     const jobId = job?.job_id
     if (typeof jobId !== 'string' || jobId.trim() === '') {
-      throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'MinerU server did not return a valid job_id', false, { provider: 'self-hosted-v2' }))
+      throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'MinerU server did not return a valid job_id', false, { provider: 'self-hosted-v1' }))
     }
 
     const submittedFiles: ProviderSubmittedFile[] = request.files.map(file => ({
@@ -550,7 +567,7 @@ export class SelfHostedV1ApiAdapter {
       fileId: file.fileId,
       name: file.name,
     }))
-    const ref: ProviderJobRef = { provider: 'self-hosted-v2', protocol: 'v1', taskId: jobId, files: submittedFiles }
+    const ref: ProviderJobRef = { provider: 'self-hosted-v1', protocol: 'v1', taskId: jobId, files: submittedFiles }
     await context.onAccepted?.(ref)
 
     const snapshot = this.snapshotFromJob(ref, job, context)
@@ -559,7 +576,7 @@ export class SelfHostedV1ApiAdapter {
 
   async inspect(ref: ProviderJobRef, context: ProviderCallContext): Promise<ProviderJobSnapshot> {
     context.signal.throwIfAborted()
-    if (ref.provider !== 'self-hosted-v2' || ref.protocol !== 'v1') {
+    if (ref.provider !== 'self-hosted-v1' || ref.protocol !== 'v1') {
       throw new MinerUError(failure('INVALID_REQUEST', `Unsupported provider ref for the self-hosted V1 API adapter`))
     }
     const job = await this.requestJson<SelfHostedV1JobResponse>(
@@ -581,7 +598,7 @@ export class SelfHostedV1ApiAdapter {
     context: ProviderCallContext,
   ): Promise<ProviderCollection> {
     context.signal.throwIfAborted()
-    if (ref.provider !== 'self-hosted-v2' || ref.protocol !== 'v1') {
+    if (ref.provider !== 'self-hosted-v1' || ref.protocol !== 'v1') {
       throw new MinerUError(failure('INVALID_REQUEST', `Unsupported provider ref for the self-hosted V1 API adapter`))
     }
 
@@ -603,7 +620,7 @@ export class SelfHostedV1ApiAdapter {
       const jobFile = matchV1JobFile(jobFiles, file, index)
       if (jobFile === undefined) {
         throw new MinerUError(failure('RESULT_NOT_READY', `Result for file "${file.name}" is not ready`, true, {
-          provider: 'self-hosted-v2',
+          provider: 'self-hosted-v1',
           fileId: file.fileId,
         }))
       }
@@ -618,14 +635,14 @@ export class SelfHostedV1ApiAdapter {
             'REMOTE_PARSE_FAILED',
             sanitizeDiagnostic(jobFile.error?.message ?? 'Remote document extraction failed', [context.credential ?? '']),
             false,
-            { provider: 'self-hosted-v2', fileId: file.fileId },
+            { provider: 'self-hosted-v1', fileId: file.fileId },
           ),
         })
         continue
       }
       if (fileState !== 'completed') {
         throw new MinerUError(failure('RESULT_NOT_READY', `Result for file "${file.name}" is not ready (state: ${String(jobFile.status)})`, true, {
-          provider: 'self-hosted-v2',
+          provider: 'self-hosted-v1',
           fileId: file.fileId,
         }))
       }
@@ -651,15 +668,8 @@ export class SelfHostedV1ApiAdapter {
     return { files: collectedFiles }
   }
 
-  /**
-   * Resolves the V1 tier for one request; shared with the compatibility key so both agree.
-   */
-  private resolveTier(model: MinerUModel): string | undefined {
-    return resolveSelfHostedTier(this.options.tier, this.options.modelMap, model)
-  }
-
   private snapshotFromJob(
-    ref: Extract<ProviderJobRef, { readonly provider: 'self-hosted-v2' }>,
+    ref: Extract<ProviderJobRef, { readonly provider: 'self-hosted-v1' }>,
     job: SelfHostedV1JobResponse,
     context: ProviderCallContext,
   ): { state: MinerUJobState; files: readonly ProviderFileSnapshot[] } {
@@ -677,7 +687,7 @@ export class SelfHostedV1ApiAdapter {
           state: fileState,
           rawState: typeof job?.status === 'string' ? job.status : undefined,
           ...(fileState === 'failed'
-            ? { failure: failure('REMOTE_PARSE_FAILED', 'Remote parse job did not complete', false, { provider: 'self-hosted-v2', fileId: file.fileId }) }
+            ? { failure: failure('REMOTE_PARSE_FAILED', 'Remote parse job did not complete', false, { provider: 'self-hosted-v1', fileId: file.fileId }) }
             : {}),
         })),
       }
@@ -703,7 +713,7 @@ export class SelfHostedV1ApiAdapter {
           state: missingState,
           rawState: 'pending',
           ...(missingState === 'failed'
-            ? { failure: failure('REMOTE_PARSE_FAILED', 'Remote parse job finished without a result for this file', false, { provider: 'self-hosted-v2', fileId: file.fileId }) }
+            ? { failure: failure('REMOTE_PARSE_FAILED', 'Remote parse job finished without a result for this file', false, { provider: 'self-hosted-v1', fileId: file.fileId }) }
             : {}),
         })
         if (missingState === 'processing') hasNonTerminal = true
@@ -724,7 +734,7 @@ export class SelfHostedV1ApiAdapter {
                 'REMOTE_PARSE_FAILED',
                 sanitizeDiagnostic(jobFile.error?.message ?? 'Remote document extraction failed', [context.credential ?? '']),
                 false,
-                { provider: 'self-hosted-v2', fileId: file.fileId },
+                { provider: 'self-hosted-v1', fileId: file.fileId },
               ),
             }
           : {}),
@@ -832,7 +842,7 @@ export class SelfHostedV1ApiAdapter {
     }
 
     await executeWithRetry({
-      provider: 'self-hosted-v2',
+      provider: 'self-hosted-v1',
       operation: 'upload-put',
       signal: context.signal,
       retryOptions: mergeRetryOptions(this.options.retry, context.retry),
@@ -936,7 +946,7 @@ export class SelfHostedV1ApiAdapter {
     }
 
     return await executeWithRetry({
-      provider: 'self-hosted-v2',
+      provider: 'self-hosted-v1',
       operation: 'result-download',
       signal: context.signal,
       retryOptions: mergeRetryOptions(this.options.retry, context.retry),
@@ -959,17 +969,17 @@ export class SelfHostedV1ApiAdapter {
           } catch (error: unknown) {
             if (context.signal.aborted) throw new MinerUError(failure('CANCELLED', 'Download was cancelled', true))
             if (timedOut) {
-              const timeoutError = new MinerUError(failure('RESULT_DOWNLOAD_FAILED', `Result download timed out after ${String(context.timeoutMs)}ms`, true, { provider: 'self-hosted-v2' }))
+              const timeoutError = new MinerUError(failure('RESULT_DOWNLOAD_FAILED', `Result download timed out after ${String(context.timeoutMs)}ms`, true, { provider: 'self-hosted-v1' }))
               Object.assign(timeoutError, { httpStatus: 408 })
               throw timeoutError
             }
             const message = error instanceof Error ? error.message : String(error)
-            throw new MinerUError(failure('RESULT_DOWNLOAD_FAILED', `Failed to download result archive: ${sanitizeDiagnostic(message)}`, true, { provider: 'self-hosted-v2' }))
+            throw new MinerUError(failure('RESULT_DOWNLOAD_FAILED', `Failed to download result archive: ${sanitizeDiagnostic(message)}`, true, { provider: 'self-hosted-v1' }))
           }
 
           if (response.status !== 200) {
             if (response.body) { try { await response.body.cancel() } catch {} }
-            const error = new MinerUError(failure('RESULT_DOWNLOAD_FAILED', `Failed to download result archive, HTTP status ${String(response.status)}`, isRetryableHttpStatus(response.status), { provider: 'self-hosted-v2' }))
+            const error = new MinerUError(failure('RESULT_DOWNLOAD_FAILED', `Failed to download result archive, HTTP status ${String(response.status)}`, isRetryableHttpStatus(response.status), { provider: 'self-hosted-v1' }))
             Object.assign(error, {
               httpStatus: response.status,
               retryAfterMs: parseRetryAfter(response.headers.get('retry-after')),
@@ -978,7 +988,7 @@ export class SelfHostedV1ApiAdapter {
           }
           const body = response.body
           if (body === null) {
-            throw new MinerUError(failure('RESULT_DOWNLOAD_FAILED', 'Result archive response body is empty', false, { provider: 'self-hosted-v2' }))
+            throw new MinerUError(failure('RESULT_DOWNLOAD_FAILED', 'Result archive response body is empty', false, { provider: 'self-hosted-v1' }))
           }
 
           const nodeStream = Readable.fromWeb(body as NodeWebReadableStream<Uint8Array>)
@@ -1007,7 +1017,7 @@ export class SelfHostedV1ApiAdapter {
                 'RESULT_DOWNLOAD_FAILED',
                 `Result archive transfer was interrupted after HTTP 200: ${message}`,
                 true,
-                { provider: 'self-hosted-v2' },
+                { provider: 'self-hosted-v1' },
               ))
               if (timedOut) Object.assign(interrupted, { httpStatus: 408 })
               throw interrupted
@@ -1016,7 +1026,7 @@ export class SelfHostedV1ApiAdapter {
               'RESULT_DOWNLOAD_FAILED',
               `Failed to stage the downloaded result archive: ${message}`,
               false,
-              { provider: 'self-hosted-v2' },
+              { provider: 'self-hosted-v1' },
             ))
           } finally {
             nodeStream.removeListener('error', onBodyError)

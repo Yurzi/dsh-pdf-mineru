@@ -2,7 +2,7 @@ import { constants } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { open } from 'node:fs/promises'
 import { setTimeout as delay } from 'node:timers/promises'
-import type { MinerUConfig, ProviderConfig } from '../config.js'
+import { effectiveParseDefaults, type MinerUConfig, type ProviderConfig } from '../config.js'
 import type { MinerUFailure, MinerUProviderId } from '../domain/errors.js'
 import { MinerUError, failure, toMinerUFailure } from '../domain/errors.js'
 import type { CacheKey, MinerUResultId } from '../domain/ids.js'
@@ -133,6 +133,9 @@ export interface ProbeView {
   readonly authentication: 'valid' | 'invalid' | 'not-configured' | 'unknown'
   readonly protocol_version: string
   readonly server_version?: string
+  readonly available_tiers?: readonly string[]
+  readonly output_formats?: readonly string[]
+  readonly source_types?: readonly string[]
   readonly queue?: {
     readonly queued?: number
     readonly processing?: number
@@ -246,6 +249,9 @@ export class MinerUService {
       authentication: result.authentication,
       protocol_version: result.protocolVersion,
       ...(result.serverVersion === undefined ? {} : { server_version: result.serverVersion }),
+      ...(result.availableTiers === undefined ? {} : { available_tiers: result.availableTiers }),
+      ...(result.outputFormats === undefined ? {} : { output_formats: result.outputFormats }),
+      ...(result.sourceTypes === undefined ? {} : { source_types: result.sourceTypes }),
       ...(result.queue === undefined ? {} : {
         queue: {
           ...(result.queue.queued === undefined ? {} : { queued: result.queue.queued }),
@@ -268,10 +274,15 @@ export class MinerUService {
     const resolved = this.options.providers.active()
     const current = this.config()
     const normalizer = new RequestNormalizer({
-      defaults: current.defaults,
+      defaults: effectiveParseDefaults(current.defaults, resolved.config),
       cwd: session.header.cwd,
       maxFileBytes: Math.min(current.limits.maxFileBytes, resolved.provider.capabilities.maxFileBytes ?? current.limits.maxFileBytes),
     })
+    if (resolved.config.type === 'self-hosted-v1') {
+      for (const field of ['model', 'language', 'formula', 'table'] as const) {
+        if (input[field] !== undefined) throw new MinerUError(failure('UNSUPPORTED_OPTION', 'V1 does not accept ' + field + '; configure its tier and OCR mode instead'))
+      }
+    }
     const backendInput: ParseRequestInput = {
       ...input,
       artifacts: input.artifacts,
@@ -536,7 +547,7 @@ export class MinerUService {
       files: [{ file_id: data.fileId, name: data.fileName, artifacts: artifactList.slice(0, 20), ...(artifactList.length > 20 ? { artifacts_truncated: true } : {}) }],
       content_status: 'not_requested', cursor: null, output_limit_chars: limit,
       source_sha256: data.item.prepared.request.files[0]!.sha256,
-      provenance: { provider: data.manifest.producer.providerId, model: data.manifest.request.semantics.model, parse_method: data.manifest.request.semantics.parseMethod, upstream_version: null, index_version: DOCUMENT_INDEX_VERSION, reader_version: READ_CURSOR_VERSION },
+      provenance: { provider: data.manifest.producer.providerId, model: data.manifest.producer.providerId === 'self-hosted-v1' ? null : data.manifest.request.semantics.model, parse_method: data.manifest.request.semantics.parseMethod, upstream_version: null, index_version: DOCUMENT_INDEX_VERSION, reader_version: READ_CURSOR_VERSION },
       ...(artifactsRequested ? { manifest_path: data.manifestPath, ...(data.markdownPath ? { markdown_path: data.markdownPath } : {}) } : {}),
       ...(summary ? { summary: counts } : {}),
       ...(pagesLabel ? { pages: pagesLabel } : {}),

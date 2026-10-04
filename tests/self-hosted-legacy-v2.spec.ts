@@ -16,9 +16,9 @@ import type {
 import type { ArtifactRef } from '../src/domain/result.js'
 import type { ArtifactKind, CanonicalParseRequest, PreparedSourceFile } from '../src/domain/request.js'
 import {
-  SelfHostedV2Provider,
-  type SelfHostedV2ProviderConfig,
-} from '../src/providers/self-hosted-v2.js'
+  SelfHostedLegacyV2Provider,
+  type SelfHostedLegacyV2ProviderConfig,
+} from '../src/providers/self-hosted-legacy-v2.js'
 
 const SHA256_A = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 const SHA256_B = 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210'
@@ -56,7 +56,7 @@ class MockArtifactSink implements ArtifactSink {
   }
 }
 
-describe('SelfHostedV2Provider', () => {
+describe('SelfHostedLegacyV2Provider', () => {
   let server: Server | undefined
   let serverUrl = ''
   const tempDirs: string[] = []
@@ -121,30 +121,30 @@ describe('SelfHostedV2Provider', () => {
 
   describe('Constructor & URL Validation', () => {
     it('accepts HTTPS baseURL', () => {
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_prod'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: 'https://mineru.example.com/api/v2',
         modelMap: { pipeline: 'pipeline', vlm: 'vlm-engine' },
       })
-      expect(provider.id).toBe('self-hosted-v2')
+      expect(provider.id).toBe('self-hosted-legacy-v2')
       expect(provider.capabilities.models).toEqual(['pipeline', 'vlm'])
     })
 
     it('rejects HTTP baseURL when allowInsecureHttp is omitted or false', () => {
       expect(() => {
-        new SelfHostedV2Provider({
+        new SelfHostedLegacyV2Provider({
           id: asProviderConfigId('mp_local'),
-          type: 'self-hosted-v2',
+          type: 'self-hosted-legacy-v2',
           baseURL: 'http://127.0.0.1:8000',
           modelMap: { pipeline: 'pipeline' },
         })
       }).toThrow(MinerUError)
 
       expect(() => {
-        new SelfHostedV2Provider({
+        new SelfHostedLegacyV2Provider({
           id: asProviderConfigId('mp_local'),
-          type: 'self-hosted-v2',
+          type: 'self-hosted-legacy-v2',
           baseURL: 'http://127.0.0.1:8000',
           modelMap: { pipeline: 'pipeline' },
           allowInsecureHttp: false,
@@ -153,47 +153,47 @@ describe('SelfHostedV2Provider', () => {
     })
 
     it('accepts HTTP baseURL when allowInsecureHttp is true', () => {
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: 'http://127.0.0.1:8000',
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
       })
-      expect(provider.id).toBe('self-hosted-v2')
+      expect(provider.id).toBe('self-hosted-legacy-v2')
     })
 
     it('rejects baseURL with credentials or invalid protocols', () => {
       expect(() => {
-        new SelfHostedV2Provider({
+        new SelfHostedLegacyV2Provider({
           id: asProviderConfigId('mp_local'),
-          type: 'self-hosted-v2',
+          type: 'self-hosted-legacy-v2',
           baseURL: 'https://user:pass@example.com',
           modelMap: { pipeline: 'pipeline' },
         })
       }).toThrow(MinerUError)
 
       expect(() => {
-        new SelfHostedV2Provider({
+        new SelfHostedLegacyV2Provider({
           id: asProviderConfigId('mp_local'),
-          type: 'self-hosted-v2',
+          type: 'self-hosted-legacy-v2',
           baseURL: 'ftp://example.com',
           modelMap: { pipeline: 'pipeline' },
         })
       }).toThrow(MinerUError)
 
       expect(() => {
-        new SelfHostedV2Provider({
+        new SelfHostedLegacyV2Provider({
           id: asProviderConfigId('mp_local'),
-          type: 'self-hosted-v2',
+          type: 'self-hosted-legacy-v2',
           baseURL: 'not-a-url',
           modelMap: { pipeline: 'pipeline' },
         })
       }).toThrow(MinerUError)
 
-      expect(() => new SelfHostedV2Provider({
+      expect(() => new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: 'https://example.com/v2?token=secret',
         modelMap: { pipeline: 'pipeline' },
       })).toThrow(/query or fragment/)
@@ -202,9 +202,9 @@ describe('SelfHostedV2Provider', () => {
 
   describe('compatibilityKey', () => {
     it('generates deterministic key without plaintext URL or credentials', async () => {
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: 'https://secret-internal-host:8000/v2/',
         modelMap: { pipeline: 'pipeline' },
         configuredVersion: 'v3.4.4',
@@ -218,7 +218,7 @@ describe('SelfHostedV2Provider', () => {
       }
 
       const key = await provider.compatibilityKey(request, {})
-      expect(key).toMatch(/^self-hosted-v2:[a-f0-9]{24}$/)
+      expect(key).toMatch(/^self-hosted-legacy-v2:[a-f0-9]{24}$/)
       expect(key).not.toContain('secret-internal-host')
       expect(key).not.toContain('https://')
     })
@@ -226,7 +226,7 @@ describe('SelfHostedV2Provider', () => {
     it('changes when the mapped upstream backend changes', async () => {
       const config = {
         id: asProviderConfigId('mp_custom_v1'),
-        type: 'self-hosted-v2' as const,
+        type: 'self-hosted-legacy-v2' as const,
         baseURL: 'https://mineru.example.com',
         modelMap: { vlm: 'vlm-engine' },
       }
@@ -237,56 +237,22 @@ describe('SelfHostedV2Provider', () => {
         requiredArtifacts: ['markdown'],
       }
 
-      const first = await new SelfHostedV2Provider(config).compatibilityKey(request, {})
-      const changed = await new SelfHostedV2Provider({
+      const first = await new SelfHostedLegacyV2Provider(config).compatibilityKey(request, {})
+      const changed = await new SelfHostedLegacyV2Provider({
         ...config, modelMap: { vlm: 'another-vlm-engine' },
       }).compatibilityKey(request, {})
-      expect(first).toMatch(/^self-hosted-v2:[a-f0-9]{24}$/)
+      expect(first).toMatch(/^self-hosted-legacy-v2:[a-f0-9]{24}$/)
       expect(changed).not.toBe(first)
     })
 
-    it('isolates cached results by the effective parse tier', async () => {
-      const config = {
-        id: asProviderConfigId('mp_tiered'),
-        type: 'self-hosted-v2' as const,
-        baseURL: 'https://mineru.example.com',
-        modelMap: { pipeline: 'pipeline', vlm: 'vlm-engine' },
-      }
-      const request: CanonicalParseRequest = {
-        schemaVersion: 1,
-        files: [{ fileId: createFileId(SHA256_A), name: 'doc.pdf', bytes: 100, sha256: SHA256_A }],
-        semantics: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true },
-        requiredArtifacts: ['markdown'],
-      }
-      const keyFor = async (patch: Partial<SelfHostedV2ProviderConfig>): Promise<string> =>
-        await new SelfHostedV2Provider({ ...config, ...patch }).compatibilityKey(request, {})
-
-      const serverDefault = await keyFor({})
-      const standard = await keyFor({ tier: 'standard' })
-      const advanced = await keyFor({ tier: 'advanced' })
-
-      // Switching tier must not reuse results produced under another tier.
-      expect(new Set([serverDefault, standard, advanced]).size).toBe(3)
-      expect(standard).not.toBe(serverDefault)
-      expect(advanced).not.toBe(standard)
-
-      // A modelMap value that names a tier is the effective tier too, so it also participates.
-      const mappedFlash = await keyFor({ modelMap: { pipeline: 'flash', vlm: 'vlm-engine' } })
-      const mappedStandard = await keyFor({ modelMap: { pipeline: 'standard', vlm: 'vlm-engine' } })
-      expect(mappedFlash).not.toBe(mappedStandard)
-      expect(mappedFlash).not.toBe(serverDefault)
-
-      // Legacy backend identifiers leave the tier unset and stay a distinct identity input.
-      const legacy = await keyFor({ modelMap: { pipeline: 'hybrid-engine', vlm: 'vlm-engine' } })
-      expect(legacy).not.toBe(serverDefault)
-      expect(await keyFor({ configuredVersion: 'v3.4.4' })).not.toBe(serverDefault)
-    })
   })
 
   describe('probe (GET /health)', () => {
-    it('returns available and queue stats on healthy 200 response', async () => {
+    it('returns available and queue stats on healthy 200 response without detecting V1', async () => {
       let receivedAuthHeader: string | undefined
+      const requestedUrls: string[] = []
       server = createServer((req, res) => {
+        requestedUrls.push(req.url ?? '')
         receivedAuthHeader = req.headers['authorization']
         if (req.url === '/health' && req.method === 'GET') {
           res.writeHead(200, { 'content-type': 'application/json' })
@@ -309,9 +275,9 @@ describe('SelfHostedV2Provider', () => {
       const port = getPort(server!)
       serverUrl = `http://127.0.0.1:${port}`
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: serverUrl,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
@@ -319,8 +285,9 @@ describe('SelfHostedV2Provider', () => {
 
       const probeResult = await provider.probe(makeContext({ credential: 'my-secret-token' }))
       expect(receivedAuthHeader).toBe('Bearer my-secret-token')
+      expect(requestedUrls).toEqual(['/health'])
       expect(probeResult.available).toBe(true)
-      expect(probeResult.provider).toBe('self-hosted-v2')
+      expect(probeResult.provider).toBe('self-hosted-legacy-v2')
       expect(probeResult.authentication).toBe('valid')
       expect(probeResult.protocolVersion).toBe('v2')
       expect(probeResult.serverVersion).toBe('3.4.4')
@@ -347,9 +314,9 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
@@ -370,9 +337,9 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
@@ -392,9 +359,9 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
@@ -406,9 +373,9 @@ describe('SelfHostedV2Provider', () => {
     })
 
     it('handles server connection errors gracefully', async () => {
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: 'http://127.0.0.1:59999', // inactive port
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
@@ -423,9 +390,9 @@ describe('SelfHostedV2Provider', () => {
       const controller = new AbortController()
       controller.abort()
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: 'https://example.com',
         modelMap: { pipeline: 'pipeline' },
       })
@@ -441,8 +408,10 @@ describe('SelfHostedV2Provider', () => {
       let requestBody = ''
       let requestHeaders: IncomingHttpHeaders | undefined
       let receivedUrl = ''
+      const requestedUrls: string[] = []
 
       server = createServer((req, res) => {
+        requestedUrls.push(req.url ?? '')
         receivedUrl = req.url ?? ''
         requestHeaders = req.headers
         req.on('data', chunk => { requestBody += chunk.toString('utf8') })
@@ -463,9 +432,9 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline', vlm: 'vlm-engine' },
         allowInsecureHttp: true,
@@ -490,6 +459,7 @@ describe('SelfHostedV2Provider', () => {
       const submission = await provider.submit(request, [file], makeContext({ credential: 'secret-key' }))
 
       expect(receivedUrl).toBe('/tasks')
+      expect(requestedUrls).toEqual(['/tasks'])
       if (requestHeaders === undefined) throw new Error('request headers were not captured')
       expect(requestHeaders['authorization']).toBe('Bearer secret-key')
       expect(requestHeaders['content-type']).toContain('multipart/form-data; boundary=')
@@ -522,9 +492,9 @@ describe('SelfHostedV2Provider', () => {
       expect(requestBody).toContain('%PDF-1.4 report content')
 
       // Verify ProviderSubmission structure
-      expect(submission.ref.provider).toBe('self-hosted-v2')
+      expect(submission.ref.provider).toBe('self-hosted-legacy-v2')
       expect(Object.keys(submission.ref).sort()).toEqual(['files', 'protocol', 'provider', 'taskId'])
-      if (submission.ref.provider === 'self-hosted-v2') {
+      if (submission.ref.provider === 'self-hosted-legacy-v2') {
         expect(submission.ref.protocol).toBe('legacy')
         expect(submission.ref.taskId).toBe('task_abc_123')
         expect(submission.ref.files).toEqual([
@@ -552,9 +522,9 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
@@ -576,9 +546,9 @@ describe('SelfHostedV2Provider', () => {
     })
 
     it('rejects unsupported model in modelMap', async () => {
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: 'https://example.com',
         modelMap: { pipeline: 'pipeline' }, // vlm not mapped
       })
@@ -597,9 +567,9 @@ describe('SelfHostedV2Provider', () => {
     })
 
     it('rejects multi-interval page ranges for self-hosted provider', async () => {
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: 'https://example.com',
         modelMap: { pipeline: 'pipeline' },
       })
@@ -618,9 +588,9 @@ describe('SelfHostedV2Provider', () => {
     })
 
     it('detects file modifications before upload via stat/fingerprint verification', async () => {
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: 'https://example.com',
         modelMap: { pipeline: 'pipeline' },
       })
@@ -652,9 +622,9 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
@@ -688,9 +658,9 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
@@ -718,6 +688,21 @@ describe('SelfHostedV2Provider', () => {
   })
 
   describe('inspect (GET /tasks/{taskId})', () => {
+    it('rejects V1 references instead of detecting or dispatching that protocol', async () => {
+      const provider = new SelfHostedLegacyV2Provider({
+        id: asProviderConfigId('mp_legacy'), type: 'self-hosted-legacy-v2',
+        baseURL: 'http://127.0.0.1:1', allowInsecureHttp: true, modelMap: { pipeline: 'pipeline' },
+      })
+      const ref = { provider: 'self-hosted-v1' as const, protocol: 'v1' as const, taskId: 'v1_job', files: [] }
+      const request: CanonicalParseRequest = {
+        schemaVersion: 1, files: [], requiredArtifacts: ['markdown'],
+        semantics: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'auto', formula: false, table: false },
+      }
+      await expect(provider.inspect(ref, makeContext())).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
+      await expect(provider.collect(ref, request, new MockArtifactSink(), makeContext()))
+        .rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
+    })
+
     it('maps task statuses to unified MinerUJobState', async () => {
       let currentStatus = 'processing'
       server = createServer((req, res) => {
@@ -733,9 +718,9 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
@@ -743,7 +728,7 @@ describe('SelfHostedV2Provider', () => {
 
       const fileId = createFileId(SHA256_A)
       const ref = {
-        provider: 'self-hosted-v2' as const,
+        provider: 'self-hosted-legacy-v2' as const, protocol: 'legacy' as const,
         taskId: 'task_123',
         files: [{ dataId: 'd1', fileId, name: 'doc.pdf' }],
       }
@@ -766,16 +751,16 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
       })
 
       const ref = {
-        provider: 'self-hosted-v2' as const,
+        provider: 'self-hosted-legacy-v2' as const, protocol: 'legacy' as const,
         taskId: 'missing_task',
         files: [{ dataId: 'd1', fileId: createFileId(SHA256_A), name: 'doc.pdf' }],
       }
@@ -796,16 +781,16 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
       })
 
       const ref = {
-        provider: 'self-hosted-v2' as const,
+        provider: 'self-hosted-legacy-v2' as const, protocol: 'legacy' as const,
         taskId: 'task_123',
         files: [{ dataId: 'd1', fileId: createFileId(SHA256_A), name: 'doc.pdf' }],
       }
@@ -848,9 +833,9 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
@@ -858,7 +843,7 @@ describe('SelfHostedV2Provider', () => {
 
       const fileId = createFileId(SHA256_A)
       const ref = {
-        provider: 'self-hosted-v2' as const,
+        provider: 'self-hosted-legacy-v2' as const, protocol: 'legacy' as const,
         taskId: 'task_123',
         files: [{ dataId: 'd1', fileId, name: 'document.pdf' }],
       }
@@ -900,14 +885,14 @@ describe('SelfHostedV2Provider', () => {
         res.end(JSON.stringify({ results: { document: { md_content: '# only markdown' } } }))
       })
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
-      const provider = new SelfHostedV2Provider({
-        id: asProviderConfigId('mp_local'), type: 'self-hosted-v2',
+      const provider = new SelfHostedLegacyV2Provider({
+        id: asProviderConfigId('mp_local'), type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${getPort(server!)}`,
         modelMap: { pipeline: 'pipeline' }, allowInsecureHttp: true,
       })
       const fileId = createFileId(SHA256_A)
       const ref = {
-        provider: 'self-hosted-v2' as const, taskId: 'partial',
+        provider: 'self-hosted-legacy-v2' as const, protocol: 'legacy' as const, taskId: 'partial',
         files: [{ dataId: 'd1', fileId, name: 'document.pdf' }],
       }
       const request: CanonicalParseRequest = {
@@ -938,9 +923,9 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
@@ -950,7 +935,7 @@ describe('SelfHostedV2Provider', () => {
       const fileIdB = createFileId(SHA256_B, 1)
 
       const ref = {
-        provider: 'self-hosted-v2' as const,
+        provider: 'self-hosted-legacy-v2' as const, protocol: 'legacy' as const,
         taskId: 'multi_task',
         files: [
           { dataId: 'd1', fileId: fileIdA, name: 'file_a.pdf' },
@@ -989,16 +974,16 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
       })
 
       const ref = {
-        provider: 'self-hosted-v2' as const,
+        provider: 'self-hosted-legacy-v2' as const, protocol: 'legacy' as const,
         taskId: 'task_err',
         files: [{ dataId: 'd1', fileId: createFileId(SHA256_A), name: 'doc.pdf' }],
       }
@@ -1028,9 +1013,9 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
@@ -1040,7 +1025,7 @@ describe('SelfHostedV2Provider', () => {
       setTimeout(() => controller.abort(), 50)
 
       const ref = {
-        provider: 'self-hosted-v2' as const,
+        provider: 'self-hosted-legacy-v2' as const, protocol: 'legacy' as const,
         taskId: 'task_1',
         files: [{ dataId: 'd1', fileId: createFileId(SHA256_A), name: 'doc.pdf' }],
       }
@@ -1057,16 +1042,16 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
       })
 
       const ref = {
-        provider: 'self-hosted-v2' as const,
+        provider: 'self-hosted-legacy-v2' as const, protocol: 'legacy' as const,
         taskId: 'task_hang',
         files: [{ dataId: 'd1', fileId: createFileId(SHA256_A), name: 'doc.pdf' }],
       }
@@ -1094,9 +1079,9 @@ describe('SelfHostedV2Provider', () => {
       const port = getPort(server!)
 
       const events: any[] = []
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
@@ -1116,7 +1101,7 @@ describe('SelfHostedV2Provider', () => {
       expect(probeCount).toBe(2)
       expect(events).toHaveLength(1)
       expect(events[0]).toMatchObject({
-        provider: 'self-hosted-v2',
+        provider: 'self-hosted-legacy-v2',
         operation: 'probe',
         attempt: 1,
         status: 500,
@@ -1139,16 +1124,16 @@ describe('SelfHostedV2Provider', () => {
       const port = getPort(server!)
 
       const events: any[] = []
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
       })
 
       const ref = {
-        provider: 'self-hosted-v2' as const,
+        provider: 'self-hosted-legacy-v2' as const, protocol: 'legacy' as const,
         taskId: 'task_retry_1',
         files: [{ dataId: 'd1', fileId: createFileId(SHA256_A), name: 'doc.pdf' }],
       }
@@ -1165,7 +1150,7 @@ describe('SelfHostedV2Provider', () => {
       expect(inspectCount).toBe(2)
       expect(events).toHaveLength(1)
       expect(events[0]).toMatchObject({
-        provider: 'self-hosted-v2',
+        provider: 'self-hosted-legacy-v2',
         operation: 'inspect',
         status: 503,
       })
@@ -1190,16 +1175,16 @@ describe('SelfHostedV2Provider', () => {
       const port = getPort(server!)
 
       const events: any[] = []
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
       })
 
       const ref = {
-        provider: 'self-hosted-v2' as const,
+        provider: 'self-hosted-legacy-v2' as const, protocol: 'legacy' as const,
         taskId: 'task_429',
         files: [{ dataId: 'd1', fileId: createFileId(SHA256_A), name: 'doc.pdf' }],
       }
@@ -1216,7 +1201,7 @@ describe('SelfHostedV2Provider', () => {
       expect(inspectCount).toBe(2)
       expect(events).toHaveLength(1)
       expect(events[0]).toMatchObject({
-        provider: 'self-hosted-v2',
+        provider: 'self-hosted-legacy-v2',
         operation: 'inspect',
         status: 429,
         retryAfterMs: 2000,
@@ -1235,16 +1220,16 @@ describe('SelfHostedV2Provider', () => {
       const port = getPort(server!)
 
       const events: any[] = []
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
       })
 
       const ref = {
-        provider: 'self-hosted-v2' as const,
+        provider: 'self-hosted-legacy-v2' as const, protocol: 'legacy' as const,
         taskId: 'task_exhaust',
         files: [{ dataId: 'd1', fileId: createFileId(SHA256_A), name: 'doc.pdf' }],
       }
@@ -1279,16 +1264,16 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
       })
 
       const ref = {
-        provider: 'self-hosted-v2' as const,
+        provider: 'self-hosted-legacy-v2' as const, protocol: 'legacy' as const,
         taskId: 'task_404',
         files: [{ dataId: 'd1', fileId: createFileId(SHA256_A), name: 'doc.pdf' }],
       }
@@ -1322,9 +1307,9 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
@@ -1383,9 +1368,9 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
@@ -1393,7 +1378,7 @@ describe('SelfHostedV2Provider', () => {
 
       const fileId = createFileId(SHA256_A)
       const ref = {
-        provider: 'self-hosted-v2' as const,
+        provider: 'self-hosted-legacy-v2' as const, protocol: 'legacy' as const,
         taskId: 'task_col',
         files: [{ dataId: 'd1', fileId, name: 'doc.pdf' }],
       }
@@ -1420,7 +1405,7 @@ describe('SelfHostedV2Provider', () => {
       expect(collectCount).toBe(2)
       expect(events).toHaveLength(1)
       expect(events[0]).toMatchObject({
-        provider: 'self-hosted-v2',
+        provider: 'self-hosted-legacy-v2',
         operation: 'collect',
         status: 500,
       })
@@ -1436,9 +1421,9 @@ describe('SelfHostedV2Provider', () => {
       await new Promise(resolve => server!.listen(0, '127.0.0.1', () => resolve(true)))
       const port = getPort(server!)
 
-      const provider = new SelfHostedV2Provider({
+      const provider = new SelfHostedLegacyV2Provider({
         id: asProviderConfigId('mp_local'),
-        type: 'self-hosted-v2',
+        type: 'self-hosted-legacy-v2',
         baseURL: `http://127.0.0.1:${port}`,
         modelMap: { pipeline: 'pipeline' },
         allowInsecureHttp: true,
@@ -1446,7 +1431,7 @@ describe('SelfHostedV2Provider', () => {
 
       const controller = new AbortController()
       const ref = {
-        provider: 'self-hosted-v2' as const,
+        provider: 'self-hosted-legacy-v2' as const, protocol: 'legacy' as const,
         taskId: 'task_abort_backoff',
         files: [{ dataId: 'd1', fileId: createFileId(SHA256_A), name: 'doc.pdf' }],
       }

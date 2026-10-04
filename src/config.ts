@@ -18,7 +18,8 @@ import {
   type OfficialV4Config,
   type ProviderConfig,
   type SelfHostedTier,
-  type SelfHostedV2Config,
+  type SelfHostedV1Config,
+  type SelfHostedLegacyV2Config,
 } from './config/pure.js'
 
 export * from './config/pure.js'
@@ -32,12 +33,12 @@ function dshHome(): string {
 }
 
 export function defaultMinerUConfig(): MinerUConfig {
-  const selfHosted = defaultProviderConfig('self-hosted-v2')
+  const selfHosted = defaultProviderConfig('self-hosted-legacy-v2')
   const official = defaultProviderConfig('official-v4')
   return {
     schemaVersion: MINERU_CONFIG_SCHEMA_VERSION,
     activeProvider: selfHosted.id,
-    providers: [selfHosted, official],
+    providers: [selfHosted, official, defaultProviderConfig('self-hosted-v1')],
     defaults: { ...DEFAULT_PARSE_DEFAULTS },
     storage: {
       storageRoot: join(dshHome(), 'cache', 'pdf-mineru'),
@@ -57,8 +58,11 @@ const ALLOWED_TOP_KEYS = new Set([
 const ALLOWED_OFFICIAL_PROVIDER_KEYS = new Set([
   'id', 'type', 'baseURL', 'apiKeyEnv', 'models', 'configuredVersion',
 ])
-const ALLOWED_SELF_HOSTED_PROVIDER_KEYS = new Set([
-  'id', 'type', 'baseURL', 'apiKeyEnv', 'modelMap', 'tier', 'configuredVersion', 'allowInsecureHttp',
+const ALLOWED_LEGACY_PROVIDER_KEYS = new Set([
+  'id', 'type', 'baseURL', 'apiKeyEnv', 'modelMap', 'configuredVersion', 'allowInsecureHttp',
+])
+const ALLOWED_V1_PROVIDER_KEYS = new Set([
+  'id', 'type', 'baseURL', 'apiKeyEnv', 'tier', 'ocrMode', 'configuredVersion', 'allowInsecureHttp',
 ])
 const ALLOWED_MODEL_MAP_KEYS = new Set(['pipeline', 'vlm'])
 const ALLOWED_DEFAULTS_KEYS = new Set(['model', 'ocr', 'parseMethod', 'language', 'formula', 'table'])
@@ -189,28 +193,40 @@ function parseProvider(value: unknown): ProviderConfig {
     }
     return official
   }
-  if (input.type !== 'self-hosted-v2') throw new TypeError('provider.type is unsupported')
-  assertAllowedKeys(input, ALLOWED_SELF_HOSTED_PROVIDER_KEYS, 'provider')
+  if (input.type === 'self-hosted-v1') {
+    assertAllowedKeys(input, ALLOWED_V1_PROVIDER_KEYS, 'provider')
+    const allowInsecureHttp = booleanValue(input.allowInsecureHttp, false, 'provider.allowInsecureHttp')
+    let tier: SelfHostedTier | undefined
+    if (input.tier !== undefined) {
+      if (typeof input.tier !== 'string' || !(SELF_HOSTED_TIERS as readonly string[]).includes(input.tier)) {
+        throw new TypeError('provider.tier must be flash, basic, standard or advanced')
+      }
+      tier = input.tier as SelfHostedTier
+    }
+    const ocrMode = input.ocrMode === undefined ? 'auto' : input.ocrMode
+    if (ocrMode !== 'auto' && ocrMode !== 'txt' && ocrMode !== 'ocr') throw new TypeError('provider.ocrMode must be auto, txt or ocr')
+    const v1: SelfHostedV1Config = {
+      id, type: 'self-hosted-v1',
+      baseURL: baseUrl(input.baseURL, 'http://localhost:8000', allowInsecureHttp, 'provider.baseURL'),
+      apiKeyEnv: credentialRef(input.apiKeyEnv, undefined, false),
+      ...(tier === undefined ? {} : { tier }), ocrMode,
+      ...(input.configuredVersion === undefined ? {} : { configuredVersion: text(input.configuredVersion, '', 'configuredVersion') }),
+      allowInsecureHttp,
+    }
+    return v1
+  }
+  if (input.type !== 'self-hosted-legacy-v2') throw new TypeError('provider.type is unsupported; choose self-hosted-v1, self-hosted-legacy-v2 or official-v4')
+  assertAllowedKeys(input, ALLOWED_LEGACY_PROVIDER_KEYS, 'provider')
   const allowInsecureHttp = booleanValue(input.allowInsecureHttp, false, 'provider.allowInsecureHttp')
   const map = record(input.modelMap, 'provider.modelMap')
   assertAllowedKeys(map, ALLOWED_MODEL_MAP_KEYS, 'modelMap')
   const pipeline = text(map.pipeline, '', 'modelMap.pipeline')
   const vlm = text(map.vlm, '', 'modelMap.vlm')
   if (pipeline === vlm) throw new TypeError('provider modelMap backends must be distinct')
-  let tier: SelfHostedTier | undefined
-  if (input.tier !== undefined && input.tier !== null) {
-    if (typeof input.tier !== 'string' || !(SELF_HOSTED_TIERS as readonly string[]).includes(input.tier)) {
-      throw new TypeError(`provider.tier must be one of ${SELF_HOSTED_TIERS.join(', ')}`)
-    }
-    tier = input.tier as SelfHostedTier
-  }
-  const selfHosted: SelfHostedV2Config = {
-    id,
-    type: 'self-hosted-v2',
+  const selfHosted: SelfHostedLegacyV2Config = {
+    id, type: 'self-hosted-legacy-v2',
     baseURL: baseUrl(input.baseURL, 'http://localhost:18000', allowInsecureHttp, 'provider.baseURL'),
-    apiKeyEnv: credentialRef(input.apiKeyEnv, undefined, false),
-    modelMap: { pipeline, vlm },
-    ...(tier === undefined ? {} : { tier }),
+    apiKeyEnv: credentialRef(input.apiKeyEnv, undefined, false), modelMap: { pipeline, vlm },
     ...(input.configuredVersion === undefined ? {} : { configuredVersion: text(input.configuredVersion, '', 'configuredVersion') }),
     allowInsecureHttp,
   }

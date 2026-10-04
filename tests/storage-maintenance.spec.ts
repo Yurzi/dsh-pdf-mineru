@@ -50,9 +50,9 @@ function sampleRequest(sourceSha256: string): CanonicalParseRequest {
 
 function sampleProducer(): ResultProducer {
   return {
-    providerId: 'self-hosted-v2',
+    providerId: 'self-hosted-legacy-v2',
     providerConfigId: asProviderConfigId('mp_maintenance'),
-    compatibilityKey: 'self-hosted-v2:maintenance:v1:pipeline',
+    compatibilityKey: 'self-hosted-legacy-v2:maintenance:v1:pipeline',
   }
 }
 

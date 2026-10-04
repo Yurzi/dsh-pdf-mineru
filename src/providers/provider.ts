@@ -56,6 +56,9 @@ export interface ProviderProbeResult {
   readonly authentication: 'valid' | 'invalid' | 'not-configured' | 'unknown'
   readonly protocolVersion: string
   readonly serverVersion?: string
+  readonly availableTiers?: readonly string[]
+  readonly outputFormats?: readonly string[]
+  readonly sourceTypes?: readonly string[]
   readonly queue?: {
     readonly queued?: number
     readonly processing?: number
@@ -77,12 +80,12 @@ export type SelfHostedProtocol = 'legacy' | 'v1'
 
 export type ProviderJobRef =
   | {
-      readonly provider: 'self-hosted-v2'
-      /** MinerU 4.x speaks the V1 API; earlier servers use the legacy task endpoints. */
-      readonly protocol: SelfHostedProtocol
+      readonly provider: 'self-hosted-legacy-v2'
+      readonly protocol: 'legacy'
       readonly taskId: string
       readonly files: readonly ProviderSubmittedFile[]
     }
+  | { readonly provider: 'self-hosted-v1'; readonly protocol: 'v1'; readonly taskId: string; readonly files: readonly ProviderSubmittedFile[] }
   | { readonly provider: 'official-v4'; readonly batchId: string; readonly files: readonly ProviderSubmittedFile[] }
 
 export interface ProviderSubmission {
@@ -169,7 +172,7 @@ export function validateProviderCapabilities(request: CanonicalParseRequest, cap
   if (!capabilities.models.includes(semantics.model)) unsupported(`Provider does not support model ${semantics.model}`)
   if (!capabilities.parseMethods.includes(semantics.parseMethod)) unsupported(`Provider does not support parse method ${semantics.parseMethod}`)
   if (semantics.ocr && !capabilities.supportsOcr) unsupported('Provider does not support OCR')
-  if (semantics.language && !capabilities.supportsLanguage) unsupported('Provider does not support language selection')
+  if (semantics.language && semantics.language !== 'auto' && !capabilities.supportsLanguage) unsupported('Provider does not support language selection')
   if (!capabilities.supportsFormula && semantics.formula) unsupported('Provider does not support formula parsing')
   if (!capabilities.supportsTable && semantics.table) unsupported('Provider does not support table parsing')
   if (semantics.pages !== undefined && !capabilities.supportsPageRanges) unsupported('Provider does not support page ranges')

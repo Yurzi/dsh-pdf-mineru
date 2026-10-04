@@ -9,7 +9,8 @@ import ConfigEditor from '@deepseek-ai/dsh-config-editor'
 import Settings from '@deepseek-ai/dsh-settings'
 import { afterEach, expect, it, vi } from 'vitest'
 import * as mineru from '../src/index.js'
-import { defaultMinerUConfig } from '../src/config.js'
+import { defaultMinerUConfig, parseConfig } from '../src/config.js'
+import { activateProvider, patchActiveProvider, resetConfigSection } from '../src/client/helpers.js'
 import type { ConnectionRpcHandler } from '../src/loopback-rpc.js'
 
 // Only transport is replaced. Loader, SettingsForms, ConfigEditor, schema
@@ -151,6 +152,66 @@ it('rejects invalid domain values and ordinary field writes before persistence',
   ]) await expect(host.ctx.settings.update('mineru-custom', patch)).rejects.toThrow()
   expect(await readFile(host.profile.patchPath, 'utf8')).toBe(before)
   expect(await host.call('mineru/config.get')).toMatchObject({ ok: true, value: { config: host.config } })
+})
+
+it('rejects cross-type provider fields at native persistence and RPC boundaries without changing state', async () => {
+  const host = await fixture()
+  const fiber = host.entry.fiber
+  const before = await readFile(host.profile.patchPath, 'utf8')
+  const [legacy, official, v1] = host.config.providers
+  const invalidProviders = [
+    { ...legacy, tier: 'standard' }, { ...legacy, ocrMode: 'ocr' },
+    { ...v1, modelMap: { pipeline: 'pipeline', vlm: 'vlm-engine' } },
+    { ...v1, models: ['pipeline'] }, { ...v1, ocrMode: 'text' }, { ...v1, tier: 'fastest' },
+    { ...official, ocrMode: 'auto' }, { ...official, tier: 'standard' },
+    { ...v1, allowInsecureHttp: false },
+    { ...v1, type: ['self', 'hosted', 'v2'].join('-') },
+  ]
+  for (const provider of invalidProviders) {
+    const patch = { activeProvider: provider.id, providers: [provider] }
+    await expect(host.ctx.settings.update('mineru-custom', patch)).rejects.toThrow()
+    expect(await host.call('mineru/config.set', { config: { ...host.config, ...patch } }))
+      .toMatchObject({ ok: false })
+    expect(await readFile(host.profile.patchPath, 'utf8')).toBe(before)
+    expect(await host.call('mineru/config.get')).toMatchObject({ ok: true, value: { config: host.config } })
+  }
+  expect(host.entry.fiber).toBe(fiber)
+  expect(host.registerTool).toHaveBeenCalledTimes(2)
+})
+
+it('persists independent V1 OCR drafts and defaults resets without remounting or losing shared defaults', async () => {
+  const host = await fixture()
+  const fiber = host.entry.fiber
+  const base = parseConfig(host.config)
+  const v1 = base.providers.find(p => p.type === 'self-hosted-v1')!
+  const sharedDefaults = { ...base.defaults, model: 'vlm' as const, language: 'ja', parseMethod: 'txt' as const }
+  const draft = patchActiveProvider(activateProvider({ ...base, defaults: sharedDefaults }, v1.id), {
+    tier: 'advanced', ocrMode: 'ocr', baseURL: 'https://mineru.example/v1',
+  })
+  expect(await host.call('mineru/config.set', { config: draft }))
+    .toMatchObject({ ok: true, value: { config: draft } })
+  expect(host.entry.fiber).toBe(fiber)
+  expect(await readFile(host.profile.patchPath, 'utf8')).toContain('ocrMode: ocr')
+
+  // Native form writes and custom draft saves share the strict domain boundary.
+  const nativeDraft = patchActiveProvider(draft, { ocrMode: 'txt' })
+  await host.ctx.settings.update('mineru-custom', { providers: nativeDraft.providers })
+  expect(await host.call('mineru/config.get')).toMatchObject({ ok: true, value: { config: nativeDraft } })
+  const reset = resetConfigSection(nativeDraft, 'defaults')
+  expect(reset.defaults).toEqual(sharedDefaults)
+  expect(reset.providers.find(p => p.id === v1.id)).toMatchObject({ ocrMode: 'auto', tier: 'advanced' })
+  expect(await host.call('mineru/config.set', { config: reset }))
+    .toMatchObject({ ok: true, value: { config: reset } })
+  expect(host.entry.fiber).toBe(fiber)
+  expect(host.registerTool).toHaveBeenCalledTimes(2)
+
+  await host.ctx.fiber.dispose()
+  const restored = await host.start()
+  expect(await restored.call('mineru/config.get')).toMatchObject({ ok: true, value: { config: reset } })
+  const legacy = activateProvider(reset, base.activeProvider)
+  expect(legacy.defaults).toEqual(sharedDefaults)
+  expect(await restored.call('mineru/config.set', { config: legacy }))
+    .toMatchObject({ ok: true, value: { config: legacy } })
 })
 
 it('normalizes Provider-based v1 on activation without profile writes', async () => {

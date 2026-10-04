@@ -60,7 +60,7 @@ async function waitFor(predicate: () => boolean, message: string): Promise<void>
 }
 
 class MockProvider implements MinerUProvider {
-  readonly id = 'self-hosted-v2' as const
+  readonly id = 'self-hosted-legacy-v2' as const
   readonly capabilities: ProviderCapabilities = {
     models: ['pipeline', 'vlm'],
     parseMethods: ['auto', 'txt', 'ocr'],
@@ -92,7 +92,7 @@ class MockProvider implements MinerUProvider {
   }
 
   compatibilityKey(_request: CanonicalParseRequest, _context: ProviderCompatibilityContext): Promise<string> {
-    return Promise.resolve('self-hosted-v2:test:v1:pipeline')
+    return Promise.resolve('self-hosted-legacy-v2:test:v1:pipeline')
   }
 
   async submit(
@@ -379,7 +379,7 @@ describe('MinerUService direct parsing', () => {
 
     await expect(h.service.probe(new AbortController().signal)).resolves.toEqual({
       available: true,
-      provider: 'self-hosted-v2',
+      provider: 'self-hosted-legacy-v2',
       authentication: 'not-configured',
       protocol_version: 'v2',
     })
@@ -410,7 +410,7 @@ describe('MinerUService direct parsing', () => {
     expect(h.provider.retryOptions).toMatchObject({ maxRetries: 2, initialDelayMs: 500, maxDelayMs: 10000 })
 
     h.provider.retryOptions?.onRetry?.({
-      provider: 'self-hosted-v2', operation: 'inspect', attempt: 1, maxRetries: 2,
+      provider: 'self-hosted-legacy-v2', operation: 'inspect', attempt: 1, maxRetries: 2,
       delayMs: 500, reason: 'transport',
     })
     expect(h.diagnostics.some(event => event.phase === 'provider-retry'
@@ -1326,7 +1326,7 @@ describe('feedback-driven scoped evidence reading', () => {
     expect(result.verification_hints).toEqual([{ reason: 'formula', block_id: result.result_id + ':b1', page: 7, view: 'page' }])
     expect(result.diagnostics ?? []).toEqual([])
     expect(formatResultProse(result)).toContain('advisory, not a detected error')
-    expect(result.provenance).toMatchObject({ provider: 'self-hosted-v2', model: defaultMinerUConfig().defaults.model, upstream_version: null, index_version: 2, reader_version: 3 })
+    expect(result.provenance).toMatchObject({ provider: 'self-hosted-legacy-v2', model: defaultMinerUConfig().defaults.model, upstream_version: null, index_version: 2, reader_version: 3 })
   })
 
   it('emits only current chunk diagnostics and avoids replaying scope notices', async () => {

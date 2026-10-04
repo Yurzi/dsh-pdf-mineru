@@ -7,13 +7,14 @@ import {
   ensureProviderProfiles,
   normalizeProviderDefaults,
   patchActiveProvider,
+  providerTypeLabelKey,
   resetConfigSection,
   resetToDefaultConfig,
   storeCredential,
   updateConfigSection,
 } from '../src/client/helpers.js'
 import { clampNumericDraft, parseNumericDraft } from '../src/client/NumericInput.js'
-import { defaultMinerUConfig, pruneConfigToDiff } from '../src/config.js'
+import { defaultMinerUConfig, parseConfig, pruneConfigToDiff } from '../src/config.js'
 import {
   DEFAULT_OUTPUT_CONFIG,
   DEFAULT_PARSE_DEFAULTS,
@@ -88,8 +89,81 @@ describe('Client helpers and state transitions', () => {
       providers: [base.providers.find(p => p.type === 'official-v4')!],
     }
     const completed = ensureProviderProfiles(officialOnly)
-    expect(completed.providers.some(p => p.type === 'self-hosted-v2')).toBe(true)
-    expect(completed.providers.some(p => p.type === 'official-v4')).toBe(true)
+    expect(completed.providers.some(p => p.type === 'self-hosted-legacy-v2')).toBe(true)
+    expect(completed.providers.map(p => p.type)).toEqual(['official-v4', 'self-hosted-legacy-v2', 'self-hosted-v1'])
+    expect(completed.activeProvider).toBe(officialOnly.activeProvider)
+    expect(completed.providers[0]).toBe(officialOnly.providers[0])
+    expect(officialOnly.providers).toHaveLength(1)
+  })
+
+  it('keeps existing profile order, values and active selection while ensuring idempotently', () => {
+    const base = defaultMinerUConfig()
+    const v1 = defaultProviderConfig('self-hosted-v1')
+    if (v1.type !== 'self-hosted-v1') throw new Error('Expected V1 profile')
+    const customV1 = { ...v1, id: asProviderConfigId('mp_custom_v1'), tier: 'advanced' as const, ocrMode: 'txt' as const }
+    const official = defaultProviderConfig('official-v4')
+    const partial = { ...base, activeProvider: customV1.id, providers: [customV1, official] }
+    const snapshot = structuredClone(partial)
+    const ensured = ensureProviderProfiles(partial)
+    expect(ensured.providers).toEqual([customV1, official, defaultProviderConfig('self-hosted-legacy-v2')])
+    expect(ensured.providers[0]).toBe(customV1)
+    expect(ensured.providers[1]).toBe(official)
+    expect(ensured.activeProvider).toBe(customV1.id)
+    expect(ensured.defaults).toBe(partial.defaults)
+    expect(partial).toEqual(snapshot)
+    expect(ensureProviderProfiles(ensured)).toBe(ensured)
+    expect(ensureProviderProfiles(base)).toBe(base)
+  })
+
+  it.each(['self-hosted-legacy-v2', 'official-v4', 'self-hosted-v1'] as const)(
+    'resolves multiple id collisions when ensuring missing %s', type => {
+      const base = defaultMinerUConfig()
+      const missing = defaultProviderConfig(type)
+      const other = defaultProviderConfig(type === 'official-v4' ? 'self-hosted-v1' : 'official-v4')
+      const occupied = [missing.id, asProviderConfigId(missing.id + '_2')].map(id => ({ ...other, id }))
+      const input = { ...base, activeProvider: occupied[0]!.id, providers: occupied }
+      const result = ensureProviderProfiles(input)
+      expect(result.providers.slice(0, 2)).toEqual(occupied)
+      expect(result.providers.find(p => p.type === type)?.id).toBe(missing.id + '_3')
+      expect(new Set(result.providers.map(p => p.id)).size).toBe(result.providers.length)
+      expect(result.activeProvider).toBe(input.activeProvider)
+      expect(parseConfig(result)).toEqual(result)
+      expect(ensureProviderProfiles(result)).toBe(result)
+    },
+  )
+
+  it('maps each explicit provider type to its own translated label', () => {
+    const keys = [
+      providerTypeLabelKey('self-hosted-v1'),
+      providerTypeLabelKey('self-hosted-legacy-v2'),
+      providerTypeLabelKey('official-v4'),
+    ]
+    expect(new Set(keys).size).toBe(3)
+    for (const key of keys) {
+      expect(en[key]).toEqual(expect.any(String))
+      expect(zh[key]).toEqual(expect.any(String))
+      expect(en[key].trim()).not.toBe('')
+      expect(zh[key].trim()).not.toBe('')
+    }
+  })
+
+  it.each(['auto', 'txt', 'ocr'] as const)('edits V1 OCR draft %s without altering shared defaults or inactive profiles', ocrMode => {
+    const base = defaultMinerUConfig()
+    const v1 = defaultProviderConfig('self-hosted-v1')
+    const original = { ...base, defaults: { ...base.defaults, model: 'vlm' as const, language: 'ja', parseMethod: 'txt' as const } }
+    const activated = activateProvider(original, v1.id)
+    expect(activated.defaults).toBe(original.defaults)
+    expect(normalizeProviderDefaults(activated, v1)).toBe(activated)
+    const patched = patchActiveProvider(activated, { ocrMode })
+    expect(patched.defaults).toBe(original.defaults)
+    expect(patched.providers[0]).toBe(original.providers[0])
+    expect(patched.providers[1]).toBe(original.providers[1])
+    expect(patched.providers[2]).toMatchObject({ ocrMode })
+    expect(original.providers[2]).toMatchObject({ ocrMode: 'auto' })
+    expect(parseConfig(patched)).toEqual(patched)
+    const returned = activateProvider(patched, original.activeProvider)
+    expect(returned.defaults).toBe(original.defaults)
+    expect(returned.providers[2]).toMatchObject({ ocrMode })
   })
 
   it('patches active provider fields cleanly', () => {
@@ -251,6 +325,42 @@ describe('Reset-to-default configuration helpers', () => {
       expect(resetVlmOnly.defaults.ocr).toBe(false)
     })
 
+    it.each(['txt', 'ocr'] as const)('resets only the active V1 OCR mode from %s', ocrMode => {
+      const base = defaultMinerUConfig()
+      const v1 = defaultProviderConfig('self-hosted-v1')
+      const activated = activateProvider({
+        ...base,
+        defaults: { ...base.defaults, model: 'vlm', parseMethod: 'ocr', ocr: true, language: 'ja' },
+      }, v1.id)
+      const modified = patchActiveProvider(activated, { ocrMode, tier: 'advanced', baseURL: 'https://custom.example' })
+      const reset = resetConfigSection(modified, 'defaults')
+      expect(reset).toEqual(patchActiveProvider(modified, { ocrMode: 'auto' }))
+      expect(reset.defaults).toBe(modified.defaults)
+      expect(reset.providers[0]).toBe(modified.providers[0])
+      expect(reset.providers[1]).toBe(modified.providers[1])
+      expect(reset.providers[2]).toMatchObject({ ocrMode: 'auto', tier: 'advanced', baseURL: 'https://custom.example' })
+      expect(modified.providers[2]).toMatchObject({ ocrMode })
+      expect(parseConfig(reset)).toEqual(reset)
+    })
+
+    it('resets V1 connection fields while preserving custom identity and shared defaults', () => {
+      const base = defaultMinerUConfig()
+      const v1 = defaultProviderConfig('self-hosted-v1')
+      const id = asProviderConfigId('mp_custom_v1')
+      const modified = {
+        ...base,
+        activeProvider: id,
+        providers: [{ ...v1, id, tier: 'advanced' as const, ocrMode: 'ocr' as const, baseURL: 'https://custom.example' }],
+        defaults: { ...base.defaults, model: 'vlm' as const, language: 'ja' },
+      }
+      const reset = resetConfigSection(modified, 'providers')
+      expect(reset.providers).toEqual([{ ...v1, id }])
+      expect(reset.activeProvider).toBe(id)
+      expect(reset.defaults).toBe(modified.defaults)
+      expect(reset.providers[0]).not.toHaveProperty('tier')
+      expect(reset.providers[0]).not.toHaveProperty('modelMap')
+    })
+
     it('reverts output to DEFAULT_OUTPUT_CONFIG', () => {
       const base = defaultMinerUConfig()
       const modified = {
@@ -313,7 +423,7 @@ describe('Reset-to-default configuration helpers', () => {
       }
 
       const reset = resetConfigSection(modified, 'providers')
-      const selfHosted = reset.providers.find(p => p.type === 'self-hosted-v2')
+      const selfHosted = reset.providers.find(p => p.type === 'self-hosted-legacy-v2')
       const official = reset.providers.find(p => p.type === 'official-v4')
       expect(selfHosted?.baseURL).toBe('http://localhost:18000')
       expect(selfHosted?.apiKeyEnv).toBe('MINERU_API_KEY')
@@ -380,10 +490,11 @@ describe('Reset-to-default configuration helpers', () => {
       expect(reset.schemaVersion).toBe(modified.schemaVersion)
 
       // Reverted fields
-      expect(reset.activeProvider).toBe(defaultProviderConfig('self-hosted-v2').id)
+      expect(reset.activeProvider).toBe(defaultProviderConfig('self-hosted-legacy-v2').id)
       expect(reset.providers).toEqual([
-        defaultProviderConfig('self-hosted-v2'),
+        defaultProviderConfig('self-hosted-legacy-v2'),
         defaultProviderConfig('official-v4'),
+        defaultProviderConfig('self-hosted-v1'),
       ])
       expect(reset.defaults).toEqual(DEFAULT_PARSE_DEFAULTS)
       expect(reset.storage.cacheEnabled).toBe(DEFAULT_STORAGE_OPTIONS.cacheEnabled)

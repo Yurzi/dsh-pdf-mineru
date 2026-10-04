@@ -1,5 +1,5 @@
 /**
- * self-hosted-v1-api.ts — MinerU 4.x self-hosted "V1 API" protocol adapter.
+ * self-hosted-v1.ts — MinerU 4.x self-hosted "V1 API" protocol adapter.
  *
  * Wire contract (see scripts/http_api_example.sh in opendatalab/MinerU):
  *   POST /v1/uploads                  create an upload session (deduplicated files are already completed)
@@ -16,19 +16,11 @@
  * canonical artifact shape (layout page list and structured content).
  */
 import type { MinerUFileState, MinerUJobState } from '../domain/job.js';
-import type { CanonicalParseRequest, MinerUModel, PreparedSourceFile } from '../domain/request.js';
-import type { ProviderHttpClient } from './http-client.js';
-import { type ArtifactSink, type ProviderCallContext, type ProviderCollection, type ProviderJobRef, type ProviderJobSnapshot, type ProviderProbeResult, type ProviderRetryOptions, type ProviderSubmission, type ProviderSubmittedFile } from './provider.js';
+import { type SelfHostedV1Config } from '../config/pure.js';
+import type { CanonicalParseRequest, PreparedSourceFile } from '../domain/request.js';
+import { type MinerUProvider, type ProviderCapabilities, type ProviderCompatibilityContext, type ProviderOptions, type ArtifactSink, type ProviderCallContext, type ProviderCollection, type ProviderJobRef, type ProviderJobSnapshot, type ProviderProbeResult, type ProviderSubmission, type ProviderSubmittedFile } from './provider.js';
 /** The only output format the plugin consumes; it carries every canonical artifact. */
 export declare const SELF_HOSTED_V1_ARCHIVE_FORMAT = "zip";
-/** Tiers advertised by the MinerU V1 API; other modelMap values fall back to the server default. */
-export declare const SELF_HOSTED_V1_TIERS: ReadonlySet<string>;
-/**
- * Effective V1 parse tier: an explicitly configured tier wins; otherwise a modelMap value that
- * names a tier is honoured, and anything else keeps the server default tier. Shared with the
- * provider compatibility key so the cached result identity matches the submitted request.
- */
-export declare function resolveSelfHostedTier(tier: string | undefined, modelMap: Readonly<Partial<Record<MinerUModel, string>>>, model: MinerUModel): string | undefined;
 export interface SelfHostedV1HealthResponse {
     readonly status?: string;
     readonly version?: string;
@@ -78,14 +70,6 @@ export interface SelfHostedV1JobResponse {
         readonly total?: number;
     } | null;
 }
-export interface SelfHostedV1ApiAdapterOptions {
-    readonly client: ProviderHttpClient;
-    readonly baseUrl: URL;
-    readonly retry: ProviderRetryOptions;
-    readonly modelMap: Readonly<Partial<Record<MinerUModel, string>>>;
-    /** Explicit V1 parse tier; absent keeps the upstream server default. */
-    readonly tier?: string;
-}
 export declare function mimeTypeForName(name: string): string;
 /** Same scheme, host, and effective port; the only target that may receive the API key. */
 export declare function isSameOriginUrl(target: URL, baseUrl: URL): boolean;
@@ -123,19 +107,22 @@ export declare function canonicalizeStructuredContent(parsed: unknown): readonly
  * canonical alias so physical page bounds stay verifiable.
  */
 export declare function canonicalizeLayoutDocument(parsed: unknown): Record<string, unknown> | undefined;
-export declare class SelfHostedV1ApiAdapter {
+export declare class SelfHostedV1Provider implements MinerUProvider {
+    readonly id: "self-hosted-v1";
+    readonly config: SelfHostedV1Config;
+    readonly capabilities: ProviderCapabilities;
     private readonly options;
-    constructor(options: SelfHostedV1ApiAdapterOptions);
+    constructor(config: SelfHostedV1Config, options?: ProviderOptions);
+    compatibilityKey(_request: CanonicalParseRequest, context: ProviderCompatibilityContext): Promise<string>;
+    probe(context: ProviderCallContext): Promise<ProviderProbeResult>;
     /** Cheap protocol probe: answers whether the configured endpoint speaks the V1 API. */
     health(context: ProviderCallContext): Promise<SelfHostedV1HealthResponse>;
-    probe(context: ProviderCallContext, health: SelfHostedV1HealthResponse): Promise<ProviderProbeResult>;
+    private discoverDeployment;
+    private deploymentIssue;
+    private probeHealth;
     submit(request: CanonicalParseRequest, sources: readonly PreparedSourceFile[], context: ProviderCallContext): Promise<ProviderSubmission>;
     inspect(ref: ProviderJobRef, context: ProviderCallContext): Promise<ProviderJobSnapshot>;
     collect(ref: ProviderJobRef, request: CanonicalParseRequest, sink: ArtifactSink, context: ProviderCallContext): Promise<ProviderCollection>;
-    /**
-     * Resolves the V1 tier for one request; shared with the compatibility key so both agree.
-     */
-    private resolveTier;
     private snapshotFromJob;
     private uploadSource;
     private requireFileId;

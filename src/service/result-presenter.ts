@@ -70,8 +70,9 @@ export interface InlinedImageView {
 
 /** Parsing identity is distinct from the current reader/projection implementation. */
 export interface ReadProvenance {
-  readonly provider: 'self-hosted-v2' | 'official-v4'
-  readonly model: 'pipeline' | 'vlm'
+  readonly provider: 'self-hosted-v1' | 'self-hosted-legacy-v2' | 'official-v4'
+  /** V1 selects a server tier, not a pipeline/vlm model. */
+  readonly model: 'pipeline' | 'vlm' | null
   readonly parse_method: 'auto' | 'txt' | 'ocr'
   readonly upstream_version: null
   readonly index_version: number

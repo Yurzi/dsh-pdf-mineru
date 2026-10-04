@@ -1,9 +1,9 @@
 import type { Dispatch, SetStateAction } from 'react'
-import { SELF_HOSTED_TIERS, type SelfHostedTier, type MinerUConfig, type OfficialV4Config, type ProviderConfig, type SelfHostedV2Config } from '../../config/pure.js'
+import { SELF_HOSTED_TIERS, type SelfHostedTier, type MinerUConfig, type OfficialV4Config, type ProviderConfig } from '../../config/pure.js'
 import type { MinerUModel } from '../../domain/request.js'
 import type { MineruKey } from '../locales.js'
 import type { CredentialView } from '../helpers.js'
-import { patchActiveProvider } from '../helpers.js'
+import { patchActiveProvider, providerTypeLabelKey } from '../helpers.js'
 import { KeyIcon } from '../icons.js'
 import css from '../SettingsPage.module.css'
 
@@ -80,10 +80,9 @@ export function ProviderSection({
           role="radiogroup"
           aria-labelledby="provider-radiogroup-label"
         >
-          {draft.providers.map(provider => {
+          {draft.providers.toSorted((a, b) => ['self-hosted-v1', 'self-hosted-legacy-v2', 'official-v4'].indexOf(a.type) - ['self-hosted-v1', 'self-hosted-legacy-v2', 'official-v4'].indexOf(b.type)).map(provider => {
             const isActive = provider.id === draft.activeProvider
-            const isSelfHosted = provider.type === 'self-hosted-v2'
-            const providerTitle = t(isSelfHosted ? 'provider.type.selfHosted' : 'provider.type.official')
+            const providerTitle = t(providerTypeLabelKey(provider.type))
             return (
               <label
                 key={provider.id}
@@ -193,27 +192,32 @@ export function ProviderSection({
         </span>
       </div>
 
-      {/* Provider-specific Options */}
-      {activeProvider.type === 'self-hosted-v2' && (
+      {/* Transport and cache namespace are shared by both self-hosted protocols. */}
+      {activeProvider.type !== 'official-v4' && (
         <div className={css.providerSubgroup}>
-          <div className={css.row}>
-            <label className={css.checkboxField}>
-              <input
-                type="checkbox"
-                checked={(activeProvider as SelfHostedV2Config).allowInsecureHttp}
-                onChange={e => setDraft(prev => prev === null ? prev : patchActiveProvider(prev, { allowInsecureHttp: e.target.checked }))}
-              />
-              <span className={css.checkboxLabel}>{t('field.allowInsecureHttp')}</span>
-            </label>
-          </div>
-
+          <span className={css.fieldHint}>{t(activeProvider.type === 'self-hosted-v1' ? 'provider.v1.hint' : 'provider.legacy.hint')}</span>
+          <label className={css.checkboxField}>
+            <input type="checkbox" checked={activeProvider.allowInsecureHttp}
+              onChange={e => setDraft(prev => prev === null ? prev : patchActiveProvider(prev, { allowInsecureHttp: e.target.checked }))} />
+            <span className={css.checkboxLabel}>{t('field.allowInsecureHttp')}</span>
+          </label>
+          <label className={css.field}>
+            <span className={css.fieldLabel}>{t('field.configuredVersion')}</span>
+            <input className={css.input} aria-label={t('field.configuredVersion')} value={activeProvider.configuredVersion ?? ''}
+              onChange={e => setDraft(prev => prev === null ? prev : patchActiveProvider(prev, { configuredVersion: e.target.value || undefined }))} />
+            <span className={css.fieldHint}>{t('field.configuredVersion.hint')}</span>
+          </label>
+        </div>
+      )}
+      {activeProvider.type === 'self-hosted-v1' && (
+        <div className={css.providerSubgroup}>
           <div className={css.row}>
             <label className={css.field}>
               <span className={css.fieldLabel}>{t('field.tier')}</span>
               <select
                 className={css.select}
                 aria-label={t('field.tier')}
-                value={(activeProvider as SelfHostedV2Config).tier ?? ''}
+                value={activeProvider.tier ?? ''}
                 onChange={e => setDraft(prev => prev === null ? prev : patchActiveProvider(prev, {
                   tier: e.target.value === '' ? undefined : e.target.value as SelfHostedTier,
                 }))}
@@ -227,6 +231,10 @@ export function ProviderSection({
             </label>
           </div>
 
+        </div>
+      )}
+      {activeProvider.type === 'self-hosted-legacy-v2' && (
+        <div className={css.providerSubgroup}>
           <div className={css.field}>
             <span className={css.fieldLabel}>{t('field.legacyParams')}</span>
             <span className={css.fieldHint}>{t('field.legacyParams.hint')}</span>
@@ -240,9 +248,9 @@ export function ProviderSection({
                 aria-label={t('field.modelMap.pipeline')}
                 list="mineru-modelmap-pipeline-options"
                 placeholder={t('field.modelMap.pipeline.placeholder')}
-                value={(activeProvider as SelfHostedV2Config).modelMap.pipeline}
+                value={activeProvider.modelMap.pipeline}
                 onChange={e => {
-                  const currentMap = (activeProvider as SelfHostedV2Config).modelMap
+                  const currentMap = activeProvider.modelMap
                   setDraft(prev => prev === null ? prev : patchActiveProvider(prev, { modelMap: { ...currentMap, pipeline: e.target.value } }))
                 }}
               />
@@ -252,9 +260,9 @@ export function ProviderSection({
               <div className={css.chipGroup}>
                 <button
                   type="button"
-                  className={`${css.chip} ${(activeProvider as SelfHostedV2Config).modelMap.pipeline === 'pipeline' ? css.chipActive : ''}`}
+                  className={`${css.chip} ${activeProvider.modelMap.pipeline === 'pipeline' ? css.chipActive : ''}`}
                   onClick={() => {
-                    const currentMap = (activeProvider as SelfHostedV2Config).modelMap
+                    const currentMap = activeProvider.modelMap
                     setDraft(prev => prev === null ? prev : patchActiveProvider(prev, { modelMap: { ...currentMap, pipeline: 'pipeline' } }))
                   }}
                 >
@@ -272,9 +280,9 @@ export function ProviderSection({
                 aria-label={t('field.modelMap.vlm')}
                 list="mineru-modelmap-vlm-options"
                 placeholder={t('field.modelMap.vlm.placeholder')}
-                value={(activeProvider as SelfHostedV2Config).modelMap.vlm}
+                value={activeProvider.modelMap.vlm}
                 onChange={e => {
-                  const currentMap = (activeProvider as SelfHostedV2Config).modelMap
+                  const currentMap = activeProvider.modelMap
                   setDraft(prev => prev === null ? prev : patchActiveProvider(prev, { modelMap: { ...currentMap, vlm: e.target.value } }))
                 }}
               />
@@ -290,9 +298,9 @@ export function ProviderSection({
                   <button
                     key={opt.value}
                     type="button"
-                    className={`${css.chip} ${(activeProvider as SelfHostedV2Config).modelMap.vlm === opt.value ? css.chipActive : ''}`}
+                    className={`${css.chip} ${activeProvider.modelMap.vlm === opt.value ? css.chipActive : ''}`}
                     onClick={() => {
-                      const currentMap = (activeProvider as SelfHostedV2Config).modelMap
+                      const currentMap = activeProvider.modelMap
                       setDraft(prev => prev === null ? prev : patchActiveProvider(prev, { modelMap: { ...currentMap, vlm: opt.value } }))
                     }}
                   >

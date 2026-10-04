@@ -270,7 +270,7 @@ describe('Retry Utility (src/providers/retry.ts)', () => {
 
       let attempts = 0
       const result = await executeWithRetry({
-        provider: 'self-hosted-v2',
+        provider: 'self-hosted-legacy-v2',
         operation: 'collect',
         signal: controller.signal,
         retryOptions: {
@@ -294,7 +294,7 @@ describe('Retry Utility (src/providers/retry.ts)', () => {
       expect(attempts).toBe(2)
       expect(slept).toEqual([3500])
       expect(events[0]).toMatchObject({
-        provider: 'self-hosted-v2',
+        provider: 'self-hosted-legacy-v2',
         operation: 'collect',
         attempt: 1,
         delayMs: 3500,
@@ -369,7 +369,7 @@ describe('Retry Utility (src/providers/retry.ts)', () => {
       const fn = vi.fn()
       await expect(
         executeWithRetry({
-          provider: 'self-hosted-v2',
+          provider: 'self-hosted-legacy-v2',
           operation: 'probe',
           signal: controller.signal,
           fn,

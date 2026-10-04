@@ -1,4 +1,4 @@
-import type { MinerUConfig, ProviderConfig } from '../config.js';
+import { type MinerUConfig, type ProviderConfig } from '../config.js';
 import type { MinerUProviderId } from '../domain/errors.js';
 import type { MinerUResultId } from '../domain/ids.js';
 import type { ParseRequestInput } from '../domain/request.js';
@@ -25,6 +25,9 @@ export interface ProbeView {
     readonly authentication: 'valid' | 'invalid' | 'not-configured' | 'unknown';
     readonly protocol_version: string;
     readonly server_version?: string;
+    readonly available_tiers?: readonly string[];
+    readonly output_formats?: readonly string[];
+    readonly source_types?: readonly string[];
     readonly queue?: {
         readonly queued?: number;
         readonly processing?: number;

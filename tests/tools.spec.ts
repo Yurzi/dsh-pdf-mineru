@@ -1066,7 +1066,7 @@ describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
         markdown_content: 'Bounded evidence.', content_status: 'complete', cursor: null, output_limit_chars: 650,
         summary: { page_count: 40, image_count: 8, table_count: 4, equation_count: 2 },
         toc: Array.from({ length: 8 }, (_, index) => ({ level: 1, title: `Heading ${index} ${largeText}` })),
-        provenance: { provider: 'self-hosted-v2', model: 'pipeline', parse_method: 'auto', upstream_version: null, index_version: 1, reader_version: 1 },
+        provenance: { provider: 'self-hosted-legacy-v2', model: 'pipeline', parse_method: 'auto', upstream_version: null, index_version: 1, reader_version: 1 },
         diagnostics: Array.from({ length: 4 }, (_, index) => ({ id: `diag-${index}`, code: 'SOURCE_REPAIR', scope: 'chunk' as const, message: largeText })),
         verification_hints: Array.from({ length: 4 }, (_, index) => ({ reason: 'formula' as const, block_id: `mr_summary_marker:b${index + 1}`, page: index + 1, view: 'page' as const })),
         warnings: Array.from({ length: 8 }, (_, index) => `warning-${index}-${largeText}`),

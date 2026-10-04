@@ -2,6 +2,7 @@ import { MinerUError } from '../domain/errors.js';
 import type { MinerUProviderId } from '../domain/errors.js';
 import type { ProviderCallContext } from './provider.js';
 import { type ProviderRetryOperation, type ProviderRetryOptions } from './retry.js';
+export declare function validateSelfHostedBaseURL(rawUrl: string, allowInsecureHttp?: boolean): URL;
 export interface ProviderHttpClientOptions {
     readonly baseURL: URL | string;
     readonly provider: MinerUProviderId;

@@ -1,5 +1,22 @@
 export type MineruKey =
   | 'nav'
+  | 'probe.tiers'
+  | 'probe.formats'
+  | 'probe.sources'
+  | 'probe.scope'
+  | 'provider.type.selfHostedV1'
+  | 'provider.v1.hint'
+  | 'provider.legacy.hint'
+  | 'field.configuredVersion'
+  | 'field.configuredVersion.hint'
+  | 'field.v1OcrMode'
+  | 'field.v1OcrMode.hint'
+  | 'notice.v1ServerManaged'
+  | 'probe.auth'
+  | 'probe.protocol'
+  | 'probe.server'
+  | 'probe.queue'
+  | 'probe.diagnostics'
   | 'page.title'
   | 'page.intro'
   | 'section.provider'
@@ -13,6 +30,7 @@ export type MineruKey =
   | 'section.limits.restartHint'
   | 'section.provider.desc'
   | 'section.defaults.desc'
+  | 'section.defaults.v1.desc'
   | 'section.storage.desc'
   | 'section.operations.desc'
   | 'section.polling.desc'
@@ -163,6 +181,24 @@ export type MineruKey =
 export const NS = 'dsh-pdf-mineru'
 
 export const en: Record<MineruKey, string> = {
+  'section.defaults.v1.desc': 'Independent OCR mode for this V1 profile; model and extraction switches are server-managed.',
+  'probe.tiers': "Available tiers",
+  'probe.formats': "API output formats",
+  'probe.sources': "API source types",
+  'probe.scope': "Discovery checks API access and advertised capabilities, not parsing quality. This plugin uses uploaded files and ZIP; URL/inline sources are not exposed.",
+  'provider.type.selfHostedV1': "Self-Hosted MinerU (V1 API)",
+  'provider.v1.hint': "MinerU 4.x resource API. Uses /v1/uploads and /v1/parse/jobs; never falls back to legacy endpoints.",
+  'provider.legacy.hint': "MinerU 3.x task API. Uses /health and /tasks only; choose V1 API for a 4.x server.",
+  'field.configuredVersion': "Deployment / model revision",
+  'field.configuredVersion.hint': "Optional cache namespace. Change this after an in-place server or model upgrade to avoid reusing old results.",
+  'field.v1OcrMode': "OCR Mode (V1)",
+  'field.v1OcrMode.hint': "Saved per V1 profile: auto detects the PDF text layer, txt uses it, ocr forces recognition. txt does not guarantee that no vision model runs.",
+  'notice.v1ServerManaged': "V1 has no request fields for model, language, formula or table switches. Tier and the server control parsing. Shared legacy/cloud defaults are preserved but do not apply here. Native documents use the server-supported native parsing route.",
+  'probe.auth': "Authentication",
+  'probe.protocol': "Protocol",
+  'probe.server': "Server",
+  'probe.queue': "Queue (active / queued / max)",
+  'probe.diagnostics': "Diagnostics",
   'nav': 'MinerU',
   'page.title': 'MinerU Configuration',
   'page.intro': 'Configure MinerU document parsing providers, global content-addressed caching, and execution limits.',
@@ -216,16 +252,15 @@ export const en: Record<MineruKey, string> = {
   'field.apiKeyEnv.hint': 'Reference name stored in MinerU configuration. The API key value is kept separately by DeepSeek Harness.',
   'field.apiKey': 'API Key',
   'field.allowInsecureHttp': 'Allow Insecure HTTP (Local Only)',
-  'field.configuredVersion': 'Server Protocol / Version',
   'field.tier': 'Parse Tier',
-  'field.tier.hint': 'Applied to MinerU 4.0+ (V1 API) jobs. The server default keeps the tier chosen at server startup; other tiers select a different quality/speed trade-off when the server advertises them.',
+  'field.tier.hint': "V1 quality / speed tier, not a model name. Server default omits tier; availability depends on the deployment. Standard and advanced may share a model with different compute effort.",
   'field.tier.serverDefault': 'Server default',
-  'field.tier.opt.flash': 'flash (fast local text extraction)',
+  'field.tier.opt.flash': "flash (fast parsing; lightweight OCR when needed)",
   'field.tier.opt.basic': 'basic (local lightweight models)',
   'field.tier.opt.standard': 'standard (balanced parsing, recommended)',
-  'field.tier.opt.advanced': 'advanced (highest quality for difficult documents)',
+  'field.tier.opt.advanced': "advanced (higher compute effort)",
   'field.legacyParams': 'Legacy Parameters (MinerU 3.x and earlier)',
-  'field.legacyParams.hint': 'MinerU 4.0 removed these request parameters. They are sent only to /tasks servers; on 4.0+ they are ignored (a tier value entered here still acts as a fallback when the parse tier above is unset).',
+  'field.legacyParams.hint': "Backend identifiers sent only to the legacy /tasks API. These are not V1 tiers.",
   'field.modelMap.pipeline': 'Pipeline Backend Map',
   'field.modelMap.pipeline.hint': 'Upstream selector for pipeline requests. MinerU 3.x and earlier expect a backend engine identifier, normally pipeline; MinerU 4.0+ ignores it unless it names a tier — set the parse tier above instead.',
   'field.modelMap.pipeline.placeholder': 'pipeline',
@@ -320,12 +355,12 @@ export const en: Record<MineruKey, string> = {
   'credential.readOnly': 'This credential comes from a read-only source, such as the process environment, and cannot be changed here.',
   'credential.referenceRequired': 'Set a credential reference before entering an API key.',
 
-  'provider.type.selfHosted': 'Self-Hosted MinerU',
+  'provider.type.selfHosted': "Self-Hosted MinerU (Legacy v2)",
   'provider.type.official': 'Official MinerU Cloud (v4 API)',
   'model.pipeline': 'Pipeline (Hallucination-free, multi-language)',
   'model.vlm': 'VLM (Visual Language Model)',
   'parse.auto': 'auto (Automatic detection)',
-  'parse.txt': 'txt (Fast text only, no OCR)',
+  'parse.txt': "txt (Use the text layer)",
   'parse.ocr': 'ocr (Force OCR recognition)',
   'artifact.markdown': 'Markdown (.md)',
   'artifact.layout': 'Layout (.json)',
@@ -335,6 +370,24 @@ export const en: Record<MineruKey, string> = {
 }
 
 export const zh: Record<MineruKey, string> = {
+  'section.defaults.v1.desc': '当前 V1 配置的独立 OCR 模式；模型及细粒度解析开关由服务端管理。',
+  'probe.tiers': "部署可用档位",
+  'probe.formats': "API 输出格式",
+  'probe.sources': "API 来源类型",
+  'probe.scope': "能力发现仅验证 API 访问和声明的能力，不代表解析效果已验证。本插件使用上传文件与 ZIP，不暴露 URL／inline 来源。",
+  'provider.type.selfHostedV1': "自托管 MinerU（V1 API）",
+  'provider.v1.hint': "MinerU 4.x 资源接口：使用 /v1/uploads 与 /v1/parse/jobs，不自动回退旧协议。",
+  'provider.legacy.hint': "MinerU 3.x 任务接口：仅使用 /health 和 /tasks；4.x 服务请选择 V1 API。",
+  'field.configuredVersion': "部署／模型版本",
+  'field.configuredVersion.hint': "可选的缓存版本标识。原地升级服务或模型后请更新，避免复用旧结果。",
+  'field.v1OcrMode': "OCR 模式（V1）",
+  'field.v1OcrMode.hint': "按 V1 配置单独保存：auto 自动判断 PDF 文本层，txt 使用文本层，ocr 强制识别；txt 不保证完全不运行视觉模型。",
+  'notice.v1ServerManaged': "V1 请求没有模型、语言、公式或表格开关；解析由档位和服务端控制。旧版／云服务的共享默认值会保留，但不作用于 V1；原生文档按服务端支持的原生路径解析。",
+  'probe.auth': "认证",
+  'probe.protocol': "协议",
+  'probe.server': "服务端",
+  'probe.queue': "队列（执行／等待／上限）",
+  'probe.diagnostics': "诊断",
   'nav': 'MinerU',
   'page.title': 'MinerU 配置',
   'page.intro': '配置 MinerU 文档解析 Provider、全局内容寻址缓存及执行资源上限。',
@@ -388,16 +441,15 @@ export const zh: Record<MineruKey, string> = {
   'field.apiKeyEnv.hint': 'MinerU 配置中仅保存此引用名；API Key 值由 DeepSeek Harness 凭据服务单独保管。',
   'field.apiKey': 'API Key',
   'field.allowInsecureHttp': '允许非加密 HTTP 连接',
-  'field.configuredVersion': '服务端协议版本标识',
   'field.tier': '解析档位',
-  'field.tier.hint': '仅对 MinerU 4.0+（V1 API）生效。选择“服务端默认”时沿用服务端启动时确定的档位；其它档位在服务端支持时用于选择速度／精度取舍。',
+  'field.tier.hint': "V1 的质量／速度档位，不是模型名称。“服务端默认”不发送 tier；可用性取决于部署。standard 与 advanced 可能共用模型、采用不同计算量。",
   'field.tier.serverDefault': '服务端默认',
-  'field.tier.opt.flash': 'flash（本地快速文本抽取）',
+  'field.tier.opt.flash': "flash（快速解析；需要时使用轻量 OCR）",
   'field.tier.opt.basic': 'basic（本地轻量模型）',
   'field.tier.opt.standard': 'standard（均衡解析，推荐）',
-  'field.tier.opt.advanced': 'advanced（面向困难文档的最高质量）',
+  'field.tier.opt.advanced': "advanced（更高推理计算量）",
   'field.legacyParams': '旧版参数（MinerU 3.x 及更早）',
-  'field.legacyParams.hint': 'MinerU 4.0 已移除这些请求参数：仅在连接 /tasks 服务端时下发，4.0+ 服务会忽略它们（此处填写的档位值仍可在上方“解析档位”未设置时作为回退）。',
+  'field.legacyParams.hint': "仅发送至旧版 /tasks 接口的后端标识，不是 V1 档位。",
   'field.modelMap.pipeline': 'Pipeline 模型后端映射',
   'field.modelMap.pipeline.hint': '自托管 MinerU 在处理 pipeline（规则与 OCR 流水线）解析请求时使用的上游选择项。MinerU 3.x 及更早填写后端标识，通常为 pipeline；MinerU 4.0+ 会忽略该值（除非它本身是档位名），请改用上方“解析档位”。',
   'field.modelMap.pipeline.placeholder': 'pipeline',
@@ -492,12 +544,12 @@ export const zh: Record<MineruKey, string> = {
   'credential.readOnly': '该凭据来自进程环境变量等只读来源，无法在此修改或清除。',
   'credential.referenceRequired': '请先填写凭据引用名，再输入 API Key。',
 
-  'provider.type.selfHosted': '自托管 MinerU',
+  'provider.type.selfHosted': "旧版自托管 MinerU（Legacy v2）",
   'provider.type.official': '官方云服务 MinerU (v4 API)',
   'model.pipeline': 'Pipeline（无幻觉，支持多语言 OCR）',
   'model.vlm': 'VLM（视觉大模型）',
   'parse.auto': 'auto（自动检测）',
-  'parse.txt': 'txt（纯文本提取，速度快）',
+  'parse.txt': "txt（使用文本层）",
   'parse.ocr': 'ocr（强制文字 OCR）',
   'artifact.markdown': 'Markdown 文本 (.md)',
   'artifact.layout': '版面分析 (.json)',

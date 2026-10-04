@@ -38,22 +38,17 @@ import {
   type ProviderRetryOptions,
   type ProviderSubmission,
   type ProviderSubmittedFile,
-  type SelfHostedProtocol,
   validateProviderCapabilities,
 } from './provider.js'
 import { assertSourcesUnchanged } from '../service/request-normalizer.js'
-import type { SelfHostedTier } from '../config/pure.js'
-import { ProviderHttpClient } from './http-client.js'
-import { SelfHostedV1ApiAdapter, resolveSelfHostedTier, type SelfHostedV1HealthResponse } from './self-hosted-v1-api.js'
+import { ProviderHttpClient, validateSelfHostedBaseURL } from './http-client.js'
 
-export interface SelfHostedV2ProviderConfig {
+export interface SelfHostedLegacyV2ProviderConfig {
   readonly id: ProviderConfigId
-  readonly type: 'self-hosted-v2'
+  readonly type: 'self-hosted-legacy-v2'
   readonly baseURL: string
   readonly apiKeyEnv?: string
   readonly modelMap: Readonly<Partial<Record<MinerUModel, string>>>
-  /** MinerU 4.0+ V1 API parse tier; absent keeps the server default. */
-  readonly tier?: SelfHostedTier
   readonly configuredVersion?: string
   readonly allowInsecureHttp?: boolean
 }
@@ -97,38 +92,6 @@ export interface SelfHostedTaskResultResponse {
   readonly results?: Readonly<Record<string, SelfHostedFileParseResult>>
 }
 
-function validateAndNormalizeBaseURL(rawUrl: string, allowInsecureHttp?: boolean): URL {
-  if (typeof rawUrl !== 'string' || rawUrl.trim() === '') {
-    throw new MinerUError(failure('INVALID_REQUEST', 'Provider baseURL must be a non-empty string'))
-  }
-  let parsed: URL
-  try {
-    parsed = new URL(rawUrl)
-  } catch (err) {
-    throw new MinerUError(
-      failure('INVALID_REQUEST', `Invalid provider baseURL: "${sanitizeDiagnostic(rawUrl)}"`),
-      { cause: err },
-    )
-  }
-  if (parsed.protocol === 'http:') {
-    if (!allowInsecureHttp) {
-      throw new MinerUError(
-        failure('INVALID_REQUEST', 'Insecure HTTP baseURL is not allowed unless allowInsecureHttp is explicitly enabled'),
-      )
-    }
-  } else if (parsed.protocol !== 'https:') {
-    throw new MinerUError(
-      failure('INVALID_REQUEST', `Unsupported protocol in baseURL: ${parsed.protocol}`),
-    )
-  }
-  if (parsed.username || parsed.password) {
-    throw new MinerUError(failure('INVALID_REQUEST', 'Provider baseURL must not contain embedded credentials'))
-  }
-  if (parsed.search || parsed.hash) {
-    throw new MinerUError(failure('INVALID_REQUEST', 'Provider baseURL must not contain a query or fragment'))
-  }
-  return parsed
-}
 
 function mapSelfHostedStatus(rawStatus: unknown): MinerUJobState {
   if (typeof rawStatus !== 'string') {
@@ -169,7 +132,7 @@ function decodeBase64Image(value: string, fileId: MinerUFileId): Uint8Array {
   const compact = value.replace(/\s+/g, '')
   if (compact.length === 0 || compact.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(compact)) {
     throw new MinerUError(failure('REMOTE_PARSE_FAILED', 'Self-hosted result contains invalid base64 image data', false, {
-      provider: 'self-hosted-v2',
+      provider: 'self-hosted-legacy-v2',
       fileId,
     }))
   }
@@ -207,34 +170,25 @@ function findFileResult(
   return undefined
 }
 
-export class SelfHostedV2Provider implements MinerUProvider {
-  readonly id = 'self-hosted-v2' as const
-  readonly config: SelfHostedV2ProviderConfig
+export class SelfHostedLegacyV2Provider implements MinerUProvider {
+  readonly id = 'self-hosted-legacy-v2' as const
+  readonly config: SelfHostedLegacyV2ProviderConfig
   readonly capabilities: ProviderCapabilities
   private readonly parsedBaseUrl: URL
   private readonly retryOptions: ProviderRetryOptions
   private readonly client: ProviderHttpClient
-  private readonly v1Api: SelfHostedV1ApiAdapter
 
-  constructor(config: SelfHostedV2ProviderConfig, options?: ProviderOptions) {
+  constructor(config: SelfHostedLegacyV2ProviderConfig, options?: ProviderOptions) {
     asProviderConfigId(config.id)
     this.config = config
     this.retryOptions = options?.retry ?? {}
-    this.parsedBaseUrl = validateAndNormalizeBaseURL(config.baseURL, config.allowInsecureHttp)
+    this.parsedBaseUrl = validateSelfHostedBaseURL(config.baseURL, config.allowInsecureHttp)
     this.client = new ProviderHttpClient({
       baseURL: this.parsedBaseUrl,
-      provider: 'self-hosted-v2',
+      provider: 'self-hosted-legacy-v2',
       defaultRetry: this.retryOptions,
       providerLabel: 'MinerU server',
     })
-    this.v1Api = new SelfHostedV1ApiAdapter({
-      client: this.client,
-      baseUrl: this.parsedBaseUrl,
-      retry: this.retryOptions,
-      modelMap: config.modelMap,
-      ...(config.tier === undefined ? {} : { tier: config.tier }),
-    })
-
     const supportedModels = (['pipeline', 'vlm'] as const).filter(
       m => typeof config.modelMap[m] === 'string' && config.modelMap[m].trim() !== '',
     )
@@ -252,61 +206,22 @@ export class SelfHostedV2Provider implements MinerUProvider {
     }
   }
 
-  /**
-   * Detection endpoint for the MinerU 4.x V1 API. `/v1/health` is public; when it does not
-   * answer, the endpoint is treated as an earlier self-hosted server using the legacy
-   * task endpoints.
-   */
-  private async detectProtocol(context: ProviderCallContext): Promise<SelfHostedProtocol> {
-    try {
-      await this.v1Api.health(context)
-      return 'v1'
-    } catch (error: unknown) {
-      if (context.signal.aborted) {
-        throw new MinerUError(failure('CANCELLED', 'Protocol detection was cancelled', true))
-      }
-      if (error instanceof MinerUError && error.failure.code === 'CANCELLED') throw error
-      return 'legacy'
-    }
-  }
-
   async compatibilityKey(
     request: CanonicalParseRequest,
     context: ProviderCompatibilityContext,
   ): Promise<string> {
     const originAndPath = `${this.parsedBaseUrl.origin}${this.parsedBaseUrl.pathname.replace(/\/+$/, '')}`
     const backend = this.config.modelMap[request.semantics.model]
-    // The V1 tier selects different upstream quality/speed behaviour, so it belongs to the
-    // cached result identity even though only the V1 dialect submits it. `null` records the
-    // server default, keeping a profile without an effective tier distinct from a tiered one.
-    const tier = resolveSelfHostedTier(this.config.tier, this.config.modelMap, request.semantics.model) ?? null
     const behaviorHash = createHash('sha256').update(JSON.stringify({
       originAndPath,
       configuredVersion: context.configuredVersion ?? this.config.configuredVersion ?? 'v2',
       model: request.semantics.model,
       backend,
-      tier,
     }), 'utf8').digest('hex').slice(0, 24)
-    return `self-hosted-v2:${behaviorHash}`
+    return `self-hosted-legacy-v2:${behaviorHash}`
   }
 
   async probe(context: ProviderCallContext): Promise<ProviderProbeResult> {
-    // MinerU 4.x answers /v1/health (public). When it does not, the endpoint is an
-    // earlier self-hosted server and the legacy health endpoint decides the result.
-    let health: SelfHostedV1HealthResponse
-    try {
-      health = await this.v1Api.health(context)
-    } catch (error: unknown) {
-      if (context.signal.aborted) {
-        throw new MinerUError(failure('CANCELLED', 'Probe operation was cancelled', true))
-      }
-      if (error instanceof MinerUError && error.failure.code === 'CANCELLED') throw error
-      return await this.probeLegacy(context)
-    }
-    return await this.v1Api.probe(context, health)
-  }
-
-  private async probeLegacy(context: ProviderCallContext): Promise<ProviderProbeResult> {
     try {
       const data = await this.requestJson<SelfHostedHealthResponse>(
         'GET',
@@ -324,7 +239,7 @@ export class SelfHostedV2Provider implements MinerUProvider {
 
       return {
         available: isHealthy,
-        provider: 'self-hosted-v2',
+        provider: 'self-hosted-legacy-v2',
         authentication: context.credential && context.credential.trim() !== '' ? 'valid' : 'not-configured',
         protocolVersion,
         ...(serverVersion !== undefined ? { serverVersion } : {}),
@@ -345,7 +260,7 @@ export class SelfHostedV2Provider implements MinerUProvider {
       const isAuthError = minerUFailure.code === 'AUTHENTICATION_FAILED'
       return {
         available: false,
-        provider: 'self-hosted-v2',
+        provider: 'self-hosted-legacy-v2',
         authentication: isAuthError ? 'invalid' : context.credential && context.credential.trim() !== '' ? 'unknown' : 'not-configured',
         protocolVersion: 'v2',
         diagnostics: sanitizeDiagnostic(minerUFailure.message),
@@ -360,20 +275,6 @@ export class SelfHostedV2Provider implements MinerUProvider {
   ): Promise<ProviderSubmission> {
     context.signal.throwIfAborted()
     validateProviderCapabilities(request, this.capabilities)
-
-    const protocol = await this.detectProtocol(context)
-    if (protocol === 'v1') {
-      return await this.v1Api.submit(request, sources, context)
-    }
-    return await this.submitLegacy(request, sources, context)
-  }
-
-  private async submitLegacy(
-    request: CanonicalParseRequest,
-    sources: readonly PreparedSourceFile[],
-    context: ProviderCallContext,
-  ): Promise<ProviderSubmission> {
-    context.signal.throwIfAborted()
 
     const backend = this.config.modelMap[request.semantics.model]
     if (typeof backend !== 'string' || backend.trim() === '') {
@@ -399,7 +300,7 @@ export class SelfHostedV2Provider implements MinerUProvider {
       })
       if (intervals.length !== 1 || intervals[0] === undefined) {
         throw new MinerUError(
-          failure('UNSUPPORTED_OPTION', 'Self-hosted v2 provider only supports a single continuous page range'),
+          failure('UNSUPPORTED_OPTION', 'Self-hosted legacy v2 provider only supports a single continuous page range'),
         )
       }
       pageInterval = intervals[0]
@@ -449,7 +350,7 @@ export class SelfHostedV2Provider implements MinerUProvider {
     }))
 
     const ref: ProviderJobRef = {
-      provider: 'self-hosted-v2',
+      provider: 'self-hosted-legacy-v2',
       protocol: 'legacy',
       taskId: data.task_id,
       files: submittedFiles,
@@ -461,7 +362,7 @@ export class SelfHostedV2Provider implements MinerUProvider {
       state: (state === 'queued' ? 'queued' : state === 'processing' ? 'processing' : state === 'completed' ? 'completed' : 'failed') as MinerUFileState,
       rawState: data.status,
       failure: state === 'failed'
-        ? failure('REMOTE_PARSE_FAILED', sanitizeDiagnostic(data.error ?? 'Remote task submission failed', [context.credential ?? '']), false, { provider: 'self-hosted-v2', fileId: f.fileId })
+        ? failure('REMOTE_PARSE_FAILED', sanitizeDiagnostic(data.error ?? 'Remote task submission failed', [context.credential ?? '']), false, { provider: 'self-hosted-legacy-v2', fileId: f.fileId })
         : undefined,
     }))
 
@@ -474,11 +375,8 @@ export class SelfHostedV2Provider implements MinerUProvider {
 
   async inspect(ref: ProviderJobRef, context: ProviderCallContext): Promise<ProviderJobSnapshot> {
     context.signal.throwIfAborted()
-    if (ref.provider !== 'self-hosted-v2') {
-      throw new MinerUError(failure('INVALID_REQUEST', `Unsupported provider ref "${ref.provider}" for SelfHostedV2Provider`))
-    }
-    if (ref.protocol === 'v1') {
-      return await this.v1Api.inspect(ref, context)
+    if (ref.provider !== 'self-hosted-legacy-v2') {
+      throw new MinerUError(failure('INVALID_REQUEST', `Unsupported provider ref "${ref.provider}" for SelfHostedLegacyV2Provider`))
     }
 
     const data = await this.requestJson<SelfHostedTaskSubmitResponse>(
@@ -494,7 +392,7 @@ export class SelfHostedV2Provider implements MinerUProvider {
     const state = mapSelfHostedStatus(data.status)
     const fileState: MinerUFileState = state === 'queued' ? 'queued' : state === 'processing' ? 'processing' : state === 'completed' ? 'completed' : 'failed'
     const fileFailure = state === 'failed'
-      ? failure('REMOTE_PARSE_FAILED', sanitizeDiagnostic(data.error ?? 'Remote task failed', [context.credential ?? '']), false, { provider: 'self-hosted-v2' })
+      ? failure('REMOTE_PARSE_FAILED', sanitizeDiagnostic(data.error ?? 'Remote task failed', [context.credential ?? '']), false, { provider: 'self-hosted-legacy-v2' })
       : undefined
 
     return {
@@ -517,11 +415,8 @@ export class SelfHostedV2Provider implements MinerUProvider {
     context: ProviderCallContext,
   ): Promise<ProviderCollection> {
     context.signal.throwIfAborted()
-    if (ref.provider !== 'self-hosted-v2') {
-      throw new MinerUError(failure('INVALID_REQUEST', `Unsupported provider ref "${ref.provider}" for SelfHostedV2Provider`))
-    }
-    if (ref.protocol === 'v1') {
-      return await this.v1Api.collect(ref, request, sink, context)
+    if (ref.provider !== 'self-hosted-legacy-v2') {
+      throw new MinerUError(failure('INVALID_REQUEST', `Unsupported provider ref "${ref.provider}" for SelfHostedLegacyV2Provider`))
     }
 
     const data = await this.requestJson<SelfHostedTaskResultResponse>(
@@ -548,7 +443,7 @@ export class SelfHostedV2Provider implements MinerUProvider {
           fileId: file.fileId,
           name: file.name,
           artifacts: [],
-          failure: failure('REMOTE_PARSE_FAILED', `No parse result found for file "${file.name}"`, false, { provider: 'self-hosted-v2', fileId: file.fileId }),
+          failure: failure('REMOTE_PARSE_FAILED', `No parse result found for file "${file.name}"`, false, { provider: 'self-hosted-legacy-v2', fileId: file.fileId }),
         })
         continue
       }
@@ -649,7 +544,7 @@ export class SelfHostedV2Provider implements MinerUProvider {
             'REMOTE_PARSE_FAILED',
             `Provider result is missing required artifacts: ${missingKinds.join(', ')}`,
             false,
-            { provider: 'self-hosted-v2', fileId: file.fileId },
+            { provider: 'self-hosted-legacy-v2', fileId: file.fileId },
           ),
         })
       } else {

@@ -1,6 +1,6 @@
 import type { MinerUFileId } from './ids.js'
 
-export type MinerUProviderId = 'self-hosted-v2' | 'official-v4'
+export type MinerUProviderId = 'self-hosted-v1' | 'self-hosted-legacy-v2' | 'official-v4'
 
 export type MinerUErrorCode =
   | 'INVALID_REQUEST'

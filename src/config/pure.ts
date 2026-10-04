@@ -8,14 +8,23 @@ export const MINERU_CONFIG_SCHEMA_VERSION = 2 as const
 export const SELF_HOSTED_TIERS = ['flash', 'basic', 'standard', 'advanced'] as const
 export type SelfHostedTier = typeof SELF_HOSTED_TIERS[number]
 
-export interface SelfHostedV2Config {
+export interface SelfHostedLegacyV2Config {
   readonly id: ProviderConfigId
-  readonly type: 'self-hosted-v2'
+  readonly type: 'self-hosted-legacy-v2'
   readonly baseURL: string
   readonly apiKeyEnv?: string
   readonly modelMap: Readonly<Record<MinerUModel, string>>
-  /** V1 API parse tier; absent keeps the upstream server default. */
+  readonly configuredVersion?: string
+  readonly allowInsecureHttp: boolean
+}
+
+export interface SelfHostedV1Config {
+  readonly id: ProviderConfigId
+  readonly type: 'self-hosted-v1'
+  readonly baseURL: string
+  readonly apiKeyEnv?: string
   readonly tier?: SelfHostedTier
+  readonly ocrMode: ParseMethod
   readonly configuredVersion?: string
   readonly allowInsecureHttp: boolean
 }
@@ -29,7 +38,7 @@ export interface OfficialV4Config {
   readonly configuredVersion: 'v4'
 }
 
-export type ProviderConfig = SelfHostedV2Config | OfficialV4Config
+export type ProviderConfig = SelfHostedV1Config | SelfHostedLegacyV2Config | OfficialV4Config
 
 export interface StorageConfig {
   readonly storageRoot: string
@@ -83,7 +92,11 @@ export interface MinerUConfig {
   readonly limits: SecurityLimits
 }
 
-export function defaultProviderConfig(type: 'self-hosted-v2' | 'official-v4'): ProviderConfig {
+export function defaultProviderConfig(type: ProviderConfig['type']): ProviderConfig {
+  if (type === 'self-hosted-v1') {
+    return { id: asProviderConfigId('mp_self_hosted_v1'), type, baseURL: 'http://localhost:8000',
+      apiKeyEnv: 'MINERU_API_KEY', ocrMode: 'auto', allowInsecureHttp: true }
+  }
   if (type === 'official-v4') {
     return {
       id: asProviderConfigId('mp_official'),
@@ -115,6 +128,13 @@ export const DEFAULT_PARSE_DEFAULTS: ParseDefaults = {
   language: 'ch',
   formula: true,
   table: true,
+}
+
+/** V1 has no model/language/formula/table selectors; use stable internal sentinels for cache identity. */
+export function effectiveParseDefaults(defaults: ParseDefaults, provider: ProviderConfig): ParseDefaults {
+  if (provider.type !== 'self-hosted-v1') return defaults
+  return { model: 'pipeline', parseMethod: provider.ocrMode, ocr: provider.ocrMode === 'ocr',
+    language: 'auto', formula: false, table: false }
 }
 
 export const DEFAULT_POLLING_CONFIG: PollingConfig = {

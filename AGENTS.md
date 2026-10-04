@@ -11,7 +11,8 @@ tools -> DSH JobRegistry (async ownership, cancellation, completion)
   -> ResultRepository
   -> SharedOperationRegistry
   -> ProviderRegistry
-    -> SelfHostedV2Provider
+    -> SelfHostedV1Provider
+    -> SelfHostedLegacyV2Provider
     -> OfficialV4Provider
 
 loopback RPC -> StorageMaintenanceService -> ResultRepository / ProcessLock
@@ -72,8 +73,8 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 
 - `src/domain/*`: IDs, requests, provider states, results, failures, strict boundary parsers.
 - `src/providers/provider.ts`, `src/providers/retry.ts`: shared Provider/ArtifactSink contracts and bounded retry policy.
-- `src/providers/self-hosted-v2.ts`: self-hosted adapter; detects MinerU 4.x from `GET /v1/health` and otherwise uses the legacy multipart `/tasks` protocol. `provider.tier` selects the V1 parse tier; `modelMap` stays the legacy backend map.
-- `src/providers/self-hosted-v1-api.ts`: MinerU 4.x V1 API adapter (upload sessions, parse jobs, bounded result-archive download, canonical artifact normalization).
+- `src/providers/self-hosted-legacy-v2.ts`: explicit legacy multipart `/tasks` Provider for MinerU 3.x; only `modelMap`, never V1 tier/OCR fields or automatic protocol detection.
+- `src/providers/self-hosted-v1.ts`: explicit MinerU 4.x V1 Provider; `tier` and per-profile `ocrMode`, health/tiers discovery before uploads, no modelMap fallback. Upload sessions, parse jobs, bounded result-archive download and canonical artifact normalization stay Provider-local.
 - `src/providers/official-v4.ts`: official API, bare PUT, status, and collection adapter.
 - `src/providers/safe-zip.ts`: bounded ZIP scanner/extractor.
 - `src/storage/*`: validated paths, process lock, ResultRepository, staging sink, and privileged maintenance service.
@@ -96,7 +97,7 @@ Providers adapt upstream protocols only. They never register tools, inspect DSH 
 
 Require DSH >= `0.2.0-rc.2`; keep engines and runtime peers aligned, pin development DSH packages to the exact baseline, and use `dsh-ptc-runtime` rather than the removed `dsh-code-runtime`. Use published Client/SlotRegistry/locale/settings types, not ambient replacements. Register the custom config page only in `plugins.bundle.config`, keyed by package name `dsh-pdf-mineru`, using the public `dsh-client-ui-plugin-manager/client` contract and `slots.inject` declaration lifecycle. Do not restore a duplicate `settings.section` entry or require the optional generic `form` prop. Settings uses Config `.volatile()` references and `settings.configure({ auto: false }, ctx.fiber)`, never the removed register/get/watch scope. Save complete live values through `settings.replace` using the actual Loader entry id; ordinary storageRoot/retainSources/limits fields stay outside form writes. Validate complete domain config at the Standard Schema boundary before persistence. Do not mutate settings during activation; DSH owns legacy document import. Keep the custom draft/confirmation settings flow; native generic forms must not bypass maintenance confirmation or silently auto-save drafts.
 
-Only canonical Provider-based config and current tool arguments are accepted. Do not reintroduce flat-config migration or deprecated tool aliases. Preserve `parseMethod` in cache semantics: `txt` is not equivalent to `auto`. Official v4 rejects `txt` because its `is_ocr` field cannot represent that distinction.
+Only canonical Provider-based config and current tool arguments are accepted. Provider types are `self-hosted-v1`, `self-hosted-legacy-v2` and `official-v4`; reject cross-protocol fields and retired type aliases. V1 uses per-profile `ocrMode` and optional `tier`, ignores shared legacy/cloud defaults without modifying their draft values, and reports provenance model as null rather than claiming a pipeline/vlm engine. Shared internal V1 language/formula/table placeholders are cache normalization only, not upstream switches. Configuration must preserve explicit save, per-profile drafts and probe-result invalidation; discovery does not promise parsing quality. Do not reintroduce flat-config migration or deprecated tool aliases. Preserve `parseMethod` in cache semantics: `txt` is not equivalent to `auto`. Official v4 rejects `txt` because its `is_ocr` field cannot represent that distinction.
 
 ## Commands
 

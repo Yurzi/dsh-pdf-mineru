@@ -12,7 +12,8 @@ read_pdf / async_parse_pdf
        ├─ SharedOperationRegistry
        ├─ ResultRepository
        ├─ ProviderRegistry
-       │    ├─ SelfHostedV2Provider
+       │    ├─ SelfHostedV1Provider
+       │    ├─ SelfHostedLegacyV2Provider
        │    └─ OfficialV4Provider
        ├─ document-index → read-delivery → tools 附件／最终预算（content）
        └─ page-renderer → Poppler 优先 / PDF.js + Canvas 子进程回退（page，无 Provider）
@@ -196,7 +197,9 @@ runShared/runProducer 在 mutation scope 中登记唯一 `.lock/users/` 目录�
 
 ## 7. Provider 与网络安全
 
-Self-hosted 适配器按上游端点自动选择协议：`GET /v1/health` 应答即 MinerU 4.0+ 的 V1 API（POST /v1/uploads → 按服务端返回的 upload_url PUT 字节 → POST /v1/uploads/{id}/complete → POST /v1/parse/jobs → GET /v1/parse/jobs/{jobId} → GET /v1/files/{id}/content 取结果 ZIP）；不可用时回落到旧版 multipart POST /tasks、GET /tasks/{taskId} 与结果端点。`provider.tier`（flash/basic/standard/advanced，缺省即服务端默认档位）只作用于 V1；`modelMap` 是旧协议的 backend 标识，在 V1 中仅当取值恰为档位名且未设置 `tier` 时作为回退。V1 结果 ZIP 中 `markdown.md`、`middle_json.json`、`structured_content.json`、`model_output.json`、`images/` 经共享有界 ZIP 提取器归一到既有 canonical artifacts（V1 的 `pages[]` 布局页码表以 `pdf_info[]` 别名暴露，`structured_content` 摊平为 content-list 数组）。Official v4 先 POST /file-urls/batch，再按预签名 URL 裸 PUT，随后轮询 batch 结果并下载 ZIP；按 data_id 映射，不猜测相似文件名。
+三类 Provider 显式选择，不自动探测降级。SelfHostedV1Provider（`self-hosted-v1`）先 GET /v1/health 与 /v1/tiers 验证部署支持 zip、file_id 与配置的 tier，再 POST /v1/uploads → 服务端 upload_url PUT → complete → POST /v1/parse/jobs → 轮询 → 下载文件内容。仅接收 tier 与独立 ocrMode（auto/txt/ocr）；不接收 modelMap。SelfHostedLegacyV2Provider（`self-hosted-legacy-v2`）只使用 /health、multipart /tasks 和结果端点，接受 modelMap 及共享解析 defaults，不接收 tier/ocrMode。Official v4 继续使用官方批量 URL 分配、裸 PUT 和 ZIP，按 data_id 映射。provider.type 参与独立身份，V1 tier 进入 compatibilityKey，ocrMode 经 parseMethod 进入 canonical cache key；V1 内部 model/language/formula/table 使用固定占位，不把无效 UI defaults 混入缓存，也不声称这些字段被发送到上游。
+
+V1 结果包内真实路径仍通过有界提取器校验；markdown.md/middle_json.json/structured_content.json/model_output.json/images 归一到既有 artifact 形状。DocVortex pages[] 以 pdf_info[] 别名供物理页数读取，结构化 blocks 归一为 content-list；保留原始 metadata/extensions，不将素材名称推断为固定哈希。状态 partial/canceled 和逐文件失败沿既有领域状态流转；本地缓存发布后不依赖服务器重启后可能失效的资源 ID。V1 provenance.model 为 null，upstream_version 未可靠提取时仍为 null；原页验证保持本地且仅支持 PDF。
 
 - 鉴权请求固定 redirect:error。官方 PUT 显式空 headers；CDN 下载不带 API Token；V1 字节 PUT 仅在 upload_url 与自建端点同源时附带 API Key。
 - 只重试幂等 GET，以及重新打开源文件流的官方 PUT／V1 上传 PUT 与结果下载。提交结果不明确的官方分配 POST、自托管 multipart POST、V1 创建 upload／complete／创建 parse job POST 绝不自动重放。

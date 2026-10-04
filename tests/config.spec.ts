@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   defaultMinerUConfig,
   defaultProviderConfig,
+  effectiveParseDefaults,
   detectBloatedSettingsOps,
   parseConfig,
   parseConfigWithMigration,
@@ -11,15 +12,21 @@ import {
 import { asProviderConfigId } from '../src/domain/ids.js'
 
 describe('MinerU config parsing and validation', () => {
-  it('creates complete independent self-hosted and official defaults', () => {
+  it('creates three independent profiles in legacy, official, V1 order', () => {
     const config = defaultMinerUConfig()
     expect(config.schemaVersion).toBe(2)
     expect(config.activeProvider).toBe('mp_self_hosted')
-    expect(config.providers).toHaveLength(2)
-    expect(config.providers[0]).toMatchObject({ id: 'mp_self_hosted', type: 'self-hosted-v2', allowInsecureHttp: true })
+    expect(config.providers).toHaveLength(3)
+    expect(config.providers[0]).toMatchObject({ id: 'mp_self_hosted', type: 'self-hosted-legacy-v2', allowInsecureHttp: true })
     expect(config.providers[1]).toMatchObject({
       id: 'mp_official', type: 'official-v4', baseURL: 'https://mineru.net/api/v4', models: ['pipeline', 'vlm'],
     })
+    expect(config.providers[2]).toEqual({
+      id: 'mp_self_hosted_v1', type: 'self-hosted-v1', baseURL: 'http://localhost:8000',
+      apiKeyEnv: 'MINERU_API_KEY', allowInsecureHttp: true, ocrMode: 'auto',
+    })
+    expect(config.providers[0]).not.toHaveProperty('tier')
+    expect(config.providers[0]).not.toHaveProperty('ocrMode')
     expect(config.defaults).toMatchObject({ model: 'pipeline', parseMethod: 'auto', ocr: false })
     expect(config.retry).toEqual({ maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 10000 })
     expect(config.output).toEqual({ maxInlineChars: 12000, maxInlineImages: 6 })
@@ -143,7 +150,7 @@ describe('MinerU config parsing and validation', () => {
       ],
     })).toThrow(/provider contains unsupported property unknownProviderKey/)
 
-    const selfHosted = base.providers[0]! as import('../src/config/pure.js').SelfHostedV2Config
+    const selfHosted = base.providers[0]! as import('../src/config/pure.js').SelfHostedLegacyV2Config
     expect(() => parseConfig({
       ...base,
       providers: [
@@ -153,18 +160,112 @@ describe('MinerU config parsing and validation', () => {
     })).toThrow(/modelMap contains unsupported property extraModel/)
   })
 
-  it('accepts a self-hosted parse tier and rejects unknown tiers', () => {
-    const base = defaultMinerUConfig()
-    const selfHosted = base.providers[0]! as import('../src/config/pure.js').SelfHostedV2Config
-    const withTier = (tier: unknown): unknown => parseConfig({
-      ...base,
-      providers: [{ ...selfHosted, tier }, base.providers[1]!],
+  it('accepts all four V1 tiers, leaves the default tier absent, and rejects invalid tiers', () => {
+    const provider = defaultProviderConfig('self-hosted-v1')
+    const withTier = (tier: unknown) => parseConfig({
+      activeProvider: provider.id,
+      providers: [{ ...provider, tier }],
     }).providers[0]
 
     expect(withTier(undefined)).not.toHaveProperty('tier')
-    expect(withTier('standard')).toMatchObject({ tier: 'standard' })
-    expect(() => withTier('fastest')).toThrow(/provider.tier must be one of flash, basic, standard, advanced/)
-    expect(() => withTier(1)).toThrow(/provider.tier must be one of/)
+    for (const tier of ['flash', 'basic', 'standard', 'advanced']) {
+      expect(withTier(tier)).toMatchObject({ type: 'self-hosted-v1', tier })
+    }
+    for (const tier of ['fastest', '', 'STANDARD', 1, null, false]) {
+      expect(() => withTier(tier)).toThrow(/provider.tier/)
+    }
+  })
+
+  it('defaults V1 OCR mode independently of shared defaults and validates all three modes', () => {
+    for (const ocrMode of [undefined, 'auto', 'txt', 'ocr']) {
+      const config = parseConfig({
+        activeProvider: 'mp_v1',
+        providers: [{ id: 'mp_v1', type: 'self-hosted-v1', allowInsecureHttp: true, ocrMode }],
+        defaults: { model: 'vlm', language: 'en', parseMethod: 'ocr', ocr: true, formula: true, table: true },
+      })
+      expect(config.providers[0]).toMatchObject({ baseURL: 'http://localhost:8000', ocrMode: ocrMode ?? 'auto' })
+      expect(config.providers[0]).not.toHaveProperty('modelMap')
+      expect(config.providers[0]).not.toHaveProperty('tier')
+      expect(config.defaults).toEqual({ model: 'vlm', language: 'en', parseMethod: 'ocr', ocr: true, formula: true, table: true })
+    }
+    for (const ocrMode of ['', 'text', 'OCR', false, 1, null]) {
+      const provider = defaultProviderConfig('self-hosted-v1')
+      expect(() => parseConfig({ activeProvider: provider.id, providers: [{ ...provider, ocrMode }] })).toThrow(/provider.ocrMode/)
+    }
+  })
+
+  it.each([
+    ['self-hosted-v1', 'modelMap', { pipeline: 'pipeline', vlm: 'vlm-engine' }],
+    ['self-hosted-v1', 'models', ['pipeline']],
+    ['self-hosted-v1', 'parseMethod', 'txt'],
+    ['self-hosted-v1', 'ocr', true],
+    ['self-hosted-legacy-v2', 'tier', 'standard'],
+    ['self-hosted-legacy-v2', 'ocrMode', 'auto'],
+    ['self-hosted-legacy-v2', 'models', ['pipeline']],
+    ['official-v4', 'tier', 'standard'],
+    ['official-v4', 'ocrMode', 'auto'],
+    ['official-v4', 'modelMap', { pipeline: 'pipeline', vlm: 'vlm-engine' }],
+    ['official-v4', 'allowInsecureHttp', true],
+  ] as const)('strictly rejects %s cross-type field %s even when undefined', (type, field, value) => {
+    const provider = defaultProviderConfig(type)
+    for (const invalidValue of [value, undefined]) {
+      expect(() => parseConfig({
+        activeProvider: provider.id,
+        providers: [{ ...provider, [field]: invalidValue }],
+      })).toThrow('provider contains unsupported property ' + field)
+    }
+  })
+
+  it.each([undefined, null, 1, '', 'unknown', ['self', 'hosted'].join('-'), ['self', 'hosted', 'v2'].join('-')])(
+    'rejects invalid or removed provider type %s without guessing a protocol', type => {
+      const base = defaultMinerUConfig()
+      const value = { ...base, providers: [{ ...base.providers[0], type }] }
+      expect(() => parseConfig(value)).toThrow(/provider.type/)
+      expect(() => parseConfigWithMigration({ ...value, schemaVersion: 1 })).toThrow(/provider.type/)
+    },
+  )
+
+  it.each(['self-hosted-v1', 'self-hosted-legacy-v2'] as const)(
+    'requires explicit HTTP opt-in for %s and rejects unsafe URL components', type => {
+      const provider = defaultProviderConfig(type)
+      const parse = (patch: Record<string, unknown>) => parseConfig({
+        activeProvider: provider.id, providers: [{ ...provider, ...patch }],
+      }).providers[0]
+      expect(() => parse({ allowInsecureHttp: false })).toThrow(/HTTPS/)
+      expect(() => parse({ allowInsecureHttp: undefined })).toThrow(/HTTPS/)
+      expect(parse({ allowInsecureHttp: true })).toMatchObject({ baseURL: provider.baseURL })
+      expect(parse({ baseURL: 'https://mineru.example/api/', allowInsecureHttp: false })).toMatchObject({ baseURL: 'https://mineru.example/api' })
+      for (const baseURL of [
+        'https://user:password@mineru.example', 'https://mineru.example?token=secret',
+        'https://mineru.example#fragment', 'ftp://mineru.example', 'file:///tmp/mineru',
+      ]) expect(() => parse({ baseURL, allowInsecureHttp: true })).toThrow()
+      expect(() => parse({ allowInsecureHttp: 'true' })).toThrow(/allowInsecureHttp/)
+    },
+  )
+
+  it('rejects duplicate identities across different provider types', () => {
+    const legacy = defaultProviderConfig('self-hosted-legacy-v2')
+    const v1 = defaultProviderConfig('self-hosted-v1')
+    expect(() => parseConfig({
+      activeProvider: legacy.id, providers: [legacy, { ...v1, id: legacy.id }],
+    })).toThrow(/unique/)
+  })
+
+  it('uses V1-only internal cache placeholders without mutating shared defaults', () => {
+    const defaults = Object.freeze({ model: 'vlm' as const, language: 'ja', formula: true, table: true, parseMethod: 'ocr' as const, ocr: true })
+    const provider = defaultProviderConfig('self-hosted-v1')
+    if (provider.type !== 'self-hosted-v1') throw new Error('Expected V1 profile')
+    for (const ocrMode of ['auto', 'txt', 'ocr'] as const) {
+      expect(effectiveParseDefaults(defaults, { ...provider, ocrMode })).toEqual({
+        model: 'pipeline', language: 'auto', formula: false, table: false,
+        parseMethod: ocrMode, ocr: ocrMode === 'ocr',
+      })
+    }
+    // These sentinels describe cache identity, not upstream formula/table switches.
+    expect(defaults).toEqual({ model: 'vlm', language: 'ja', formula: true, table: true, parseMethod: 'ocr', ocr: true })
+    for (const type of ['self-hosted-legacy-v2', 'official-v4'] as const) {
+      expect(effectiveParseDefaults(defaults, defaultProviderConfig(type))).toBe(defaults)
+    }
   })
 
   it('enforces explicit retainSources: false contract', () => {

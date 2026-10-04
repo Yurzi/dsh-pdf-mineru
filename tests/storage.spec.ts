@@ -78,9 +78,9 @@ function sampleRequest(sourceSha256 = 'a'.repeat(64)): CanonicalParseRequest {
 
 function sampleProducer(): ResultProducer {
   return {
-    providerId: 'self-hosted-v2',
+    providerId: 'self-hosted-legacy-v2',
     providerConfigId: asProviderConfigId('mp_default'),
-    compatibilityKey: 'self-hosted-v2:test-hash:v1:pipeline',
+    compatibilityKey: 'self-hosted-legacy-v2:test-hash:v1:pipeline',
   }
 }
 

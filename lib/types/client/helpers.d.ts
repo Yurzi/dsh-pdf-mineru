@@ -1,5 +1,6 @@
 import type { ClientConnectionRpc, RpcResult } from '@deepseek-ai/dsh-client-connection/client';
 import { type MinerUConfig, type ProviderConfig } from '../config/pure.js';
+import type { MineruKey } from './locales.js';
 export interface CredentialView {
     readonly configured: boolean;
     readonly source?: string;
@@ -11,6 +12,7 @@ export interface CredentialClient {
     set(ref: string, value: string): Promise<RpcResult<void>>;
     unset(ref: string): Promise<RpcResult<void>>;
 }
+export declare function providerTypeLabelKey(type: ProviderConfig['type']): MineruKey;
 export declare function ensureProviderProfiles(config: MinerUConfig): MinerUConfig;
 export declare function patchActiveProvider(config: MinerUConfig, patch: Partial<ProviderConfig>): MinerUConfig;
 export declare function normalizeProviderDefaults(config: MinerUConfig, provider: ProviderConfig): MinerUConfig;

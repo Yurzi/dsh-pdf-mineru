@@ -1,17 +1,25 @@
-import type { MinerUModel, ParseDefaults } from '../domain/request.js';
+import type { MinerUModel, ParseDefaults, ParseMethod } from '../domain/request.js';
 import { type ProviderConfigId } from '../domain/ids.js';
 export declare const MINERU_CONFIG_SCHEMA_VERSION: 2;
 /** Parse tiers advertised by the MinerU 4.0+ self-hosted V1 API. */
 export declare const SELF_HOSTED_TIERS: readonly ["flash", "basic", "standard", "advanced"];
 export type SelfHostedTier = typeof SELF_HOSTED_TIERS[number];
-export interface SelfHostedV2Config {
+export interface SelfHostedLegacyV2Config {
     readonly id: ProviderConfigId;
-    readonly type: 'self-hosted-v2';
+    readonly type: 'self-hosted-legacy-v2';
     readonly baseURL: string;
     readonly apiKeyEnv?: string;
     readonly modelMap: Readonly<Record<MinerUModel, string>>;
-    /** V1 API parse tier; absent keeps the upstream server default. */
+    readonly configuredVersion?: string;
+    readonly allowInsecureHttp: boolean;
+}
+export interface SelfHostedV1Config {
+    readonly id: ProviderConfigId;
+    readonly type: 'self-hosted-v1';
+    readonly baseURL: string;
+    readonly apiKeyEnv?: string;
     readonly tier?: SelfHostedTier;
+    readonly ocrMode: ParseMethod;
     readonly configuredVersion?: string;
     readonly allowInsecureHttp: boolean;
 }
@@ -23,7 +31,7 @@ export interface OfficialV4Config {
     readonly models: readonly MinerUModel[];
     readonly configuredVersion: 'v4';
 }
-export type ProviderConfig = SelfHostedV2Config | OfficialV4Config;
+export type ProviderConfig = SelfHostedV1Config | SelfHostedLegacyV2Config | OfficialV4Config;
 export interface StorageConfig {
     readonly storageRoot: string;
     readonly cacheEnabled: boolean;
@@ -69,9 +77,11 @@ export interface MinerUConfig {
     readonly output: OutputConfig;
     readonly limits: SecurityLimits;
 }
-export declare function defaultProviderConfig(type: 'self-hosted-v2' | 'official-v4'): ProviderConfig;
+export declare function defaultProviderConfig(type: ProviderConfig['type']): ProviderConfig;
 export declare function providerById(config: MinerUConfig, id: ProviderConfigId): ProviderConfig | undefined;
 export declare const DEFAULT_PARSE_DEFAULTS: ParseDefaults;
+/** V1 has no model/language/formula/table selectors; use stable internal sentinels for cache identity. */
+export declare function effectiveParseDefaults(defaults: ParseDefaults, provider: ProviderConfig): ParseDefaults;
 export declare const DEFAULT_POLLING_CONFIG: PollingConfig;
 export declare const DEFAULT_RETRY_CONFIG: RetryConfig;
 export declare const DEFAULT_OUTPUT_CONFIG: OutputConfig;

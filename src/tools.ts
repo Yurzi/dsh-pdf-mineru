@@ -41,7 +41,7 @@ const failureSchema = {
   type: 'object',
   properties: {
     code: { type: 'string' }, message: { type: 'string' }, retryable: { type: 'boolean' },
-    provider: { type: 'string', enum: ['self-hosted-v2', 'official-v4'] },
+    provider: { type: 'string', enum: ['self-hosted-v1', 'self-hosted-legacy-v2', 'official-v4'] },
     providerCode: { type: 'string' }, traceId: { type: 'string' }, fileId: { type: 'string' },
   },
   additionalProperties: false,
@@ -137,7 +137,7 @@ const resultViewSchema = {
       description: 'Non-empty continuation token when content_status is partial; null otherwise. Stop reading when null.',
     },
     warnings: { type: 'array', items: { type: 'string' } },
-    provenance: { type: 'object', properties: { provider: { type: 'string', enum: ['self-hosted-v2', 'official-v4'], required: true }, model: { type: 'string', enum: ['pipeline', 'vlm'], required: true }, parse_method: { type: 'string', enum: ['auto', 'txt', 'ocr'], required: true }, upstream_version: { type: 'null', required: true }, index_version: { type: 'integer', required: true }, reader_version: { type: 'integer', required: true } }, additionalProperties: false },
+    provenance: { type: 'object', properties: { provider: { type: 'string', enum: ['self-hosted-v1', 'self-hosted-legacy-v2', 'official-v4'], required: true }, model: { oneOf: [{ type: 'string', enum: ['pipeline', 'vlm'] }, { type: 'null' }], required: true }, parse_method: { type: 'string', enum: ['auto', 'txt', 'ocr'], required: true }, upstream_version: { type: 'null', required: true }, index_version: { type: 'integer', required: true }, reader_version: { type: 'integer', required: true } }, additionalProperties: false },
     diagnostics: { type: 'array', items: { type: 'object', properties: { id: { type: 'string', required: true }, code: { type: 'string', required: true }, scope: { type: 'string', enum: ['document', 'selection', 'chunk'], required: true }, message: { type: 'string', required: true }, block_id: { type: 'string' }, page: { type: 'integer' } }, additionalProperties: false } },
     verification_hints: { type: 'array', items: { type: 'object', properties: { reason: { type: 'string', enum: ['formula'], required: true }, block_id: { type: 'string', required: true }, page: { type: 'integer' }, view: { type: 'string', enum: ['page'], required: true } }, additionalProperties: false } },
     metadata_shortened: { type: 'array', items: { type: 'string', enum: ['summary', 'provenance', 'diagnostics', 'verification_hints', 'warnings'] } },

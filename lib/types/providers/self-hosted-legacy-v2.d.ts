@@ -1,15 +1,12 @@
 import { type ProviderConfigId } from '../domain/ids.js';
 import type { CanonicalParseRequest, MinerUModel, PreparedSourceFile } from '../domain/request.js';
 import { type ArtifactSink, type MinerUProvider, type ProviderCallContext, type ProviderCapabilities, type ProviderCollection, type ProviderCompatibilityContext, type ProviderJobRef, type ProviderJobSnapshot, type ProviderOptions, type ProviderProbeResult, type ProviderSubmission } from './provider.js';
-import type { SelfHostedTier } from '../config/pure.js';
-export interface SelfHostedV2ProviderConfig {
+export interface SelfHostedLegacyV2ProviderConfig {
     readonly id: ProviderConfigId;
-    readonly type: 'self-hosted-v2';
+    readonly type: 'self-hosted-legacy-v2';
     readonly baseURL: string;
     readonly apiKeyEnv?: string;
     readonly modelMap: Readonly<Partial<Record<MinerUModel, string>>>;
-    /** MinerU 4.0+ V1 API parse tier; absent keeps the server default. */
-    readonly tier?: SelfHostedTier;
     readonly configuredVersion?: string;
     readonly allowInsecureHttp?: boolean;
 }
@@ -48,26 +45,17 @@ export interface SelfHostedTaskResultResponse {
     readonly version?: string;
     readonly results?: Readonly<Record<string, SelfHostedFileParseResult>>;
 }
-export declare class SelfHostedV2Provider implements MinerUProvider {
-    readonly id: "self-hosted-v2";
-    readonly config: SelfHostedV2ProviderConfig;
+export declare class SelfHostedLegacyV2Provider implements MinerUProvider {
+    readonly id: "self-hosted-legacy-v2";
+    readonly config: SelfHostedLegacyV2ProviderConfig;
     readonly capabilities: ProviderCapabilities;
     private readonly parsedBaseUrl;
     private readonly retryOptions;
     private readonly client;
-    private readonly v1Api;
-    constructor(config: SelfHostedV2ProviderConfig, options?: ProviderOptions);
-    /**
-     * Detection endpoint for the MinerU 4.x V1 API. `/v1/health` is public; when it does not
-     * answer, the endpoint is treated as an earlier self-hosted server using the legacy
-     * task endpoints.
-     */
-    private detectProtocol;
+    constructor(config: SelfHostedLegacyV2ProviderConfig, options?: ProviderOptions);
     compatibilityKey(request: CanonicalParseRequest, context: ProviderCompatibilityContext): Promise<string>;
     probe(context: ProviderCallContext): Promise<ProviderProbeResult>;
-    private probeLegacy;
     submit(request: CanonicalParseRequest, sources: readonly PreparedSourceFile[], context: ProviderCallContext): Promise<ProviderSubmission>;
-    private submitLegacy;
     inspect(ref: ProviderJobRef, context: ProviderCallContext): Promise<ProviderJobSnapshot>;
     collect(ref: ProviderJobRef, request: CanonicalParseRequest, sink: ArtifactSink, context: ProviderCallContext): Promise<ProviderCollection>;
     private requestJson;

@@ -172,7 +172,7 @@ try {
       assert.ok(officialFirstReference.list_items[index - 1].startsWith(`[${index}]`), `Official block 202 reference ${index} must retain its label`)
     }
   } else {
-    assert.equal(manifest.producer.providerId, 'self-hosted-v2', 'Replay supports the known self-hosted-v2 and official-v4 caches')
+    assert.equal(manifest.producer.providerId, 'self-hosted-legacy-v2', 'Replay supports the known self-hosted-legacy-v2 and official-v4 caches')
     assert.equal(manifest.request.semantics.model, 'vlm', 'Self-hosted replay must use the VLM cache')
   }
 

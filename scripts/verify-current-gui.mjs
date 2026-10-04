@@ -72,7 +72,7 @@ const config = {
   schemaVersion: 2,
   activeProvider: 'mp_self_hosted',
   providers: [{
-    id: 'mp_self_hosted', type: 'self-hosted-v2', baseURL: 'http://localhost:18000',
+    id: 'mp_self_hosted', type: 'self-hosted-legacy-v2', baseURL: 'http://localhost:18000',
     apiKeyEnv: 'MINERU_API_KEY', modelMap: { pipeline: 'pipeline', vlm: 'vlm-engine' }, allowInsecureHttp: true,
   }],
   defaults: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true },
@@ -351,7 +351,10 @@ await page.route('**/dsh-pdf-mineru-api/**', async route => {
   }
   else if (endpoint === 'mineru/config.set') result = { ok: true, value: { config: payload.config } }
   else if (endpoint === 'mineru/probe') result = {
-    ok: true, value: { available: true, provider: payload.provider.type, authentication: 'valid', protocol_version: payload.provider.type === 'official-v4' ? 'v4' : 'v2' },
+    ok: true, value: { available: true, provider: payload.provider.type, authentication: 'valid',
+      protocol_version: payload.provider.type === 'official-v4' ? 'v4' : payload.provider.type === 'self-hosted-v1' ? 'v1' : 'v2',
+      ...(payload.provider.type === 'self-hosted-v1' ? { available_tiers: ['flash','basic','standard','advanced'], output_formats: ['markdown','middle_json','structured_content','zip'], source_types: ['file_id','url','inline'] } : {}),
+    },
   }
   else if (endpoint === 'mineru/storage.stats') result = { ok: true, value: storageStats }
   else if (endpoint === 'mineru/storage.integrity.scan') result = { ok: true, value: integrityScan }
@@ -383,7 +386,12 @@ await page.getByRole('button', { name: 'Settings', exact: true }).click().catch(
   throw error
 })
 const globalSettings = page.getByRole('dialog', { name: 'Settings', exact: true })
-await globalSettings.waitFor({ timeout: 5000 })
+await globalSettings.waitFor({ timeout: 10000 }).catch(async error => {
+  console.error(JSON.stringify({ errors, failedRequests, unrelatedPluginErrors: [...unrelatedPluginErrors], body: (await page.locator('body').innerText()).slice(0, 10000) }, null, 2))
+  await page.screenshot({ path: join(screenshotDir, 'mineru-shell-failure.png'), fullPage: true })
+  await browser.close()
+  throw error
+})
 if (await globalSettings.getByRole('navigation').getByRole('button', { name: /MinerU/i }).count() !== 0) {
   throw new Error('MinerU still appears in global settings navigation')
 }
@@ -432,13 +440,30 @@ await page.screenshot({ path: join(screenshotDir, 'mineru-current-settings-crede
 const providerGroup = page.getByRole('radiogroup', { name: 'Active Provider', exact: true })
 const selfHostedProvider = providerGroup.locator('input[value=mp_self_hosted]')
 const officialProvider = providerGroup.locator('input[value=mp_official]')
+const v1Provider = providerGroup.locator('input[value=mp_self_hosted_v1]')
 if (!await selfHostedProvider.isChecked()) throw new Error('initial active provider mismatch')
-if (await providerGroup.getByRole('radio').count() !== 2) throw new Error('legacy single-provider config was not completed with both profiles')
+if (await providerGroup.getByRole('radio').count() !== 3) throw new Error('legacy single-provider config was not completed with all three profiles')
 if (await page.getByText('Pipeline Backend Map', { exact: true }).count() !== 1) throw new Error('self-hosted fields are missing')
 const baseUrlInput = page.getByLabel('API Base URL')
 await baseUrlInput.fill('http://gpu-server:18000')
 await openCardFor(page.getByLabel('Default Parse Method'))
 await page.getByLabel('Default Parse Method').selectOption('txt')
+if (await page.getByLabel('Parse Tier', {exact:true}).count() !== 0) throw new Error('V1 tier leaked into legacy profile')
+await v1Provider.locator('..').click()
+if (await page.getByLabel('Default Parse Method').count() !== 0 || await page.getByLabel('Default Model', {exact:true}).count() !== 0 || await page.getByText('Pipeline Backend Map', {exact:true}).count() !== 0 || await page.getByText('Enable Formula Extraction', {exact:true}).count() !== 0) throw new Error('legacy controls leaked into V1')
+await page.getByLabel('Parse Tier', {exact:true}).selectOption('advanced')
+await page.getByLabel('OCR Mode (V1)', {exact:true}).selectOption('txt')
+await baseUrlInput.fill('http://v1-gpu:8000')
+await page.getByLabel('Deployment / model revision', {exact:true}).fill('4.0.10-review')
+await page.getByRole('button', {name:'Test Active Provider',exact:true}).click()
+await page.getByText('Available tiers: flash, basic, standard, advanced', {exact:true}).waitFor()
+await selfHostedProvider.locator('..').click()
+if (await page.getByText(/Connection Healthy/).count() !== 0) throw new Error('stale V1 probe result remained after switching')
+if (await page.getByLabel('Default Parse Method').inputValue() !== 'txt') throw new Error('V1 profile changed shared legacy defaults')
+if (await baseUrlInput.inputValue() !== 'http://gpu-server:18000') throw new Error('V1 switch discarded legacy draft')
+await v1Provider.locator('..').click()
+if (await page.getByLabel('Parse Tier', {exact:true}).inputValue() !== 'advanced' || await page.getByLabel('OCR Mode (V1)', {exact:true}).inputValue() !== 'txt' || await baseUrlInput.inputValue() !== 'http://v1-gpu:8000') throw new Error('V1 draft was reset by profile switching')
+await page.screenshot({path:join(screenshotDir,'mineru-v1-settings-desktop.png'),fullPage:true,animations:'disabled'})
 await officialProvider.locator('..').click()
 if (!await officialProvider.isChecked()) throw new Error('official provider radio did not activate')
 if (await page.getByLabel('Default Parse Method').inputValue() !== 'auto') throw new Error('official provider did not normalize txt to auto')
@@ -633,15 +658,17 @@ await page.screenshot({ path: join(screenshotDir, 'mineru-current-settings-overv
 if (errors.length > 0) throw new Error(`browser errors: ${errors.join('; ')}; failed requests: ${JSON.stringify(failedRequests)}`)
 if (!credentialCalls.some(call => call.method === 'set' && call.ref === 'MINERU_API_KEY')) throw new Error('credential set did not use the Remote positional API')
 if (!credentialCalls.some(call => call.method === 'unset' && call.ref === 'MINERU_API_KEY')) throw new Error('credential unset did not use the Remote positional API')
-const probe = rpcCalls.find(call => call.endpoint === 'mineru/probe')
+const probe = rpcCalls.find(call => call.endpoint === 'mineru/probe' && call.payload?.provider?.type === 'official-v4')
 if (probe?.payload?.provider?.type !== 'official-v4') throw new Error('draft probe did not carry official provider')
 const save = rpcCalls.find(call => call.endpoint === 'mineru/config.set')
-if (save?.payload?.config?.providers?.length !== 2) throw new Error('save did not carry both provider profiles')
-const savedSelfHosted = save?.payload?.config?.providers?.find(provider => provider.type === 'self-hosted-v2')
+if (save?.payload?.config?.providers?.length !== 3) throw new Error('save did not carry all three provider profiles')
+const savedSelfHosted = save?.payload?.config?.providers?.find(provider => provider.type === 'self-hosted-legacy-v2')
 const savedOfficial = save?.payload?.config?.providers?.find(provider => provider.type === 'official-v4')
 if (savedSelfHosted?.baseURL !== 'http://gpu-server:18000') throw new Error('save reset the self-hosted profile')
 if (savedOfficial?.baseURL !== 'https://mineru.net/api/v4') throw new Error('save reset the official profile')
-if ('models' in savedSelfHosted || 'modelMap' in savedOfficial) throw new Error('provider-specific fields leaked across profiles')
+const savedV1 = save?.payload?.config?.providers?.find(provider => provider.type === 'self-hosted-v1')
+if (savedV1?.tier !== 'advanced' || savedV1?.ocrMode !== 'txt' || savedV1?.baseURL !== 'http://v1-gpu:8000' || savedV1?.configuredVersion !== '4.0.10-review') throw new Error('save lost V1 settings')
+if ('models' in savedSelfHosted || 'tier' in savedSelfHosted || 'modelMap' in savedOfficial || 'modelMap' in savedV1 || 'models' in savedV1) throw new Error('provider-specific fields leaked across profiles')
 if (save?.payload?.config?.retry?.maxAttempts !== 4) throw new Error('save did not carry retry policy')
 if (save?.payload?.config?.output?.maxInlineImages !== 9) throw new Error('save did not carry inline image budget')
 const cacheClearPreviewCall = rpcCalls.find(call => call.endpoint === 'mineru/storage.cache.clear' && call.payload?.dry_run === true)
@@ -666,6 +693,7 @@ console.log(JSON.stringify({
   bundleRequests,
   hmrIsolated: true,
   screenshots: [
+    join(screenshotDir, 'mineru-v1-settings-desktop.png'),
     join(screenshotDir, 'mineru-current-settings-credential-desktop.png'),
     join(screenshotDir, 'mineru-current-settings-desktop.png'),
     join(screenshotDir, 'mineru-current-settings-credential-mobile.png'),

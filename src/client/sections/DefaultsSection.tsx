@@ -2,7 +2,7 @@ import type { Dispatch, SetStateAction } from 'react'
 import type { MinerUConfig, ProviderConfig } from '../../config/pure.js'
 import type { MinerUModel, ParseMethod } from '../../domain/request.js'
 import type { MineruKey } from '../locales.js'
-import { updateConfigSection } from '../helpers.js'
+import { patchActiveProvider, updateConfigSection } from '../helpers.js'
 import css from '../SettingsPage.module.css'
 
 export interface DefaultsSectionProps {
@@ -22,6 +22,21 @@ export function DefaultsSection({
   onDismissTxtNotice,
   t,
 }: DefaultsSectionProps) {
+  if (activeProvider.type === 'self-hosted-v1') {
+    return <div className={css.sectionInner}>
+      <label className={css.field}>
+        <span className={css.fieldLabel}>{t('field.v1OcrMode')}</span>
+        <select className={css.select} aria-label={t('field.v1OcrMode')} value={activeProvider.ocrMode}
+          onChange={e => setDraft(prev => prev === null ? prev : patchActiveProvider(prev, { ocrMode: e.target.value as ParseMethod }))}>
+          <option value="auto">{t('parse.auto')}</option>
+          <option value="txt">{t('parse.txt')}</option>
+          <option value="ocr">{t('parse.ocr')}</option>
+        </select>
+        <span className={css.fieldHint}>{t('field.v1OcrMode.hint')}</span>
+      </label>
+      <p className={css.fieldHint}>{t('notice.v1ServerManaged')}</p>
+    </div>
+  }
   return (
     <div className={css.sectionInner}>
       {txtToAutoNotice && (
@@ -63,7 +78,7 @@ export function DefaultsSection({
             onChange={e => setDraft(prev => prev === null ? prev : updateConfigSection(prev, 'defaults', { parseMethod: e.target.value as ParseMethod, ocr: e.target.value === 'ocr' }))}
           >
             <option value="auto">{t('parse.auto')}</option>
-            {activeProvider.type === 'self-hosted-v2' && <option value="txt">{t('parse.txt')}</option>}
+            {activeProvider.type === 'self-hosted-legacy-v2' && <option value="txt">{t('parse.txt')}</option>}
             <option value="ocr">{t('parse.ocr')}</option>
           </select>
         </label>

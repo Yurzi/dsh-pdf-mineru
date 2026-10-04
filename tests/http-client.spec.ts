@@ -67,7 +67,7 @@ describe('ProviderHttpClient', () => {
 
   describe('extractErrorMessage', () => {
     it('extracts detail field for self-hosted provider', () => {
-      const msg = extractErrorMessage(JSON.stringify({ detail: 'Validation failed' }), 'self-hosted-v2')
+      const msg = extractErrorMessage(JSON.stringify({ detail: 'Validation failed' }), 'self-hosted-legacy-v2')
       expect(msg).toBe('Validation failed')
     })
 
@@ -98,7 +98,7 @@ describe('ProviderHttpClient', () => {
     })
 
     it('maps 429 to PROVIDER_RATE_LIMITED with retryAfterMs', () => {
-      const err = createHttpStatusError('self-hosted-v2', 429, '', 5000)
+      const err = createHttpStatusError('self-hosted-legacy-v2', 429, '', 5000)
       expect(err.failure.code).toBe('PROVIDER_RATE_LIMITED')
       expect(err.failure.retryable).toBe(true)
       expect(err.httpStatus).toBe(429)
@@ -106,7 +106,7 @@ describe('ProviderHttpClient', () => {
     })
 
     it('maps 413 to FILE_TOO_LARGE', () => {
-      const err = createHttpStatusError('self-hosted-v2', 413, '')
+      const err = createHttpStatusError('self-hosted-legacy-v2', 413, '')
       expect(err.failure.code).toBe('FILE_TOO_LARGE')
       expect(err.failure.retryable).toBe(false)
     })
@@ -131,7 +131,7 @@ describe('ProviderHttpClient', () => {
 
       const client = new ProviderHttpClient({
         baseURL: `http://127.0.0.1:${port}`,
-        provider: 'self-hosted-v2',
+        provider: 'self-hosted-legacy-v2',
       })
 
       const result = await client.requestJson<{ ok: boolean }>({
@@ -156,7 +156,7 @@ describe('ProviderHttpClient', () => {
 
       const client = new ProviderHttpClient({
         baseURL: `http://127.0.0.1:${port}`,
-        provider: 'self-hosted-v2',
+        provider: 'self-hosted-legacy-v2',
       })
 
       await expect(
@@ -178,7 +178,7 @@ describe('ProviderHttpClient', () => {
 
       const client = new ProviderHttpClient({
         baseURL: `http://127.0.0.1:${port}`,
-        provider: 'self-hosted-v2',
+        provider: 'self-hosted-legacy-v2',
       })
 
       await expect(
@@ -202,7 +202,7 @@ describe('ProviderHttpClient', () => {
 
       const client = new ProviderHttpClient({
         baseURL: `http://127.0.0.1:${port}`,
-        provider: 'self-hosted-v2',
+        provider: 'self-hosted-legacy-v2',
       })
 
       const controller = new AbortController()

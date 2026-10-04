@@ -10,6 +10,39 @@ import {
   readBoundedResponseText,
 } from './retry.js'
 
+export function validateSelfHostedBaseURL(rawUrl: string, allowInsecureHttp?: boolean): URL {
+  if (typeof rawUrl !== 'string' || rawUrl.trim() === '') {
+    throw new MinerUError(failure('INVALID_REQUEST', 'Provider baseURL must be a non-empty string'))
+  }
+  let parsed: URL
+  try {
+    parsed = new URL(rawUrl)
+  } catch (err) {
+    throw new MinerUError(
+      failure('INVALID_REQUEST', `Invalid provider baseURL: "${sanitizeDiagnostic(rawUrl)}"`),
+      { cause: err },
+    )
+  }
+  if (parsed.protocol === 'http:') {
+    if (!allowInsecureHttp) {
+      throw new MinerUError(
+        failure('INVALID_REQUEST', 'Insecure HTTP baseURL is not allowed unless allowInsecureHttp is explicitly enabled'),
+      )
+    }
+  } else if (parsed.protocol !== 'https:') {
+    throw new MinerUError(
+      failure('INVALID_REQUEST', `Unsupported protocol in baseURL: ${parsed.protocol}`),
+    )
+  }
+  if (parsed.username || parsed.password) {
+    throw new MinerUError(failure('INVALID_REQUEST', 'Provider baseURL must not contain embedded credentials'))
+  }
+  if (parsed.search || parsed.hash) {
+    throw new MinerUError(failure('INVALID_REQUEST', 'Provider baseURL must not contain a query or fragment'))
+  }
+  return parsed
+}
+
 export interface ProviderHttpClientOptions {
   readonly baseURL: URL | string
   readonly provider: MinerUProviderId

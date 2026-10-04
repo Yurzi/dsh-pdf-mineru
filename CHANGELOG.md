@@ -4,21 +4,21 @@
 
 ### Added
 
-- Support the MinerU 4.0+ self-hosted V1 API next to the legacy task endpoints: the self-hosted adapter selects the protocol from `GET /v1/health`, then uses `POST /v1/uploads` + service-provided `upload_url` PUT + `POST /v1/uploads/{id}/complete` + `POST /v1/parse/jobs`, polling `GET /v1/parse/jobs/{jobId}` and downloading `GET /v1/files/{fileId}/content`.
-- Add an explicit self-hosted parse tier (`provider.tier`, selectable in the plugin settings page) for the MinerU 4.0+ V1 API; a `modelMap` value that names a tier is still honoured as a fallback so nothing breaks for existing profiles, and the legacy backend map is labelled as a 3.x parameter.
-- Note that MinerU 4.0 removed the language/formula/table request parameters: the V1 API expresses only page range, tier, and OCR mode, so those settings stay server-side while the plugin still keys caches by them.
+- Add an explicit `self-hosted-v1` Provider for MinerU 4.x upload sessions, parse jobs and ZIP artifacts, alongside `self-hosted-legacy-v2` and `official-v4`.
+- Add per-profile V1 tier and OCR mode (auto/txt/ocr), and discover deployed tiers/output/source capabilities with health and tiers requests before uploading.
+- Provide three independently editable settings profiles, protocol-specific controls, bilingual guidance, editable deployment cache revision, and stale-probe invalidation without auto-saving drafts.
 
 ### Changed
 
-- Canonicalize MinerU 4.x result archives into the existing artifact shapes: `markdown.md`, `middle_json.json`, `structured_content.json`, `model_output.json` and `images/` become the canonical markdown, layout, content-list, model-output and images artifacts, with the V1 `pages[]` page list exposed as `pdf_info[]` and structured content flattened into a content-list array.
-- Send the API key on a V1 upload URL only when it is same-origin with the configured endpoint; retry the byte PUT and result download with a fresh source stream, never the upload/complete/job-creation POSTs.
+- Standardize source, API identifiers, tests and generated declarations on `self-hosted-v1` / `self-hosted-legacy-v2` with separate Provider implementations. Explicit selection replaces automatic protocol fallback; V1 no longer interprets a legacy backend map as a tier.
+- Reject cross-protocol configuration fields. V1 keeps shared legacy/cloud defaults in drafts but does not apply them to requests or cache semantics. V1 provenance.model is null rather than a claimed pipeline/vlm engine.
+- Normalize MinerU 4.x ZIP entries and structured documents through the existing bounded artifact pipeline, preserving metadata and real asset references.
+- Existing mixed self-hosted profiles require an explicit new type and removal of fields unsupported by that type; no aliases or automatic profile/artifact migration are added. New self-hosted identities re-parse old caches. Schema container version 2, cursor v3, index v2, native jobs and tool arguments remain unchanged.
 
 ### Fixed
 
-- Include the effective self-hosted parse tier in the provider compatibility key, so switching tiers re-parses instead of reusing a result produced under another tier (and a profile without an effective tier is distinct from a tiered one). Self-hosted cache entries written before this change are re-created once, because their compatibility key changed.
-- Retry the self-hosted result-archive download when the response body is interrupted or times out after an accepted HTTP 200; cancellation, byte limits and local staging failures stay non-retryable, and a local staging failure is now reported as a typed `RESULT_DOWNLOAD_FAILED` instead of a raw error.
-
-Provider/config/cache formats, cursor v3, index v2, native-job semantics and tool arguments are unchanged; existing parsed caches require no migration or re-upload. Upgrade `configuredVersion` when a server is upgraded in place to a different MinerU API generation.
+- Isolate V1 results by tier and effective OCR mode instead of reusing another tier/mode result; transport retries cover result-body interruption after HTTP 200, while cancellation and byte limits remain terminal.
+- Preserve drafts and maintenance confirmation boundaries when switching protocol-specific forms. Legacy submissions no longer contact a V1 detection endpoint.
 
 ## 0.1.5
 
@@ -257,7 +257,7 @@ This release includes the bounded-reader work recorded under 0.0.13; the previou
 - Re-architected model output and tool descriptions to strict Plain Text English with zero emoji, eliminating hallucinated guidance references to deprecated fields.
 - Decoupled document presentation, outline (TOC) extraction, character budget allocation, and prose formatting from `MinerUService` into dedicated `src/service/result-presenter.ts`.
 - Consolidated shared HTTP request pipelines, timeout management, error body diagnostics, and retry policies into `src/providers/http-client.ts`, eliminating duplicate logic across official and self-hosted providers.
-- Upgraded `self-hosted-v2` multipart streaming to Node 22 native `FormData` and `openAsBlob`, removing third-party `form-data` package dependency.
+- Upgraded `self-hosted-legacy-v2` multipart streaming to Node 22 native `FormData` and `openAsBlob`, removing third-party `form-data` package dependency.
 - Replaced hand-rolled streaming JSON parser in `safe-zip` with standard V8 `JSON.parse`, and standardized delay timers across all modules using `node:timers/promises`.
 - Adopted scoped locking (`withLock`) across mutating storage operations (`clearCache`, `commitTransaction`, `quarantine`) with contention backoff, eliminating startup lifetime lock holding to allow concurrent multi-process initialization.
 - Eliminated self-inflicted read-only (`0o400`/`0o500`) permission cycles in `result-repository`, streamlining cache cleanup and quarantine deletions.
@@ -289,7 +289,7 @@ This release includes the bounded-reader work recorded under 0.0.13; the previou
 
 ### Changed
 
-- New installations now provision independent self-hosted v2 and official v4 Provider profiles, while existing single-Provider settings drafts are completed without overwriting their configured values.
+- New installations now provision independent self-hosted legacy v2 and official v4 Provider profiles, while existing single-Provider settings drafts are completed without overwriting their configured values.
 - Expanded peer compatibility for the current DSH 0.1.2 alpha packages, Cordis 4.0.2, and Schemastery 3.18.2.
 
 ### Fixed
@@ -362,4 +362,4 @@ No canonical request, CacheKey, ProviderJobRef, or result manifest schema versio
 
 ## 0.0.1
 
-- Initial npm release with provider-independent tools, self-hosted v2 and official v4 adapters, session Jobs, immutable global results, request coalescing, restart recovery, safe ZIP extraction, and Provider-aware settings.
+- Initial npm release with provider-independent tools, self-hosted legacy v2 and official v4 adapters, session Jobs, immutable global results, request coalescing, restart recovery, safe ZIP extraction, and Provider-aware settings.

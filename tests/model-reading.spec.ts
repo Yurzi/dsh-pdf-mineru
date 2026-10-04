@@ -57,7 +57,7 @@ interface MockImageArtifact {
 }
 
 class ModelReadingMockProvider implements MinerUProvider {
-  readonly id = 'self-hosted-v2' as const
+  readonly id = 'self-hosted-legacy-v2' as const
   readonly capabilities: ProviderCapabilities = {
     models: ['pipeline', 'vlm'],
     parseMethods: ['auto', 'txt', 'ocr'],
@@ -82,7 +82,7 @@ class ModelReadingMockProvider implements MinerUProvider {
   }
 
   compatibilityKey(_request: CanonicalParseRequest, _context: ProviderCompatibilityContext): Promise<string> {
-    return Promise.resolve('self-hosted-v2:test:reading:v1')
+    return Promise.resolve('self-hosted-legacy-v2:test:reading:v1')
   }
 
   async submit(

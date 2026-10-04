@@ -2,7 +2,8 @@ import { MinerUError, failure } from '../domain/errors.js'
 import type { ProviderConfigId } from '../domain/ids.js'
 import type { MinerUConfig, ProviderConfig } from '../config.js'
 import { providerById } from '../config.js'
-import { SelfHostedV2Provider } from './self-hosted-v2.js'
+import { SelfHostedLegacyV2Provider } from './self-hosted-legacy-v2.js'
+import { SelfHostedV1Provider } from './self-hosted-v1.js'
 import { OfficialV4Provider } from './official-v4.js'
 import type { MinerUProvider, ProviderOptions } from './provider.js'
 
@@ -32,8 +33,10 @@ export class ProviderRegistry {
 
   create(config: ProviderConfig): MinerUProvider {
     switch (config.type) {
-      case 'self-hosted-v2':
-        return new SelfHostedV2Provider(config, this.options)
+      case 'self-hosted-v1':
+        return new SelfHostedV1Provider(config, this.options)
+      case 'self-hosted-legacy-v2':
+        return new SelfHostedLegacyV2Provider(config, this.options)
       case 'official-v4':
         return new OfficialV4Provider(config, this.options)
     }

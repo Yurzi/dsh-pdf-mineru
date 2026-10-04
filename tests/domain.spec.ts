@@ -193,15 +193,15 @@ describe('cache key', () => {
   })
 
   it.each([
-    ['auto', '71c1ee24770042d2b931a918ddddbc052d28ac77ecd4a0f061e06787d8b70777'],
-    ['txt', 'ffeaac8ba9e290669abecc4b71a7a1fd6f34cf7fa80d815166f5552dfe916a2d'],
-  ] as const)('preserves the %s golden cache key', (method, expected) => {
+    ['auto', 'b2d5313dacfb974770f45a4e0dbbc87b7c5188e0c06a8a106810316f1dbb93b4'],
+    ['txt', '247a4fd5e650ddd14ffafdd216f7248e59d11898c0d417c7f48900d9d75b1bea'],
+  ] as const)('preserves the %s golden cache key in the renamed legacy namespace', (method, expected) => {
     const file = { fileId: createFileId('a'.repeat(64)), name: 'fixture.pdf', bytes: 10, sha256: 'a'.repeat(64) }
     const req: CanonicalParseRequest = {
       schemaVersion: 1, files: [file], requiredArtifacts: ['markdown'],
       semantics: { model: 'pipeline', ocr: false, parseMethod: method, language: 'ch', formula: true, table: true },
     }
-    expect(computeCacheKey(req, file, 'self-hosted-v2:golden')).toBe(expected)
+    expect(computeCacheKey(req, file, 'self-hosted-legacy-v2:golden')).toBe(expected)
   })
 
   it('preserves NFC normalization, sorted keys and negative zero', () => {

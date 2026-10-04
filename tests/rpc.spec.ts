@@ -22,7 +22,7 @@ import { rpcErrorSchema } from '@deepseek-ai/dsh-client-connection'
 vi.mock('../src/loopback-rpc.js', () => ({
   registerLoopbackRpc: (ctx: Context, channel: string, handler: RpcHandler) => ctx.connection.rpc.handle(channel, handler),
 }))
-import { defaultMinerUConfig, type MinerUConfig, type OfficialV4Config, type SelfHostedV2Config } from '../src/config.js'
+import { defaultMinerUConfig, type MinerUConfig, type OfficialV4Config, type SelfHostedLegacyV2Config } from '../src/config.js'
 import { asProviderConfigId } from '../src/domain/ids.js'
 import { failure, MinerUError } from '../src/domain/errors.js'
 import { mapRpcError, registerRpc, RPC_CHANNEL, type MineruRpcDeps, type RpcResult } from '../src/rpc.js'
@@ -104,7 +104,7 @@ describe('MinerU RPC (registerRpc)', () => {
       setConfig: vi.fn(async c => c as MinerUConfig),
       probe: vi.fn(async () => ({
         available: true,
-        provider: 'self-hosted-v2' as const,
+        provider: 'self-hosted-legacy-v2' as const,
         authentication: 'valid' as const,
         protocol_version: '2.0',
       })),
@@ -518,9 +518,9 @@ describe('Client UI Pure Helpers (SettingsPage)', () => {
 
   it('completes legacy single-provider drafts and preserves both profiles across switching', () => {
     const base = defaultMinerUConfig()
-    const selfHosted: SelfHostedV2Config = {
+    const selfHosted: SelfHostedLegacyV2Config = {
       id: asProviderConfigId('mp_primary'),
-      type: 'self-hosted-v2',
+      type: 'self-hosted-legacy-v2',
       baseURL: 'http://gpu-server:18000',
       apiKeyEnv: 'LOCAL_KEY',
       modelMap: { pipeline: 'pipeline', vlm: 'hybrid-engine' },
@@ -530,7 +530,7 @@ describe('Client UI Pure Helpers (SettingsPage)', () => {
     const legacySingle = { ...base, activeProvider: selfHosted.id, providers: [selfHosted] }
 
     const completed = ensureProviderProfiles(legacySingle)
-    expect(completed.providers).toHaveLength(2)
+    expect(completed.providers).toHaveLength(3)
     expect(completed.providers[0]).toEqual(selfHosted)
     const official = completed.providers.find(provider => provider.type === 'official-v4')
     expect(official).toMatchObject({
@@ -558,8 +558,8 @@ describe('Client UI Pure Helpers (SettingsPage)', () => {
     const official = { ...base.providers[1]!, id: asProviderConfigId('mp_self_hosted') } as OfficialV4Config
     const completed = ensureProviderProfiles({ ...base, activeProvider: official.id, providers: [official] })
 
-    expect(completed.providers.map(provider => provider.id)).toEqual(['mp_self_hosted', 'mp_self_hosted_2'])
-    expect(completed.providers.map(provider => provider.type)).toEqual(['official-v4', 'self-hosted-v2'])
+    expect(completed.providers.map(provider => provider.id)).toEqual(['mp_self_hosted', 'mp_self_hosted_2', 'mp_self_hosted_v1'])
+    expect(completed.providers.map(provider => provider.type)).toEqual(['official-v4', 'self-hosted-legacy-v2', 'self-hosted-v1'])
   })
 
   it('normalizes defaults to the active official provider capabilities', () => {

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
 import type { ClientConnectionRpc, RpcResult } from '@deepseek-ai/dsh-client-connection/client'
@@ -7,6 +7,7 @@ import type { ProbeView } from '../service/mineru-service.js'
 import type { MineruKey } from './locales.js'
 import {
   activateProvider,
+  providerTypeLabelKey,
   callRpc,
   clearCredential,
   credentialReference,
@@ -82,6 +83,14 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
     view?: ProbeView
     error?: string
   }>({ status: 'idle' })
+
+  const probeRevision = useRef(0)
+  const activeProviderFingerprint = JSON.stringify(draft?.providers.find(provider => provider.id === draft.activeProvider))
+  useEffect(() => {
+    probeRevision.current++
+    setTestState({ status: 'idle' })
+    return () => { probeRevision.current++ }
+  }, [activeProviderFingerprint, credentialRevision])
 
   // Individual card disclosure states
   const [cardsOpen, setCardsOpen] = useState<Record<string, boolean>>({
@@ -226,9 +235,11 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
     const active = draft.providers.find(p => p.id === draft.activeProvider)
     if (active === undefined) return
 
+    const revision = ++probeRevision.current
     setTestState({ status: 'testing' })
     try {
       const result = await callRpc<ProbeRpcResult>(rpc, 'mineru/probe', { provider: active })
+      if (revision !== probeRevision.current) return
       if (result.ok) {
         setTestState({
           status: result.value.available ? 'healthy' : 'unhealthy',
@@ -241,6 +252,7 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
         })
       }
     } catch (err: unknown) {
+      if (revision !== probeRevision.current) return
       setTestState({
         status: 'error',
         error: err instanceof Error ? err.message : String(err),
@@ -423,11 +435,15 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
                 </span>
               </div>
               <div className={css.testDetails}>
-                <div>Auth: {testState.view.authentication} | Protocol: {testState.view.protocol_version}{testState.view.server_version ? ` | Server: v${testState.view.server_version}` : ''}</div>
+                <div>{t('probe.auth')}: {testState.view.authentication} | {t('probe.protocol')}: {testState.view.protocol_version}{testState.view.server_version ? ` | ${t('probe.server')}: v${testState.view.server_version}` : ''}</div>
                 {testState.view.queue && (
-                  <div>Queue: {testState.view.queue.processing ?? 0} active, {testState.view.queue.queued ?? 0} queued (max concurrent: {testState.view.queue.max_concurrent ?? 'N/A'})</div>
+                  <div>{t('probe.queue')}: {testState.view.queue.processing ?? 0} / {testState.view.queue.queued ?? 0} / {testState.view.queue.max_concurrent ?? 'N/A'}</div>
                 )}
-                {testState.view.diagnostics && <div>Diagnostics: {testState.view.diagnostics}</div>}
+                {testState.view.available_tiers && <div>{t('probe.tiers')}: {testState.view.available_tiers.join(', ')}</div>}
+                {testState.view.output_formats && <div>{t('probe.formats')}: {testState.view.output_formats.join(', ')}</div>}
+                {testState.view.source_types && <div>{t('probe.sources')}: {testState.view.source_types.join(', ')}</div>}
+                {testState.view.provider === 'self-hosted-v1' && <div>{t('probe.scope')}</div>}
+                {testState.view.diagnostics && <div>{t('probe.diagnostics')}: {testState.view.diagnostics}</div>}
               </div>
             </>
           )}
@@ -448,7 +464,7 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
           badge={
             <div className={css.cardBadgeGroup}>
               <span className={`${css.cardBadge} ${css.badgeInfo}`}>
-                {t(activeProvider.type === 'self-hosted-v2' ? 'badge.selfHosted' : 'badge.official')}
+                {t(providerTypeLabelKey(activeProvider.type))}
               </span>
               <span
                 className={`${css.cardBadge} ${
@@ -494,7 +510,7 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
         <DisclosureCard
           id="defaults"
           title={t('section.defaults')}
-          subtitle={t('section.defaults.desc')}
+          subtitle={t(activeProvider.type === 'self-hosted-v1' ? 'section.defaults.v1.desc' : 'section.defaults.desc')}
           icon={<SlidersIcon size={16} />}
           open={cardsOpen.defaults ?? true}
           onToggle={() => toggleCard('defaults')}
@@ -502,7 +518,9 @@ export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
           badge={
             <div className={css.cardBadgeGroup}>
               <span className={`${css.cardBadge} ${css.badgeNeutral}`}>
-                {draft.defaults.model.toUpperCase()} · {draft.defaults.parseMethod} · {draft.defaults.language}
+                {activeProvider.type === 'self-hosted-v1'
+                  ? (activeProvider.tier ?? t('field.tier.serverDefault')) + ' · ' + activeProvider.ocrMode
+                  : draft.defaults.model.toUpperCase() + ' · ' + draft.defaults.parseMethod + ' · ' + draft.defaults.language}
               </span>
             </div>
           }

@@ -91,9 +91,10 @@ PDF.js 包解压约34.8 MB，Canvas JS 约0.13 MB，Linux x64 glibc 二进制约
 3. 在设置中选择 **Official v4**，保持 **API Key Env Var** 为 `MINERU_API_KEY`，点击 **Test Active Provider** 即可完成验证。
 
 #### 方案 B：使用本地 / 私有化自建服务
-1. 启动您的 MinerU 自建服务（如 FastAPI v2，默认端口 18000）。
-2. 在设置中选择 **Self-hosted v2**，填入服务地址（例如 `http://localhost:18000`）。
-3. 若使用本地 HTTP，勾选 **Allow Insecure HTTP**，点击 **Test Active Provider** 验证连通。
+1. 启动 MinerU 服务：4.x 请选择 **Self-Hosted MinerU (V1 API)**（常见地址 `http://localhost:8000`）；3.x 请选择 **Self-Hosted MinerU (Legacy v2)**（常见地址 `http://localhost:18000`）。API 代际不等于软件大版本，也不要填入 VLM 推理服务地址。
+2. V1 配置档位 `tier` 和独立的 OCR 模式 `ocrMode: auto/txt/ocr`；legacy-v2 配置 backend 映射及共享解析默认值。两种协议显式选择，不自动降级或映射 backend 为 tier。
+3. 本地 HTTP 需勾选 **Allow Insecure HTTP**。点击 **Test Active Provider** 验证：V1 显示部署声明的档位、产物和来源，真实解析前也检查 ZIP、file_id 与选定档位是否可用。验证不等于解析效果保证。
+4. 配置修改只更新草稿，点击 **Save Configuration** 才保存。切换协议、折叠卡片不清空各 profile 的草稿。
 
 ### 3. 开始使用
 
@@ -181,9 +182,11 @@ flowchart LR
     Cache -->|hit| Result[Immutable result]
     Cache -->|miss| Shared[SharedOperationRegistry]
     Shared --> Providers
-    Providers --> V2[Self-hosted v2]
+    Providers --> V1[Self-hosted V1]
+    Providers --> V2[Self-hosted legacy v2]
+    V1 --> Staging[Validated staging]
     Providers --> V4[Official v4]
-    V2 --> Staging[Validated staging]
+    V2 --> Staging
     V4 --> Staging
     Staging --> Publish[Atomic publish]
     Publish --> Result
@@ -192,19 +195,17 @@ flowchart LR
 - **统一工具分发**：Agent 发起的同步请求（`read_pdf`）直接返回结果，异步长任务（`async_parse_pdf`）交由 DSH 原生 JobRegistry 调度。
 - **缓存复用**：按文件 SHA-256 与解析语义寻址；命中时无需重新提交上游解析，但仍校验本地源文件及产物。
 - **并发请求合并**：同进程内的并发重复请求由 `SharedOperationRegistry` 合并，避免重复向上游提交。
-- **双 Provider 适配**：上游适配自建 MinerU（自动识别 4.0+ 的 V1 API 与 3.x 及更早的 `/tasks` 接口）或官方云 v4，解析产物经校验后原子发布。
+- **显式三类 Provider**：`self-hosted-v1` 使用 4.x `/v1/...`，`self-hosted-legacy-v2` 使用 3.x `/tasks`，`official-v4` 使用官方云接口；各自有独立配置、缓存身份和能力校验。
 
 ## 🔌 Provider 选型对比
 
-| 维度 | 官方云服务 (Official v4) | 本地 / 私有化自建 (Self-hosted v2) |
-| --- | --- | --- |
-| **部署难度** | ⭐ **零门槛**（仅需配置 API Key） | 需自行部署 MinerU 服务及模型环境 |
-| **硬件要求** | 无需本地 GPU，云端集群算力支持 | 推荐配备 NVIDIA GPU 显卡 |
-| **数据安全性** | 数据上传至 MinerU 官方云端解析 | 由自建服务的部署位置、网络与安全配置决定 |
-| **上游版本** | 固定官方 v4 接口 | 自动识别：MinerU 4.0+ 走 V1 API（uploads + parse jobs），3.x 及更早走 `/tasks` 接口 |
-| **支持模型** | 原生支持 `pipeline` 与 `vlm` | 支持 `pipeline`，亦可通过 `modelMap` 映射自建 VLM 引擎（3.x）；4.0+ 在设置页选择解析档位 `flash`/`basic`/`standard`/`advanced` |
-| **单文件限制** | 单文件最大 200 MB，最多 200 页 | 取决于自建服务端硬件与配置 |
-| **网络协议** | 强制 HTTPS，安全传输 | 支持 HTTP / HTTPS，本地可配置 `allowInsecureHttp` |
+| 配置类型 | 适用服务 | 可配置解析选项 | 不接受的混用字段 |
+| --- | --- | --- | --- |
+| `self-hosted-v1` | 自部署 MinerU 4.x，V1 API | `tier`（四档或服务端默认）、`ocrMode`（三态） | `modelMap`、请求级模型／语言／公式／表格开关 |
+| `self-hosted-legacy-v2` | 自部署 MinerU 3.x，旧任务 API | `modelMap`；共享 `defaults` 中的模型、解析方式、语言、公式、表格 | `tier`、`ocrMode` |
+| `official-v4` | MinerU 官方云 API | `models`；共享解析默认值（不支持 txt） | `tier`、`ocrMode`、`modelMap` |
+
+两类自托管支持显式 HTTP opt-in、可选凭据引用和 `configuredVersion`；官方云保持 HTTPS 与凭据要求。新安装提供三份独立 profile，默认仍选 legacy-v2，不自动更改既有部署目标。
 
 ---
 
@@ -232,17 +233,16 @@ defaults:
   table: true
 ```
 
-### 2. 本地私有化 (Self-hosted v2) 推荐配置
+### 2. 本地私有化 (Self-hosted legacy v2) 推荐配置
 ```yaml
 schemaVersion: 2
 activeProvider: mp_self_hosted
 providers:
   - id: mp_self_hosted
-    type: self-hosted-v2
+    type: self-hosted-legacy-v2
     baseURL: http://localhost:18000
     allowInsecureHttp: true
-    tier: standard            # 仅 MinerU 4.0+（V1 API）；留空使用服务端默认档位
-    modelMap:                 # 仅 MinerU 3.x 及更早的 /tasks 接口
+    modelMap:                 # legacy-v2 的 backend 名称
       pipeline: pipeline
       vlm: vlm-engine
 defaults:
@@ -252,11 +252,29 @@ defaults:
   table: true
 ```
 
-> 自托管 Provider 自动识别上游协议：`/v1/health` 可用即 MinerU 4.0+，走 V1 API 并使用 `tier`（`flash` / `basic` / `standard` / `advanced`，留空=服务端默认档位）；否则走旧版 `/tasks`，使用 `modelMap` 中的后端标识，此时 `tier` 被忽略。反向兼容：4.0+ 上 `modelMap` 默认值（`pipeline`、`vlm-engine`）会被忽略，但若其中填的是档位名，则在 `tier` 未设置时作为回退。若在同一地址原地升级 MinerU 大版本，请同时更新 `configuredVersion` 以避免复用旧协议产生的缓存结果。
->
-> MinerU 4.0 的 V1 API 只接受 `page_range`、`tier` 与 `ocr_mode`：语言、公式、表格开关已从请求参数中移除，与旧版 `/tasks` 接口不同，这些设置需在服务端配置；插件仍按既有语义参与缓存寻址。
+### 3. MinerU 4.x 自托管（V1 API）配置
 
-### 3. 存储与限制自定义（可选）
+```yaml
+schemaVersion: 2
+activeProvider: mp_self_hosted_v1
+providers:
+  - id: mp_self_hosted_v1
+    type: self-hosted-v1
+    baseURL: http://localhost:8000
+    allowInsecureHttp: true
+    apiKeyEnv: MINERU_API_KEY
+    tier: standard          # 可省略，让服务端选择；不是具体模型名
+    ocrMode: auto           # auto / txt / ocr；按 V1 profile 独立保存
+    configuredVersion: '4.0.10' # 原地升级服务或模型后更新缓存版本
+```
+
+V1 不暴露上游已移除的请求级语言／公式／表格参数。隐藏这些共享默认值不会把它们清空，但它们不影响 V1 请求或缓存；内部占位值不表示服务端关闭相关能力。OCR 的 txt 与 auto 保持不同语义，txt 不保证完全不运行视觉模型。档位切换和 OCR 模式变化会隔离缓存；standard/advanced 可以使用同一模型、不同计算量。
+
+**升级注意：**此前混合型自托管 profile 需手动改为上述明确的类型，并删除不属于该类型的字段；不接受旧 type 别名、不自动迁移保存的配置或产物。原自托管缓存不会被新身份复用，下次读取会重新解析。协议明确后，连接失败不会降级到另一个协议。
+
+**V1 功能边界：**使用本地路径或会话附件，经上传去重、任务轮询及 ZIP 下载后发布到插件自身缓存。已处理 partial/canceled 状态、逐文件错误和素材实际路径；不把服务器资源 ID 当作重启后可恢复的持久化记录。工具仍是单文件；不暴露 URL/inline 来源、callback/Webhook、服务端 DELETE 取消、HTML/DOCX 产物选择或 Doclib。job_kill 只取消本次等待，不中止共享上游任务。read_pdf.pages 是已解析内容的物理页投影，不是完整上游 page_range 语法；原页 view 仅支持 PDF。当前输入白名单仍限于 PDF、常见图片及 doc/docx/ppt/pptx/xls/xlsx；HTML/MHTML、OpenDocument、RTF、EPUB、OFD、CSV/TSV 等上游新增格式尚未开放，HTML 已验证在上传前明确拒绝。不能将四档×所有文件类型视作均已覆盖或验证。
+
+### 4. 存储与限制自定义（可选）
 ```yaml
 storage:
   storageRoot: /absolute/path/to/dsh/cache/pdf-mineru  # 默认在 $DSH_HOME/cache/pdf-mineru

@@ -8,7 +8,7 @@
         activeProvider: mp_self_hosted
         providers:
           - id: mp_self_hosted
-            type: self-hosted-v2
+            type: self-hosted-legacy-v2
             baseURL: 'http://localhost:18000'
             apiKeyEnv: MINERU_API_KEY
             allowInsecureHttp: true
@@ -23,6 +23,12 @@
               - pipeline
               - vlm
             configuredVersion: v4
+          - id: mp_self_hosted_v1
+            type: self-hosted-v1
+            baseURL: 'http://localhost:8000'
+            apiKeyEnv: MINERU_API_KEY
+            allowInsecureHttp: true
+            ocrMode: auto
         defaults:
           model: pipeline
           ocr: false

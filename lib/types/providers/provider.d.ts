@@ -48,6 +48,9 @@ export interface ProviderProbeResult {
     readonly authentication: 'valid' | 'invalid' | 'not-configured' | 'unknown';
     readonly protocolVersion: string;
     readonly serverVersion?: string;
+    readonly availableTiers?: readonly string[];
+    readonly outputFormats?: readonly string[];
+    readonly sourceTypes?: readonly string[];
     readonly queue?: {
         readonly queued?: number;
         readonly processing?: number;
@@ -65,9 +68,13 @@ export interface ProviderSubmittedFile {
 /** Upstream self-hosted dialect selected for one submission. */
 export type SelfHostedProtocol = 'legacy' | 'v1';
 export type ProviderJobRef = {
-    readonly provider: 'self-hosted-v2';
-    /** MinerU 4.x speaks the V1 API; earlier servers use the legacy task endpoints. */
-    readonly protocol: SelfHostedProtocol;
+    readonly provider: 'self-hosted-legacy-v2';
+    readonly protocol: 'legacy';
+    readonly taskId: string;
+    readonly files: readonly ProviderSubmittedFile[];
+} | {
+    readonly provider: 'self-hosted-v1';
+    readonly protocol: 'v1';
     readonly taskId: string;
     readonly files: readonly ProviderSubmittedFile[];
 } | {
