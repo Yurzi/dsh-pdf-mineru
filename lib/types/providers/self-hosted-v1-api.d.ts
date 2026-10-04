@@ -21,6 +21,14 @@ import type { ProviderHttpClient } from './http-client.js';
 import { type ArtifactSink, type ProviderCallContext, type ProviderCollection, type ProviderJobRef, type ProviderJobSnapshot, type ProviderProbeResult, type ProviderRetryOptions, type ProviderSubmission, type ProviderSubmittedFile } from './provider.js';
 /** The only output format the plugin consumes; it carries every canonical artifact. */
 export declare const SELF_HOSTED_V1_ARCHIVE_FORMAT = "zip";
+/** Tiers advertised by the MinerU V1 API; other modelMap values fall back to the server default. */
+export declare const SELF_HOSTED_V1_TIERS: ReadonlySet<string>;
+/**
+ * Effective V1 parse tier: an explicitly configured tier wins; otherwise a modelMap value that
+ * names a tier is honoured, and anything else keeps the server default tier. Shared with the
+ * provider compatibility key so the cached result identity matches the submitted request.
+ */
+export declare function resolveSelfHostedTier(tier: string | undefined, modelMap: Readonly<Partial<Record<MinerUModel, string>>>, model: MinerUModel): string | undefined;
 export interface SelfHostedV1HealthResponse {
     readonly status?: string;
     readonly version?: string;
@@ -125,8 +133,7 @@ export declare class SelfHostedV1ApiAdapter {
     inspect(ref: ProviderJobRef, context: ProviderCallContext): Promise<ProviderJobSnapshot>;
     collect(ref: ProviderJobRef, request: CanonicalParseRequest, sink: ArtifactSink, context: ProviderCallContext): Promise<ProviderCollection>;
     /**
-     * Resolves the V1 tier: an explicitly configured tier wins; otherwise a modelMap value that
-     * names a tier is honoured, and anything else keeps the server default tier.
+     * Resolves the V1 tier for one request; shared with the compatibility key so both agree.
      */
     private resolveTier;
     private snapshotFromJob;

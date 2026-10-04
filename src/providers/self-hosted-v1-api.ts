@@ -59,7 +59,24 @@ import {
 export const SELF_HOSTED_V1_ARCHIVE_FORMAT = 'zip'
 
 /** Tiers advertised by the MinerU V1 API; other modelMap values fall back to the server default. */
-const SELF_HOSTED_V1_TIERS: ReadonlySet<string> = new Set(['flash', 'basic', 'standard', 'advanced'])
+export const SELF_HOSTED_V1_TIERS: ReadonlySet<string> = new Set(['flash', 'basic', 'standard', 'advanced'])
+
+/**
+ * Effective V1 parse tier: an explicitly configured tier wins; otherwise a modelMap value that
+ * names a tier is honoured, and anything else keeps the server default tier. Shared with the
+ * provider compatibility key so the cached result identity matches the submitted request.
+ */
+export function resolveSelfHostedTier(
+  tier: string | undefined,
+  modelMap: Readonly<Partial<Record<MinerUModel, string>>>,
+  model: MinerUModel,
+): string | undefined {
+  if (typeof tier === 'string' && SELF_HOSTED_V1_TIERS.has(tier)) return tier
+  const configured = modelMap[model]
+  if (typeof configured !== 'string') return undefined
+  const candidate = configured.trim().toLowerCase()
+  return SELF_HOSTED_V1_TIERS.has(candidate) ? candidate : undefined
+}
 
 const EXTENSION_MIME_TYPES: Readonly<Record<string, string>> = {
   '.pdf': 'application/pdf',
@@ -635,16 +652,10 @@ export class SelfHostedV1ApiAdapter {
   }
 
   /**
-   * Resolves the V1 tier: an explicitly configured tier wins; otherwise a modelMap value that
-   * names a tier is honoured, and anything else keeps the server default tier.
+   * Resolves the V1 tier for one request; shared with the compatibility key so both agree.
    */
   private resolveTier(model: MinerUModel): string | undefined {
-    const explicit = this.options.tier
-    if (typeof explicit === 'string' && SELF_HOSTED_V1_TIERS.has(explicit)) return explicit
-    const configured = this.options.modelMap[model]
-    if (typeof configured !== 'string') return undefined
-    const tier = configured.trim().toLowerCase()
-    return SELF_HOSTED_V1_TIERS.has(tier) ? tier : undefined
+    return resolveSelfHostedTier(this.options.tier, this.options.modelMap, model)
   }
 
   private snapshotFromJob(
@@ -971,6 +982,11 @@ export class SelfHostedV1ApiAdapter {
           }
 
           const nodeStream = Readable.fromWeb(body as NodeWebReadableStream<Uint8Array>)
+          // An accepted response whose body then breaks is a transport failure and stays
+          // retryable; failures raised by staging itself (byte limits, local writes) are not.
+          let bodyFailed = false
+          const onBodyError = (): void => { bodyFailed = true }
+          nodeStream.once('error', onBodyError)
           try {
             // The submitted-file index keeps two files that resolve to the same archive id
             // from colliding on one staging temporary name.
@@ -981,7 +997,29 @@ export class SelfHostedV1ApiAdapter {
             )
           } catch (error) {
             nodeStream.destroy()
-            throw error
+            if (context.signal.aborted) {
+              throw new MinerUError(failure('CANCELLED', 'Download was cancelled', true))
+            }
+            if (error instanceof MinerUError) throw error
+            const message = sanitizeDiagnostic(error instanceof Error ? error.message : String(error))
+            if (bodyFailed) {
+              const interrupted = new MinerUError(failure(
+                'RESULT_DOWNLOAD_FAILED',
+                `Result archive transfer was interrupted after HTTP 200: ${message}`,
+                true,
+                { provider: 'self-hosted-v2' },
+              ))
+              if (timedOut) Object.assign(interrupted, { httpStatus: 408 })
+              throw interrupted
+            }
+            throw new MinerUError(failure(
+              'RESULT_DOWNLOAD_FAILED',
+              `Failed to stage the downloaded result archive: ${message}`,
+              false,
+              { provider: 'self-hosted-v2' },
+            ))
+          } finally {
+            nodeStream.removeListener('error', onBodyError)
           }
         } finally {
           clearTimeout(timer)

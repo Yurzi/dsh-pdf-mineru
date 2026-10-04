@@ -13,6 +13,11 @@
 - Canonicalize MinerU 4.x result archives into the existing artifact shapes: `markdown.md`, `middle_json.json`, `structured_content.json`, `model_output.json` and `images/` become the canonical markdown, layout, content-list, model-output and images artifacts, with the V1 `pages[]` page list exposed as `pdf_info[]` and structured content flattened into a content-list array.
 - Send the API key on a V1 upload URL only when it is same-origin with the configured endpoint; retry the byte PUT and result download with a fresh source stream, never the upload/complete/job-creation POSTs.
 
+### Fixed
+
+- Include the effective self-hosted parse tier in the provider compatibility key, so switching tiers re-parses instead of reusing a result produced under another tier (and a profile without an effective tier is distinct from a tiered one). Self-hosted cache entries written before this change are re-created once, because their compatibility key changed.
+- Retry the self-hosted result-archive download when the response body is interrupted or times out after an accepted HTTP 200; cancellation, byte limits and local staging failures stay non-retryable, and a local staging failure is now reported as a typed `RESULT_DOWNLOAD_FAILED` instead of a raw error.
+
 Provider/config/cache formats, cursor v3, index v2, native-job semantics and tool arguments are unchanged; existing parsed caches require no migration or re-upload. Upgrade `configuredVersion` when a server is upgraded in place to a different MinerU API generation.
 
 ## 0.1.5

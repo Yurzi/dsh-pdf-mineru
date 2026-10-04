@@ -27,6 +27,7 @@ import {
   mapSelfHostedV1FileState,
   mapSelfHostedV1JobState,
   mimeTypeForName,
+  resolveSelfHostedTier,
 } from '../src/providers/self-hosted-v1-api.js'
 import { testPng } from './fixtures/png.js'
 
@@ -117,6 +118,9 @@ class V1Mock {
   uploadPutErrorBody: string | undefined
   uploadPutDelayMs = 0
   archiveFailures = 0
+  archiveStallAttempts = 0
+  archiveStallDelayMs = 120
+  archiveStallMs = 0
   completeStatus = 'completed'
   jobStatus = 'queued'
   jobFiles: readonly Record<string, unknown>[] | undefined
@@ -321,6 +325,22 @@ class V1Mock {
         this.#json(res, this.archiveStatus, { error: { type: 'not_found_error', code: 'not_found', message: 'missing', param: null } })
         return
       }
+      if (this.archiveStallAttempts > 0) {
+        // Deliver headers plus half the body, then break the connection while the caller is
+        // still consuming the body (a mid-transfer failure, not a request failure).
+        this.archiveStallAttempts--
+        res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(this.archive.byteLength) })
+        res.write(this.archive.subarray(0, Math.max(1, Math.floor(this.archive.byteLength / 2))))
+        setTimeout(() => { if (!res.writableEnded) res.destroy() }, this.archiveStallDelayMs)
+        return
+      }
+      if (this.archiveStallMs > 0) {
+        // Keep the partial body open until the caller gives up (cancellation coverage).
+        res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(this.archive.byteLength) })
+        res.write(this.archive.subarray(0, Math.max(1, Math.floor(this.archive.byteLength / 2))))
+        setTimeout(() => { if (!res.writableEnded) res.destroy() }, this.archiveStallMs)
+        return
+      }
       res.writeHead(200, { 'content-type': 'application/octet-stream' })
       res.end(this.archive)
       return
@@ -490,6 +510,33 @@ describe('SelfHostedV2Provider — MinerU 4.x V1 API', () => {
       expect(layout?.pdf_info).toEqual([{ page_idx: 0 }, { page_idx: 1 }])
       expect(canonicalizeLayoutDocument({ pdf_info: [{ page_idx: 0 }] })).toBeUndefined()
       expect(canonicalizeLayoutDocument({ metadata: {} })).toBeUndefined()
+    })
+
+    it('resolves the effective tier the same way for the key and the submitted job', () => {
+      expect(resolveSelfHostedTier(undefined, { pipeline: 'pipeline' }, 'pipeline')).toBeUndefined()
+      expect(resolveSelfHostedTier(undefined, { pipeline: 'hybrid-engine' }, 'pipeline')).toBeUndefined()
+      expect(resolveSelfHostedTier('advanced', { pipeline: 'pipeline' }, 'pipeline')).toBe('advanced')
+      expect(resolveSelfHostedTier(undefined, { pipeline: ' Standard ' }, 'pipeline')).toBe('standard')
+      // An explicit tier wins even when the modelMap names a different tier for that model.
+      expect(resolveSelfHostedTier('advanced', { vlm: 'flash' }, 'vlm')).toBe('advanced')
+    })
+
+    it('submits the tier that the compatibility key records', async () => {
+      mock = new V1Mock()
+      await mock.start()
+      const provider = makeProvider({ baseURL: mock.url, modelMap: { pipeline: 'standard', vlm: 'vlm-engine' } })
+      const file = await createTestFile('doc.pdf')
+      const request = makeRequest(file)
+
+      const key = await provider.compatibilityKey(request, {})
+      await provider.submit(request, [file], makeContext())
+
+      const job = mock.requestsFor('/v1/parse/jobs')[0]!
+      expect(JSON.parse(job.body.toString('utf8')).tier).toBe('standard')
+
+      // The same request without an effective tier is a different cache identity.
+      const untiered = makeProvider({ baseURL: mock.url, modelMap: { pipeline: 'pipeline', vlm: 'vlm-engine' } })
+      expect(await untiered.compatibilityKey(request, {})).not.toBe(key)
     })
 
     it('accepts only a positive V1 health shape', () => {
@@ -979,6 +1026,83 @@ describe('SelfHostedV2Provider — MinerU 4.x V1 API', () => {
       await expect(provider.collect(v1Ref(), makeRequest(file), failingSink, makeContext({ retry }))).rejects.toMatchObject({
         failure: expect.objectContaining({ code: 'RESULT_DOWNLOAD_FAILED' }),
       })
+    })
+
+    it('retries when the archive body breaks after an accepted HTTP 200', async () => {
+      mock = new V1Mock()
+      mock.jobStatus = 'completed'
+      mock.archive = await v1Archive()
+      mock.archiveStallAttempts = 1
+      await mock.start()
+      const provider = makeProvider({ baseURL: mock.url })
+      const sink = new RecordingSink()
+      const file = await createTestFile('doc.pdf')
+      const retry = { maxRetries: 2, initialDelayMs: 1, maxDelayMs: 2, jitter: false, sleep: async () => {} }
+
+      const collected = await provider.collect(v1Ref(), makeRequest(file), sink, makeContext({ retry }))
+
+      expect(collected.files[0]?.failure).toBeUndefined()
+      expect(sink.artifact('markdown')?.toString('utf8')).toContain('# Title')
+      expect(mock.requests.filter(request => request.url.startsWith('/v1/files/'))).toHaveLength(2)
+    })
+
+    it('exhausts the download retry budget on a persistently broken body', async () => {
+      mock = new V1Mock()
+      mock.jobStatus = 'completed'
+      mock.archive = await v1Archive()
+      mock.archiveStallAttempts = 10
+      await mock.start()
+      const provider = makeProvider({ baseURL: mock.url })
+      const sink = new RecordingSink()
+      const file = await createTestFile('doc.pdf')
+      const retry = { maxRetries: 2, initialDelayMs: 1, maxDelayMs: 2, jitter: false, sleep: async () => {} }
+
+      await expect(provider.collect(v1Ref(), makeRequest(file), sink, makeContext({ retry }))).rejects.toMatchObject({
+        failure: expect.objectContaining({ code: 'RESULT_DOWNLOAD_FAILED', retryable: true }),
+      })
+      expect(mock.requests.filter(request => request.url.startsWith('/v1/files/'))).toHaveLength(3)
+    })
+
+    it('does not retry a download that fails while staging locally', async () => {
+      mock = new V1Mock()
+      mock.jobStatus = 'completed'
+      mock.archive = await v1Archive()
+      await mock.start()
+      const provider = makeProvider({ baseURL: mock.url })
+      const sink = new RecordingSink()
+      sink.writeTemporary = async () => { throw new Error('EACCES: permission denied, open staging file') }
+      const file = await createTestFile('doc.pdf')
+      const retry = { maxRetries: 2, initialDelayMs: 1, maxDelayMs: 2, jitter: false, sleep: async () => {} }
+
+      const error = await provider.collect(v1Ref(), makeRequest(file), sink, makeContext({ retry }))
+        .then(() => undefined, (reason: unknown) => reason as { failure: { code: string; retryable: boolean; message: string } })
+
+      expect(error?.failure.code).toBe('RESULT_DOWNLOAD_FAILED')
+      expect(error?.failure.retryable).toBe(false)
+      expect(error?.failure.message).toContain('Failed to stage the downloaded result archive')
+      expect(error?.failure.message).toContain('EACCES')
+      expect(mock.requests.filter(request => request.url.startsWith('/v1/files/'))).toHaveLength(1)
+    })
+
+    it('does not retry a download cancelled while its body is still streaming', async () => {
+      mock = new V1Mock()
+      mock.jobStatus = 'completed'
+      mock.archive = await v1Archive()
+      mock.archiveStallMs = 3000
+      await mock.start()
+      const provider = makeProvider({ baseURL: mock.url })
+      const sink = new RecordingSink()
+      const file = await createTestFile('doc.pdf')
+      const controller = new AbortController()
+      const retry = { maxRetries: 2, initialDelayMs: 1, maxDelayMs: 2, jitter: false, sleep: async () => {} }
+
+      const pending = provider.collect(v1Ref(), makeRequest(file), sink, makeContext({ signal: controller.signal, retry }))
+      setTimeout(() => controller.abort(new DOMException('Caller stopped', 'AbortError')), 50)
+
+      await expect(pending).rejects.toMatchObject({
+        failure: expect.objectContaining({ code: 'CANCELLED' }),
+      })
+      expect(mock.requests.filter(request => request.url.startsWith('/v1/files/'))).toHaveLength(1)
     })
 
     it('refuses to collect while the job is still running', async () => {

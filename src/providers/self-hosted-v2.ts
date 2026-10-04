@@ -44,7 +44,7 @@ import {
 import { assertSourcesUnchanged } from '../service/request-normalizer.js'
 import type { SelfHostedTier } from '../config/pure.js'
 import { ProviderHttpClient } from './http-client.js'
-import { SelfHostedV1ApiAdapter, type SelfHostedV1HealthResponse } from './self-hosted-v1-api.js'
+import { SelfHostedV1ApiAdapter, resolveSelfHostedTier, type SelfHostedV1HealthResponse } from './self-hosted-v1-api.js'
 
 export interface SelfHostedV2ProviderConfig {
   readonly id: ProviderConfigId
@@ -276,11 +276,16 @@ export class SelfHostedV2Provider implements MinerUProvider {
   ): Promise<string> {
     const originAndPath = `${this.parsedBaseUrl.origin}${this.parsedBaseUrl.pathname.replace(/\/+$/, '')}`
     const backend = this.config.modelMap[request.semantics.model]
+    // The V1 tier selects different upstream quality/speed behaviour, so it belongs to the
+    // cached result identity even though only the V1 dialect submits it. `null` records the
+    // server default, keeping a profile without an effective tier distinct from a tiered one.
+    const tier = resolveSelfHostedTier(this.config.tier, this.config.modelMap, request.semantics.model) ?? null
     const behaviorHash = createHash('sha256').update(JSON.stringify({
       originAndPath,
       configuredVersion: context.configuredVersion ?? this.config.configuredVersion ?? 'v2',
       model: request.semantics.model,
       backend,
+      tier,
     }), 'utf8').digest('hex').slice(0, 24)
     return `self-hosted-v2:${behaviorHash}`
   }
