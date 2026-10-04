@@ -244,6 +244,43 @@ describe('SelfHostedV2Provider', () => {
       expect(first).toMatch(/^self-hosted-v2:[a-f0-9]{24}$/)
       expect(changed).not.toBe(first)
     })
+
+    it('isolates cached results by the effective parse tier', async () => {
+      const config = {
+        id: asProviderConfigId('mp_tiered'),
+        type: 'self-hosted-v2' as const,
+        baseURL: 'https://mineru.example.com',
+        modelMap: { pipeline: 'pipeline', vlm: 'vlm-engine' },
+      }
+      const request: CanonicalParseRequest = {
+        schemaVersion: 1,
+        files: [{ fileId: createFileId(SHA256_A), name: 'doc.pdf', bytes: 100, sha256: SHA256_A }],
+        semantics: { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true },
+        requiredArtifacts: ['markdown'],
+      }
+      const keyFor = async (patch: Partial<SelfHostedV2ProviderConfig>): Promise<string> =>
+        await new SelfHostedV2Provider({ ...config, ...patch }).compatibilityKey(request, {})
+
+      const serverDefault = await keyFor({})
+      const standard = await keyFor({ tier: 'standard' })
+      const advanced = await keyFor({ tier: 'advanced' })
+
+      // Switching tier must not reuse results produced under another tier.
+      expect(new Set([serverDefault, standard, advanced]).size).toBe(3)
+      expect(standard).not.toBe(serverDefault)
+      expect(advanced).not.toBe(standard)
+
+      // A modelMap value that names a tier is the effective tier too, so it also participates.
+      const mappedFlash = await keyFor({ modelMap: { pipeline: 'flash', vlm: 'vlm-engine' } })
+      const mappedStandard = await keyFor({ modelMap: { pipeline: 'standard', vlm: 'vlm-engine' } })
+      expect(mappedFlash).not.toBe(mappedStandard)
+      expect(mappedFlash).not.toBe(serverDefault)
+
+      // Legacy backend identifiers leave the tier unset and stay a distinct identity input.
+      const legacy = await keyFor({ modelMap: { pipeline: 'hybrid-engine', vlm: 'vlm-engine' } })
+      expect(legacy).not.toBe(serverDefault)
+      expect(await keyFor({ configuredVersion: 'v3.4.4' })).not.toBe(serverDefault)
+    })
   })
 
   describe('probe (GET /health)', () => {
@@ -486,8 +523,9 @@ describe('SelfHostedV2Provider', () => {
 
       // Verify ProviderSubmission structure
       expect(submission.ref.provider).toBe('self-hosted-v2')
-      expect(Object.keys(submission.ref).sort()).toEqual(['files', 'provider', 'taskId'])
+      expect(Object.keys(submission.ref).sort()).toEqual(['files', 'protocol', 'provider', 'taskId'])
       if (submission.ref.provider === 'self-hosted-v2') {
+        expect(submission.ref.protocol).toBe('legacy')
         expect(submission.ref.taskId).toBe('task_abc_123')
         expect(submission.ref.files).toEqual([
           { dataId: `data_${file.fileId}`, fileId: file.fileId, name: 'report.pdf' },

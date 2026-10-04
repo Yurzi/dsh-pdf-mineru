@@ -9,7 +9,9 @@ export type ProviderRetryOperation =
   | 'collect'
   | 'api-json'
   | 'presigned-put'
+  | 'upload-put'
   | 'cdn-download'
+  | 'result-download'
 
 export interface ProviderRetryEvent {
   readonly provider: MinerUProviderId

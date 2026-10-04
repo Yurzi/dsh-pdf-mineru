@@ -1,5 +1,5 @@
 import type { Dispatch, SetStateAction } from 'react';
-import type { MinerUConfig, ProviderConfig } from '../../config/pure.js';
+import { type MinerUConfig, type ProviderConfig } from '../../config/pure.js';
 import type { MineruKey } from '../locales.js';
 import type { CredentialView } from '../helpers.js';
 export interface ProviderSectionProps {

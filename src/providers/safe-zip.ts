@@ -155,14 +155,19 @@ function classify(subpath: string): ArtifactClassification | undefined {
     const name = normalized.slice('images/'.length).replaceAll('/', '_').replace(/[^A-Za-z0-9_.-]/g, '_')
     return { kind: 'images', relativeName: `images/${name || 'image.bin'}`, mediaType, json: false }
   }
-  if (base === 'full.md') return { kind: 'markdown', relativeName: 'full.md', mediaType: 'text/markdown; charset=utf-8', json: false }
-  if (base === 'layout.json' || base === 'middle.json' || base.endsWith('_layout.json')) {
+  // `full.md`/`*_middle.json`/`*_content_list.json`/`*_model.json` are the legacy MinerU
+  // archive names; `markdown.md`/`middle_json.json`/`structured_content.json`/
+  // `model_output.json` are the MinerU 4.x V1 API names for the same artifacts.
+  if (base === 'full.md' || base === 'markdown.md') {
+    return { kind: 'markdown', relativeName: 'full.md', mediaType: 'text/markdown; charset=utf-8', json: false }
+  }
+  if (base === 'layout.json' || base === 'middle.json' || base === 'middle_json.json' || base.endsWith('_layout.json')) {
     return { kind: 'layout', relativeName: 'layout.json', mediaType: 'application/json', json: true }
   }
-  if (base === 'content_list.json' || base.endsWith('_content_list.json')) {
+  if (base === 'content_list.json' || base === 'structured_content.json' || base.endsWith('_content_list.json')) {
     return { kind: 'content-list', relativeName: 'content_list.json', mediaType: 'application/json', json: true }
   }
-  if (base === 'model.json' || base.endsWith('_model.json')) {
+  if (base === 'model.json' || base === 'model_output.json' || base.endsWith('_model.json')) {
     return { kind: 'model-output', relativeName: 'model.json', mediaType: 'application/json', json: true }
   }
   return undefined

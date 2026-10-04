@@ -1,11 +1,20 @@
 import type { Dispatch, SetStateAction } from 'react'
-import type { MinerUConfig, OfficialV4Config, ProviderConfig, SelfHostedV2Config } from '../../config/pure.js'
+import { SELF_HOSTED_TIERS, type SelfHostedTier, type MinerUConfig, type OfficialV4Config, type ProviderConfig, type SelfHostedV2Config } from '../../config/pure.js'
 import type { MinerUModel } from '../../domain/request.js'
 import type { MineruKey } from '../locales.js'
 import type { CredentialView } from '../helpers.js'
 import { patchActiveProvider } from '../helpers.js'
 import { KeyIcon } from '../icons.js'
 import css from '../SettingsPage.module.css'
+
+function tierOptionKey(tier: SelfHostedTier): MineruKey {
+  switch (tier) {
+    case 'flash': return 'field.tier.opt.flash'
+    case 'basic': return 'field.tier.opt.basic'
+    case 'standard': return 'field.tier.opt.standard'
+    case 'advanced': return 'field.tier.opt.advanced'
+  }
+}
 
 export interface ProviderSectionProps {
   readonly draft: MinerUConfig
@@ -196,6 +205,31 @@ export function ProviderSection({
               />
               <span className={css.checkboxLabel}>{t('field.allowInsecureHttp')}</span>
             </label>
+          </div>
+
+          <div className={css.row}>
+            <label className={css.field}>
+              <span className={css.fieldLabel}>{t('field.tier')}</span>
+              <select
+                className={css.select}
+                aria-label={t('field.tier')}
+                value={(activeProvider as SelfHostedV2Config).tier ?? ''}
+                onChange={e => setDraft(prev => prev === null ? prev : patchActiveProvider(prev, {
+                  tier: e.target.value === '' ? undefined : e.target.value as SelfHostedTier,
+                }))}
+              >
+                <option value="">{t('field.tier.serverDefault')}</option>
+                {SELF_HOSTED_TIERS.map(tier => (
+                  <option key={tier} value={tier}>{t(tierOptionKey(tier))}</option>
+                ))}
+              </select>
+              <span className={css.fieldHint}>{t('field.tier.hint')}</span>
+            </label>
+          </div>
+
+          <div className={css.field}>
+            <span className={css.fieldLabel}>{t('field.legacyParams')}</span>
+            <span className={css.fieldHint}>{t('field.legacyParams.hint')}</span>
           </div>
 
           <div className={css.row}>

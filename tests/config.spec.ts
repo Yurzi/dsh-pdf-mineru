@@ -153,6 +153,20 @@ describe('MinerU config parsing and validation', () => {
     })).toThrow(/modelMap contains unsupported property extraModel/)
   })
 
+  it('accepts a self-hosted parse tier and rejects unknown tiers', () => {
+    const base = defaultMinerUConfig()
+    const selfHosted = base.providers[0]! as import('../src/config/pure.js').SelfHostedV2Config
+    const withTier = (tier: unknown): unknown => parseConfig({
+      ...base,
+      providers: [{ ...selfHosted, tier }, base.providers[1]!],
+    }).providers[0]
+
+    expect(withTier(undefined)).not.toHaveProperty('tier')
+    expect(withTier('standard')).toMatchObject({ tier: 'standard' })
+    expect(() => withTier('fastest')).toThrow(/provider.tier must be one of flash, basic, standard, advanced/)
+    expect(() => withTier(1)).toThrow(/provider.tier must be one of/)
+  })
+
   it('enforces explicit retainSources: false contract', () => {
     const base = defaultMinerUConfig()
     expect(parseConfig({

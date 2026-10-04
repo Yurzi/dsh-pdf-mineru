@@ -196,10 +196,10 @@ runShared/runProducer 在 mutation scope 中登记唯一 `.lock/users/` 目录�
 
 ## 7. Provider 与网络安全
 
-Self-hosted v2 使用 multipart POST /tasks、GET /tasks/{taskId} 与结果端点，显式 modelMap 将统一 model 映射为 backend。Official v4 先 POST /file-urls/batch，再按预签名 URL 裸 PUT，随后轮询 batch 结果并下载 ZIP；按 data_id 映射，不猜测相似文件名。
+Self-hosted 适配器按上游端点自动选择协议：`GET /v1/health` 应答即 MinerU 4.0+ 的 V1 API（POST /v1/uploads → 按服务端返回的 upload_url PUT 字节 → POST /v1/uploads/{id}/complete → POST /v1/parse/jobs → GET /v1/parse/jobs/{jobId} → GET /v1/files/{id}/content 取结果 ZIP）；不可用时回落到旧版 multipart POST /tasks、GET /tasks/{taskId} 与结果端点。`provider.tier`（flash/basic/standard/advanced，缺省即服务端默认档位）只作用于 V1；`modelMap` 是旧协议的 backend 标识，在 V1 中仅当取值恰为档位名且未设置 `tier` 时作为回退。V1 结果 ZIP 中 `markdown.md`、`middle_json.json`、`structured_content.json`、`model_output.json`、`images/` 经共享有界 ZIP 提取器归一到既有 canonical artifacts（V1 的 `pages[]` 布局页码表以 `pdf_info[]` 别名暴露，`structured_content` 摊平为 content-list 数组）。Official v4 先 POST /file-urls/batch，再按预签名 URL 裸 PUT，随后轮询 batch 结果并下载 ZIP；按 data_id 映射，不猜测相似文件名。
 
-- 鉴权请求固定 redirect:error。官方 PUT 显式空 headers；CDN 下载不带 API Token。
-- 只重试幂等 GET，以及重新打开源文件流的官方 PUT。提交结果不明确的官方分配 POST／自托管 multipart POST 绝不自动重放。
+- 鉴权请求固定 redirect:error。官方 PUT 显式空 headers；CDN 下载不带 API Token；V1 字节 PUT 仅在 upload_url 与自建端点同源时附带 API Key。
+- 只重试幂等 GET，以及重新打开源文件流的官方 PUT／V1 上传 PUT 与结果下载。提交结果不明确的官方分配 POST、自托管 multipart POST、V1 创建 upload／complete／创建 parse job POST 绝不自动重放。
 - 处理有界退避、Retry-After、取消和耗尽；重试诊断只含 typed operation/status/count，不含 URL、header、body、密钥和路径。
 - 源文件流式哈希，上传前复核 size/mtime/device/inode，不能把变化后的文件上传到旧缓存身份。
 - ZIP 使用 yauzl lazy entries，先验证路径、类型、声明大小和压缩比，再逐条目流式写入 staging。限制下载、条目数、单条目、总解压量；拒绝绝对路径、遍历、符号链接和压缩炸弹。
