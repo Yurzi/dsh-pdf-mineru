@@ -1,6 +1,6 @@
 {
   "name": "dsh-pdf-mineru",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Read PDFs in DeepSeek Harness with MinerU (official cloud or self-hosted): bounded evidence reading, background parsing jobs, and local page verification.",
   "keywords": [
     "dsh-plugin",
