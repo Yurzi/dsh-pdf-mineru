@@ -1,1648 +1,284 @@
-import { mkdtemp, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it, vi } from 'vitest'
+import { AttachmentId } from '@deepseek-ai/dsh-attachment'
+import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
+import { isJsonValue } from '@deepseek-ai/dsh-util-values'
+import { describe, expect, it, onTestFinished, vi } from 'vitest'
+import { defaultMinerUConfig } from '../src/config/parse.js'
+import { cursorForRemainder, decodeReadCursor } from '../src/reader/read-cursor.js'
+import { fitsReadBudget } from '../src/reader/read-delivery.js'
+import type { ImageCandidateView } from '../src/reader/views.js'
+import { parseAsyncArguments } from '../src/tools/async-parse-pdf.js'
+import { parseReadArguments } from '../src/tools/read-pdf.js'
+import { renderResult } from '../src/tools/render.js'
+import { projectedReader, selectQuery, toolHarness, withOutput } from './support/tool-harness.js'
+import { deepFreeze, imageCandidate, jsonValue, maximalResultView, resultFile, resultView } from './support/views.js'
 
-vi.mock('@deepseek-ai/dsh-tools', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@deepseek-ai/dsh-tools')>()
-  return {
-    ...actual,
-    defineTool: <T>(options: T): T => options,
-  }
+const invalidRequest = expect.objectContaining({ failure: expect.objectContaining({ code: 'INVALID_REQUEST' }) })
+
+async function pngFiles(count: number): Promise<string[]> {
+  const directory = await mkdtemp(join(tmpdir(), 'mineru-tool-images-'))
+  onTestFinished(() => rm(directory, { recursive: true, force: true }))
+  return await Promise.all(Array.from({ length: count }, async (_, index) => {
+    const path = join(directory, 'figure-' + String(index + 1) + '.png')
+    await writeFile(path, Buffer.from('fake-png-data'))
+    return path
+  }))
+}
+
+const withImages = (images: readonly ImageCandidateView[]) => projectedReader(() => resultView({ ordered_images: images }))
+
+describe('tool admission', () => {
+  it.each(['read_pdf', 'async_parse_pdf'] as const)('%s requires an authenticated agent session before any work', async name => {
+    const h = await toolHarness()
+    await expect(h.tool(name).execute({ file_path: 'paper.pdf' }, h.exec({ agent: undefined })))
+      .rejects.toMatchObject({ failure: { code: 'UNAUTHENTICATED_SESSION' } })
+    expect(h.ensure).not.toHaveBeenCalled()
+    expect(h.reader.readContent).not.toHaveBeenCalled()
+    expect(h.ctx.jobs.list(h.session.id)).toEqual([])
+  })
+
+  it('reports PROVIDER_UNAVAILABLE for async parsing on hosts without the jobs registry', async () => {
+    const h = await toolHarness({ jobs: false })
+    await expect(h.submit({ file_path: 'paper.pdf' })).rejects.toMatchObject({ failure: { code: 'PROVIDER_UNAVAILABLE' } })
+    expect(h.reader.summarize).not.toHaveBeenCalled()
+  })
+
+  it('registers no job when the call is already cancelled', async () => {
+    const h = await toolHarness()
+    const controller = new AbortController()
+    controller.abort(new Error('cancelled before submission'))
+    await expect(h.submit({ file_path: 'paper.pdf' }, h.exec({ signal: controller.signal }))).rejects.toThrow('cancelled before submission')
+    expect(h.ctx.jobs.list(h.session.id)).toEqual([])
+  })
 })
 
-import {
-  parseReadInput,
-  registerTools,
-  renderResult,
-} from '../src/tools.js'
-import { formatResultProse, formatSingleSummaryProse } from '../src/service/result-presenter.js'
-import type { Context } from '@deepseek-ai/cordis'
-import { JobId, type JobSpec, type JobOutcome, type JobHandle } from '@deepseek-ai/dsh-jobs'
-import type {
-  DefineToolOptions,
-  ObjectValueSchemaSpec,
-  ToolRunContext,
-  ValueSchemaSpec,
-} from '@deepseek-ai/dsh-tools'
-import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
-import { isJsonValue, snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
-import type {
-  FailedParseView,
-  MinerUService,
-  ParseDocumentView,
-  ResultView,
-} from '../src/service/mineru-service.js'
-import { failure, MinerUError } from '../src/domain/errors.js'
-import { StorageAccessGate } from '../src/storage/access-gate.js'
-import { cursorForRemainder } from '../src/service/read-cursor.js'
-import { fitsReadBudget } from '../src/service/read-delivery.js'
+describe('read_pdf argument boundary', () => {
+  const cursor = cursorForRemainder('mr_fixture', undefined, new Set(['all']), 4, { inline_images: false })
 
-type NativeJobOutcome = JobOutcome
-type NativeJobStartSpec = JobSpec
-const jobHandle = (): JobHandle => ({ id: JobId('mineru-1'), append: vi.fn(), updateProgress: vi.fn() })
-
-function createMockJobRegistry() {
-  let counter = 0
-  const specs: NativeJobStartSpec[] = []
-  const registry = {
-    start: vi.fn((spec: NativeJobStartSpec) => {
-      counter++
-      specs.push(spec)
-      return 'mineru-' + counter
-    }),
-  }
-  return { registry, specs }
-}
-
-function createMockContext(jobsRegistry?: unknown) {
-  const registeredTools: DefineToolOptions[] = []
-  const ctx = {
-    tools: {
-      register: vi.fn((def: DefineToolOptions) => {
-        registeredTools.push(def)
-        return vi.fn()
-      }),
-      schemas: vi.fn(() => []),
-    },
-    get: vi.fn((name: string) => {
-      if (name === 'jobs') return jobsRegistry
-      return undefined
-    }),
-    effect: vi.fn(),
-    on: vi.fn(),
-    inject: vi.fn(),
-    logger: {
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-      debug: vi.fn(),
-    },
-  } as unknown as Context
-  return { ctx, registeredTools }
-}
-
-function createMockExec(hasAgent = true, signal = new AbortController().signal): ToolRunContext {
-  const base: ToolRunContext = {
-    callId: 'call_123',
-    name: 'mineru_tool',
-    arguments: {},
-    signal,
-  }
-  if (!hasAgent) return base
-  return {
-    ...base,
-    agent: {
-      id: 'agent_001',
-      session: {
-        id: 'session_001',
-        header: { id: 'session_001', cwd: '/workspace' },
-      },
-    },
-  }
-}
-
-type ModelRoute = Pick<NonNullable<ToolRunContext['agent']>['options'], 'provider' | 'model'>
-
-interface CallingRouteFixture {
-  readonly requestHeader?: () => { config?: ModelRoute } | undefined
-  readonly options?: ModelRoute
-}
-
-async function createCallingRouteFixture(route: CallingRouteFixture, signal = new AbortController().signal) {
-  const directory = await mkdtemp(join(tmpdir(), 'mineru-calling-route-'))
-  const path = join(directory, 'figure.png')
-  await writeFile(path, Buffer.from('fake-png-data'))
-  const view: ResultView = {
-    state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_route',
-    files: [{ file_id: 'mf_route', name: 'paper.pdf', artifacts: [] }],
-    content_status: 'complete', cursor: null, manifest_path: '/cache/manifest.json', output_limit_chars: 20_000,
-    ordered_images: [{ path, name: 'figure.png', media_type: 'image/png', bytes: 13 }],
-  }
-  const resolveModelInfo = vi.fn(async (_provider: string, model: string, _signal?: AbortSignal): Promise<{ inputModalities?: readonly string[] } | undefined> => ({
-    inputModalities: model === 'text-model' ? ['text'] : ['text', 'image'],
-  }))
-  const saveImage = vi.fn(async () => ({ attachmentId: 'att_route', mediaType: 'image/png', name: 'figure.png', bytes: 13 }))
-  const parseDocument = vi.fn(async (_session: unknown, _input: unknown, callerSignal?: AbortSignal) => {
-    callerSignal?.throwIfAborted()
-    return view
+  it.each([
+    [{ file_path: 'paper.pdf' }, selectQuery()],
+    [{ file_path: 'paper.pdf', pages: '1-3, 5', focus: 'table' }, selectQuery({ pages: new Set([1, 2, 3, 5]), focus: new Set(['table']) })],
+    [{ file_path: 'paper.pdf', focus: ['toc', 'text'] }, selectQuery({ focus: new Set(['toc', 'text']) })],
+    [{ file_path: 'paper.pdf', query: '  equation  ', inline_images: false }, selectQuery({ target: { kind: 'query', text: 'equation' } }, { inlineImages: false })],
+    [{ file_path: 'paper.pdf', block_id: 'mr_fixture:b1', poll_timeout_ms: 1234 }, selectQuery({ target: { kind: 'block', blockId: 'mr_fixture:b1' } }, { pollTimeoutMs: 1234 })],
+    [{ file_path: 'paper.pdf', cursor }, { kind: 'continue', cursor: decodeReadCursor(cursor), inlineImages: false }],
+    [{ file_path: 'paper.pdf', cursor, inline_images: true }, { kind: 'continue', cursor: decodeReadCursor(cursor), inlineImages: true }],
+  ])('parses %j into one ReadQuery', (args, query) => {
+    expect(parseReadArguments(args)).toEqual({ source: { file_path: 'paper.pdf' }, query })
   })
-  const services: Record<string, unknown> = { llm: { resolveModelInfo }, attachments: { saveImage } }
-  const registeredTools: DefineToolOptions[] = []
-  const ctx = {
-    tools: { register: (definition: DefineToolOptions) => { registeredTools.push(definition); return vi.fn() } },
-    get: (name: string) => services[name],
-  } as unknown as Context
-  const dispose = registerTools(ctx, () => ({ parseDocument }) as unknown as MinerUService)
-  const base = createMockExec(true, signal)
-  const exec = {
-    ...base,
-    agent: {
-      ...base.agent,
-      ...(route.options === undefined ? {} : { options: route.options }),
-      session: {
-        ...base.agent!.session,
-        ...(route.requestHeader === undefined ? {} : { requestHeader: route.requestHeader }),
-      },
-    },
-  } as ToolRunContext
-  const tool = registeredTools.find(item => item.name === 'read_pdf')!
-  return {
-    exec, view, resolveModelInfo, saveImage, parseDocument, services,
-    execute: () => tool.execute({ file_path: '/paper.pdf', focus: 'image', inline_images: true }, exec) as Promise<ResultView>,
-    cleanup: async () => { await dispose(); await rm(directory, { recursive: true, force: true }) },
-  }
-}
 
-function assertAllObjectSchemasClosed(schema: ValueSchemaSpec, path = 'root'): void {
-  if ('oneOf' in schema && schema.oneOf) {
-    schema.oneOf.forEach((sub, i) => assertAllObjectSchemasClosed(sub, path + '.oneOf[' + i + ']'))
-    return
-  }
-  if ('type' in schema) {
-    if (schema.type === 'object') {
-      const obj = schema as ObjectValueSchemaSpec
-      expect(obj.additionalProperties, 'additionalProperties at ' + path + ' must be false').toBe(false)
-      if (obj.properties) {
-        for (const [propName, propSchema] of Object.entries(obj.properties)) {
-          assertAllObjectSchemasClosed(propSchema, path + '.' + propName)
-        }
-      }
-    } else if (schema.type === 'array') {
-      const arr = schema as { type: 'array'; items?: ValueSchemaSpec }
-      if (arr.items) {
-        assertAllObjectSchemasClosed(arr.items, path + '[]')
-      }
+  it.each([
+    ...['model', 'ocr', 'formula', 'table', 'language', 'artifacts', 'max_inline_images', 'unexpected'].map(key => ({ [key]: 'x' })),
+    ...[-1, 0, 86_400_001, 1.5, Number.NaN].map(poll_timeout_ms => ({ poll_timeout_ms })),
+    { cursor: '' }, { cursor: '   ' }, { cursor: 'opaque' },
+    { cursor, pages: 1 }, { cursor, focus: 'text' }, { cursor, query: 'x' }, { cursor, block_id: 'mr_fixture:b1' },
+    { block_id: 'mr_fixture:b1', query: 'x' }, { block_id: 'not-a-block' }, { query: '' }, { query: 'x'.repeat(257) },
+    { query: 'x', focus: 'toc' }, { block_id: 'mr_fixture:b1', focus: 'artifacts' },
+    { focus: 'pictures' }, { pages: '0' }, { pages: [] }, { inline_images: 'yes' }, { expected_sha256: 'a'.repeat(64) },
+    { view: 'outline' },
+  ])('rejects %j as INVALID_REQUEST', extra => {
+    expect(() => parseReadArguments({ file_path: 'paper.pdf', ...extra })).toThrow(invalidRequest)
+  })
+
+  it('rejects unknown async parameters with the same boundary', () => {
+    expect(() => parseAsyncArguments({ file_path: 'paper.pdf', pages: 1 })).toThrow(invalidRequest)
+  })
+
+  it('never reaches the reader with invalid arguments', async () => {
+    const h = await toolHarness()
+    for (const args of [{ file_path: 'paper.pdf', model: 'vlm' }, { file_path: 'paper.pdf', poll_timeout_ms: 0 }, { pages: 1 }]) {
+      await expect(h.read(args)).rejects.toThrow()
     }
-  }
-}
-
-describe('MinerU Tool Layer (Native Background & Direct Contract)', () => {
-  it('registers exactly 2 model-facing tools with disposer', async () => {
-    const { ctx, registeredTools } = createMockContext()
-    const mockService = {} as MinerUService
-    const dispose = registerTools(ctx, () => mockService)
-
-    expect(registeredTools).toHaveLength(2)
-    const names = registeredTools.map(t => t.name)
-    expect(names).toEqual([
-      'async_parse_pdf',
-      'read_pdf',
-    ])
-    expect(typeof dispose).toBe('function')
-    await dispose()
+    expect(h.reader.readContent).not.toHaveBeenCalled()
+    expect(h.ensure).not.toHaveBeenCalled()
   })
 
-  it('strictly enforces additionalProperties: false recursively on all output schemas', () => {
-    const { ctx, registeredTools } = createMockContext()
-    registerTools(ctx, () => ({} as MinerUService))
+  it('passes the resolved absolute path, query, live config snapshot and caller signal to the reader', async () => {
+    let maxInlineChars = 2000
+    const h = await toolHarness({ config: () => withOutput({ maxInlineChars }) })
+    const exec = h.exec()
+    await h.read({ file_path: 'docs/paper.pdf', pages: 2 }, exec)
+    maxInlineChars = 3000
+    await h.read({ file_path: '/abs/paper.pdf' }, exec)
+    expect(h.reader.readContent).toHaveBeenNthCalledWith(1, '/workspace/docs/paper.pdf', selectQuery({ pages: new Set([2]) }),
+      expect.objectContaining({ output: expect.objectContaining({ maxInlineChars: 2000 }) }), undefined, exec.signal)
+    expect(h.reader.readContent).toHaveBeenNthCalledWith(2, '/abs/paper.pdf', selectQuery(),
+      expect.objectContaining({ output: expect.objectContaining({ maxInlineChars: 3000 }) }), undefined, exec.signal)
+  })
+})
 
-    for (const tool of registeredTools) {
-      assertAllObjectSchemasClosed(tool.output.schema, tool.name + '.output.schema')
-    }
+describe('calling model image capability', () => {
+  const header = (provider: string, model: string) => ({ header: { config: { provider, model } }, reason: 'initial' as const })
+
+  it.each([
+    { name: 'routed image model overrides text-only options', routed: ['routed', 'image-model'], options: { provider: 'opt', model: 'text-model' }, expected: ['routed', 'image-model'], inline: true },
+    { name: 'routed text-only model overrides image options', routed: ['routed', 'text-model'], options: { provider: 'opt', model: 'image-model' }, expected: ['routed', 'text-model'], inline: false },
+    { name: 'agent options apply without a request header', options: { provider: 'opt', model: 'image-model' }, expected: ['opt', 'image-model'], inline: true },
+    { name: 'an incomplete route fails closed', options: { provider: 'opt' }, inline: false },
+  ] as const)('$name', async ({ routed, options, expected, inline }) => {
+    const [path] = await pngFiles(1)
+    const h = await toolHarness({ imageModel: true, route: options, reader: { readContent: withImages([imageCandidate({ path: path! })]) } })
+    h.resolveModelInfo.mockImplementation(async (provider, model) => ({
+      provider, id: model, name: model, inputModalities: model === 'text-model' ? ['text'] : ['text', 'image'],
+    }))
+    if (routed) h.session.append('request/header', header(routed[0], routed[1]))
+    const value = await h.read({ file_path: 'paper.pdf', focus: 'image' })
+    if (expected) expect(h.resolveModelInfo).toHaveBeenCalledExactlyOnceWith(expected[0], expected[1], expect.any(AbortSignal))
+    else expect(h.resolveModelInfo).not.toHaveBeenCalled()
+    expect(h.saveImage).toHaveBeenCalledTimes(inline ? 1 : 0)
+    expect(renderResult(value).map(block => block.type)).toEqual(inline ? ['text', 'image'] : ['text'])
+    expect(value.ordered_images).toHaveLength(1)
   })
 
-  it('declares isConcurrencySafe on all tools for parallel tool dispatch', () => {
-    const { ctx, registeredTools } = createMockContext()
-    registerTools(ctx, () => ({} as MinerUService))
-
-    for (const tool of registeredTools) {
-      expect(typeof tool.isConcurrencySafe).toBe('function')
-      expect(tool.isConcurrencySafe?.({})).toBe(true)
-    }
+  it.each(['no llm service', 'unknown modalities', 'resolver rejection'] as const)('fails closed with %s even when inline_images is true', async mode => {
+    const [path] = await pngFiles(1)
+    const h = await toolHarness({ imageModel: mode === 'no llm service' ? undefined : true, reader: { readContent: withImages([imageCandidate({ path: path! })]) } })
+    if (mode === 'unknown modalities') h.resolveModelInfo.mockResolvedValue({ provider: 'mock', id: 'vision', name: 'vision' })
+    if (mode === 'resolver rejection') h.resolveModelInfo.mockRejectedValue(new Error('resolver unavailable'))
+    const value = await h.read({ file_path: 'paper.pdf', focus: 'image', inline_images: true })
+    expect(h.saveImage).not.toHaveBeenCalled()
+    expect(value.inlined_images).toBeUndefined()
+    expect(value.ordered_images).toHaveLength(1)
   })
 
-  it('rejects execute on all 2 tools when agent session is missing', async () => {
-    const { ctx, registeredTools } = createMockContext()
-    registerTools(ctx, () => ({} as MinerUService))
-    const unauthenticatedExec = createMockExec(false)
+  it('preserves caller cancellation raised during model resolution', async () => {
+    const h = await toolHarness({ imageModel: true })
+    const controller = new AbortController()
+    const reason = new Error('caller cancelled during model resolution')
+    h.resolveModelInfo.mockImplementation(async (_provider, _model, signal) => {
+      controller.abort(reason)
+      signal!.throwIfAborted()
+      throw new Error('unreachable')
+    })
+    await expect(h.read({ file_path: 'paper.pdf' }, h.exec({ signal: controller.signal }))).rejects.toBe(reason)
+    expect(h.reader.readContent).not.toHaveBeenCalled()
+  })
+})
 
-    for (const tool of registeredTools) {
-      await expect(
-        tool.execute({ file_path: '/doc.pdf' }, unauthenticatedExec),
-      ).rejects.toThrow(/UNAUTHENTICATED_SESSION/)
-    }
+describe('inline image delivery', () => {
+  it('applies the live image budget per invocation and marks the rest omitted', async () => {
+    const paths = await pngFiles(8)
+    let maxInlineImages = 2
+    const h = await toolHarness({
+      imageModel: true, config: () => withOutput({ maxInlineChars: 20_000, maxInlineImages }),
+      reader: { readContent: projectedReader(() => { maxInlineImages = 8; return resultView({ output_limit_chars: 20_000, ordered_images: paths.map(path => imageCandidate({ path })) }) }) },
+    })
+    const first = await h.read({ file_path: 'paper.pdf', focus: 'image' })
+    expect(first.inlined_images).toHaveLength(2)
+    expect(first.ordered_images?.map(image => image.status)).toEqual(['available', 'available', ...Array(6).fill('omitted')])
+    expect(first.visuals).toEqual({ listed: 8, attached: 2, omitted: 6, scope: 'chunk' })
+    expect((await h.read({ file_path: 'paper.pdf', focus: 'image' })).inlined_images).toHaveLength(8)
   })
 
-  describe('async_parse_pdf (Native DSH Background Job)', () => {
-    it('rejects when native DSH background jobs are unavailable', async () => {
-      const { ctx, registeredTools } = createMockContext(undefined)
-      registerTools(ctx, () => ({} as MinerUService))
-      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
-      const exec = createMockExec(true)
-
-      await expect(submitTool.execute({ file_path: '/doc.pdf' }, exec)).rejects.toMatchObject({
-        failure: { code: 'PROVIDER_UNAVAILABLE' },
-      })
-    })
-
-    it('rejects immediately when exec signal is already aborted', async () => {
-      const { registry } = createMockJobRegistry()
-      const { ctx, registeredTools } = createMockContext(registry)
-      registerTools(ctx, () => ({} as MinerUService))
-      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
-
-      const controller = new AbortController()
-      controller.abort()
-      const exec = createMockExec(true, controller.signal)
-
-      await expect(submitTool.execute({ file_path: '/doc.pdf' }, exec)).rejects.toThrow()
-      expect(registry.start).not.toHaveBeenCalled()
-    })
-
-    it('submits native background job, captures start spec, and returns immediate mineru-N ID', async () => {
-      const { registry, specs } = createMockJobRegistry()
-      const { ctx, registeredTools } = createMockContext(registry)
-      const mockService = {
-        parseDocument: vi.fn(),
-      } as unknown as MinerUService
-      registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
-
-      const exec = createMockExec(true)
-      const inputArgs = {
-        file_path: '/data/one.pdf',
-      }
-
-      const result = await submitTool.execute(inputArgs, exec)
-      expect(result).toEqual({ job_id: 'mineru-1', state: 'running' })
-      expect(registry.start).toHaveBeenCalledTimes(1)
-      expect(specs).toHaveLength(1)
-
-      const captured = specs[0]!
-      expect(captured.kind).toBe('mineru')
-      expect(captured.label).toBe('Parse one.pdf with MinerU')
-      expect(captured.owner).toBe(exec.agent?.session.id)
-      expect(typeof captured.run).toBe('function')
-
-      const rendered = submitTool.output.render(inputArgs, result)
-      expect(rendered[0]?.text).toBe('Started native MinerU background job mineru-1.')
-    })
-
-    it('resolves done hook with completed outcome and document summary on success', async () => {
-      const { registry, specs } = createMockJobRegistry()
-      const { ctx, registeredTools } = createMockContext(registry)
-
-      const completedResult: ResultView = {
-        state: 'completed',
-        source: 'provider',
-        cache_hit: false,
-        result_id: 'mr_test_123',
-        files: [
-          {
-            file_id: 'mf_1',
-            name: 'sample.pdf',
-            artifacts: [{ kind: 'markdown', path: '/cache/sample/full.md', bytes: 512 }],
-          },
-        ],
-        markdown_content: '# Background Parsed Content',
-        content_status: 'complete', cursor: null,
-        manifest_path: '/cache/sample/manifest.json',
-        output_limit_chars: 2000,
-        summary: {
-          page_count: 5,
-          table_count: 2,
-          image_count: 3,
-        },
-      }
-
-      const mockService = {
-        ensureParsed: vi.fn(async () => completedResult),
-      } as unknown as MinerUService
-      registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
-
-      const exec = createMockExec(true)
-      const inputArgs = { file_path: '/sample.pdf' }
-      await submitTool.execute(inputArgs, exec)
-
-      const hooks = specs[0]!.run(jobHandle())
-      const outcome = await hooks.done
-
-      expect(mockService.ensureParsed).toHaveBeenCalledWith(
-        exec.agent?.session,
-        { file_path: '/sample.pdf' },
-        expect.any(AbortSignal),
-        expect.any(Function),
-      )
-      expect(outcome.status).toBe('completed')
-      expect(outcome.detail).toBe('completed')
-      expect(outcome.result).toContain('MinerU Document Parse Summary')
-      expect(outcome.result).toContain('sample.pdf')
-      expect(outcome.result).toContain('read_pdf')
-    })
-
-
-
-    it('handles cancelation and resolves done with killed status', async () => {
-      const { registry, specs } = createMockJobRegistry()
-      const { ctx, registeredTools } = createMockContext(registry)
-
-      const mockService = {
-        ensureParsed: vi.fn(async (_session, _input, signal: AbortSignal) => {
-          return new Promise<ResultView>((_resolve, reject) => {
-            signal.addEventListener('abort', () => {
-              reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
-            })
-          })
-        }),
-      } as unknown as MinerUService
-      registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
-
-      const exec = createMockExec(true)
-      await submitTool.execute({ file_path: '/hang.pdf' }, exec)
-
-      const hooks = specs[0]!.run(jobHandle())
-      hooks.cancel('User requested cancellation')
-      const outcome = await hooks.done
-
-      expect(outcome.status).toBe('killed')
-      expect(outcome.detail).toBe('cancelled')
-    })
-
-    it('cancels and awaits active native wrappers when tools are disposed', async () => {
-      const { registry, specs } = createMockJobRegistry()
-      const { ctx, registeredTools } = createMockContext(registry)
-      const mockService = {
-        ensureParsed: vi.fn(async (_session, _input, signal: AbortSignal) => {
-          return await new Promise<ResultView>((_resolve, reject) => {
-            if (signal.aborted) { reject(signal.reason); return }
-            signal.addEventListener('abort', () => reject(signal.reason), { once: true })
-          })
-        }),
-      } as unknown as MinerUService
-      const dispose = registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
-
-      await submitTool.execute({ file_path: '/hang.pdf' }, createMockExec(true))
-      const hooks = specs[0]!.run(jobHandle())
-      await dispose()
-
-      await expect(hooks.done).resolves.toMatchObject({ status: 'killed', detail: 'cancelled' })
-    })
-
-    it('handles parse failure and maps to failed outcome with error detail', async () => {
-      const { registry, specs } = createMockJobRegistry()
-      const { ctx, registeredTools } = createMockContext(registry)
-
-      const mockService = {
-        ensureParsed: vi.fn(async () => {
-          throw new MinerUError(failure('FILE_TOO_LARGE', 'Input exceeds limit'))
-        }),
-      } as unknown as MinerUService
-      registerTools(ctx, () => mockService)
-      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
-
-      const exec = createMockExec(true)
-      await submitTool.execute({ file_path: '/giant.pdf' }, exec)
-
-      const hooks = specs[0]!.run(jobHandle())
-      const outcome = await hooks.done
-
-      expect(outcome.status).toBe('failed')
-      expect(outcome.detail).toBe('FILE_TOO_LARGE')
-      expect(outcome.result).toBe('[FILE_TOO_LARGE] Input exceeds limit')
-    })
-
-    it('projects structured presentation metadata for submitted jobs', () => {
-      const { ctx, registeredTools } = createMockContext()
-      registerTools(ctx, () => ({} as MinerUService))
-      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
-
-      expect(submitTool.output.presentationMeta?.({}, { job_id: 'mineru-1', state: 'running' })).toEqual({
-        job_id: 'mineru-1',
-        state: 'running',
-      })
-    })
-
-    it('wraps background execution with storage access gate when provided', async () => {
-      const { registry, specs } = createMockJobRegistry()
-      const { ctx, registeredTools } = createMockContext(registry)
-      const accessGate = new StorageAccessGate()
-      const runSharedSpy = vi.spyOn(accessGate, 'runShared')
-
-      const completedResult: ResultView = {
-        state: 'completed',
-        source: 'cache',
-        cache_hit: true,
-        result_id: 'mr_gate_1',
-        files: [],
-        content_status: 'complete', cursor: null,
-        manifest_path: '/cache/manifest.json',
-        output_limit_chars: 1000,
-      }
-      const mockService = {
-        ensureParsed: vi.fn(async () => completedResult),
-      } as unknown as MinerUService
-
-      registerTools(ctx, () => mockService, accessGate)
-      const submitTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
-
-      const exec = createMockExec(true)
-      await submitTool.execute({ file_path: '/doc.pdf' }, exec)
-
-      const hooks = specs[0]!.run(jobHandle())
-      const outcome = await hooks.done
-
-      expect(outcome.status).toBe('completed')
-      expect(runSharedSpy).toHaveBeenCalled()
-    })
+  it.each([
+    { copies: 1, bytes: 25 * 1024 * 1024, attached: 0 },
+    { copies: 4, bytes: 8 * 1024 * 1024, attached: 3 },
+  ])('bounds host-normalized growth for $copies images independently of source bytes', async ({ copies, bytes, attached }) => {
+    const paths = await pngFiles(copies)
+    const h = await toolHarness({ imageModel: true, reader: { readContent: withImages(paths.map(path => imageCandidate({ path }))) } })
+    h.saveImage.mockImplementation(async image => ({ attachmentId: AttachmentId('sha256:' + 'c'.repeat(64)), mediaType: image.mediaType, bytes, width: 1, height: 1 }))
+    const value = await h.read({ file_path: 'paper.pdf', focus: 'image' })
+    expect(value.inlined_images?.length ?? 0).toBe(attached)
+    expect(value.ordered_images?.at(-1)?.status).toBe('omitted')
   })
 
-  describe('read_pdf (Direct Result, No Plugin Job)', () => {
-    it('executes synchronous direct parseDocument and returns direct result', async () => {
-      const completedResult: ResultView = {
-        state: 'completed',
-        source: 'provider',
-        cache_hit: false,
-        result_id: 'mr_sync_1',
-        files: [
-          {
-            file_id: 'mf_1',
-            name: 'sync.pdf',
-            artifacts: [{ kind: 'markdown', path: '/cache/sync/full.md', bytes: 100 }],
-          },
-        ],
-        markdown_content: '# Synchronous Direct Result',
-        content_status: 'complete', cursor: null,
-        manifest_path: '/cache/sync/manifest.json',
-        output_limit_chars: 2000,
-      }
-      const mockService = {
-        parseDocument: vi.fn(async () => completedResult),
-      } as unknown as MinerUService
-
-      const { ctx, registeredTools } = createMockContext()
-      registerTools(ctx, () => mockService)
-      const parseTool = registeredTools.find(t => t.name === 'read_pdf')!
-
-      const exec = createMockExec(true)
-      const args = { file_path: '/sync.pdf', poll_timeout_ms: 30000 }
-      const result = await parseTool.execute(args, exec)
-
-      expect(mockService.parseDocument).toHaveBeenCalledWith(
-        exec.agent?.session,
-        { file_path: '/sync.pdf', inline_images: true },
-        exec.signal,
-        30000,
-      )
-      expect(result).toEqual(completedResult)
-
-      const rendered = parseTool.output.render(args, result)
-      expect(rendered[0]?.text).toContain('Synchronous Direct Result')
-      expect(rendered[0]?.text).toContain('# Document: sync.pdf')
-      expect(rendered[0]?.text).not.toContain('MinerU Parse Result')
-      expect(rendered[0]?.text).toContain('Status: Content complete.')
-      expect(rendered[0]?.text).toContain('Selected parsed text complete across this and preceding chunks; not a guarantee of OCR fidelity or visual coverage.')
-      expect(rendered[0]?.text).not.toContain('/cache/sync/manifest.json')
-    })
-
-    it('documents direct content inlining and positive usage guidance', () => {
-      const { ctx, registeredTools } = createMockContext()
-      registerTools(ctx, () => ({} as MinerUService))
-      const parseTool = registeredTools.find(t => t.name === 'read_pdf')!
-      expect(parseTool.description).toContain('null when complete or not_requested')
-      expect(parseTool.description).toContain('markdown_content')
-      expect(parseTool.description).toContain('Continue only when partial')
-      expect(parseTool.description).toContain('stop rather than passing null back')
-      expect(parseTool.description).not.toContain('If pre-parsed by async_parse_pdf, reads instantly from local cache.')
-      expect(parseTool.description).not.toContain('reads instantly from local cache')
-    })
-
-    it('accepts single file_path parameter on both tools and normalizes appropriately', async () => {
-      const { registry } = createMockJobRegistry()
-      const { ctx, registeredTools } = createMockContext(registry)
-      const mockService = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'cache' as const, cache_hit: true, result_id: 'mr_1', files: [], content_status: 'complete' as const, cursor: null, manifest_path: '/p/m.json', output_limit_chars: 1000 })) } as unknown as MinerUService
-      registerTools(ctx, () => mockService)
-      const asyncTool = registeredTools.find(t => t.name === 'async_parse_pdf')!
-      const readTool = registeredTools.find(t => t.name === 'read_pdf')!
-      const exec = createMockExec(true)
-
-      const asyncRes = await asyncTool.execute({ file_path: '/single.pdf' }, exec)
-      expect(asyncRes).toMatchObject({ state: 'running' })
-
-      await readTool.execute({ file_path: '/single.pdf' }, exec)
-      expect(mockService.parseDocument).toHaveBeenCalledWith(
-        exec.agent?.session,
-        { file_path: '/single.pdf', inline_images: true },
-        exec.signal,
-        undefined,
-      )
-    })
-
-    it('passes restored and overridden cursor image intent to the service', async () => {
-      const { ctx, registeredTools } = createMockContext()
-      const mockService = { parseDocument: vi.fn(async () => ({
-        state: 'completed' as const, source: 'cache' as const, cache_hit: true, result_id: 'mr_intent', files: [],
-        content_status: 'complete' as const, cursor: null, output_limit_chars: 1000,
-      })) } as unknown as MinerUService
-      registerTools(ctx, () => mockService)
-      const readTool = registeredTools.find(t => t.name === 'read_pdf')!
-      const exec = createMockExec(true)
-      const cursor = cursorForRemainder('mr_intent', undefined, new Set(['all']), 10, { inline_images: false })
-
-      await readTool.execute({ file_path: '/intent.pdf', cursor }, exec)
-      await readTool.execute({ file_path: '/intent.pdf', cursor, inline_images: true }, exec)
-
-      expect(mockService.parseDocument).toHaveBeenNthCalledWith(1, exec.agent?.session, { file_path: '/intent.pdf', cursor, inline_images: false }, exec.signal, undefined)
-      expect(mockService.parseDocument).toHaveBeenNthCalledWith(2, exec.agent?.session, { file_path: '/intent.pdf', cursor, inline_images: true }, exec.signal, undefined)
-    })
-
-    it('rejects removed technical parameters (model, ocr, formula, table, language, artifacts, max_inline_images)', async () => {
-      const { ctx, registeredTools } = createMockContext()
-      registerTools(ctx, () => ({} as MinerUService))
-      const exec = createMockExec(true)
-      for (const tool of registeredTools) {
-        for (const param of ['model', 'ocr', 'formula', 'table', 'language', 'artifacts', 'max_inline_images']) {
-          await expect(tool.execute({ file_path: '/doc.pdf', [param]: 'test' }, exec))
-            .rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
-        }
-      }
-    })
-
-    it('passes pages and focus options to mineru service in read_pdf', async () => {
-      const { ctx, registeredTools } = createMockContext()
-      const mockService = {
-        parseDocument: vi.fn(async () => ({
-          state: 'completed' as const,
-          source: 'cache' as const,
-          cache_hit: true,
-          result_id: 'mr_1',
-          files: [],
-          content_status: 'complete' as const, cursor: null,
-          manifest_path: '/cache/m.json',
-          output_limit_chars: 1000,
-        })),
-      } as unknown as MinerUService
-      registerTools(ctx, () => mockService)
-      const readTool = registeredTools.find(t => t.name === 'read_pdf')!
-      const exec = createMockExec(true)
-
-      await readTool.execute({ file_path: '/paper.pdf', pages: '1-3, 5', focus: 'table' }, exec)
-      expect(mockService.parseDocument).toHaveBeenCalledWith(
-        exec.agent?.session,
-        expect.objectContaining({
-          file_path: '/paper.pdf',
-          pages: '1-3, 5',
-          focus: 'table',
-        }),
-        exec.signal,
-        undefined,
-      )
-
-      await readTool.execute({ file_path: '/paper.pdf', focus: 'toc' }, exec)
-      expect(mockService.parseDocument).toHaveBeenCalledWith(
-        exec.agent?.session,
-        expect.objectContaining({
-          file_path: '/paper.pdf',
-          focus: 'toc',
-        }),
-        exec.signal,
-        undefined,
-      )
-
-      await readTool.execute({ file_path: '/paper.pdf', focus: 'artifacts' }, exec)
-      expect(mockService.parseDocument).toHaveBeenCalledWith(
-        exec.agent?.session,
-        expect.objectContaining({
-          file_path: '/paper.pdf',
-          focus: 'artifacts',
-        }),
-        exec.signal,
-        undefined,
-      )
-    })
-
-    describe('calling model image capability', () => {
-      const imageOptions = { provider: 'options-provider', model: 'image-model' }
-      const cases: { name: string; route: CallingRouteFixture; expectedRoute?: [string, string]; inline: boolean }[] = [
-        {
-          name: 'routed image model overrides text-only options',
-          route: { requestHeader: () => ({ config: { provider: 'routed-provider', model: 'image-model' } }), options: { ...imageOptions, model: 'text-model' } },
-          expectedRoute: ['routed-provider', 'image-model'], inline: true,
-        },
-        {
-          name: 'routed text-only model overrides image-capable options',
-          route: { requestHeader: () => ({ config: { provider: 'routed-provider', model: 'text-model' } }), options: imageOptions },
-          expectedRoute: ['routed-provider', 'text-model'], inline: false,
-        },
-        {
-          name: 'absent requestHeader method falls back to options',
-          route: { options: imageOptions }, expectedRoute: ['options-provider', 'image-model'], inline: true,
-        },
-        {
-          name: 'absent request header falls back to options',
-          route: { requestHeader: () => undefined, options: imageOptions }, expectedRoute: ['options-provider', 'image-model'], inline: true,
-        },
-        {
-          name: 'absent header config falls back to options',
-          route: { requestHeader: () => ({}), options: imageOptions }, expectedRoute: ['options-provider', 'image-model'], inline: true,
-        },
-        {
-          name: 'missing routed model falls back independently',
-          route: { requestHeader: () => ({ config: { provider: 'routed-provider' } }), options: imageOptions },
-          expectedRoute: ['routed-provider', 'image-model'], inline: true,
-        },
-        {
-          name: 'missing routed provider falls back independently',
-          route: { requestHeader: () => ({ config: { model: 'text-model' } }), options: imageOptions },
-          expectedRoute: ['options-provider', 'text-model'], inline: false,
-        },
-        {
-          name: 'complete routed config works without options',
-          route: { requestHeader: () => ({ config: { provider: 'routed-provider', model: 'image-model' } }) },
-          expectedRoute: ['routed-provider', 'image-model'], inline: true,
-        },
-        { name: 'absent header and options fail closed', route: {}, inline: false },
-        { name: 'absent config and options fail closed', route: { requestHeader: () => ({}) }, inline: false },
-        { name: 'missing provider fails closed', route: { options: { model: 'image-model' } }, inline: false },
-        { name: 'missing model fails closed', route: { options: { provider: 'options-provider' } }, inline: false },
-        {
-          name: 'empty routed model does not fall back to options',
-          route: { requestHeader: () => ({ config: { model: '' } }), options: imageOptions }, inline: false,
-        },
-      ]
-
-      it.each(cases)('$name', async ({ route, expectedRoute, inline }) => {
-        const fixture = await createCallingRouteFixture(route)
-        try {
-          const result = await fixture.execute()
-          if (expectedRoute) {
-            expect(fixture.resolveModelInfo).toHaveBeenCalledExactlyOnceWith(...expectedRoute, fixture.exec.signal)
-          } else {
-            expect(fixture.resolveModelInfo).not.toHaveBeenCalled()
-          }
-          expect(fixture.parseDocument).toHaveBeenCalledExactlyOnceWith(fixture.exec.agent!.session, { file_path: '/paper.pdf', focus: 'image', inline_images: true }, fixture.exec.signal, undefined)
-          expect(fixture.saveImage).toHaveBeenCalledTimes(inline ? 1 : 0)
-          if (inline) {
-            expect(result.inlined_images).toHaveLength(1)
-            expect(renderResult(result).map(block => block.type)).toEqual(['text', 'image'])
-          } else {
-            expect(result.inlined_images).toBeUndefined()
-            expect(result.ordered_images).toEqual(fixture.view.ordered_images)
-            expect(renderResult(result).map(block => block.type)).toEqual(['text'])
-          }
-        } finally { await fixture.cleanup() }
-      })
-
-      it.each(['missing llm', 'missing resolver', 'missing model info', 'missing modalities', 'resolver rejection'] as const)(
-        'fails closed for %s even when inline_images is explicitly true', async mode => {
-          const fixture = await createCallingRouteFixture({ options: imageOptions })
-          try {
-            if (mode === 'missing llm') delete fixture.services.llm
-            else if (mode === 'missing resolver') fixture.services.llm = {}
-            else if (mode === 'missing model info') fixture.resolveModelInfo.mockResolvedValue(undefined)
-            else if (mode === 'missing modalities') fixture.resolveModelInfo.mockResolvedValue({})
-            else fixture.resolveModelInfo.mockRejectedValue(new Error('resolver unavailable'))
-            const result = await fixture.execute()
-            expect(fixture.resolveModelInfo).toHaveBeenCalledTimes(mode === 'missing llm' || mode === 'missing resolver' ? 0 : 1)
-            expect(fixture.parseDocument).toHaveBeenCalledOnce()
-            expect(fixture.saveImage).not.toHaveBeenCalled()
-            expect(result.inlined_images).toBeUndefined()
-            expect(result.ordered_images).toEqual(fixture.view.ordered_images)
-          } finally { await fixture.cleanup() }
-        },
-      )
-
-      it('preserves caller cancellation through model resolver failure and the parse waiter', async () => {
-        const controller = new AbortController()
-        const reason = new Error('caller cancelled during model resolution')
-        const fixture = await createCallingRouteFixture({ options: imageOptions }, controller.signal)
-        try {
-          fixture.resolveModelInfo.mockImplementation(async (_provider, _model, signal) => {
-            controller.abort(reason)
-            signal!.throwIfAborted()
-            return undefined
-          })
-          await expect(fixture.execute()).rejects.toBe(reason)
-          expect(fixture.resolveModelInfo).toHaveBeenCalledExactlyOnceWith('options-provider', 'image-model', controller.signal)
-          expect(fixture.parseDocument).toHaveBeenCalledExactlyOnceWith(fixture.exec.agent!.session, { file_path: '/paper.pdf', focus: 'image', inline_images: true }, controller.signal, undefined)
-          expect(fixture.saveImage).not.toHaveBeenCalled()
-        } finally { await fixture.cleanup() }
-      })
-    })
-
-    it('does not inline images when focus does not include image modality', async () => {
-      const mockAttachments = {
-        saveImage: vi.fn(async () => ({
-          attachmentId: 'att_img_1',
-          mediaType: 'image/png',
-          name: 'fig1.png',
-          width: 100,
-          height: 100,
-          bytes: 50,
-        })),
-      }
-      const mockLlm = {
-        resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text', 'image'] })),
-      }
-      const registeredTools: DefineToolOptions[] = []
-      const ctx = {
-        tools: {
-          register: vi.fn((def: DefineToolOptions) => {
-            registeredTools.push(def)
-            return vi.fn()
-          }),
-          schemas: vi.fn(() => []),
-        },
-        get: vi.fn((name: string) => {
-          if (name === 'attachments') return mockAttachments
-          if (name === 'llm') return mockLlm
-          return undefined
-        }),
-        effect: vi.fn(),
-        on: vi.fn(),
-        inject: vi.fn(),
-        logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
-      } as unknown as Context
-
-      const mockService = {
-        parseDocument: vi.fn(async () => ({
-          state: 'completed' as const,
-          source: 'cache' as const,
-          cache_hit: true,
-          result_id: 'mr_1',
-          files: [{
-            file_id: 'mf_1',
-            name: 'doc.pdf',
-            artifacts: [{ kind: 'images', path: '/fake/img.png', bytes: 100 }],
-          }],
-          content_status: 'complete' as const, cursor: null,
-          manifest_path: '/cache/m.json',
-          output_limit_chars: 1000,
-          ordered_images: [],
-        })),
-      } as unknown as MinerUService
-
-      registerTools(ctx, () => mockService)
-      const readTool = registeredTools.find(t => t.name === 'read_pdf')!
-      const exec: ToolRunContext = {
-        callId: 'call_1',
-        name: 'read_pdf',
-        arguments: {},
-        signal: new AbortController().signal,
-        agent: {
-          id: 'agent_1',
-          options: { provider: 'test-p', model: 'test-m' },
-          session: {
-            id: 'sess_1',
-            header: { id: 'sess_1', cwd: '/work' },
-          },
-        } as any,
-      }
-
-      // 1. focus: 'toc' should NOT inline images
-      const tocRes = await readTool.execute({ file_path: '/paper.pdf', focus: 'toc' }, exec) as ResultView
-      expect(mockAttachments.saveImage).not.toHaveBeenCalled()
-      expect(tocRes.inlined_images).toBeUndefined()
-      expect(renderResult(tocRes)).toHaveLength(1)
-
-      // 2. focus: 'text' should NOT inline images
-      const textRes = await readTool.execute({ file_path: '/paper.pdf', focus: 'text' }, exec) as ResultView
-      expect(mockAttachments.saveImage).not.toHaveBeenCalled()
-      expect(textRes.inlined_images).toBeUndefined()
-
-      // 3. focus: 'table' should NOT inline images
-      const tableRes = await readTool.execute({ file_path: '/paper.pdf', focus: 'table' }, exec) as ResultView
-      expect(mockAttachments.saveImage).not.toHaveBeenCalled()
-      expect(tableRes.inlined_images).toBeUndefined()
-
-      // 3b. focus: 'artifacts' should NOT inline images
-      const artifactsRes = await readTool.execute({ file_path: '/paper.pdf', focus: 'artifacts' }, exec) as ResultView
-      expect(mockAttachments.saveImage).not.toHaveBeenCalled()
-      expect(artifactsRes.inlined_images).toBeUndefined()
-
-      // 4. focus: ['toc', 'text'] should NOT inline images
-      const multiRes = await readTool.execute({ file_path: '/paper.pdf', focus: ['toc', 'text'] }, exec) as ResultView
-      expect(mockAttachments.saveImage).not.toHaveBeenCalled()
-      expect(multiRes.inlined_images).toBeUndefined()
-
-      // 5. focus: 'all' when ordered_images is empty should NOT fallback to all document images
-      const allEmptyRes = await readTool.execute({ file_path: '/paper.pdf', focus: 'all' }, exec) as ResultView
-      expect(mockAttachments.saveImage).not.toHaveBeenCalled()
-      expect(allEmptyRes.inlined_images).toBeUndefined()
-
-      // 6. focus: 'image' when ordered_images has an image should inline it
-      const testImgPath = join(tmpdir(), 'test-inline-fig.png')
-      await writeFile(testImgPath, Buffer.from('fake-png-data'))
-      try {
-        const mockServiceWithImages = {
-          parseDocument: vi.fn(async () => ({
-            state: 'completed' as const,
-            source: 'cache' as const,
-            cache_hit: true,
-            result_id: 'mr_2',
-            files: [{
-              file_id: 'mf_1',
-              name: 'doc.pdf',
-              artifacts: [],
-            }],
-            content_status: 'complete' as const, cursor: null,
-            manifest_path: '/cache/m.json',
-            output_limit_chars: 1000,
-            ordered_images: [{
-              path: testImgPath,
-              name: 'test-inline-fig.png',
-              page: 1,
-              media_type: 'image/png',
-              bytes: 13,
-            }],
-          })),
-        } as unknown as MinerUService
-        const { ctx: ctx2, registeredTools: tools2 } = createMockContext()
-        ;(ctx2.get as any) = vi.fn((name: string) => {
-          if (name === 'attachments') return mockAttachments
-          if (name === 'llm') return mockLlm
-          return undefined
-        })
-        registerTools(ctx2, () => mockServiceWithImages)
-        const readTool2 = tools2.find(t => t.name === 'read_pdf')!
-
-        const imageRes = await readTool2.execute({ file_path: '/paper.pdf', focus: 'image' }, exec) as ResultView
-        expect(mockAttachments.saveImage).toHaveBeenCalledTimes(1)
-        expect(imageRes.inlined_images).toHaveLength(1)
-        expect(imageRes.inlined_images![0]?.name).toBe('fig1.png')
-        expect(renderResult(imageRes)).toHaveLength(2)
-      } finally {
-        await rm(testImgPath, { force: true })
-      }
-    })
-
-    it.each([
-      { copies: 1, bytes: 25 * 1024 * 1024, attached: 0 },
-      { copies: 4, bytes: 8 * 1024 * 1024, attached: 3 },
-    ])('limits normalized growth for $copies images independently of source bytes', async ({ copies, bytes, attached }) => {
-      const path = join(tmpdir(), 'mineru-normalized-growth.png')
-      await writeFile(path, Buffer.from('fake-png-data'))
-      try {
-        const saveImage = vi.fn(async () => ({ attachmentId: 'att_growth', mediaType: 'image/png', name: 'growth.png', bytes }))
-        const service = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'provider' as const, cache_hit: false, result_id: 'mr_growth', files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }], content_status: 'complete' as const, cursor: null, manifest_path: '/cache/m.json', output_limit_chars: 20_000, ordered_images: Array.from({ length: copies }, () => ({ path, name: 'growth.png', media_type: 'image/png', bytes: 13 })) })) } as unknown as MinerUService
-        const { ctx, registeredTools } = createMockContext()
-        ;(ctx.get as any) = vi.fn((name: string) => name === 'attachments' ? { saveImage } : name === 'llm' ? { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text', 'image'] })) } : undefined)
-        registerTools(ctx, () => service)
-        const exec = createMockExec()
-        ;(exec.agent as any).options = { provider: 'test-p', model: 'test-m' }
-        const value = await registeredTools.find(item => item.name === 'read_pdf')!.execute({ file_path: '/paper.pdf', focus: 'image' }, exec) as ResultView
-        expect(value.inlined_images?.length ?? 0).toBe(attached)
-        expect(value.ordered_images?.at(-1)?.status).toBe('omitted')
-        expect(saveImage).toHaveBeenCalledTimes(copies)
-      } finally { await rm(path, { force: true }) }
-    })
-
-    it('applies the live inline image budget and snapshots it per invocation', async () => {
-      const path = join(tmpdir(), 'mineru-configured-inline-budget.png')
-      await writeFile(path, Buffer.from('fake-png-data'))
-      try {
-        let maxInlineImages = 2
-        const saveImage = vi.fn(async () => ({ attachmentId: 'att_budget', mediaType: 'image/png', name: 'budget.png', bytes: 13 }))
-        const view = {
-          state: 'completed' as const,
-          source: 'provider' as const,
-          cache_hit: false,
-          result_id: 'mr_budget',
-          files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
-          content_status: 'complete' as const, cursor: null,
-          manifest_path: '/cache/m.json',
-          output_limit_chars: 20_000,
-          ordered_images: Array.from({ length: 8 }, (_, index) => ({
-            path,
-            name: `figure-${String(index + 1)}.png`,
-            media_type: 'image/png' as const,
-            bytes: 13,
-          })),
-        }
-        const service = {
-          parseDocument: vi.fn(async () => {
-            maxInlineImages = 8
-            return view
-          }),
-        } as unknown as MinerUService
-        const { ctx, registeredTools } = createMockContext()
-        ;(ctx.get as any) = vi.fn((name: string) => name === 'attachments'
-          ? { saveImage }
-          : name === 'llm' ? { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text', 'image'] })) } : undefined)
-        registerTools(ctx, () => service, undefined, () => ({ maxInlineChars: 20_000, maxInlineImages }))
-        const exec = createMockExec()
-        ;(exec.agent as any).options = { provider: 'test-p', model: 'test-m' }
-        const tool = registeredTools.find(item => item.name === 'read_pdf')!
-
-        const first = await tool.execute({ file_path: '/paper.pdf', focus: 'image' }, exec) as ResultView
-        expect(first.inlined_images).toHaveLength(2)
-        expect(first.ordered_images?.map(item => item.status)).toEqual([
-          'available', 'available', 'omitted', 'omitted', 'omitted', 'omitted', 'omitted', 'omitted',
-        ])
-
-        const second = await tool.execute({ file_path: '/paper.pdf', focus: 'image' }, exec) as ResultView
-        expect(second.inlined_images).toHaveLength(8)
-        expect(saveImage).toHaveBeenCalledTimes(10)
-      } finally { await rm(path, { force: true }) }
-    })
-
-    it('omits normalized images with missing or invalid emitted byte counts', async () => {
-      const paths = [1, 2].map(index => join(tmpdir(), 'mineru-invalid-bytes-' + String(index) + '.png'))
-      await Promise.all(paths.map(path => writeFile(path, Buffer.from('fake-png-data'))))
-      try {
-        const saveImage = vi.fn()
-          .mockResolvedValueOnce({ attachmentId: 'att_missing', mediaType: 'image/png', name: 'missing.png' })
-          .mockResolvedValueOnce({ attachmentId: 'att_invalid', mediaType: 'image/png', name: 'invalid.png', bytes: '13' })
-        const service = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'provider' as const, cache_hit: false, result_id: 'mr_invalid_bytes', files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }], content_status: 'complete' as const, cursor: null, manifest_path: '/cache/m.json', output_limit_chars: 20_000, ordered_images: paths.map((path, index) => ({ path, name: 'figure-' + String(index + 1) + '.png', media_type: 'image/png', bytes: 13 })) })) } as unknown as MinerUService
-        const { ctx, registeredTools } = createMockContext()
-        ;(ctx.get as any) = vi.fn((name: string) => name === 'attachments' ? { saveImage } : name === 'llm' ? { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text', 'image'] })) } : undefined)
-        registerTools(ctx, () => service)
-        const exec = createMockExec()
-        ;(exec.agent as any).options = { provider: 'test-p', model: 'test-m' }
-        const value = await registeredTools.find(item => item.name === 'read_pdf')!.execute({ file_path: '/paper.pdf', focus: 'image' }, exec) as ResultView
-        expect(value.inlined_images).toBeUndefined()
-        expect(value.ordered_images?.map(item => item.status)).toEqual(['omitted', 'omitted'])
-      } finally { await Promise.all(paths.map(path => rm(path, { force: true }))) }
-    })
-
-    it('propagates cancellation after saving the last image', async () => {
-      const path = join(tmpdir(), 'mineru-last-image-abort.png')
-      await writeFile(path, Buffer.from('fake-png-data'))
-      try {
-        const controller = new AbortController()
-        const saveImage = vi.fn(async () => { controller.abort(); return { attachmentId: 'att_last', mediaType: 'image/png', name: 'last.png', bytes: 13 } })
-        const service = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'provider' as const, cache_hit: false, result_id: 'mr_last_abort', files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }], content_status: 'complete' as const, cursor: null, manifest_path: '/cache/m.json', output_limit_chars: 20_000, ordered_images: [{ path, name: 'last.png', media_type: 'image/png', bytes: 13 }] })) } as unknown as MinerUService
-        const { ctx, registeredTools } = createMockContext()
-        ;(ctx.get as any) = vi.fn((name: string) => name === 'attachments' ? { saveImage } : name === 'llm' ? { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text', 'image'] })) } : undefined)
-        registerTools(ctx, () => service)
-        const exec = createMockExec(true, controller.signal)
-        ;(exec.agent as any).options = { provider: 'test-p', model: 'test-m' }
-        await expect(registeredTools.find(item => item.name === 'read_pdf')!.execute({ file_path: '/paper.pdf', focus: 'image' }, exec)).rejects.toThrow()
-      } finally { await rm(path, { force: true }) }
-    })
-
-    it('reports failed and omitted figures while preserving stable numbering', async () => {
-      const paths = [1, 2, 3].map(index => join(tmpdir(), 'mineru-figure-' + String(index) + '.png'))
-      await Promise.all(paths.map(path => writeFile(path, Buffer.from('fake-png-data'))))
-      try {
-        const saveImage = vi.fn()
-          .mockResolvedValueOnce({ attachmentId: 'att_1', mediaType: 'image/png', name: 'one.png', bytes: 13 })
-          .mockRejectedValueOnce(new Error('save failed'))
-          .mockResolvedValueOnce({ attachmentId: 'att_3', mediaType: 'image/png', name: 'three.png', bytes: 25 * 1024 * 1024 })
-        const service = { parseDocument: vi.fn(async () => ({ state: 'completed' as const, source: 'provider' as const, cache_hit: false, result_id: 'mr_figures', files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }], content_status: 'complete' as const, cursor: null, manifest_path: '/cache/m.json', output_limit_chars: 20_000, ordered_images: paths.map((path, index) => ({ path, name: 'figure-' + String(index + 1) + '.png', media_type: 'image/png', bytes: 13, page: index + 1 })) })) } as unknown as MinerUService
-        const { ctx, registeredTools } = createMockContext()
-        ;(ctx.get as any) = vi.fn((name: string) => name === 'attachments' ? { saveImage } : name === 'llm' ? { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text', 'image'] })) } : undefined)
-        registerTools(ctx, () => service)
-        const tool = registeredTools.find(value => value.name === 'read_pdf')!
-        const exec = createMockExec()
-        ;(exec.agent as any).options = { provider: 'test-p', model: 'test-m' }
-        const value = await tool.execute({ file_path: '/paper.pdf', focus: 'image' }, exec) as ResultView
-        expect(value.inlined_images).toHaveLength(1)
-        expect(value.inlined_images![0]?.figure).toBe(1)
-        expect(value.ordered_images?.map(image => image.status)).toEqual(['available', 'failed', 'omitted'])
-        const text = (renderResult(value)[0] as any).text as string
-        expect(text).toContain('Figure 2 (Page 2)')
-        expect(text).toContain('[failed]')
-        expect(text).toContain('[omitted]')
-      } finally {
-        await Promise.all(paths.map(path => rm(path, { force: true })))
-      }
-    })
-
-    it('formats extracted image paths for non-multimodal models when images are requested', async () => {
-      const exec = createMockExec(true)
-      const mockLlmTextOnly = {
-        resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })),
-      }
-      const testImgPath = join(tmpdir(), 'test-textonly-fig.png')
-      await writeFile(testImgPath, Buffer.from('fake-png-data'))
-      try {
-        const mockServiceWithImages = {
-          parseDocument: vi.fn(async () => ({
-            state: 'completed' as const,
-            source: 'cache' as const,
-            cache_hit: true,
-            result_id: 'mr_textonly',
-            files: [{
-              file_id: 'mf_1',
-              name: 'doc.pdf',
-              artifacts: [],
-            }],
-            markdown_content: '# Document with Figures\n> 🖼️ **[Attached Image #1]** Page 1: Diagram',
-            content_status: 'complete' as const, cursor: null,
-            manifest_path: '/cache/m.json',
-            output_limit_chars: 1000,
-            ordered_images: [{
-              path: testImgPath,
-              name: 'test-textonly-fig.png',
-              page: 1,
-              caption: 'Diagram',
-              media_type: 'image/png',
-              bytes: 13,
-            }],
-          })),
-        } as unknown as MinerUService
-        const { ctx, registeredTools } = createMockContext()
-        ;(ctx.get as any) = vi.fn((name: string) => {
-          if (name === 'llm') return mockLlmTextOnly
-          return undefined
-        })
-        registerTools(ctx, () => mockServiceWithImages)
-        const readTool = registeredTools.find(t => t.name === 'read_pdf')!
-
-        const res = await readTool.execute({ file_path: '/paper.pdf', focus: 'image' }, exec) as ResultView
-        expect(res.inlined_images).toBeUndefined()
-        expect(res.ordered_images).toHaveLength(1)
-
-        const rendered = readTool.output.render({ file_path: '/paper.pdf', focus: 'image' }, res)
-        expect(rendered).toHaveLength(1)
-        expect(rendered[0]?.text).not.toContain('**Extracted Images**:')
-        expect(rendered[0]?.text).toContain(`Figure 1 (Page 1, "Diagram"): ${testImgPath}`)
-        expect(rendered[0]?.text).not.toContain('manifest.json')
-      } finally {
-        await rm(testImgPath, { force: true })
-      }
-    })
-
-    it('preserves the summary compaction marker after its warning is compacted away', async () => {
-      const { ctx, registeredTools } = createMockContext()
-      const largeText = 'x'.repeat(300)
-      const service = { parseDocument: vi.fn(async (): Promise<ResultView> => ({
-        state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_summary_marker',
-        files: [{ file_id: 'mf_1', name: 'paper.pdf', artifacts: [] }],
-        markdown_content: 'Bounded evidence.', content_status: 'complete', cursor: null, output_limit_chars: 650,
-        summary: { page_count: 40, image_count: 8, table_count: 4, equation_count: 2 },
-        toc: Array.from({ length: 8 }, (_, index) => ({ level: 1, title: `Heading ${index} ${largeText}` })),
-        provenance: { provider: 'self-hosted-legacy-v2', model: 'pipeline', parse_method: 'auto', upstream_version: null, index_version: 1, reader_version: 1 },
-        diagnostics: Array.from({ length: 4 }, (_, index) => ({ id: `diag-${index}`, code: 'SOURCE_REPAIR', scope: 'chunk' as const, message: largeText })),
-        verification_hints: Array.from({ length: 4 }, (_, index) => ({ reason: 'formula' as const, block_id: `mr_summary_marker:b${index + 1}`, page: index + 1, view: 'page' as const })),
-        warnings: Array.from({ length: 8 }, (_, index) => `warning-${index}-${largeText}`),
-        ordered_images: Array.from({ length: 4 }, (_, index) => ({ path: `/cache/${largeText}-${index}.png`, name: `image-${index}.png`, media_type: 'image/png', bytes: 10, caption: largeText })),
-        visuals: { listed: 4, attached: 0, omitted: 4, scope: 'chunk' },
-      })) } as unknown as MinerUService
-      registerTools(ctx, () => service)
-      const readTool = registeredTools.find(t => t.name === 'read_pdf')!
-
-      const value = await readTool.execute({ file_path: '/paper.pdf' }, createMockExec(true)) as ResultView
-
-      expect(value.summary).toBeUndefined()
-      expect(value.toc).toBeUndefined()
-      expect(value.metadata_shortened).toContain('summary')
-      expect(value.warnings?.some(warning => warning.includes('[SUMMARY_SHORTENED]')) ?? false).toBe(false)
-      expect(fitsReadBudget(value)).toBe(true)
-      expect(validateJsonSchemaValue(readTool.output.schema, value, 'value')).toEqual([])
-      const rendered = readTool.output.render({ file_path: '/paper.pdf' }, value)
-      expect(rendered).toHaveLength(1)
-      expect(rendered[0]?.text.length).toBeLessThanOrEqual(value.output_limit_chars)
-      expect(rendered[0]?.text).not.toContain('[RESULT_TOO_LARGE]')
-    })
-
-    it('projects structured presentation metadata for single result', () => {
-      const { ctx, registeredTools } = createMockContext()
-      registerTools(ctx, () => ({} as MinerUService))
-      const parseTool = registeredTools.find(t => t.name === 'read_pdf')!
-
-      const singleResult: ResultView = {
-        state: 'completed',
-        source: 'cache',
-        cache_hit: true,
-        result_id: 'mr_test_1',
-        files: [{ file_id: 'mf_1', name: 'paper.pdf', artifacts: [{ kind: 'markdown', path: '/p/out.md', bytes: 50 }] }],
-        manifest_path: '/p/manifest.json',
-        content_status: 'complete', cursor: null,
-        output_limit_chars: 2000,
-      }
-      expect(parseTool.output.presentationMeta?.({}, singleResult)).toEqual({
-        result_id: 'mr_test_1',
-        cursor: null,
-        source: 'cache',
-        cache_hit: true,
-        manifest_path: '/p/manifest.json',
-        files: [{ file_id: 'mf_1', name: 'paper.pdf', artifacts: [{ kind: 'markdown', path: '/p/out.md', bytes: 50 }] }],
-      })
-
-      const singleWithToc: ResultView = {
-        state: 'completed',
-        source: 'provider',
-        cache_hit: false,
-        result_id: 'mr_test_toc',
-        files: [{ file_id: 'mf_1', name: 'paper.pdf', artifacts: [] }],
-        manifest_path: '/p/manifest.json',
-        content_status: 'partial', cursor: 'opaque-test-cursor',
-        output_limit_chars: 2000,
-        toc: [
-          { level: 1, title: 'Introduction', line: 1 },
-          { level: 2, title: 'Background', line: 15 },
-        ],
-      }
-      expect(parseTool.output.presentationMeta?.({}, singleWithToc)).toEqual({
-        result_id: 'mr_test_toc',
-        cursor: 'opaque-test-cursor',
-        source: 'provider',
-        cache_hit: false,
-        manifest_path: '/p/manifest.json',
-        files: [{ file_id: 'mf_1', name: 'paper.pdf', artifacts: [] }],
-        toc: [
-          { level: 1, title: 'Introduction', line: 1 },
-          { level: 2, title: 'Background', line: 15 },
-        ],
-      })
-    })
-
-    it('rejects invalid poll timeouts before invoking the service', async () => {
-      const mockService = { parseDocument: vi.fn() } as unknown as MinerUService
-      const { ctx, registeredTools } = createMockContext()
-      registerTools(ctx, () => mockService)
-      const parseTool = registeredTools.find(t => t.name === 'read_pdf')!
-      const exec = createMockExec(true)
-
-      for (const poll_timeout_ms of [-1, 0, 86_400_001, Number.MAX_SAFE_INTEGER, 1.5, NaN]) {
-        await expect(parseTool.execute({ file_path: '/doc.pdf', poll_timeout_ms }, exec))
-          .rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
-      }
-      expect(mockService.parseDocument).not.toHaveBeenCalled()
-    })
-
-    it('rejects invalid non-object arguments', async () => {
-      const mockService = { parseDocument: vi.fn() } as unknown as MinerUService
-      const { ctx, registeredTools } = createMockContext()
-      registerTools(ctx, () => mockService)
-      const parseTool = registeredTools.find(t => t.name === 'read_pdf')!
-      const exec = createMockExec(true)
-
-      for (const invalid of [null, undefined, 'bad', 123, []]) {
-        await expect(parseTool.execute(invalid, exec))
-          .rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
-      }
-    })
-
-    it('requires one source, rejects unknown arguments, and accepts cursor-only continuation', () => {
-      expect(() => parseReadInput({ pages: 1 })).toThrow(/file_path.*required/)
-      expect(() => parseReadInput({ file_path: '/tmp/a.pdf', unexpected: true })).toThrow(/Unsupported parameter/)
-      expect(parseReadInput({ file_path: '/tmp/a.pdf' }).input).toEqual({ file_path: '/tmp/a.pdf', inline_images: true })
-      const cursor = cursorForRemainder('mr_result', undefined, new Set(['all']), 4, { inline_images: false })
-      expect(parseReadInput({ file_path: '/tmp/a.pdf', cursor }).input).toEqual({ file_path: '/tmp/a.pdf', inline_images: false, cursor })
-      expect(parseReadInput({ file_path: '/tmp/a.pdf', cursor, inline_images: true }).input).toEqual({ file_path: '/tmp/a.pdf', inline_images: true, cursor })
-      expect(() => parseReadInput({ file_path: '/tmp/a.pdf', cursor: 'opaque' })).toThrow(/cursor/)
-      for (const cursor of [null, '', '   ']) {
-        expect(() => parseReadInput({ file_path: '/tmp/a.pdf', cursor })).toThrow(/cursor must be a non-empty string/)
-      }
-      for (const selection of [{ pages: 1 }, { focus: 'text' }, { focus: ['text', 'table'] }]) {
-        expect(() => parseReadInput({ file_path: '/tmp/a.pdf', cursor, ...selection })).toThrow(/must be omitted/)
-      }
-    })
-
-    it('renders single completed result with preview truncation and limit clamping', () => {
-      const resultData: ResultView = {
-        state: 'completed',
-        source: 'cache',
-        cache_hit: true,
-        result_id: 'mr_long_preview',
-        files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
-        markdown_content: 'A'.repeat(5000),
-        content_status: 'partial', cursor: 'opaque-test-cursor',
-        manifest_path: '/cache/doc/manifest.json',
-        output_limit_chars: 150,
-      }
-      const rendered = renderResult(resultData)
-      expect(rendered[0]?.text.length).toBeLessThanOrEqual(150)
-      expect(rendered[0]?.text).toContain('[RESULT_TOO_LARGE]')
-      expect(rendered[0]?.text).not.toContain('Content complete')
-    })
-
-    it('makes structured artifact truncation explicit in rendered prose', () => {
-      const rendered = renderResult({
-        state: 'completed',
-        source: 'provider',
-        cache_hit: false,
-        result_id: 'mr_truncated_artifacts',
-        files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [], artifacts_truncated: true }],
-        content_status: 'complete', cursor: null,
-        manifest_path: '/cache/manifest.json',
-        output_limit_chars: 2000,
-      })
-      expect(rendered[0]?.text).toContain('Artifact list truncated to output limit')
-    })
-
-    it('renders truncation footer with markdown artifact path when content_status is partial', () => {
-      const resultData: ResultView = {
-        state: 'completed',
-        source: 'provider',
-        cache_hit: false,
-        result_id: 'mr_trunc',
-        files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [{ kind: 'markdown', path: '/cache/doc/full.md', bytes: 5000 }] }],
-        markdown_content: '# Truncated Content',
-        content_status: 'partial', cursor: 'opaque-test-cursor',
-        manifest_path: '/cache/doc/manifest.json',
-        output_limit_chars: 2000,
-      }
-      const rendered = renderResult(resultData)
-      expect(rendered[0]?.text).toContain('Status: Content partial (truncated to output limit)')
-      expect(rendered[0]?.text).not.toContain('read_offset_line')
-      expect(rendered[0]?.text).not.toContain('Manifest:')
-    })
-
-    it('renders secondary artifacts compactly when present', () => {
-      const resultData: ResultView = {
-        state: 'completed',
-        source: 'provider',
-        cache_hit: false,
-        result_id: 'mr_secondary',
-        files: [{
-          file_id: 'mf_1',
-          name: 'doc.pdf',
-          artifacts: [
-            { kind: 'markdown', path: '/cache/doc/full.md', bytes: 500 },
-            { kind: 'layout', path: '/cache/doc/layout.json', bytes: 200 },
-            { kind: 'images', path: '/cache/doc/images', bytes: 800 },
-          ],
-        }],
-        markdown_content: '# Document with Secondary Artifacts',
-        content_status: 'complete', cursor: null,
-        manifest_path: '/cache/doc/manifest.json',
-        output_limit_chars: 2000,
-      }
-      const rendered = renderResult(resultData)
-      expect(rendered[0]?.text).toContain('Artifacts: layout (200 bytes): /cache/doc/layout.json, images (800 bytes): /cache/doc/images')
-      expect(rendered[0]?.text).toContain('Status: Content complete. Selected parsed text complete across this and preceding chunks; not a guarantee of OCR fidelity or visual coverage.')
-      expect(rendered[0]?.text).not.toContain('/cache/doc/manifest.json')
-    })
-    it('renders clean message when markdown was not requested and does NOT claim complete delivery', () => {
-      const resultData: ResultView = {
-        state: 'completed',
-        source: 'provider',
-        cache_hit: false,
-        result_id: 'mr_no_md',
-        files: [{
-          file_id: 'mf_1',
-          name: 'scan.pdf',
-          artifacts: [
-            { kind: 'layout', path: '/cache/scan/layout.json', bytes: 300 },
-            { kind: 'images', path: '/cache/scan/images', bytes: 1200 },
-          ],
-        }],
-        content_status: 'not_requested', cursor: null,
-        manifest_path: '/cache/scan/manifest.json',
-        output_limit_chars: 2000,
-      }
-      const rendered = renderResult(resultData)
-      expect(rendered[0]?.text).not.toContain('Content complete')
-      expect(rendered[0]?.text).not.toContain('Complete document content delivered')
-      expect(rendered[0]?.text).toContain('Status: Markdown content was not requested')
-      expect(rendered[0]?.text).not.toContain('Manifest:')
-      expect(rendered[0]?.text).toContain('Artifacts: layout (300 bytes): /cache/scan/layout.json, images (1200 bytes): /cache/scan/images')
-    })
-
-    it('renders unchanged continuation token when content is partial', () => {
-      const resultData: ResultView = {
-        state: 'completed',
-        source: 'provider',
-        cache_hit: false,
-        result_id: 'mr_resume',
-        files: [{
-          file_id: 'mf_1',
-          name: 'doc.pdf',
-          artifacts: [{ kind: 'markdown', path: '/cache/doc/full.md', bytes: 8000 }],
-        }],
-        markdown_content: '# First Part of Text\nLine 2',
-        content_status: 'partial', cursor: 'opaque-test-cursor',
-        markdown_path: '/cache/doc/full.md',
-        manifest_path: '/cache/doc/manifest.json',
-        output_limit_chars: 2000,
-      }
-      const rendered = renderResult(resultData)
-      expect(rendered[0]?.text).toContain('Status: Content partial (truncated to output limit)')
-      expect(rendered[0]?.text).toContain('cursor: "opaque-test-cursor"')
-      expect(rendered[0]?.text).toContain('omit pages/focus.')
-      expect(rendered[0]?.text).not.toContain('Manifest:')
-    })
-
-    it('renders extracted image file paths for non-multimodal model when images are present', () => {
-      const resultData: ResultView = {
-        state: 'completed',
-        source: 'provider',
-        cache_hit: false,
-        result_id: 'mr_img_paths',
-        files: [{
-          file_id: 'mf_1',
-          name: 'doc.pdf',
-          artifacts: [{ kind: 'markdown', path: '/cache/doc/full.md', bytes: 500 }],
-        }],
-        markdown_content: '# Document with Figures\n> 🖼️ **[Attached Image #1]** Page 2: Chart',
-        content_status: 'complete', cursor: null,
-        manifest_path: '/cache/doc/manifest.json',
-        output_limit_chars: 2000,
-        ordered_images: [
-          { path: '/cache/doc/images/fig1.png', name: 'fig1.png', page: 2, caption: 'Chart', media_type: 'image/png', bytes: 1200 },
-          { path: '/cache/doc/images/fig2.png', name: 'fig2.png', page: 3, media_type: 'image/png', bytes: 3400 },
-        ],
-      }
-      const rendered = renderResult(resultData)
-      expect(rendered).toHaveLength(1)
-      expect(rendered[0]?.text).not.toContain('**Extracted Images**:')
-      expect(rendered[0]?.text).toContain('Figure 1 (Page 2, "Chart"): /cache/doc/images/fig1.png')
-      expect(rendered[0]?.text).toContain('Figure 2 (Page 3): /cache/doc/images/fig2.png')
-    })
-
-
-    it('renders inlined image ContentBlocks alongside text block', () => {
-      const resultData: ResultView = {
-        state: 'completed',
-        source: 'provider',
-        cache_hit: false,
-        result_id: 'mr_with_img',
-        files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
-        markdown_content: '# Visual Doc',
-        content_status: 'complete', cursor: null,
-        manifest_path: '/cache/doc/manifest.json',
-        output_limit_chars: 2000,
-        inlined_images: [
-          {
-            attachment_id: 'att_123',
-            name: 'figure1.png',
-            media_type: 'image/png',
-            width: 800,
-            height: 600,
-            bytes: 12345,
-            attachmentRef: {
-              attachmentId: 'att_123' as any,
-              mediaType: 'image/png',
-              bytes: 12345,
-              width: 800,
-              height: 600,
-              name: 'figure1.png',
-            },
-          },
-        ],
-      }
-      const rendered = renderResult(resultData)
-      expect(rendered).toHaveLength(2)
-      expect(rendered[0]).toMatchObject({ type: 'text' })
-      expect((rendered[0] as any).text).toContain('Inlined Visual Figures')
-      expect((rendered[0] as any).text).toContain('Figure 1: figure1.png (800x600)')
-      expect(rendered[1]).toEqual({
-        type: 'image',
-        attachment: resultData.inlined_images![0]!.attachmentRef,
-      })
-    })
-
-    it('reconstructs ImageAttachmentRef from InlinedImageView when attachmentRef property is omitted', () => {
-      const resultData: ResultView = {
-        state: 'completed',
-        source: 'provider',
-        cache_hit: false,
-        result_id: 'mr_with_img_no_ref',
-        files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
-        markdown_content: '# Visual Doc',
-        content_status: 'complete', cursor: null,
-        manifest_path: '/cache/doc/manifest.json',
-        output_limit_chars: 2000,
-        inlined_images: [
-          {
-            attachment_id: 'att_reconstructed',
-            name: 'figure2.jpg',
-            media_type: 'image/jpeg',
-            width: 640,
-            height: 480,
-            bytes: 65432,
-          },
-        ],
-      }
-      const rendered = renderResult(resultData)
-      expect(rendered).toHaveLength(2)
-      expect(rendered[1]).toEqual({
-        type: 'image',
-        attachment: {
-          attachmentId: 'att_reconstructed',
-          mediaType: 'image/jpeg',
-          bytes: 65432,
-          width: 640,
-          height: 480,
-          name: 'figure2.jpg',
-        },
-      })
-    })
-
-    it('validates tool output with inlined_images against read_pdf schema without violations', () => {
-      const { ctx, registeredTools } = createMockContext()
-      registerTools(ctx, () => ({} as MinerUService))
-      const readTool = registeredTools.find(t => t.name === 'read_pdf')!
-
-      const validResult: ResultView = {
-        state: 'completed',
-        source: 'provider',
-        cache_hit: false,
-        result_id: 'mr_schema_test',
-        files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
-        markdown_content: '# Test',
-        content_status: 'complete', cursor: null,
-        manifest_path: '/cache/doc/manifest.json',
-        output_limit_chars: 2000,
-        inlined_images: [
-          {
-            attachment_id: 'att_123',
-            name: 'fig.png',
-            media_type: 'image/png',
-            width: 100,
-            height: 100,
-            bytes: 500,
-          },
-        ],
-      }
-      const violations = validateJsonSchemaValue(readTool.output.schema, validResult, 'value')
-      expect(violations).toEqual([])
-
-      const invalidResultWithAttachmentRef = {
-        ...validResult,
-        inlined_images: [
-          {
-            ...validResult.inlined_images![0],
-            attachmentRef: { some: 'ref' },
-          },
-        ],
-      }
-      const invalidViolations = validateJsonSchemaValue(readTool.output.schema, invalidResultWithAttachmentRef, 'value')
-      expect(invalidViolations).toContain('"value.inlined_images[0].attachmentRef" is not a declared property (additionalProperties: false)')
-    })
-
-    it('rejects an empty nested result file object', () => {
-      const { ctx, registeredTools } = createMockContext()
-      registerTools(ctx, () => ({} as MinerUService))
-      const readTool = registeredTools.find(t => t.name === 'read_pdf')!
-      const fileSchema = (readTool.output.schema as any).properties.files.items
-      expect(fileSchema.properties.file_id.required).toBe(true)
-      expect(fileSchema.properties.name.required).toBe(true)
-      expect(fileSchema.properties.artifacts.required).toBe(true)
-    })
-
-    it('renders document outline and guidance hint in prose when content_status is partial and toc has entries', () => {
-      const resultData: ResultView = {
-        state: 'completed',
-        source: 'provider',
-        cache_hit: false,
-        result_id: 'mr_toc',
-        files: [{
-          file_id: 'mf_1',
-          name: 'paper.pdf',
-          artifacts: [{ kind: 'markdown', path: '/cache/paper/full.md', bytes: 15000 }],
-        }],
-        markdown_content: '# Introduction\nThis is the beginning...',
-        content_status: 'partial', cursor: 'opaque-test-cursor',
-        markdown_path: '/cache/paper/full.md',
-        manifest_path: '/cache/paper/manifest.json',
-        output_limit_chars: 2000,
-        toc: [
-          { level: 1, title: 'Introduction', line: 1 },
-          { level: 2, title: 'Prior Work', line: 15 },
-          { level: 2, title: 'Methodology', line: 45 },
-          { level: 3, title: 'Dataset Collection', line: 70 },
-          { level: 1, title: 'Experiments', line: 120 },
-        ],
-      }
-      const rendered = renderResult(resultData)
-      const text = rendered[0]?.text ?? ''
-      expect(text).toContain('Document Outline:')
-      expect(text).toContain('- Introduction (line 1)')
-      expect(text).toContain('  - Prior Work (line 15)')
-      expect(text).toContain('  - Methodology (line 45)')
-      expect(text).toContain('    - Dataset Collection (line 70)')
-      expect(text).toContain('- Experiments (line 120)')
-      expect(text).not.toContain('starting from the given line offset')
-      expect(text).toContain('Status: Content partial (truncated to output limit)')
-    })
-
-    it('does not render document outline when content_status is partial but toc is empty', () => {
-      const resultData: ResultView = {
-        state: 'completed',
-        source: 'provider',
-        cache_hit: false,
-        result_id: 'mr_no_toc',
-        files: [{
-          file_id: 'mf_1',
-          name: 'doc.pdf',
-          artifacts: [{ kind: 'markdown', path: '/cache/doc/full.md', bytes: 5000 }],
-        }],
-        markdown_content: 'Some plain text...',
-        content_status: 'partial', cursor: 'opaque-test-cursor',
-        markdown_path: '/cache/doc/full.md',
-        manifest_path: '/cache/doc/manifest.json',
-        output_limit_chars: 2000,
-        toc: [],
-      }
-      const rendered = renderResult(resultData)
-      const text = rendered[0]?.text ?? ''
-      expect(text).not.toContain('Document Outline')
-      expect(text).not.toContain('Note: To read specific sections')
-      expect(text).toContain('Status: Content partial (truncated to output limit)')
-    })
-
-    it('does not render document outline when content_status is complete even if toc is present', () => {
-      const resultData: ResultView = {
-        state: 'completed',
-        source: 'provider',
-        cache_hit: false,
-        result_id: 'mr_complete_toc',
-        files: [{
-          file_id: 'mf_1',
-          name: 'doc.pdf',
-          artifacts: [{ kind: 'markdown', path: '/cache/doc/full.md', bytes: 500 }],
-        }],
-        markdown_content: '# Heading 1\nContent',
-        content_status: 'complete', cursor: null,
-        manifest_path: '/cache/doc/manifest.json',
-        output_limit_chars: 2000,
-        toc: [{ level: 1, title: 'Heading 1', line: 1 }],
-      }
-      const rendered = renderResult(resultData)
-      const text = rendered[0]?.text ?? ''
-      expect(text).not.toContain('Document Outline')
-      expect(text).toContain('Status: Content complete. Selected parsed text complete across this and preceding chunks; not a guarantee of OCR fidelity or visual coverage.')
-    })
-
-    it('omits unknown heading coordinates from both Native presenters', () => {
-      const toc = [{ level: 1, title: 'Title without a location' }]
-      const view: ResultView = {
-        state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_test',
-        files: [{ file_id: 'mf_test', name: 'document.pdf', artifacts: [] }],
-        content_status: 'partial', markdown_content: 'First chunk',
-        cursor: cursorForRemainder('mr_test', undefined, new Set(['all']), 11),
-        manifest_path: '/cache/m.json', output_limit_chars: 2048,
-        summary: { toc }, toc,
-      }
-      for (const render of [formatResultProse, formatSingleSummaryProse]) {
-        expect(render(view)).toContain('Title without a location')
-        expect(render(view)).not.toMatch(/line undefined|line 0/)
-      }
-    })
-
-    it.each(['complete', 'not_requested'] as const)('does not advertise continuation for %s output with a null cursor', content_status => {
-      const view: ResultView = {
-        state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_test',
-        files: [{ file_id: 'mf_test', name: 'document.pdf', artifacts: [] }],
-        content_status, cursor: null,
-        ...(content_status === 'complete' ? { markdown_content: 'Full selected text' } : {}),
-        manifest_path: '/cache/m.json', output_limit_chars: 2048,
-      }
-      const prose = formatResultProse(view)
-      expect(prose).not.toContain('Continue with')
-      expect(prose).not.toContain('cursor:')
-    })
+  it('reports failed and omitted figures while preserving stable ordinals', async () => {
+    const paths = await pngFiles(3)
+    const h = await toolHarness({ imageModel: true, reader: { readContent: withImages(paths.map((path, index) => imageCandidate({ path, page: index + 1 }))) } })
+    const ref = (bytes: number) => ({ attachmentId: AttachmentId('sha256:' + 'd'.repeat(64)), mediaType: 'image/png' as const, bytes, width: 1, height: 1 })
+    h.saveImage.mockResolvedValueOnce(ref(13)).mockRejectedValueOnce(new Error('save failed')).mockResolvedValueOnce(ref(25 * 1024 * 1024))
+    const value = await h.read({ file_path: 'paper.pdf', focus: 'image' })
+    expect(value.inlined_images?.map(image => image.figure)).toEqual([1])
+    expect(value.ordered_images?.map(image => image.status)).toEqual(['available', 'failed', 'omitted'])
   })
 
-  describe('lossless JSON compliance', () => {
-    it.each([
-      ['complete', null],
-      ['not_requested', null],
-      ['partial', 'opaque-token'],
-    ] as const)('keeps model-projected cursor and metadata lossless for %s', async (content_status, cursor) => {
-      const { ctx, registeredTools } = createMockContext()
-      const value: ResultView = {
-        state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_projection',
-        files: [], content_status, cursor, manifest_path: '/cache/manifest.json', output_limit_chars: 2000,
-      }
-      const dispose = registerTools(ctx, () => ({ parseDocument: vi.fn(async () => value) }) as unknown as MinerUService)
-      try {
-        const tool = registeredTools.find(t => t.name === 'read_pdf')!
-        const result = await tool.execute({ file_path: '/doc.pdf' }, createMockExec(true)) as ResultView
-        // Reproduce the model's projection, deliberately without a ?? null workaround.
-        const projected = { contentStatus: result.content_status, cursor: result.cursor }
-        expect(projected).toEqual({ contentStatus: content_status, cursor })
-        expect(isJsonValue(projected)).toBe(true)
-        expect(snapshotJsonValue(projected)).toEqual(projected)
-        const meta = tool.output.presentationMeta?.({}, result)
-        expect(meta).toHaveProperty('cursor', cursor)
-        expect(isJsonValue(meta)).toBe(true)
-        const rendered = renderResult(result)[0]?.text ?? ''
-        if (cursor === null) {
-          expect(rendered).not.toContain('Continue with')
-          expect(rendered).not.toContain('cursor: "null"')
-        } else {
-          expect(rendered).toContain('cursor: "opaque-token"')
-        }
-      } finally { await dispose() }
+  it('propagates cancellation observed after the last image is saved', async () => {
+    const [path] = await pngFiles(1)
+    const controller = new AbortController()
+    const h = await toolHarness({ imageModel: true, reader: { readContent: withImages([imageCandidate({ path: path! })]) } })
+    h.saveImage.mockImplementation(async image => {
+      controller.abort(new Error('cancelled after save'))
+      return { attachmentId: AttachmentId('sha256:' + 'e'.repeat(64)), mediaType: image.mediaType, bytes: 13, width: 1, height: 1 }
     })
+    await expect(h.read({ file_path: 'paper.pdf', focus: 'image' }, h.exec({ signal: controller.signal }))).rejects.toThrow('cancelled after save')
+  })
 
-    it('returns strictly lossless JSON when optional fields (pages, etc.) are omitted', async () => {
-      const { ctx, registeredTools } = createMockContext()
-      const mockResult: ResultView = {
-        state: 'completed',
-        source: 'cache',
-        cache_hit: true,
-        result_id: 'mr_lossless_test',
-        files: [{ file_id: 'mf_1', name: 'doc.pdf', artifacts: [] }],
-        markdown_content: 'sample content',
-        content_status: 'complete', cursor: null,
-        manifest_path: '/cache/doc/manifest.json',
-        output_limit_chars: 2000,
-        summary: {
-          table_count: 0,
-          image_count: 0,
-          equation_count: 0,
-        },
-      }
-      registerTools(ctx, () => ({
-        parseDocument: vi.fn(async () => mockResult),
-      } as unknown as MinerUService))
-      const readTool = registeredTools.find(t => t.name === 'read_pdf')!
-      const exec = createMockExec(true)
-      const res = await readTool.execute({ file_path: '/doc.pdf' }, exec)
+  it('keeps candidates as listed paths for text-only routes', async () => {
+    const [path] = await pngFiles(1)
+    const h = await toolHarness({ imageModel: false, reader: { readContent: withImages([imageCandidate({ path: path!, page: 1 })]) } })
+    const value = await h.read({ file_path: 'paper.pdf', focus: 'image' })
+    expect(value.inlined_images).toBeUndefined()
+    expect(value.visuals).toMatchObject({ listed: 1, attached: 0 })
+    const rendered = renderResult(value)
+    expect(rendered).toHaveLength(1)
+    expect(rendered[0]).toMatchObject({ type: 'text', text: expect.stringContaining(path!) })
+  })
+})
 
-      expect(isJsonValue(res)).toBe(true)
-      expect(snapshotJsonValue(res)).toBeDefined()
-      expect('pages' in (res as Record<string, unknown>)).toBe(false)
+describe('read_pdf response budget', () => {
+  it('shortens metadata to fit the budget and records metadata_shortened', async () => {
+    const large = 'x'.repeat(300)
+    const many = <T>(count: number, item: (index: number) => T): T[] => Array.from({ length: count }, (_, index) => item(index))
+    const h = await toolHarness({ reader: { readContent: projectedReader(() => resultView({
+      markdown_content: 'Bounded evidence.', output_limit_chars: 650,
+      summary: { page_count: 40, image_count: 8, table_count: 4, equation_count: 2 },
+      toc: many(8, index => ({ level: 1, title: 'Heading ' + String(index) + ' ' + large })),
+      provenance: { provider: 'self-hosted-legacy-v2', model: 'pipeline', parse_method: 'auto', upstream_version: null, index_version: 1, reader_version: 1 },
+      diagnostics: many(4, index => ({ id: 'diag-' + String(index), code: 'SOURCE_REPAIR', scope: 'chunk' as const, message: large })),
+      verification_hints: many(4, index => ({ reason: 'formula' as const, block_id: 'mr_fixture:b' + String(index + 1), view: 'page' as const })),
+      warnings: many(8, index => 'warning-' + String(index) + '-' + large),
+      ordered_images: many(4, index => imageCandidate({ path: '/cache/' + large + String(index) + '.png', caption: large })),
+    })) } })
+    const value = await h.read({ file_path: 'paper.pdf' })
+    expect(value.metadata_shortened).toContain('summary')
+    expect(value.summary).toBeUndefined()
+    expect(fitsReadBudget(value)).toBe(true)
+    expect(validateJsonSchemaValue(h.tool('read_pdf').output.schema, value, 'value')).toEqual([])
+    const [text] = renderResult(value)
+    expect(text).toMatchObject({ type: 'text' })
+    expect(text?.type === 'text' && text.text.length).toBeLessThanOrEqual(value.output_limit_chars)
+    expect(JSON.stringify(text)).not.toContain('[RESULT_TOO_LARGE]')
+  })
+})
+
+describe('read_pdf presentation metadata', () => {
+  it('is pure, deterministic, lossless JSON of counts and ids below 2 KiB for a maximal value', async () => {
+    const h = await toolHarness()
+    const meta = h.tool('read_pdf').output.presentationMeta!
+    const value = deepFreeze(jsonValue(maximalResultView()))
+    const first = meta({}, value)
+    expect(meta({}, value)).toEqual(first)
+    expect(isJsonValue(first)).toBe(true)
+    expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThanOrEqual(2048)
+    expect(first).toMatchObject({
+      result_id: 'mr_maximal', file_ids: ['mf_maximal'], content_status: 'partial', has_more: true, renderer: 'pdfjs',
+      counts: { files: 1, artifacts: 100, images: 100, attachments: 100, headings: 100, diagnostics: 100, warnings: 100 },
     })
+    expect(JSON.stringify(first)).not.toContain('Evidence')
+    expect(JSON.stringify(first)).not.toContain('opaque-cursor')
+    expect(JSON.stringify(first)).not.toContain('/cache/')
+  })
+
+  it.each([['complete', null], ['not_requested', null], ['partial', 'opaque-token']] as const)(
+    'reports has_more only for a non-null cursor (%s)', async (content_status, cursor) => {
+      const h = await toolHarness({ reader: { readContent: projectedReader(() => resultView({ files: [resultFile()], content_status, cursor })) } })
+      const value = await h.read({ file_path: 'paper.pdf' })
+      expect(value.cursor).toBe(cursor)
+      expect(h.tool('read_pdf').output.presentationMeta!({}, jsonValue(value))).toMatchObject({ has_more: cursor !== null })
+    })
+})
+
+describe('async_parse_pdf submission', () => {
+  it('snapshots config at submission and summarizes the resolved path in the job', async () => {
+    let maxInlineChars = 1000
+    const summarize = vi.fn(async () => ({ ...resultView({ content_status: 'not_requested' }) }))
+    const h = await toolHarness({ config: () => withOutput({ maxInlineChars }), reader: { summarize } })
+    const id = await h.submit({ file_path: 'paper.pdf' })
+    maxInlineChars = 5000
+    await h.ctx.jobs.wait(id, 1000, h.session.id)
+    expect(summarize).toHaveBeenCalledWith('/workspace/paper.pdf', expect.objectContaining({ output: expect.objectContaining({ maxInlineChars: 1000 }) }), expect.any(AbortSignal), expect.any(Function))
+    expect(defaultMinerUConfig().output.maxInlineChars).not.toBe(1000)
   })
 })

@@ -1,455 +1,226 @@
 import { describe, it, expect, vi } from 'vitest'
-import { MinerUError, failure } from '../src/domain/errors.js'
+import { MinerUError, failure, type MinerUErrorCode } from '../src/domain/errors.js'
 import {
   calculateBackoffDelay,
-  DEFAULT_RETRY_POLICY,
   defaultSleep,
   executeWithRetry,
   isRetryableError,
   isRetryableHttpStatus,
-  mergeRetryOptions,
   parseRetryAfter,
   readBoundedResponseText,
   resolveRetryPolicy,
   type ProviderRetryEvent,
+  type ProviderRetryOptions,
   type ProviderRetryPolicy,
-} from '../src/providers/retry.js'
+} from '../src/providers/http/retry.js'
 
-describe('Retry Utility (src/providers/retry.ts)', () => {
-  describe('shared provider helpers', () => {
-    it('merges per-call retry options over provider defaults', () => {
-      const sleep = vi.fn()
-      expect(mergeRetryOptions(
-        { maxRetries: 2, initialDelayMs: 500, jitter: true },
-        { maxRetries: 0, sleep },
-      )).toEqual({ maxRetries: 0, initialDelayMs: 500, jitter: true, sleep })
-    })
+/** A typed provider error carrying the HTTP metadata the http client attaches. */
+function httpError(code: MinerUErrorCode, retryable: boolean, http?: MinerUError['http']): MinerUError {
+  return new MinerUError(failure(code, code, retryable), { http })
+}
 
-    it('reads response bodies within the limit and cancels oversized bodies', async () => {
-      const signal = new AbortController().signal
-      await expect(readBoundedResponseText(new Response('hello'), 5, signal)).resolves.toBe('hello')
-      await expect(readBoundedResponseText(new Response('too large'), 3, signal))
-        .rejects.toMatchObject({ failure: expect.objectContaining({ code: 'RESULT_TOO_LARGE' }) })
-    })
+const transient = (): MinerUError => httpError('PROVIDER_UNAVAILABLE', true)
+
+describe('MinerUError HTTP metadata', () => {
+  it('preserves ErrorOptions and keeps HTTP metadata separate from the failure', () => {
+    const cause = new Error('upstream failed')
+    const details = failure('PROVIDER_UNAVAILABLE', 'Unavailable', true)
+    const http = { status: 503, retryAfterMs: 2000 }
+    const error = new MinerUError(details, { cause, http })
+    expect(error.cause).toBe(cause)
+    expect(error.http).toEqual(http)
+    expect(error.failure).toBe(details)
+    expect(new MinerUError(details).http).toBeUndefined()
+  })
+})
+
+/** Records attempts, sleeps and sanitized retry events of one executeWithRetry run. */
+function run<T>(fn: (attempt: number) => Promise<T>, options: ProviderRetryOptions = {}, signal = new AbortController().signal) {
+  const events: ProviderRetryEvent[] = []
+  const slept: number[] = []
+  let attempts = 0
+  const result = executeWithRetry({
+    provider: 'official-v4', operation: 'inspect', signal,
+    retryOptions: {
+      maxRetries: 2, initialDelayMs: 100, jitter: false,
+      sleep: async ms => { slept.push(ms) },
+      onRetry: event => { events.push(event) },
+      ...options,
+    },
+    fn: async attempt => { attempts++; return await fn(attempt) },
+  })
+  return { result, events, slept, attempts: () => attempts }
+}
+
+describe('readBoundedResponseText', () => {
+  it('reads bodies within the limit and rejects oversized bodies as RESULT_TOO_LARGE', async () => {
+    const signal = new AbortController().signal
+    await expect(readBoundedResponseText(new Response('hello'), 5, signal)).resolves.toBe('hello')
+    await expect(readBoundedResponseText(new Response('too large'), 3, signal))
+      .rejects.toMatchObject({ failure: { code: 'RESULT_TOO_LARGE' } })
+  })
+})
+
+describe('parseRetryAfter', () => {
+  const now = Date.parse('Wed, 21 Oct 2025 07:28:00 GMT')
+  it.each([
+    [undefined, undefined], [null, undefined], ['', undefined], ['   ', undefined],
+    ['0', 0], ['5', 5000], ['  30  ', 30_000],
+    ['-5', undefined], ['12.34', undefined], ['abc', undefined], ['999999999999999999999999999', undefined],
+    ['Wed, 21 Oct 2025 07:29:00 GMT', 60_000],
+    ['Wed, 21 Oct 2025 07:27:00 GMT', 0],
+  ] as const)('parses %j as %j ms', (header, expected) => {
+    expect(parseRetryAfter(header, now)).toBe(expected)
+  })
+})
+
+describe('retry classification', () => {
+  it.each([
+    [408, true], [429, true], [500, true], [503, true], [599, true],
+    [200, false], [204, false], [302, false], [400, false], [401, false], [404, false], [413, false], [422, false],
+  ])('treats HTTP %i as retryable=%s', (status, expected) => {
+    expect(isRetryableHttpStatus(status)).toBe(expected)
   })
 
-  describe('parseRetryAfter', () => {
-    it('returns undefined for undefined, null, empty or whitespace strings', () => {
-      expect(parseRetryAfter(undefined)).toBeUndefined()
-      expect(parseRetryAfter(null)).toBeUndefined()
-      expect(parseRetryAfter('')).toBeUndefined()
-      expect(parseRetryAfter('   ')).toBeUndefined()
-    })
+  const aborted = new AbortController()
+  aborted.abort()
+  it.each([
+    ['a retryable MinerUError', transient(), undefined, true],
+    ['a non-retryable MinerUError', httpError('AUTHENTICATION_FAILED', false), undefined, false],
+    ['CANCELLED even when flagged retryable', httpError('CANCELLED', true), undefined, false],
+    ['a DOMException AbortError', new DOMException('Aborted', 'AbortError'), undefined, false],
+    ['an untyped error (fails closed)', Object.assign(new Error('disk full'), { code: 'ENOSPC' }), undefined, false],
+    ['any error once the caller aborted', transient(), aborted.signal, false],
+  ] as const)('classifies %s', (_label, error, signal, expected) => {
+    expect(isRetryableError(error, signal)).toBe(expected)
+  })
+})
 
-    it('parses decimal integer seconds correctly', () => {
-      expect(parseRetryAfter('0')).toBe(0)
-      expect(parseRetryAfter('5')).toBe(5000)
-      expect(parseRetryAfter('120')).toBe(120000)
-      expect(parseRetryAfter('  30  ')).toBe(30000)
-    })
+describe('backoff policy', () => {
+  const policy: Required<ProviderRetryPolicy> = { maxRetries: 3, initialDelayMs: 500, maxDelayMs: 1500, backoffFactor: 2, jitter: false }
 
-    it('returns undefined for invalid integer formats or negative numbers', () => {
-      expect(parseRetryAfter('-5')).toBeUndefined()
-      expect(parseRetryAfter('12.34')).toBeUndefined()
-      expect(parseRetryAfter('abc')).toBeUndefined()
-      expect(parseRetryAfter('999999999999999999999999999')).toBeUndefined()
-    })
-
-    it('parses valid HTTP-date strings correctly against a reference timestamp', () => {
-      const baseTime = Date.parse('Wed, 21 Oct 2025 07:28:00 GMT')
-      const targetTime = Date.parse('Wed, 21 Oct 2025 07:29:00 GMT') // 60s later
-      const dateStr = new Date(targetTime).toUTCString()
-
-      expect(parseRetryAfter(dateStr, baseTime)).toBe(60000)
-    })
-
-    it('clamps past HTTP-date strings to 0ms', () => {
-      const baseTime = Date.parse('Wed, 21 Oct 2025 07:28:00 GMT')
-      const pastTime = Date.parse('Wed, 21 Oct 2025 07:27:00 GMT') // 60s before
-      const dateStr = new Date(pastTime).toUTCString()
-
-      expect(parseRetryAfter(dateStr, baseTime)).toBe(0)
-    })
+  it.each([[1, 500], [2, 1000], [3, 1500], [4, 1500]])('backs off exponentially, clamped (attempt %i → %i ms)', (attempt, delay) => {
+    expect(calculateBackoffDelay(attempt, policy)).toBe(delay)
   })
 
-  describe('isRetryableHttpStatus', () => {
-    it('identifies 408, 429, and 5xx as retryable', () => {
-      expect(isRetryableHttpStatus(408)).toBe(true)
-      expect(isRetryableHttpStatus(429)).toBe(true)
-      expect(isRetryableHttpStatus(500)).toBe(true)
-      expect(isRetryableHttpStatus(502)).toBe(true)
-      expect(isRetryableHttpStatus(503)).toBe(true)
-      expect(isRetryableHttpStatus(504)).toBe(true)
-      expect(isRetryableHttpStatus(599)).toBe(true)
-    })
-
-    it('identifies 2xx, 3xx, and client 4xx (except 408/429) as non-retryable', () => {
-      expect(isRetryableHttpStatus(200)).toBe(false)
-      expect(isRetryableHttpStatus(201)).toBe(false)
-      expect(isRetryableHttpStatus(204)).toBe(false)
-      expect(isRetryableHttpStatus(301)).toBe(false)
-      expect(isRetryableHttpStatus(302)).toBe(false)
-      expect(isRetryableHttpStatus(400)).toBe(false)
-      expect(isRetryableHttpStatus(401)).toBe(false)
-      expect(isRetryableHttpStatus(403)).toBe(false)
-      expect(isRetryableHttpStatus(404)).toBe(false)
-      expect(isRetryableHttpStatus(413)).toBe(false)
-      expect(isRetryableHttpStatus(422)).toBe(false)
-    })
+  it('prefers Retry-After, clamped to maxDelayMs', () => {
+    expect(calculateBackoffDelay(1, policy, 1200)).toBe(1200)
+    expect(calculateBackoffDelay(1, policy, 50_000)).toBe(1500)
   })
 
-  describe('isRetryableError', () => {
-    it('returns false when signal is already aborted', () => {
-      const controller = new AbortController()
-      controller.abort()
-      expect(isRetryableError(new Error('Network drop'), controller.signal)).toBe(false)
-    })
-
-    it('returns false for AbortError', () => {
-      expect(isRetryableError(new DOMException('Aborted', 'AbortError'))).toBe(false)
-      const err = new Error('The operation was aborted')
-      err.name = 'AbortError'
-      expect(isRetryableError(err)).toBe(false)
-    })
-
-    it('honors MinerUError retryable flag', () => {
-      const retryableErr = new MinerUError(failure('PROVIDER_UNAVAILABLE', 'Server down', true))
-      expect(isRetryableError(retryableErr)).toBe(true)
-
-      const nonRetryableErr = new MinerUError(failure('AUTHENTICATION_FAILED', 'Bad key', false))
-      expect(isRetryableError(nonRetryableErr)).toBe(false)
-
-      const cancelledErr = new MinerUError(failure('CANCELLED', 'Cancelled', true))
-      expect(isRetryableError(cancelledErr)).toBe(false)
-    })
-
-    it('fails closed for untyped errors so local failures are not retried', () => {
-      expect(isRetryableError(new TypeError('fetch failed'))).toBe(false)
-      expect(isRetryableError(Object.assign(new Error('disk full'), { code: 'ENOSPC' }))).toBe(false)
-    })
+  it.each([[0, 250], [0.5, 375], [1, 500]])('keeps jitter within [delay/2, delay] (random %d → %i ms)', (random, delay) => {
+    expect(calculateBackoffDelay(1, { ...policy, jitter: true }, undefined, () => random)).toBe(delay)
   })
 
-  describe('calculateBackoffDelay', () => {
-    const testPolicy: Required<ProviderRetryPolicy> = {
+  it('defaults to three total attempts and rejects unsafe bounds', () => {
+    expect(resolveRetryPolicy()).toMatchObject({ maxRetries: 2, initialDelayMs: 500, maxDelayMs: 10_000 })
+    expect(() => resolveRetryPolicy({ maxRetries: 10 })).toThrow(TypeError)
+    expect(() => resolveRetryPolicy({ initialDelayMs: 2000, maxDelayMs: 1000 })).toThrow(TypeError)
+    expect(() => resolveRetryPolicy({ backoffFactor: Number.POSITIVE_INFINITY })).toThrow(TypeError)
+  })
+})
+
+describe('defaultSleep', () => {
+  it('resolves immediately for non-positive delays', async () => {
+    const signal = new AbortController().signal
+    await expect(defaultSleep(0, signal)).resolves.toBeUndefined()
+    await expect(defaultSleep(-100, signal)).resolves.toBeUndefined()
+  })
+
+  it('rejects with the abort reason before or during the delay', async () => {
+    const before = new AbortController()
+    const reason = new DOMException('stopped', 'AbortError')
+    before.abort(reason)
+    await expect(defaultSleep(60_000, before.signal)).rejects.toBe(reason)
+
+    const during = new AbortController()
+    const sleeping = defaultSleep(60_000, during.signal)
+    during.abort(reason)
+    await expect(sleeping).rejects.toBe(reason)
+  })
+})
+
+describe('executeWithRetry', () => {
+  it('returns the first success without sleeping or emitting events', async () => {
+    const execution = run(async attempt => `ok-${String(attempt)}`)
+    await expect(execution.result).resolves.toBe('ok-1')
+    expect(execution.slept).toEqual([])
+    expect(execution.events).toEqual([])
+  })
+
+  it('retries transient failures with backoff and emits only typed diagnostic fields', async () => {
+    const execution = run(async attempt => {
+      if (attempt === 1) throw httpError('PROVIDER_UNAVAILABLE', true, { status: 503 })
+      return 'recovered'
+    }, { maxRetries: 3, initialDelayMs: 200 })
+    await expect(execution.result).resolves.toBe('recovered')
+    expect(execution.attempts()).toBe(2)
+    expect(execution.slept).toEqual([200])
+    expect(execution.events).toEqual([{
+      provider: 'official-v4', operation: 'inspect', attempt: 1, maxRetries: 3, delayMs: 200, reason: 'http-status', status: 503,
+    }])
+  })
+
+  it('honors Retry-After carried by the error', async () => {
+    const execution = run(async attempt => {
+      if (attempt === 1) throw httpError('PROVIDER_RATE_LIMITED', true, { status: 429, retryAfterMs: 3500 })
+      return 'ok'
+    }, { maxDelayMs: 10_000 })
+    await expect(execution.result).resolves.toBe('ok')
+    expect(execution.slept).toEqual([3500])
+    expect(execution.events[0]).toMatchObject({ status: 429, retryAfterMs: 3500, delayMs: 3500 })
+  })
+
+  it('rethrows the last error once the retry budget is exhausted', async () => {
+    const last = transient()
+    const execution = run(async () => { throw last })
+    await expect(execution.result).rejects.toBe(last)
+    expect(execution.attempts()).toBe(3)
+    expect(execution.events.map(event => event.attempt)).toEqual([1, 2])
+    expect(execution.events.every(event => event.reason === 'transport')).toBe(true)
+  })
+
+  it('never retries non-retryable errors', async () => {
+    const execution = run(async () => { throw httpError('AUTHENTICATION_FAILED', false, { status: 401 }) })
+    await expect(execution.result).rejects.toMatchObject({ failure: { code: 'AUTHENTICATION_FAILED' } })
+    expect(execution.attempts()).toBe(1)
+    expect(execution.slept).toEqual([])
+  })
+
+  it('does not start when the caller already aborted', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const fn = vi.fn(async () => 'never')
+    await expect(executeWithRetry({ provider: 'self-hosted-legacy-v2', operation: 'probe', signal: controller.signal, fn }))
+      .rejects.toThrow()
+    expect(fn).not.toHaveBeenCalled()
+  })
+
+  it('stops as CANCELLED when the caller aborts during backoff', async () => {
+    const controller = new AbortController()
+    const execution = run(async () => { throw transient() }, {
       maxRetries: 3,
-      initialDelayMs: 500,
-      maxDelayMs: 30000,
-      backoffFactor: 2,
-      jitter: false,
-    }
-
-    it('calculates deterministic exponential backoff when jitter is false', () => {
-      expect(calculateBackoffDelay(1, testPolicy)).toBe(500)
-      expect(calculateBackoffDelay(2, testPolicy)).toBe(1000)
-      expect(calculateBackoffDelay(3, testPolicy)).toBe(2000)
-      expect(calculateBackoffDelay(4, testPolicy)).toBe(4000)
-    })
-
-    it('clamps delay to maxDelayMs', () => {
-      const tightPolicy = { ...testPolicy, maxDelayMs: 1500 }
-      expect(calculateBackoffDelay(1, tightPolicy)).toBe(500)
-      expect(calculateBackoffDelay(2, tightPolicy)).toBe(1000)
-      expect(calculateBackoffDelay(3, tightPolicy)).toBe(1500)
-      expect(calculateBackoffDelay(4, tightPolicy)).toBe(1500)
-    })
-
-    it('uses Retry-After header delay when provided and clamps to maxDelayMs', () => {
-      expect(calculateBackoffDelay(1, testPolicy, 3000)).toBe(3000)
-      expect(calculateBackoffDelay(2, testPolicy, 50000)).toBe(30000)
-    })
-
-    it('applies jitter within [0.5 * delay, delay] when jitter is true', () => {
-      const jitterPolicy = { ...testPolicy, jitter: true }
-      // random returns 0 -> 0.5 * 500 = 250
-      expect(calculateBackoffDelay(1, jitterPolicy, undefined, () => 0)).toBe(250)
-      // random returns 1 -> 1.0 * 500 = 500
-      expect(calculateBackoffDelay(1, jitterPolicy, undefined, () => 1)).toBe(500)
-      // random returns 0.5 -> 0.75 * 500 = 375
-      expect(calculateBackoffDelay(1, jitterPolicy, undefined, () => 0.5)).toBe(375)
-    })
+      sleep: async (_ms, signal) => {
+        controller.abort(new DOMException('User cancelled', 'AbortError'))
+        signal.throwIfAborted()
+      },
+    }, controller.signal)
+    await expect(execution.result).rejects.toMatchObject({ failure: { code: 'CANCELLED' } })
+    expect(execution.attempts()).toBe(1)
   })
 
-  describe('resolveRetryPolicy', () => {
-    it('uses three total attempts by default and rejects unsafe bounds', () => {
-      expect(resolveRetryPolicy()).toMatchObject({ maxRetries: 2, initialDelayMs: 500, maxDelayMs: 10000 })
-      expect(() => resolveRetryPolicy({ maxRetries: 10 })).toThrow(/maxRetries/)
-      expect(() => resolveRetryPolicy({ initialDelayMs: 2000, maxDelayMs: 1000 })).toThrow(/cannot exceed/)
-      expect(() => resolveRetryPolicy({ backoffFactor: Number.POSITIVE_INFINITY })).toThrow(/backoffFactor/)
-    })
+  it('propagates a sleep failure that is not a cancellation', async () => {
+    const sleepError = new Error('custom sleep error')
+    const execution = run(async () => { throw transient() }, { sleep: async () => { throw sleepError } })
+    await expect(execution.result).rejects.toBe(sleepError)
   })
 
-  describe('defaultSleep', () => {
-    it('resolves immediately when ms <= 0', async () => {
-      const controller = new AbortController()
-      await expect(defaultSleep(0, controller.signal)).resolves.toBeUndefined()
-      await expect(defaultSleep(-100, controller.signal)).resolves.toBeUndefined()
-    })
-
-    it('throws immediately when signal is already aborted', async () => {
-      const controller = new AbortController()
-      controller.abort(new DOMException('Already cancelled', 'AbortError'))
-      await expect(defaultSleep(1000, controller.signal)).rejects.toThrowError(/cancelled/i)
-    })
-
-    it('rejects when aborted during sleep delay and cleans up timer', async () => {
-      const controller = new AbortController()
-      const sleepPromise = defaultSleep(5000, controller.signal)
-      setTimeout(() => {
-        controller.abort(new DOMException('User stopped', 'AbortError'))
-      }, 20)
-      await expect(sleepPromise).rejects.toThrowError(/User stopped/i)
-    })
-  })
-
-  describe('executeWithRetry', () => {
-    it('returns result immediately on first attempt if successful', async () => {
-      const onRetry = vi.fn()
-      const sleep = vi.fn()
-      const controller = new AbortController()
-
-      const result = await executeWithRetry({
-        provider: 'official-v4',
-        operation: 'inspect',
-        signal: controller.signal,
-        retryOptions: { onRetry, sleep },
-        fn: async attempt => `ok-${attempt}`,
-      })
-
-      expect(result).toBe('ok-1')
-      expect(onRetry).not.toHaveBeenCalled()
-      expect(sleep).not.toHaveBeenCalled()
-    })
-
-    it('retries on transient failure and succeeds on subsequent attempt', async () => {
-      const events: ProviderRetryEvent[] = []
-      const slept: number[] = []
-      const controller = new AbortController()
-
-      let attempts = 0
-      const result = await executeWithRetry({
-        provider: 'official-v4',
-        operation: 'inspect',
-        signal: controller.signal,
-        retryOptions: {
-          maxRetries: 3,
-          initialDelayMs: 200,
-          backoffFactor: 2,
-          jitter: false,
-          onRetry: event => events.push(event),
-          sleep: async ms => { slept.push(ms) },
-        },
-        fn: async attempt => {
-          attempts++
-          if (attempt === 1) {
-            const err = new MinerUError(failure('PROVIDER_UNAVAILABLE', 'Server overloaded (503)', true))
-            Object.assign(err, { httpStatus: 503 })
-            throw err
-          }
-          return 'recovered'
-        },
-      })
-
-      expect(result).toBe('recovered')
-      expect(attempts).toBe(2)
-      expect(slept).toEqual([200])
-      expect(events).toHaveLength(1)
-      expect(events[0]).toMatchObject({
-        provider: 'official-v4',
-        operation: 'inspect',
-        attempt: 1,
-        maxRetries: 3,
-        delayMs: 200,
-        status: 503,
-      })
-    })
-
-    it('honors Retry-After in transient error', async () => {
-      const events: ProviderRetryEvent[] = []
-      const slept: number[] = []
-      const controller = new AbortController()
-
-      let attempts = 0
-      const result = await executeWithRetry({
-        provider: 'self-hosted-legacy-v2',
-        operation: 'collect',
-        signal: controller.signal,
-        retryOptions: {
-          maxRetries: 3,
-          initialDelayMs: 200,
-          onRetry: event => events.push(event),
-          sleep: async ms => { slept.push(ms) },
-        },
-        fn: async attempt => {
-          attempts++
-          if (attempt === 1) {
-            const err = new MinerUError(failure('PROVIDER_RATE_LIMITED', 'Rate limited (429)', true))
-            Object.assign(err, { httpStatus: 429, retryAfterMs: 3500 })
-            throw err
-          }
-          return 'ok-after-rate-limit'
-        },
-      })
-
-      expect(result).toBe('ok-after-rate-limit')
-      expect(attempts).toBe(2)
-      expect(slept).toEqual([3500])
-      expect(events[0]).toMatchObject({
-        provider: 'self-hosted-legacy-v2',
-        operation: 'collect',
-        attempt: 1,
-        delayMs: 3500,
-        status: 429,
-        retryAfterMs: 3500,
-      })
-    })
-
-    it('throws final error upon exhaustion when maxRetries is exceeded', async () => {
-      const events: ProviderRetryEvent[] = []
-      const controller = new AbortController()
-
-      let attempts = 0
-      await expect(
-        executeWithRetry({
-          provider: 'official-v4',
-          operation: 'cdn-download',
-          signal: controller.signal,
-          retryOptions: {
-            maxRetries: 2,
-            initialDelayMs: 100,
-            jitter: false,
-            onRetry: e => events.push(e),
-            sleep: async () => {},
-          },
-          fn: async () => {
-            attempts++
-            throw new MinerUError(failure('PROVIDER_UNAVAILABLE', 'Persistent 500', true))
-          },
-        }),
-      ).rejects.toThrowError(/Persistent 500/)
-
-      // 1 initial + 2 retries = 3 attempts total
-      expect(attempts).toBe(3)
-      expect(events).toHaveLength(2)
-      expect(events[0]!.attempt).toBe(1)
-      expect(events[1]!.attempt).toBe(2)
-    })
-
-    it('does NOT retry non-retryable errors and throws on attempt 1', async () => {
-      const events: ProviderRetryEvent[] = []
-      const sleep = vi.fn()
-      const controller = new AbortController()
-
-      let attempts = 0
-      await expect(
-        executeWithRetry({
-          provider: 'official-v4',
-          operation: 'inspect',
-          signal: controller.signal,
-          retryOptions: {
-            maxRetries: 3,
-            onRetry: e => events.push(e),
-            sleep,
-          },
-          fn: async () => {
-            attempts++
-            throw new MinerUError(failure('AUTHENTICATION_FAILED', 'Invalid token', false))
-          },
-        }),
-      ).rejects.toThrowError(/Invalid token/)
-
-      expect(attempts).toBe(1)
-      expect(events).toHaveLength(0)
-      expect(sleep).not.toHaveBeenCalled()
-    })
-
-    it('aborts immediately and throws CANCELLED without retry when caller aborts before start', async () => {
-      const controller = new AbortController()
-      controller.abort()
-
-      const fn = vi.fn()
-      await expect(
-        executeWithRetry({
-          provider: 'self-hosted-legacy-v2',
-          operation: 'probe',
-          signal: controller.signal,
-          fn,
-        }),
-      ).rejects.toThrowError()
-
-      expect(fn).not.toHaveBeenCalled()
-    })
-
-    it('rethrows sleep error when sleep fails without signal abort', async () => {
-      const controller = new AbortController()
-      await expect(
-        executeWithRetry({
-          provider: 'official-v4',
-          operation: 'presigned-put',
-          signal: controller.signal,
-          retryOptions: {
-            maxRetries: 2,
-            sleep: async () => { throw new Error('custom sleep error') },
-          },
-          fn: async () => { throw new MinerUError(failure('UPLOAD_FAILED', 'error', true)) },
-        }),
-      ).rejects.toThrow('custom sleep error')
-    })
-
-    it('aborts immediately and throws CANCELLED when caller aborts during backoff delay', async () => {
-      const controller = new AbortController()
-      let attempts = 0
-
-      await expect(
-        executeWithRetry({
-          provider: 'official-v4',
-          operation: 'presigned-put',
-          signal: controller.signal,
-          retryOptions: {
-            maxRetries: 3,
-            sleep: async (_, signal) => {
-              // Simulate caller aborting during sleep
-              controller.abort(new DOMException('User cancelled operation', 'AbortError'))
-              signal.throwIfAborted()
-            },
-          },
-          fn: async () => {
-            attempts++
-            throw new MinerUError(failure('UPLOAD_FAILED', 'Transient upload error', true))
-          },
-        }),
-      ).rejects.toMatchObject({
-        failure: expect.objectContaining({ code: 'CANCELLED' }),
-      })
-
-      expect(attempts).toBe(1)
-    })
-
-    it('catches and ignores diagnostic hook errors without interrupting the retry loop', async () => {
-      const controller = new AbortController()
-      let attempts = 0
-
-      const result = await executeWithRetry({
-        provider: 'official-v4',
-        operation: 'inspect',
-        signal: controller.signal,
-        retryOptions: {
-          maxRetries: 2,
-          sleep: async () => {},
-          onRetry: () => {
-            throw new Error('Broken logging listener')
-          },
-        },
-        fn: async attempt => {
-          attempts++
-          if (attempt === 1) {
-            throw new MinerUError(failure('PROVIDER_UNAVAILABLE', 'Temporary glitch', true))
-          }
-          return 'success-despite-hook-throw'
-        },
-      })
-
-      expect(result).toBe('success-despite-hook-throw')
-      expect(attempts).toBe(2)
-    })
+  it('isolates a throwing onRetry hook from the retry loop', async () => {
+    const execution = run(async attempt => {
+      if (attempt === 1) throw transient()
+      return 'ok'
+    }, { onRetry: () => { throw new Error('Broken logging listener') } })
+    await expect(execution.result).resolves.toBe('ok')
+    expect(execution.attempts()).toBe(2)
   })
 })

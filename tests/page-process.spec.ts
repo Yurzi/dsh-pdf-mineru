@@ -1,8 +1,8 @@
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { runPdfPageProcess, type PdfPageProcessRequest } from '../src/service/page-renderer.js'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { runPdfPageProcess, type PdfPageProcessRequest } from '../src/reader/page/page-renderer.js'
 
 describe('local renderer process lifecycle', () => {
   let root: string
@@ -14,45 +14,43 @@ describe('local renderer process lifecycle', () => {
       signal: new AbortController().signal, timeoutMs: 2000,
       maxStdoutBytes: 1024, maxStderrBytes: 1024, ...overrides }
   }
-  async function waitForPid(): Promise<number> {
-    for (let attempt = 0; attempt < 200; attempt++) {
-      try { return Number(await readFile(join(root, 'pid'), 'utf8')) } catch {}
-      await new Promise(resolve => setTimeout(resolve, 5))
-    }
-    throw new Error('Child did not start')
-  }
-  function expectReaped(pid: number) {
+  const childPid = async (): Promise<number> => Number(await readFile(join(root, 'pid'), 'utf8'))
+  /** Resolves once the child has written its pid, i.e. it is running. */
+  const startedPid = (): Promise<number> => vi.waitFor(childPid, { timeout: 2000, interval: 5 })
+  function expectReaped(pid: number): void {
     expect(() => process.kill(pid, 0)).toThrowError(expect.objectContaining({ code: 'ESRCH' }))
   }
+
   it('kills and reaps the Node child before rejecting cancellation', async () => {
     const controller = new AbortController()
-    const pending = runPdfPageProcess(request(hanging, { signal: controller.signal }))
-    const rejection = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
-    const pid = await waitForPid()
+    const rejection = expect(runPdfPageProcess(request(hanging, { signal: controller.signal }))).rejects.toMatchObject({ name: 'AbortError' })
+    const pid = await startedPid()
     controller.abort()
     await rejection
     expectReaped(pid)
   })
+
   it('kills and reaps the Node child on its remaining runtime limit', async () => {
-    const pending = runPdfPageProcess(request(hanging, { timeoutMs: 400 }))
-    const rejection = expect(pending).rejects.toMatchObject({ kind: 'timeout' })
-    const pid = await waitForPid()
+    const rejection = expect(runPdfPageProcess(request(hanging, { timeoutMs: 400 }))).rejects.toMatchObject({ kind: 'timeout' })
+    const pid = await startedPid()
     await rejection
     expectReaped(pid)
   })
+
   it.each(['stdout', 'stderr'] as const)('terminates on bounded %s capture overflow', async stream => {
-    await expect(runPdfPageProcess(request(
-      hanging + '; process.' + stream + '.write(Buffer.alloc(2048))',
-    ))).rejects.toMatchObject({ kind: 'output-limit' })
-    expectReaped(Number(await readFile(join(root, 'pid'), 'utf8')))
+    await expect(runPdfPageProcess(request(hanging + '; process.' + stream + '.write(Buffer.alloc(2048))')))
+      .rejects.toMatchObject({ kind: 'output-limit' })
+    expectReaped(await childPid())
   })
+
   it('terminates growing PNG output and reaps before completion', async () => {
     await expect(runPdfPageProcess(request(
       hanging + "; require('node:fs').writeFileSync('page.png', Buffer.alloc(2048))",
       { watchedOutput: { path: join(root, 'page.png'), maxBytes: 1024 } },
     ))).rejects.toMatchObject({ kind: 'output-limit' })
-    expectReaped(Number(await readFile(join(root, 'pid'), 'utf8')))
+    expectReaped(await childPid())
   })
+
   it('reports abnormal child exit without accepting it as successful output', async () => {
     await expect(runPdfPageProcess(request('process.exit(23)'))).resolves.toMatchObject({ exitCode: 23, signal: null })
   })

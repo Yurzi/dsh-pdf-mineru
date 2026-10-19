@@ -1,0 +1,64 @@
+/* Floating save bar: an elevated surface docked to the bottom of the scrolling page. */
+
+.dock {
+  position: sticky;
+  bottom: 16px;
+  z-index: 1;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  width: min(100%, 560px);
+  margin: 0;
+  padding: 6px 6px 6px 16px;
+  border: 0;
+  border-radius: var(--dsw-radius-lg);
+  background: var(--dsw-alias-bg-layer-2);
+  box-shadow: var(--dsw-elevation-prominent);
+  pointer-events: auto;
+  animation: rise 160ms ease-out;
+}
+
+.status {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-size: 13px;
+  line-height: 20px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.problem {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.saved {
+  width: auto;
+  gap: 6px;
+  padding: 8px 14px;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--dsw-alias-state-success-primary);
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bar {
+    animation: none;
+  }
+}

@@ -1,559 +1,331 @@
-import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { describe, expect, it } from 'vitest'
+import { createOperationId } from '../src/domain/ids.js'
+import { ProcessLock } from '../src/storage/process-lock.js'
+import { StorageAccessGate } from '../src/storage/access-gate.js'
+import { StorageMaintenanceService } from '../src/storage/maintenance/service.js'
 import {
-  asCacheKey,
-  asProviderConfigId,
-  createFileId,
-  createOperationId,
-  type CacheKey,
-} from '../src/domain/ids.js'
-import { CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, type CanonicalParseRequest } from '../src/domain/request.js'
-import type { ResultProducer } from '../src/domain/result.js'
-import { SharedOperationRegistry } from '../src/service/shared-operations.js'
-import {
-  ProcessLock,
-  ResultRepository,
-  StorageMaintenanceService,
-  StoragePaths,
-} from '../src/storage/index.js'
+  holdBlocker, maintenanceFixture, publish, sampleProducer, sampleRequest, tempRoot,
+  type MaintenanceFixture, type StorageBlocker,
+} from './support/storage-fixtures.js'
 
-const tempRoots: string[] = []
+const exists = (path: string) => expect(stat(path)).resolves.toBeDefined()
+const absent = (path: string) => expect(stat(path)).rejects.toThrow()
 
-async function createTempRoot(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), 'mineru-maintenance-test-'))
-  tempRoots.push(root)
-  return root
+async function stageUnpublished(fixture: MaintenanceFixture, sha: string): Promise<string> {
+  const request = sampleRequest(sha)
+  const tx = fixture.results.beginTransaction(createOperationId(), request, sampleProducer())
+  await tx.writeArtifact(request.files[0]!.fileId, 'markdown', '# staging', { mediaType: 'text/markdown' })
+  return tx.stagingDir
 }
 
-afterEach(async () => {
-  await Promise.all(tempRoots.splice(0).map(root => rm(root, { recursive: true, force: true }).catch(() => undefined)))
-})
-
-function sampleRequest(sourceSha256: string): CanonicalParseRequest {
-  const fileId = createFileId(sourceSha256)
-  return {
-    schemaVersion: CANONICAL_PARSE_REQUEST_SCHEMA_VERSION,
-    files: [{ fileId, name: 'sample.pdf', bytes: 1024, sha256: sourceSha256 }],
-    semantics: {
-      model: 'pipeline',
-      ocr: false,
-      parseMethod: 'auto',
-      language: 'ch',
-      formula: true,
-      table: true,
-    },
-    requiredArtifacts: ['markdown'],
-  }
-}
-
-function sampleProducer(): ResultProducer {
-  return {
-    providerId: 'self-hosted-legacy-v2',
-    providerConfigId: asProviderConfigId('mp_maintenance'),
-    compatibilityKey: 'self-hosted-legacy-v2:maintenance:v1:pipeline',
-  }
-}
-
-interface MaintenanceFixture {
-  readonly paths: StoragePaths
-  readonly results: ResultRepository
-  readonly operations: SharedOperationRegistry
-  readonly maintenance: StorageMaintenanceService
-  readonly lock: ProcessLock
-}
-
-async function createMaintenanceFixture(): Promise<MaintenanceFixture> {
-  const root = await createTempRoot()
-  const paths = new StoragePaths(root)
-  const operations = new SharedOperationRegistry()
-  const lock = new ProcessLock(paths)
-  const results = new ResultRepository(paths, {}, lock)
-  return { paths, results, operations, maintenance: new StorageMaintenanceService(paths, results, operations, lock), lock }
-}
-
-type MaintenanceBlocker = 'operation' | 'reader'
-
-async function holdMaintenanceBlocker(
-  fixture: MaintenanceFixture,
-  blocker: MaintenanceBlocker,
-): Promise<() => Promise<void>> {
-  if (blocker === 'operation') {
-    const reservation = fixture.operations.reserve(
-      asCacheKey('9'.repeat(64)), asProviderConfigId('mp_maintenance'), 1000,
-    )
-    if (!reservation.created) throw new Error('failed to reserve maintenance test operation')
-    return async () => { fixture.operations.dispose() }
-  }
-
-  let release!: () => void
-  let entered!: () => void
-  const ready = new Promise<void>(resolve => { entered = resolve })
-  const held = fixture.maintenance.accessGate.runShared(async () => {
-    entered()
-    await new Promise<void>(resolve => { release = resolve })
-  })
-  await ready
-  return async () => {
-    release()
-    await held
-  }
-}
-
-async function publish(
-  results: ResultRepository,
-  sourceSha256: string,
-  content: string,
-): Promise<{ readonly cacheKey: CacheKey; readonly fileId: string; readonly artifactPath: string }> {
-  const request = sampleRequest(sourceSha256)
-  const transaction = results.beginTransaction(createOperationId(), request, sampleProducer())
-  const file = request.files[0]!
-  const artifact = await transaction.writeArtifact(file.fileId, 'markdown', content, { mediaType: 'text/markdown; charset=utf-8' })
-  const committed = await results.commitTransaction(transaction, transaction.buildManifest(file, [artifact]))
-  return { cacheKey: committed.cacheKey, fileId: file.fileId, artifactPath: artifact.relativePath }
-}
-
-async function makePublishedWritable(paths: StoragePaths, cacheKey: CacheKey, fileId: string): Promise<void> {
-  await chmod(paths.resultDir(cacheKey), 0o755)
-  await chmod(paths.filesDir(cacheKey), 0o755)
-  await chmod(paths.fileDir(cacheKey, fileId), 0o755)
-  await chmod(paths.manifestFile(cacheKey), 0o644).catch(() => undefined)
+async function quarantineEntry(fixture: MaintenanceFixture, id: string, payload = 'payload'): Promise<string> {
+  const entry = fixture.paths.quarantineDir(id)
+  await mkdir(entry, { recursive: true })
+  await writeFile(join(entry, 'payload.txt'), payload)
+  return entry
 }
 
 describe('StorageMaintenanceService statistics and integrity', () => {
-  it('reports normal cache usage without following symlinks', async () => {
-    const { paths, results, maintenance } = await createMaintenanceFixture()
-    const published = await publish(results, 'a'.repeat(64), '# published')
-
-    const staging = results.beginTransaction(createOperationId(), sampleRequest('b'.repeat(64)), sampleProducer())
-    await staging.writeArtifact(sampleRequest('b'.repeat(64)).files[0]!.fileId, 'markdown', '# staging', { mediaType: 'text/markdown' })
-
-    const quarantine = paths.quarantineDir('manual_entry')
-    await mkdir(quarantine, { recursive: true })
-    await writeFile(join(quarantine, 'note.txt'), 'quarantine bytes')
+  it('reports cache usage per area without following symlinks', async () => {
+    const fixture = await maintenanceFixture()
+    const { paths, maintenance } = fixture
+    await publish(fixture.results)
+    await stageUnpublished(fixture, 'b'.repeat(64))
+    await quarantineEntry(fixture, 'manual_entry', 'quarantine bytes')
     const outside = join(paths.root, 'outside.txt')
     await writeFile(outside, 'must not be counted through a symlink')
     await symlink(outside, join(paths.quarantineDir(), 'outside-link'))
 
     const stats = await maintenance.getStatistics()
-    expect(stats.publishedResults.logicalEntryCount).toBe(1)
-    expect(stats.staging.logicalEntryCount).toBe(1)
-    expect(stats.quarantine.logicalEntryCount).toBe(1)
+    expect(stats.publishedResults).toMatchObject({ logicalEntryCount: 1, byteUsage: expect.any(Number) })
     expect(stats.publishedResults.byteUsage).toBeGreaterThan(0)
+    expect(stats.staging.logicalEntryCount).toBe(1)
     expect(stats.staging.byteUsage).toBeGreaterThan(0)
-    expect(stats.quarantine.byteUsage).toBe('quarantine bytes'.length)
-    expect(stats.quarantine.skippedSymlinkCount).toBe(1)
+    expect(stats.quarantine).toMatchObject({ logicalEntryCount: 1, byteUsage: 'quarantine bytes'.length, skippedSymlinkCount: 1 })
     expect(await readFile(outside, 'utf8')).toBe('must not be counted through a symlink')
-    expect(await stat(paths.resultDir(published.cacheKey))).toBeDefined()
   })
 
-  it('does not traverse or initialize storage through a configured-root symlink for read operations', async () => {
-    const container = await createTempRoot()
-    const outside = await createTempRoot()
-    const alias = join(container, 'storage-alias')
+  it('does not traverse or initialize storage through a symlinked root or results directory', async () => {
+    const outside = await tempRoot()
     await mkdir(join(outside, 'results', 'sha256', 'aa'), { recursive: true })
     await mkdir(join(outside, 'quarantine', 'outside_entry'), { recursive: true })
     await writeFile(join(outside, 'quarantine', 'outside_entry', 'preserve.txt'), 'preserve')
+    const alias = join(await tempRoot(), 'storage-alias')
     await symlink(outside, alias)
-
-    const paths = new StoragePaths(alias)
-    const lock = new ProcessLock(paths)
-    const maintenance = new StorageMaintenanceService(
-      paths,
-      new ResultRepository(paths, {}, lock),
-      new SharedOperationRegistry(),
-      lock,
-    )
-    const stats = await maintenance.getStatistics()
-    expect(stats.publishedResults.complete).toBe(false)
-    expect(stats.publishedResults.byteUsage).toBe(0)
+    const { maintenance } = await maintenanceFixture({ root: alias })
+    expect((await maintenance.getStatistics()).publishedResults).toMatchObject({ complete: false, byteUsage: 0 })
     const integrity = await maintenance.scanIntegrity()
     expect(integrity.validCount).toBe(0)
-    expect(integrity.diagnostics).toEqual(expect.arrayContaining([
-      expect.objectContaining({ code: 'unreadable-entry' }),
-    ]))
-    const quarantine = await maintenance.listQuarantine()
-    expect(quarantine.totalCount).toBe(0)
-    expect(quarantine.unreadableEntryCount).toBe(1)
+    expect(integrity.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: 'unreadable-entry' })]))
+    expect(await maintenance.listQuarantine()).toMatchObject({ totalCount: 0, unreadableEntryCount: 1 })
     expect(await readFile(join(outside, 'quarantine', 'outside_entry', 'preserve.txt'), 'utf8')).toBe('preserve')
-    await expect(stat(join(outside, '.lock'))).rejects.toThrow()
+    await absent(join(outside, '.lock'))
 
-    const realRoot = await createTempRoot()
-    const outsideResults = await createTempRoot()
+    const realRoot = await tempRoot()
+    const outsideResults = await tempRoot()
     await mkdir(join(realRoot, 'results'))
-    await mkdir(join(outsideResults, 'aa'), { recursive: true })
+    await mkdir(join(outsideResults, 'aa'))
     await writeFile(join(outsideResults, 'aa', 'preserve.txt'), 'preserve results')
-    const realPaths = new StoragePaths(realRoot)
-    await symlink(outsideResults, realPaths.resultsDir())
-    const realLock = new ProcessLock(realPaths)
-    const intermediate = new StorageMaintenanceService(
-      realPaths,
-      new ResultRepository(realPaths, {}, realLock),
-      new SharedOperationRegistry(),
-      realLock,
-    )
-    const intermediateStats = await intermediate.getStatistics()
-    expect(intermediateStats.publishedResults.complete).toBe(false)
-    expect(intermediateStats.publishedResults.byteUsage).toBe(0)
-    const intermediateScan = await intermediate.scanIntegrity()
-    expect(intermediateScan.validCount).toBe(0)
+    const intermediate = await maintenanceFixture({ root: realRoot })
+    await symlink(outsideResults, intermediate.paths.resultsDir())
+    expect((await intermediate.maintenance.getStatistics()).publishedResults).toMatchObject({ complete: false, byteUsage: 0 })
+    expect((await intermediate.maintenance.scanIntegrity()).validCount).toBe(0)
     expect(await readFile(join(outsideResults, 'aa', 'preserve.txt'), 'utf8')).toBe('preserve results')
-    await expect(stat(join(realRoot, '.lock'))).rejects.toThrow()
+    await absent(join(realRoot, '.lock'))
   })
 
-  it('uses a read-only strict scan by default and isolates invalid results only on request', async () => {
-    const { paths, results, maintenance } = await createMaintenanceFixture()
+  it('scans read-only by default and isolates only invalid results on request', async () => {
+    const fixture = await maintenanceFixture()
+    const { paths, results, maintenance } = fixture
     const valid = await publish(results, 'a'.repeat(64), '# valid')
-    const malformedManifest = await publish(results, 'b'.repeat(64), '# malformed')
-    const missingArtifact = await publish(results, 'c'.repeat(64), '# missing')
-    const symlinkArtifact = await publish(results, 'd'.repeat(64), '# symlink')
-
-    await makePublishedWritable(paths, malformedManifest.cacheKey, malformedManifest.fileId)
-    await writeFile(paths.manifestFile(malformedManifest.cacheKey), '{invalid json')
-
-    await makePublishedWritable(paths, missingArtifact.cacheKey, missingArtifact.fileId)
-    await rm(paths.resolveArtifactPath(missingArtifact.cacheKey, missingArtifact.artifactPath))
-
-    await makePublishedWritable(paths, symlinkArtifact.cacheKey, symlinkArtifact.fileId)
+    const malformed = await publish(results, 'b'.repeat(64), '# malformed')
+    const missing = await publish(results, 'c'.repeat(64), '# missing')
+    const linked = await publish(results, 'd'.repeat(64), '# symlink')
+    await writeFile(paths.manifestFile(malformed.cacheKey), '{invalid json')
+    await rm(paths.resolveArtifactPath(missing.cacheKey, missing.artifactPath))
     const outside = join(paths.root, 'outside-artifact.md')
     await writeFile(outside, '# outside')
-    const symlinkPath = paths.resolveArtifactPath(symlinkArtifact.cacheKey, symlinkArtifact.artifactPath)
-    await rm(symlinkPath)
-    await symlink(outside, symlinkPath)
+    const linkPath = paths.resolveArtifactPath(linked.cacheKey, linked.artifactPath)
+    await rm(linkPath)
+    await symlink(outside, linkPath)
+    const invalid = [malformed, missing, linked].map(item => paths.resultDir(item.cacheKey))
 
     const readOnly = await maintenance.scanIntegrity({ diagnosticLimit: 2 })
-    expect(readOnly.readOnly).toBe(true)
-    expect(readOnly.isolateInvalid).toBe(false)
-    expect(readOnly.validCount).toBe(1)
-    expect(readOnly.corruptCount).toBe(2)
-    expect(readOnly.missingCount).toBe(1)
-    expect(readOnly.quarantinedCount).toBe(0)
+    expect(readOnly).toMatchObject({
+      readOnly: true, isolateInvalid: false, validCount: 1, corruptCount: 2, missingCount: 1, quarantinedCount: 0,
+      scan: { diagnosticsTruncated: true },
+    })
     expect(readOnly.diagnostics).toHaveLength(2)
-    expect(readOnly.scan.diagnosticsTruncated).toBe(true)
-    await expect(stat(paths.resultDir(malformedManifest.cacheKey))).resolves.toBeDefined()
-    await expect(stat(paths.resultDir(missingArtifact.cacheKey))).resolves.toBeDefined()
-    await expect(stat(paths.resultDir(symlinkArtifact.cacheKey))).resolves.toBeDefined()
-    expect(await readFile(outside, 'utf8')).toBe('# outside')
+    for (const dir of invalid) await exists(dir)
 
     const isolated = await maintenance.scanIntegrity({ isolateInvalid: true })
-    expect(isolated.readOnly).toBe(false)
-    expect(isolated.quarantinedCount).toBe(3)
-    await expect(stat(paths.resultDir(valid.cacheKey))).resolves.toBeDefined()
-    await expect(stat(paths.resultDir(malformedManifest.cacheKey))).rejects.toThrow()
-    await expect(stat(paths.resultDir(missingArtifact.cacheKey))).rejects.toThrow()
-    await expect(stat(paths.resultDir(symlinkArtifact.cacheKey))).rejects.toThrow()
+    expect(isolated).toMatchObject({ readOnly: false, quarantinedCount: 3 })
+    await exists(paths.resultDir(valid.cacheKey))
+    for (const dir of invalid) await absent(dir)
     expect(await readFile(outside, 'utf8')).toBe('# outside')
   })
 
-  it.each(['operation', 'reader'] as const)(
-    'blocks destructive isolation while storage has an active %s',
-    async blocker => {
-      const fixture = await createMaintenanceFixture()
-      const published = await publish(fixture.results, '8'.repeat(64), '# invalid')
-      await makePublishedWritable(fixture.paths, published.cacheKey, published.fileId)
-      await writeFile(fixture.paths.manifestFile(published.cacheKey), '{invalid json')
-      const release = await holdMaintenanceBlocker(fixture, blocker)
-
-      try {
-        await expect(fixture.maintenance.scanIntegrity({ isolateInvalid: true }))
-          .rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
-      } finally {
-        await release()
-      }
-      await expect(stat(fixture.paths.resultDir(published.cacheKey))).resolves.toBeDefined()
-    },
-  )
-
-  it('reports scan truncation and undeclared published data without mutating valid results', async () => {
-    const { paths, results, maintenance } = await createMaintenanceFixture()
+  it('reports scan truncation and undeclared published data without mutating results', async () => {
+    const { paths, results, maintenance } = await maintenanceFixture()
     const first = await publish(results, 'a'.repeat(64), '# first')
     await publish(results, 'b'.repeat(64), '# second')
     await publish(results, 'c'.repeat(64), '# third')
-
-    const truncated = await maintenance.scanIntegrity({ resultLimit: 1 })
-    expect(truncated.scan.scanned).toBe(1)
-    expect(truncated.scan.truncated).toBe(true)
-
-    await makePublishedWritable(paths, first.cacheKey, first.fileId)
+    expect((await maintenance.scanIntegrity({ resultLimit: 1 })).scan).toMatchObject({ scanned: 1, truncated: true })
     await writeFile(join(paths.resultDir(first.cacheKey), 'undeclared.txt'), 'unexpected')
     const scan = await maintenance.scanIntegrity()
     expect(scan.corruptCount).toBeGreaterThanOrEqual(1)
     expect(scan.diagnostics.some(diagnostic => diagnostic.code === 'corrupt-result')).toBe(true)
-    await expect(stat(paths.resultDir(first.cacheKey))).resolves.toBeDefined()
+    await exists(paths.resultDir(first.cacheKey))
   })
 
-  it('honors a cancelled integrity scan without mutation', async () => {
-    const { paths, results, maintenance } = await createMaintenanceFixture()
-    const published = await publish(results, 'a'.repeat(64), '# cancelled')
+  it.each([false, true])('honors a cancelled integrity scan without mutation (isolateInvalid=%s)', async isolateInvalid => {
+    const { paths, results, maintenance } = await maintenanceFixture()
+    const published = await publish(results)
+    await writeFile(paths.manifestFile(published.cacheKey), '{invalid json')
     const controller = new AbortController()
     controller.abort(new DOMException('Cancelled', 'AbortError'))
-    await expect(maintenance.scanIntegrity({ signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' })
-    await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
+    await expect(maintenance.scanIntegrity({ signal: controller.signal, isolateInvalid })).rejects.toMatchObject({ name: 'AbortError' })
+    await exists(paths.resultDir(published.cacheKey))
+  })
+})
+
+describe('StorageMaintenanceService fail-closed destructive work', () => {
+  const destructive = {
+    'integrity isolation': async (fixture: MaintenanceFixture) => {
+      const published = await publish(fixture.results, '8'.repeat(64), '# invalid')
+      await writeFile(fixture.paths.manifestFile(published.cacheKey), '{invalid json')
+      return { run: () => fixture.maintenance.scanIntegrity({ isolateInvalid: true }), preserved: fixture.paths.resultDir(published.cacheKey) }
+    },
+    'quarantine cleanup': async (fixture: MaintenanceFixture) => ({
+      run: () => fixture.maintenance.cleanupQuarantine({ entryIds: ['blocked_entry'], dryRun: false }),
+      preserved: await quarantineEntry(fixture, 'blocked_entry'),
+    }),
+    'cache clear': async (fixture: MaintenanceFixture) => {
+      const published = await publish(fixture.results, 'e'.repeat(64), '# leased')
+      const preview = await fixture.maintenance.clearCache()
+      return {
+        run: () => fixture.maintenance.clearCache({ dryRun: false, confirmationToken: preview.confirmationToken }),
+        preserved: fixture.paths.resultDir(published.cacheKey),
+      }
+    },
+  } as const
+  const cases = Object.keys(destructive).flatMap(operation =>
+    (['operation', 'reader'] as const).map(blocker => [operation as keyof typeof destructive, blocker] as const))
+
+  it.each(cases)('blocks %s while storage has an active %s', async (operation, blocker: StorageBlocker) => {
+    const fixture = await maintenanceFixture()
+    const { run, preserved } = await destructive[operation](fixture)
+    const release = await holdBlocker(fixture, blocker)
+    try {
+      await expect(run()).rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
+    } finally { await release() }
+    await exists(preserved)
   })
 
-  it('blocks destructive cache clear when process lock is held by another owner', async () => {
-    const root = await createTempRoot()
-    const paths = new StoragePaths(root)
-    const results = new ResultRepository(paths)
-    const activeLock = new ProcessLock(paths)
-    await activeLock.acquire()
+  it('blocks destructive cache clear when the process lock is held by another owner', async () => {
+    const { paths, lock, results } = await maintenanceFixture()
+    await lock.acquire()
     try {
-      const contenderLock = new ProcessLock(paths, { acquireTimeoutMs: 100, pollIntervalMs: 2 })
-      const maintenance = new StorageMaintenanceService(paths, results, new SharedOperationRegistry(), contenderLock)
+      const contender = new ProcessLock(paths, { acquireTimeoutMs: 100, pollIntervalMs: 2 })
+      const maintenance = new StorageMaintenanceService(paths, results, { activeOperationCount: () => 0 }, contender, new StorageAccessGate({ paths, lock: contender }))
       await expect(maintenance.clearCache({ dryRun: false })).rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
-    } finally {
-      await activeLock.release()
-    }
+    } finally { await lock.release() }
+  })
+
+  it('needs only the active-operation count capability', async () => {
+    const { paths, results, lock, accessGate } = await maintenanceFixture()
+    await publish(results, '7'.repeat(64), '# preserve')
+    let activeCount = 1
+    const maintenance = new StorageMaintenanceService(paths, results, { activeOperationCount: () => activeCount }, lock, accessGate)
+    const blocked = await maintenance.clearCache()
+    expect(blocked).toMatchObject({ eligible: false, activeOperationCount: 1 })
+    expect(blocked.confirmationToken).toBeUndefined()
+    await expect(maintenance.clearCache({ dryRun: false })).rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
+    activeCount = 0
+    expect(await maintenance.clearCache()).toMatchObject({ eligible: true, confirmationToken: expect.any(String) })
   })
 })
 
 describe('StorageMaintenanceService quarantine operations', () => {
-  it('lists bounded quarantine entries and cleans only requested safe entries', async () => {
-    const { paths, results, maintenance } = await createMaintenanceFixture()
-    const published = await publish(results, 'a'.repeat(64), '# preserve result')
-    const staging = results.beginTransaction(createOperationId(), sampleRequest('b'.repeat(64)), sampleProducer())
-    await staging.writeArtifact(sampleRequest('b'.repeat(64)).files[0]!.fileId, 'markdown', '# preserve staging', { mediaType: 'text/markdown' })
-
-    for (let index = 0; index < 16; index++) {
-      const entry = paths.quarantineDir('entry_' + String(index))
-      await mkdir(entry, { recursive: true })
-      await writeFile(join(entry, 'payload.txt'), 'payload-' + String(index))
-    }
+  it('lists bounded quarantine entries and cleans only requested safe entries after dry run', async () => {
+    const fixture = await maintenanceFixture()
+    const { paths, maintenance } = fixture
+    const published = await publish(fixture.results)
+    const staging = await stageUnpublished(fixture, 'b'.repeat(64))
+    for (let index = 0; index < 16; index++) await quarantineEntry(fixture, 'entry_' + String(index))
     const outside = join(paths.root, 'outside-quarantine.txt')
     await writeFile(outside, 'outside')
     await symlink(outside, join(paths.quarantineDir(), 'unsafe-link'))
 
     const listed = await maintenance.listQuarantine({ limit: 3 })
-    expect(listed.totalCount).toBe(16)
+    expect(listed).toMatchObject({ totalCount: 16, truncated: true, skippedSymlinkCount: 1 })
     expect(listed.entries).toHaveLength(3)
-    expect(listed.truncated).toBe(true)
-    expect(listed.skippedSymlinkCount).toBe(1)
-
     await expect(maintenance.cleanupQuarantine({ entryIds: ['../results'], dryRun: false })).rejects.toThrow(TypeError)
-    const dryRun = await maintenance.cleanupQuarantine({ entryIds: ['entry_0'] })
-    expect(dryRun.dryRun).toBe(true)
-    expect(dryRun.plannedCount).toBe(1)
-    await expect(stat(paths.quarantineDir('entry_0'))).resolves.toBeDefined()
-
-    const cleaned = await maintenance.cleanupQuarantine({ entryIds: ['entry_0'], dryRun: false })
-    expect(cleaned.dryRun).toBe(false)
-    expect(cleaned.deletedCount).toBe(1)
-    await expect(stat(paths.quarantineDir('entry_0'))).rejects.toThrow()
-    await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
-    await expect(stat(staging.stagingDir)).resolves.toBeDefined()
+    expect(await maintenance.cleanupQuarantine({ entryIds: ['entry_0'] })).toMatchObject({ dryRun: true, plannedCount: 1, deletedCount: 0 })
+    await exists(paths.quarantineDir('entry_0'))
+    expect(await maintenance.cleanupQuarantine({ entryIds: ['entry_0'], dryRun: false })).toMatchObject({ dryRun: false, deletedCount: 1 })
+    await absent(paths.quarantineDir('entry_0'))
+    await exists(paths.quarantineDir('entry_1'))
+    await exists(paths.resultDir(published.cacheKey))
+    await exists(staging)
     expect(await readFile(outside, 'utf8')).toBe('outside')
   })
 
-  it.each(['operation', 'reader'] as const)(
-    'blocks destructive cleanup while storage has an active %s',
-    async blocker => {
-      const fixture = await createMaintenanceFixture()
-      const entry = fixture.paths.quarantineDir('blocked_entry')
-      await mkdir(entry, { recursive: true })
-      await writeFile(join(entry, 'payload.txt'), 'preserve')
-      const release = await holdMaintenanceBlocker(fixture, blocker)
-
-      try {
-        await expect(fixture.maintenance.cleanupQuarantine({ entryIds: ['blocked_entry'], dryRun: false }))
-          .rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
-      } finally {
-        await release()
-      }
-      await expect(stat(entry)).resolves.toBeDefined()
-    },
-  )
-
   it('refuses a symlinked quarantine root without touching its target', async () => {
-    const { paths, maintenance } = await createMaintenanceFixture()
-    const outside = await mkdtemp(join(tmpdir(), 'mineru-maintenance-outside-'))
-    tempRoots.push(outside)
-    await mkdir(join(outside, 'entry_0'), { recursive: true })
+    const { paths, maintenance } = await maintenanceFixture()
+    const outside = await tempRoot()
+    await mkdir(join(outside, 'entry_0'))
     await writeFile(join(outside, 'entry_0', 'payload.txt'), 'outside payload')
     await symlink(outside, paths.quarantineDir())
-
-    const report = await maintenance.cleanupQuarantine({ entryIds: ['entry_0'], dryRun: false })
-    expect(report.deletedCount).toBe(0)
-    expect(report.skippedCount).toBe(1)
+    expect(await maintenance.cleanupQuarantine({ entryIds: ['entry_0'], dryRun: false })).toMatchObject({ deletedCount: 0, skippedCount: 1 })
     expect(await readFile(join(outside, 'entry_0', 'payload.txt'), 'utf8')).toBe('outside payload')
   })
 
-  it('preserves unsafe quarantine trees and removes verified read-only result quarantine trees', async () => {
-    const { paths, results, maintenance } = await createMaintenanceFixture()
-    const published = await publish(results, 'a'.repeat(64), '# to quarantine')
-    const physical = paths.resolveArtifactPath(published.cacheKey, published.artifactPath)
-    await makePublishedWritable(paths, published.cacheKey, published.fileId)
-    await rm(physical)
+  it('removes verified result quarantine trees and preserves trees containing symlinks', async () => {
+    const fixture = await maintenanceFixture()
+    const { paths, results, maintenance } = fixture
+    const published = await publish(results)
+    await rm(paths.resolveArtifactPath(published.cacheKey, published.artifactPath))
     await expect(results.get(published.cacheKey)).rejects.toMatchObject({ failure: { code: 'CACHE_CORRUPT' } })
-    const isolation = await maintenance.scanIntegrity({ isolateInvalid: true })
-    expect(isolation.quarantinedCount).toBe(1)
+    expect((await maintenance.scanIntegrity({ isolateInvalid: true })).quarantinedCount).toBe(1)
+    const [entry] = (await maintenance.listQuarantine()).entries
+    expect((await maintenance.cleanupQuarantine({ entryIds: [entry!.id], dryRun: false })).deletedCount).toBe(1)
+    await absent(paths.quarantineDir(entry!.id))
 
-    const resultQuarantine = await maintenance.listQuarantine()
-    expect(resultQuarantine.totalCount).toBe(1)
-    const quarantineId = resultQuarantine.entries[0]!.id
-    const cleaned = await maintenance.cleanupQuarantine({ entryIds: [quarantineId], dryRun: false })
-    expect(cleaned.deletedCount).toBe(1)
-    await expect(stat(paths.quarantineDir(quarantineId))).rejects.toThrow()
-
-    const unsafe = paths.quarantineDir('unsafe_entry')
-    await mkdir(unsafe, { recursive: true })
+    const unsafe = await quarantineEntry(fixture, 'unsafe_entry')
     const outside = join(paths.root, 'outside-unsafe.txt')
     await writeFile(outside, 'safe outside')
     await symlink(outside, join(unsafe, 'payload-link'))
-    const skipped = await maintenance.cleanupQuarantine({ entryIds: ['unsafe_entry'], dryRun: false })
-    expect(skipped.plannedCount).toBe(0)
-    expect(skipped.skippedCount).toBe(1)
-    await expect(stat(unsafe)).resolves.toBeDefined()
+    expect(await maintenance.cleanupQuarantine({ entryIds: ['unsafe_entry'], dryRun: false })).toMatchObject({ plannedCount: 0, skippedCount: 1 })
+    await exists(unsafe)
     expect(await readFile(outside, 'utf8')).toBe('safe outside')
   })
 })
 
-describe('StorageMaintenanceService cache clear', () => {
-  it('previews then deletes all published results while no parse operation is active', async () => {
-    const { paths, results, maintenance } = await createMaintenanceFixture()
+describe('StorageMaintenanceService cache clear confirmation', () => {
+  it('previews, then deletes every published result with the preview token', async () => {
+    const { paths, results, maintenance } = await maintenanceFixture()
     const first = await publish(results, 'a'.repeat(64), '# first')
     const second = await publish(results, 'b'.repeat(64), '# second')
-
     const preview = await maintenance.clearCache()
-    expect(preview.dryRun).toBe(true)
-    expect(preview.eligible).toBe(true)
-    expect(preview.plannedCount).toBe(2)
-    expect(preview.deletedCount).toBe(0)
-    await expect(stat(paths.resultDir(first.cacheKey))).resolves.toBeDefined()
-    await expect(stat(paths.resultDir(second.cacheKey))).resolves.toBeDefined()
-
+    expect(preview).toMatchObject({ dryRun: true, eligible: true, plannedCount: 2, deletedCount: 0 })
+    await exists(paths.resultDir(first.cacheKey))
     const cleared = await maintenance.clearCache({ dryRun: false, confirmationToken: preview.confirmationToken })
-    expect(cleared.eligible).toBe(true)
-    expect(cleared.deletedCount).toBe(2)
+    expect(cleared).toMatchObject({ eligible: true, deletedCount: 2, skippedCount: 0 })
     expect(cleared.deletedBytes).toBeGreaterThan(0)
-    expect(cleared.skippedCount).toBe(0)
-    await expect(stat(paths.resultDir(first.cacheKey))).rejects.toThrow()
-    await expect(stat(paths.resultDir(second.cacheKey))).rejects.toThrow()
+    await absent(paths.resultDir(first.cacheKey))
+    await absent(paths.resultDir(second.cacheKey))
   })
 
-  it('blocks deletion while a background shared operation is still active', async () => {
-    const { paths, results, operations, maintenance } = await createMaintenanceFixture()
-    const published = await publish(results, 'e'.repeat(64), '# producer')
-    const reserved = operations.reserve(published.cacheKey, asProviderConfigId('mp_maintenance'), 1000)
-    expect(reserved.created).toBe(true)
-
-    await expect(maintenance.clearCache({ dryRun: false }))
-      .rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
-    await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
-    operations.dispose()
-  })
-  it('blocks deletion while a model tool holds shared storage access', async () => {
-    const { paths, results, maintenance } = await createMaintenanceFixture()
-    const published = await publish(results, 'e'.repeat(64), '# leased')
-    let release!: () => void
-    let entered!: () => void
-    const ready = new Promise<void>(resolve => { entered = resolve })
-    const held = maintenance.accessGate.runShared(async () => {
-      entered()
-      await new Promise<void>(resolve => { release = resolve })
-    })
-    await ready
-
-    await expect(maintenance.clearCache({ dryRun: false, confirmationToken: 'stale' }))
-      .rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
-    await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
-    release()
-    await held
+  it.each([undefined, 'wrong-token'])('refuses deletion without the matching token (%s)', async confirmationToken => {
+    const { paths, results, maintenance } = await maintenanceFixture()
+    const published = await publish(results)
+    expect(await maintenance.clearCache({ dryRun: false, confirmationToken })).toMatchObject({ eligible: false, deletedCount: 0 })
+    await exists(paths.resultDir(published.cacheKey))
   })
 
-  it('rejects a stale preview when the result set changes', async () => {
-    const { paths, results, maintenance } = await createMaintenanceFixture()
+  it('rejects a stale preview token when the result set changed', async () => {
+    const { paths, results, maintenance } = await maintenanceFixture()
     const first = await publish(results, 'f'.repeat(64), '# first')
     const preview = await maintenance.clearCache()
     const second = await publish(results, '1'.repeat(64), '# second')
-
-    const report = await maintenance.clearCache({
-      dryRun: false,
-      confirmationToken: preview.confirmationToken,
-    })
-    expect(report.eligible).toBe(false)
-    expect(report.deletedCount).toBe(0)
-    await expect(stat(paths.resultDir(first.cacheKey))).resolves.toBeDefined()
-    await expect(stat(paths.resultDir(second.cacheKey))).resolves.toBeDefined()
+    expect(await maintenance.clearCache({ dryRun: false, confirmationToken: preview.confirmationToken }))
+      .toMatchObject({ eligible: false, deletedCount: 0 })
+    await exists(paths.resultDir(first.cacheKey))
+    await exists(paths.resultDir(second.cacheKey))
   })
 
-  it('rejects symlinked result ancestors without touching the target', async () => {
-    const { paths, results, maintenance } = await createMaintenanceFixture()
+  it('fails closed on a truncated traversal even with a matching complete-preview token', async () => {
+    const { paths, results, maintenance } = await maintenanceFixture()
+    const first = await publish(results, 'a'.repeat(64), '# first')
+    const second = await publish(results, 'b'.repeat(64), '# second')
+    const preview = await maintenance.clearCache()
+    const report = await maintenance.clearCache({ dryRun: false, resultLimit: 1, confirmationToken: preview.confirmationToken })
+    expect(report).toMatchObject({ scan: { scanned: 1, truncated: true }, eligible: false, deletedCount: 0 })
+    expect(report.confirmationToken).toBeUndefined()
+    await exists(paths.resultDir(first.cacheKey))
+    await exists(paths.resultDir(second.cacheKey))
+  })
+
+  it('fails closed for every planned result when any prefix is a symlink', async () => {
+    const { paths, results, maintenance } = await maintenanceFixture()
+    const published = await publish(results, '5'.repeat(64), '# preserve')
+    const preview = await maintenance.clearCache()
+    const outside = await tempRoot()
+    await writeFile(join(outside, 'preserve.txt'), 'outside')
+    const prefix = ['00', '01'].find(value => value !== published.cacheKey.slice(0, 2))!
+    await symlink(outside, join(paths.resultsDir(), prefix))
+    const report = await maintenance.clearCache({ dryRun: false, confirmationToken: preview.confirmationToken })
+    expect(report).toMatchObject({ eligible: false, deletedCount: 0 })
+    expect(report.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: 'symlink-skipped' })]))
+    expect(await readFile(join(outside, 'preserve.txt'), 'utf8')).toBe('outside')
+    await exists(paths.resultDir(published.cacheKey))
+  })
+
+  it('withholds a preview token behind a symlinked results ancestor', async () => {
+    const { paths, results, maintenance } = await maintenanceFixture()
     const published = await publish(results, '2'.repeat(64), '# ancestor')
     const outside = join(paths.root, 'outside-results')
     await mkdir(outside)
     await rename(paths.resultsDir(), join(outside, 'sha256'))
     await rm(join(paths.root, 'results'), { recursive: true })
     await symlink(outside, join(paths.root, 'results'))
-
     const report = await maintenance.clearCache()
     expect(report.eligible).toBe(false)
     expect(report.confirmationToken).toBeUndefined()
-    await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
+    await exists(paths.resultDir(published.cacheKey))
   })
 
-  it('never follows symlinks while clearing cache', async () => {
-    const { paths, results, maintenance } = await createMaintenanceFixture()
+  it('never follows symlinks inside a published result while clearing', async () => {
+    const { paths, results, maintenance } = await maintenanceFixture()
     const published = await publish(results, 'd'.repeat(64), '# linked')
     const outside = join(paths.root, 'outside-cache.txt')
     await writeFile(outside, 'preserve me')
-    await makePublishedWritable(paths, published.cacheKey, published.fileId)
     await symlink(outside, join(paths.fileDir(published.cacheKey, published.fileId), 'outside-link'))
-
-    const report = await maintenance.clearCache({ dryRun: false })
-    expect(report.eligible).toBe(false)
-    expect(report.deletedCount).toBe(0)
-    expect(report.skippedCount).toBe(1)
+    expect(await maintenance.clearCache({ dryRun: false })).toMatchObject({ eligible: false, deletedCount: 0, skippedCount: 1 })
     expect(await readFile(outside, 'utf8')).toBe('preserve me')
-    await expect(stat(paths.resultDir(published.cacheKey))).resolves.toBeDefined()
-  })
-})
-
-describe('StorageMaintenanceService GC dry run', () => {
-  it('returns bounded candidates without deleting published results', async () => {
-    const { paths, results, maintenance } = await createMaintenanceFixture()
-    const first = await publish(results, 'a'.repeat(64), '# first')
-    const second = await publish(results, 'b'.repeat(64), '# second')
-
-    const report = await maintenance.gcDryRun({ candidateLimit: 1 })
-    expect(report.dryRun).toBe(true)
-    expect(report.eligible).toBe(true)
-    expect(report.candidateCount).toBe(2)
-    expect(report.candidates).toHaveLength(1)
-    expect(report.candidatesTruncated).toBe(true)
-    expect([first.cacheKey, second.cacheKey]).toContain(report.candidates[0]!.cacheKey)
-    await expect(stat(paths.resultDir(first.cacheKey))).resolves.toBeDefined()
-    await expect(stat(paths.resultDir(second.cacheKey))).resolves.toBeDefined()
-  })
-  it('never makes corrupt or scan-truncated results GC candidates', async () => {
-    const { paths, results, maintenance } = await createMaintenanceFixture()
-    const corrupt = await publish(results, 'a'.repeat(64), 'same-size-A')
-    const validOne = await publish(results, 'b'.repeat(64), '# valid one')
-    const validTwo = await publish(results, 'c'.repeat(64), '# valid two')
-
-    await makePublishedWritable(paths, corrupt.cacheKey, corrupt.fileId)
-    const physical = paths.resolveArtifactPath(corrupt.cacheKey, corrupt.artifactPath)
-    await chmod(physical, 0o644)
-    await writeFile(physical, 'same-size-B')
-
-    const full = await maintenance.gcDryRun()
-    expect(full.invalidResultCount).toBe(1)
-    expect(full.candidateCount).toBe(2)
-    expect(full.candidates.some(candidate => candidate.cacheKey === corrupt.cacheKey)).toBe(false)
-    await expect(stat(paths.resultDir(corrupt.cacheKey))).resolves.toBeDefined()
-
-    const outsidePrefix = join(paths.root, 'outside-prefix')
-    await mkdir(outsidePrefix)
-    await symlink(outsidePrefix, join(paths.resultsDir(), 'ff'))
-    const incomplete = await maintenance.gcDryRun()
-    expect(incomplete.eligible).toBe(false)
-    expect(incomplete.candidateTotalsComplete).toBe(false)
-
-    const truncated = await maintenance.gcDryRun({ resultLimit: 1 })
-    expect(truncated.scan.truncated).toBe(true)
-    expect(truncated.eligible).toBe(false)
-    expect(truncated.candidateTotalsComplete).toBe(false)
-    await expect(stat(paths.resultDir(validOne.cacheKey))).resolves.toBeDefined()
-    await expect(stat(paths.resultDir(validTwo.cacheKey))).resolves.toBeDefined()
+    await exists(paths.resultDir(published.cacheKey))
   })
 })

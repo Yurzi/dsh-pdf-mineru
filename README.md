@@ -4,387 +4,176 @@
 
 # dsh-pdf-mineru
 
-**让 DeepSeek Harness 拥有强大的 PDF 与文档智能解析能力**
+**用 MinerU 解析 PDF，让 DeepSeek Harness 里的 Agent 按证据阅读文档**
 
-支持 **MinerU 官方云 (v4)** 与 **私有化自建服务 (v2)**，为 AI Agent 提供高精度的文档版面分析、公式与表格提取、图文解析，原生支持后台异步任务与智能缓存。
+支持 MinerU 官方云（v4）、自部署 MinerU 4.x（V1 API）和 3.x（旧版任务 API）。Agent 可以分段读取正文、公式、表格和插图，长文档在后台解析，关键内容可在本地回看原页核对。
 
 <p>
   <a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin"></a>
   <a href="https://www.npmjs.com/package/dsh-pdf-mineru"><img src="https://img.shields.io/npm/v/dsh-pdf-mineru?style=flat-square&amp;label=npm&amp;color=CB3837" alt="npm version"></a>
-  <a href="./package.json"><img src="https://img.shields.io/badge/Node.js-%3E%3D22.19.0-339933?style=flat-square&amp;logo=nodedotjs&amp;logoColor=white" alt="Node.js 22.19.0 or newer"></a>
-  <img src="https://img.shields.io/badge/DSH-%3E%3D0.2.0--rc.2%20(RC%20only)-111827?style=flat-square" alt="DSH >=0.2.0-rc.2 (RC only)">
-  <img src="https://img.shields.io/badge/MinerU-Official%20v4%20%7C%20Self--hosted%20v2-2563EB?style=flat-square" alt="MinerU v2 and v4">
+  <a href="./package.json"><img src="https://img.shields.io/badge/Node.js-%5E22.19.0%20%7C%7C%20%3E%3D24-339933?style=flat-square&amp;logo=nodedotjs&amp;logoColor=white" alt="Node.js ^22.19.0 || >=24"></a>
+  <a href="./package.json"><img src="https://img.shields.io/badge/DSH-%3E%3D0.2.1--rc.2%20%3C0.3.0--0-111827?style=flat-square" alt="DSH >=0.2.1-rc.2 <0.3.0-0"></a>
+  <img src="https://img.shields.io/badge/MinerU-Official%20v4%20%7C%20Self--hosted%204.x%20V1%20%7C%203.x%20legacy-2563EB?style=flat-square" alt="MinerU Official v4, Self-hosted 4.x V1, 3.x legacy">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-2EA44F?style=flat-square" alt="MIT License"></a>
 </p>
 
-[✨ 核心亮点](#-核心亮点) · [🚀 快速开始](#-快速开始) · [💬 对话示例](#-对话与提示词示例) · [⚙️ 模型工具](#️-模型工具与参数参考) · [🏗️ 工作架构](#️-工作架构与流程) · [🔌 Provider 选型](#-provider-选型对比) · [🛠️ 设置与配置](#️-设置与配置参考) · [❓ 常见问题](#-常见问题-faq) · [🧑‍💻 开发者指南](#-开发者指南)
+[核心亮点](#核心亮点) · [快速开始](#快速开始) · [模型工具](#模型工具一览) · [原页核对](#原页核对的依赖) · [常见问题](#常见问题) · [文档](#文档)
 
 </div>
 
----
+## 核心亮点
 
-## ✨ 核心亮点
+- **按证据阅读**：目录、字面检索、稳定块 ID 和物理页码帮助 Agent 定位内容；公式、数值和图表可以回看原页核对，不假设 OCR 无误。
+- **三种 Provider 显式切换**：官方云免部署；自部署服务让文档留在内网。三种协议共用同一套工具参数。
+- **后台解析长文档**：几十到几百页的文档可提交为 DSH 原生后台任务，解析期间不阻塞对话，完成后由 DSH 通知。
+- **内容寻址缓存**：按文件内容和解析配置复用已发布结果，同一份文档不重复上传解析。
+- **Web 设置页**：在 Plugins 页面配置 Provider、测试连接、管理缓存；修改需显式保存，破坏性操作先预览再确认。
 
-- 📑 **结构化提取与证据定位**：支持双栏正文、目录、LaTeX公式、表格、参考文献与插图；通过搜索、稳定块ID和原页核对检查解析证据，而非假设OCR无损。
-- ☁️ **云端 / 本地自由切换**：支持开箱即用的 **MinerU 官方云 API**（无需本地显卡）与 **私有化自建服务**（数据不出内网），统一工具接口无缝切换。
-- ⚡ **无感后台异步解析**：几十页至数百页的长篇论文或研报，Agent 会自动提交为 DSH 原生后台任务（Native Job），解析期间不阻塞聊天，解析完成后自动提醒。
-- 💾 **智能内容寻址缓存**：基于文件指纹与解析配置自动去重，同一份文档无需重复解析，极大节省 Token、官方 API 额度与计算资源，二次调用秒级响应。
-- 🖥️ **深度集成 Web GUI**：提供内置可视化设置面板，支持一键连通性测试、参数预设、缓存统计与磁盘管理，配置即改即用。
+## 快速开始
 
----
+### 环境要求
 
-## 🚀 快速开始
+- DeepSeek Harness：版本范围以 [package.json](./package.json) 的 `engines.dsh` 为准（当前为 `>=0.2.1-rc.2 <0.3.0-0`）。
+- Node.js `^22.19.0 || >=24.0.0`。
+- 设置页需要 DSH Web；没有 Web 服务的宿主仍可使用两个模型工具，配置直接写在 profile 中。
 
-### 0. 环境要求与版本兼容说明
-
-> ⚠️ **重要版本声明与环境要求**：
-> - **最低支持的 DSH 版本**：`>= 0.2.0-rc.2`。
-> - **仅支持 RC 版本**：本插件**只会对 DeepSeek Harness 的 RC（Release Candidate）版本及后续正式发布版本进行官方支持**。由于早期 `alpha` 测试版本包含较多实验性且剧烈变动的内部 API，本插件不再对 `alpha` 等非稳定测试版本提供兼容与维护支持。
-> - **运行环境要求**：Node.js `^22.19.0 || >=24.0.0`，包管理器推荐 `pnpm@11+`。
-
-插件 `0.1.5` 起以 DSH `v0.2.0-rc.2` 为基线，当前版本为 `0.2.0`。升级前请先升级宿主；`0.2.0` 将配置升级到 schema 3，旧配置读取时内存迁移、用户显式保存时写入新格式。自托管 Provider 身份变化会导致旧缓存重新解析；工具参数不变。Web 设置与维护 RPC 仅在 `connection` 和 `webServer` 同时可用时注册；无 WebServer 的宿主仍可使用两个模型工具，但不提供这些 HTTP RPC。
-
-后台任务使用 DSH 的 SessionId 归属与原生 JobRegistry：阶段进度显示为 `preparing`、`waiting-for-parse`、`reading-result`、`summarizing`，不是页数或百分比；缓存命中跳过等待阶段。完成摘要通过原生任务结果交付，通知、空闲唤醒、输出消费与会话归档准入由 DSH 负责。宿主必须为该会话装配任务控制器（如 `tool-jobs`），否则启动会在解析前拒绝。`job_kill` 仍只取消本次等待，不中止其他调用共用的解析生产者。
-
-### 1. 安装插件
-
-在 DeepSeek Harness 环境中一键安装：
+### 安装
 
 ```sh
 dsh plugin --profile web add dsh-pdf-mineru
 ```
 
-rc.2 暂不支持已安装插件的自动更新。升级已安装版本时，请先升级 DSH 宿主，再在 Plugins 中卸载旧插件并安装 `dsh-pdf-mineru@0.2.0`；操作前备份 profile 配置，不要执行缓存清除。旧配置在内存中自动迁移，保存后写入 schema 3；旧自托管缓存不再按新 Provider 身份复用，首次读取会重新解析。Desktop profile 需先启动过桌面端，生成 profile 后再使用 CLI 管理插件。
-
-> 本地开发或测试源码时，可使用：`dsh plugin --profile web add link:/absolute/path/to/dsh-pdf-mineru`
-
-### 本地原页渲染的安装条件
-
-正常安装插件会安装固定版本的 [pdfjs-dist 6.3.289](https://www.npmjs.com/package/pdfjs-dist/v/6.3.289)（Apache-2.0）和 [@napi-rs/canvas 1.0.9](https://www.npmjs.com/package/@napi-rs/canvas/v/1.0.9)（MIT）。在支持的平台且未禁用平台可选依赖时，**无需系统安装 Poppler 即可使用原有原页接口**；字体、CMap、WASM 都从安装包本地加载，无 CDN。
-
-这并非“纯 JavaScript、无原生依赖”：Canvas 使用预编译 Skia/N-API 平台二进制，包管理器通过 optionalDependencies 选择平台包，无安装期编译脚本。上游提供 Linux x64/arm64（glibc、musl）、Linux armv7（glibc）、Linux riscv64（glibc）、macOS x64/arm64、Windows x64/arm64 和 Android arm64 包；仍要求匹配的系统 ABI/运行库和本插件 Node 版本；Canvas上游文档要求glibc ≥2.18、Linux arm64为Cortex-A57或更新、armv7为Cortex-A7或更新，Node自身的系统要求仍须同时满足。实际验收平台为 Linux x64 glibc（Node 22.19.0 与26.8.2的独立生产安装包），其它平台有上游二进制不等于本仓库逐一验收。不要使用会删掉平台包的 --no-optional 安装选项。两后端均不可用时会提示安装 Poppler，或在支持平台重新安装插件及其平台可选依赖；不会使普通文本阅读失效。
-
-PDF.js 包解压约34.8 MB，Canvas JS 约0.13 MB，Linux x64 glibc 二进制约34.8 MB（十进制，其他平台不同），这是安装依赖体积，不是插件 tarball 体积。PDF.js 的 Node 要求覆盖本插件现有 Node.js `^22.19.0 || >=24.0.0` 范围。
-
-只对依赖/执行环境不可用自动切换：损坏、加密、解析失败、页码越界、源摘要不匹配、取消、资源超限或超时不会通过换后端重试。后端间可能存在字体、抗锯齿、透明度和裁切保真差异，不承诺像素相同；详见[阅读指南](docs/model-reading.md)。
-
-### 2. 配置与连接
-
-打开 DSH 界面中的 **Plugins / 插件 → dsh-pdf-mineru**，根据您的使用场景选择 Provider。配置页位于插件 bundle 详情中，不再单独出现在全局 Settings 导航。设置页按卡片分组，高级配置按需展开；修改后点击 **Save Configuration / 保存配置** 生效。连接测试使用当前草稿，缓存清理仍需先预览再确认。
-
-配置由 DSH Loader 的 Config 与 profile patch 管理；可热更新字段使用 `Volatile.get()`，保存后影响后续调用。插件关闭原生自动生成表单，保留显式草稿保存。Provider-based v1 配置在内存中规范化，启动不写回配置；旧 `settings.yaml` 的导入由 DSH 负责。
-
-设置页包含 Provider、解析默认值、存储与缓存、轮询、重试、输出限制、安全上限和存储维护八张卡片。支持全部展开／折叠，折叠不会丢失表单草稿；启动时固定的安全上限只读展示，需修改宿主配置并重启。界面沿用 DSH 深浅色主题，并支持键盘导航和紧凑布局。
-
-<p align="center">
-  <img src="./docs/assets/mineru-settings-preview.webp" width="780" alt="MinerU 配置卡片预览（旧版导航，当前入口为 Plugins → dsh-pdf-mineru）">
-</p>
-
-> 上图展示配置卡片；旧版 Settings 导航仅供参考，当前请从 **Plugins / 插件 → dsh-pdf-mineru** 打开。
-
-#### 方案 A：使用 MinerU 官方云（推荐，免部署）
-1. 前往 [MinerU 官网](https://mineru.net) 注册并获取 API Token。
-2. 在终端配置环境变量（或通过 DSH 凭据服务管理）：
-   ```sh
-   export MINERU_API_KEY="your-token-here"
-   ```
-3. 在设置中选择 **Official v4**，保持 **API Key Env Var** 为 `MINERU_API_KEY`，点击 **Test Active Provider** 即可完成验证。
-
-#### 方案 B：使用本地 / 私有化自建服务
-1. 启动 MinerU 服务：4.x 请选择 **Self-Hosted MinerU (V1 API)**（常见地址 `http://localhost:8000`）；3.x 请选择 **Self-Hosted MinerU (Legacy v2)**（常见地址 `http://localhost:18000`）。API 代际不等于软件大版本，也不要填入 VLM 推理服务地址。
-2. V1 配置档位 `tier` 和独立的 OCR 模式 `ocrMode: auto/txt/ocr`；legacy-v2 配置 backend 映射及共享解析默认值。两种协议显式选择，不自动降级或映射 backend 为 tier。
-3. 本地 HTTP 需勾选 **Allow Insecure HTTP**。点击 **Test Active Provider** 验证：V1 显示部署声明的档位、产物和来源，真实解析前也检查 ZIP、file_id 与选定档位是否可用。验证不等于解析效果保证。
-4. 配置修改只更新草稿，点击 **Save Configuration** 才保存。切换协议、折叠卡片不清空各 profile 的草稿。
-
-### 3. 开始使用
-
-配置完成后，无需记忆复杂指令，直接在聊天框中用自然语言对 Agent 下达需求即可！
-
----
-
-## 💬 对话与提示词示例
-
-Agent 会自动根据文档长度和指令意图，智能选择同步返回或后台异步处理：
-
-### 场景 1：常规论文 / 报告解析
-> **你**：“帮我解析 `/workspace/paper.pdf`，提取正文、数学公式和表格，整理成 Markdown 格式。”
-> **Agent**：调用 `read_pdf`，直接返回排版好的 Markdown 文本与关键内联图表。
-
-### 场景 2：超长文档后台全量解析（推荐）
-> **你**：“请在后台解析这本 120 页的技术研报 `/data/annual-report.pdf`，解析完成后告诉我。”
-> **Agent**：提交 `async_parse_pdf` 并返回任务 ID（如 `mineru-1`），全量解析到本地缓存，完成后返回文档结构化摘要（页数、大纲、表格数、图片数等），并提示使用 `read_pdf` 按需读取。
-
-### 场景 3：按需切片读取（指定页码与关注内容）
-> **你**：“读取 `/data/report.pdf` 的第 1 到 5 页中的表格。”
-> **Agent**：调用 `read_pdf` 并传入 `pages: "1-5"` 与 `focus: "table"` 进行精准定向提取。
-
-## ⚙️ 模型工具与参数参考
-
-插件为 Agent 注册了两项核心文档解析工具：
-
-| 工具名称 | 适用场景 | 说明 |
-| --- | --- | --- |
-| `read_pdf` | 同步读取 / 按需切片 | 同步读取 PDF，支持指定页码（`pages`）与内容类型（`focus`）切片提取，返回 Markdown 文本与按自然顺序排列的内联多模态图表 |
-| `async_parse_pdf` | 长篇文档 / 后台解析 | 注册为 DSH 原生后台任务（`mineru-N`），全量解析 PDF 至本地缓存，完成后交付文档结构化摘要与后续阅读指引，不阻塞当前对话 |
-
-### 证据阅读：定位 → 精读 → 续读 → 原页核对
-
-1. 用 `focus: "toc"` 看目录，或用 `query: "图 7"` 字面检索。空格有意义，“图7”与“图 7”不同。
-2. 用返回的 `block_id` 精读完整块，或用物理页码与focus选择内容。标题块不代表整节。
-3. `content_status: "partial"` 时，以同一来源选择器（`file_path` 或 `attachment_id`）和原样cursor继续，不重复pages/focus/block_id/query；结束时cursor为null。
-4. 对关键公式、数值和图表，用 `view: "page"` 回看原页；可传source_sha256作为expected_sha256。
-
-**complete只表示所选解析文本交付完成，不保证OCR正确或图像全部展示。** 检查当前块的diagnostics、公式verification_hints及visuals；metadata_shortened表示元数据因预算未完整列出。
-
-- 默认响应预算12,000个UTF-16单元、正文每块最多8,000；JSON和Native文本各最多48,000字节。默认不重复返回缓存路径；导出用focus: artifacts。
-- `inline_images` 首次省略默认true，续读省略继承，显式布尔值覆盖；模型能力和图像预算始终构成上限。
-- **0.0.14起使用v3游标，0.1.1保持该协议及索引v2；旧v1/v2游标需重新开始，解析缓存无需迁移。** 续读不会在缓存丢失时偷偷重新上传。
-- 原页模式优先使用 PATH 中的 Poppler（pdfinfo/pdftoppm），命令缺失或明确不可执行时自动回退到 PDF.js + Node Canvas 子进程；仍需图像模型、附件服务及大于0的图像预算。结果以 `renderer: "poppler" | "pdfjs"` 标明后端，不会上传PDF或要求模型重新调用。它是本地有界执行，不是OS级隔离沙箱。
-
-字段语义、完整示例、来源/索引版本、预算、安全边界、错误恢复和离线验收见 **[PDF阅读指南](docs/model-reading.md)**。更新插件后需要让宿主重新加载工具定义；只构建源码或刷新Web页面不等于后端已重载。
-
-### 文件来源
-
-`read_pdf` 的正文、续读、原页模式及 `async_parse_pdf` 都保留 `file_path`，也可改用互斥的 `attachment_id`，例如 `{"attachment_id":"<当前附件的完整内容ID>","focus":"toc"}`。两个来源字段在 schema 中均可选，但每次调用运行时必须且只能提供一个；调用方续读应保留同一选择器；游标仍按既有结果／投影身份校验，不新增选择器字符串绑定。
-
-附件 ID 可为完整 `sha256:` 加 64 位十六进制摘要，或 8–64 位摘要前缀（可带 `sha256:`）。只匹配当前会话可见消息中的文件引用（包括独立的 `role: "tool"` 工具结果消息）；已压缩移出的引用不可见。多个不同内容 ID 匹配时拒绝，需提供更长前缀或完整 ID；不会猜测路径或搜索全局附件库。附件仍由 DSH 管理；宿主不提供本地路径能力时返回 `UNSUPPORTED_OPTION`，插件不会将附件流落盘。Provider、缓存和既有完整性校验不变。
-
-### 常用解析参数（均可通过自然语言告知 Agent）
-
-| 参数 | 类型 | 适用工具 | 作用说明 |
-| --- | --- | --- | --- |
-| `file_path` | `string` | 全部 | 本地文件路径；与 `attachment_id` 必须且只能选一个 |
-| `attachment_id` | `string` | 全部 | 当前会话可见文件附件的完整内容 ID 或唯一摘要前缀（8–64 位十六进制，可带 `sha256:`） |
-| `pages` | `number` / `string` / `number[]` | `read_pdf` | 1-based 页码选择，支持单页（如 `3`）、数组（如 `[1, 2, 5]`）或范围字符串（如 `"1-3, 5"`） |
-| `focus` | `string` / `string[]` | `read_pdf` | `all`（默认）、`text`、`table`、`image`、`toc` 或 `artifacts` |
-| `cursor` | `string` | `read_pdf` | 原样传回上一条部分阅读响应的 token；与 `pages`／`focus`／`block_id`／`query` 互斥，仍须传同一来源选择器（`file_path` 或 `attachment_id`） |
-| `block_id` | `string` | `read_pdf` | 原样使用此前返回的稳定块 ID；与 `query`、`cursor` 互斥 |
-| `query` | `string` | `read_pdf` | 1–256 字符、不区分大小写的字面检索；返回上下文摘要与块 ID，再用 `block_id` 读全文 |
-| `view` | `"content"` / `"page"` | `read_pdf` | 默认解析文本；page 模式只接受一页 `pages`，本地渲染原页，不调用 Provider |
-| `expected_sha256` | `string` | `read_pdf` | 仅 page 模式；可选的源文件 SHA-256，通常来自此前结果的 `source_sha256` |
-| `inline_images` | `boolean` | `read_pdf` | 首次省略默认true；续读省略继承，显式值覆盖，仍受模型能力和图像预算约束 |
-| `poll_timeout_ms` | `number` | `read_pdf` | 最大同步等待超时毫秒数 |
-
----
-
-## 🏗️ 工作架构与流程
-
-```mermaid
-flowchart LR
-    Agent[DSH Agent] --> Sync[read_pdf]
-    Agent --> Async[async_parse_pdf]
-
-    Async --> Jobs[DSH JobRegistry]
-    Jobs --> Service[MinerUService]
-    Sync --> Service
-
-    Service --> Cache{Result cache}
-    Cache -->|hit| Result[Immutable result]
-    Cache -->|miss| Shared[SharedOperationRegistry]
-    Shared --> Providers
-    Providers --> V1[Self-hosted V1]
-    Providers --> V2[Self-hosted legacy v2]
-    V1 --> Staging[Validated staging]
-    Providers --> V4[Official v4]
-    V2 --> Staging
-    V4 --> Staging
-    Staging --> Publish[Atomic publish]
-    Publish --> Result
-```
-
-- **统一工具分发**：Agent 发起的同步请求（`read_pdf`）直接返回结果，异步长任务（`async_parse_pdf`）交由 DSH 原生 JobRegistry 调度。
-- **缓存复用**：按文件 SHA-256 与解析语义寻址；命中时无需重新提交上游解析，但仍校验本地源文件及产物。
-- **并发请求合并**：同进程内的并发重复请求由 `SharedOperationRegistry` 合并，避免重复向上游提交。
-- **显式三类 Provider**：`self-hosted-v1` 使用 4.x `/v1/...`，`self-hosted-legacy-v2` 使用 3.x `/tasks`，`official-v4` 使用官方云接口；各自有独立配置、缓存身份和能力校验。
-
-## 🔌 Provider 选型对比
-
-| 配置类型 | 适用服务 | 可配置解析选项 | 不接受的混用字段 |
-| --- | --- | --- | --- |
-| `self-hosted-v1` | 自部署 MinerU 4.x，V1 API | `tier`（四档或服务端默认）、`ocrMode`（三态） | `modelMap`、请求级模型／语言／公式／表格开关 |
-| `self-hosted-legacy-v2` | 自部署 MinerU 3.x，旧任务 API | `modelMap`；共享 `defaults` 中的模型、解析方式、语言、公式、表格 | `tier`、`ocrMode` |
-| `official-v4` | MinerU 官方云 API | `models`；共享解析默认值（不支持 txt） | `tier`、`ocrMode`、`modelMap` |
-
-两类自托管支持显式 HTTP opt-in、可选凭据引用和 `configuredVersion`；官方云保持 HTTPS 与凭据要求。新安装提供三份独立 profile，默认仍选 legacy-v2，不自动更改既有部署目标。
-
----
-
-## 🛠️ 设置与配置参考
-
-推荐直接在 **DSH Web GUI (Plugins / 插件 → dsh-pdf-mineru)** 中进行可视化调整。若需要直接编辑配置文件（`cordis.patch.yml`），可参考以下常用配置：
-
-<details>
-<summary><strong>📋 点击展开：YAML 配置示例</strong></summary>
-
-### 1. 官方云 (Official v4) 推荐配置
-```yaml
-schemaVersion: 3
-activeProvider: mp_official
-providers:
-  - id: mp_official
-    type: official-v4
-    baseURL: https://mineru.net/api/v4
-    apiKeyEnv: MINERU_API_KEY
-    models: [pipeline, vlm]
-defaults:
-  model: vlm
-  ocr: false
-  formula: true
-  table: true
-```
-
-### 2. 本地私有化 (Self-hosted legacy v2) 推荐配置
-```yaml
-schemaVersion: 3
-activeProvider: mp_self_hosted
-providers:
-  - id: mp_self_hosted
-    type: self-hosted-legacy-v2
-    baseURL: http://localhost:18000
-    allowInsecureHttp: true
-    modelMap:                 # legacy-v2 的 backend 名称
-      pipeline: pipeline
-      vlm: vlm-engine
-defaults:
-  model: pipeline
-  ocr: false
-  formula: true
-  table: true
-```
-
-### 3. MinerU 4.x 自托管（V1 API）配置
-
-```yaml
-schemaVersion: 3
-activeProvider: mp_self_hosted_v1
-providers:
-  - id: mp_self_hosted_v1
-    type: self-hosted-v1
-    baseURL: http://localhost:8000
-    allowInsecureHttp: true
-    apiKeyEnv: MINERU_API_KEY
-    tier: standard          # 可省略，让服务端选择；不是具体模型名
-    ocrMode: auto           # auto / txt / ocr；按 V1 profile 独立保存
-    configuredVersion: '4.0.10' # 原地升级服务或模型后更新缓存版本
-```
-
-V1 不暴露上游已移除的请求级语言／公式／表格参数。隐藏这些共享默认值不会把它们清空，但它们不影响 V1 请求或缓存；内部占位值不表示服务端关闭相关能力。OCR 的 txt 与 auto 保持不同语义，txt 不保证完全不运行视觉模型。档位切换和 OCR 模式变化会隔离缓存；standard/advanced 可以使用同一模型、不同计算量。
-
-**配置版本与自动迁移：**当前插件配置为 schemaVersion: 3，独立于 MinerU 软件/API 版本及缓存、游标版本。读取旧配置时只在内存中按 **1 → 2 → 3** 转换；未声明版本的 Provider-based 配置按版本 2 处理。启动、配置读取均不自动改写磁盘；用户点击保存后，才通过宿主事务持久化版本 3 的完整迁移结果，后续普通保存仍沿用原生 Settings。
-
-- 1 → 2 移除旧批量/产物默认字段；2 → 3 将 self-hosted-v2 转为 self-hosted-legacy-v2，保留有效 ID、活动选择、地址、凭据引用、backend 映射及其他有效设置，移除 legacy 不支持的 tier。
-- 旧版本缺失或不支持的字段值使用对应默认值修复；重复/无效 ID 采用不冲突的默认 ID。迁移记录只含版本、字段路径和 Provider ID，不记录原始值或密钥。不会因迁移自动开启未经明确授权的 HTTP；缺少授权的 HTTP 默认端点改用 HTTPS，无效凭据引用不会被传给 Provider。
-- 最新版本编辑继续严格校验；未知未来版本和未知结构字段拒绝，防止误降级或吞掉配置。宿主组合基础层中残留的两个已废弃字段仅在内存清除；不恢复旧 flat config。
-- 首次显式保存迁移配置时，完整快照同时保存修复后的非表单字段，避免更新版本号后残留坏值；运行中的 storageRoot/limits 仍不允许改变。保存失败不会提前更新运行时配置。
-
-**接口选择与缓存：**迁移不根据 URL/backend/tier 猜测接口。此前依赖 V1 自动识别的部署需主动选择 self-hosted-v1。原自托管缓存不会被新 Provider 身份复用，配置迁移也不改写解析产物；连接失败不会降级到另一个协议。
-
-**V1 功能边界：**使用本地路径或会话附件，经上传去重、任务轮询及 ZIP 下载后发布到插件自身缓存。已处理 partial/canceled 状态、逐文件错误和素材实际路径；不把服务器资源 ID 当作重启后可恢复的持久化记录。工具仍是单文件；不暴露 URL/inline 来源、callback/Webhook、服务端 DELETE 取消、HTML/DOCX 产物选择或 Doclib。job_kill 只取消本次等待，不中止共享上游任务。read_pdf.pages 是已解析内容的物理页投影，不是完整上游 page_range 语法；原页 view 仅支持 PDF。当前输入白名单仍限于 PDF、常见图片及 doc/docx/ppt/pptx/xls/xlsx；HTML/MHTML、OpenDocument、RTF、EPUB、OFD、CSV/TSV 等上游新增格式尚未开放，HTML 已验证在上传前明确拒绝。不能将四档×所有文件类型视作均已覆盖或验证。
-
-### 4. 存储与限制自定义（可选）
-```yaml
-storage:
-  storageRoot: /absolute/path/to/dsh/cache/pdf-mineru  # 默认在 $DSH_HOME/cache/pdf-mineru
-  cacheEnabled: true
-output:
-  maxInlineChars: 12000   # 单次响应预算；正文每块另限 8000 UTF-16 单元
-  maxInlineImages: 6      # 单次 read_pdf 响应最多内联图片数（0–100）
-limits:
-  maxFileBytes: 209715200  # 200 MB
-```
-
-</details>
-
-### 多进程共享存储与升级
-
-多个进程可以共享同一 `storageRoot`，前提是同一主机、同一 PID 可见命名空间及支持 hard link 的一致本地文件系统。不支持 NFS、跨主机或互不可见 PID 的容器共享这一锁协议。
-
-升级时请先停止所有使用该目录的 MinerU 进程，再统一更新并重启。新协议的 `.process.lock` 是持久版本隔离标记，实际互斥与使用记录位于 `.lock/`；它不是应当在退出时删除的“残留锁”。遇到旧锁或损坏记录，请先确认所有相关进程已停止，再按错误提示人工恢复，切勿在活跃进程运行时删除协调文件。
-
-`storageRoot` 与 `limits.*` 在启动时固定。运行中的配置保存会拒绝这些值的变更；应修改宿主配置并重启插件，不能依赖一次被拒绝的保存自动生效。
-
----
-
-## ❓ 常见问题 (FAQ)
-
-<details>
-<summary><strong>Q: 如何获取 MinerU 官方 API Token？</strong></summary>
-
-1. 访问 [MinerU 官网 (mineru.net)](https://mineru.net) 注册账号。
-2. 在个人中心创建并复制您的 API Key。
-3. 导出为环境变量 `export MINERU_API_KEY="xxx"`，或在 DSH Settings 中统一管理。
-</details>
-
-<details>
-<summary><strong>Q: 扫描版 PDF 或图片文档识别不准怎么办？</strong></summary>
-
-普通纯文本 PDF 通常可以使用默认设置。对于扫描件或识别效果不佳的文档，在 MinerU 设置中将 **Default Parse Method** 改为 `ocr`；`ocr` 布尔值由该选择保持一致。模型工具不接受 `ocr`、`model` 等技术参数，不能通过向 `read_pdf` 添加这些参数切换解析方式。
-</details>
-
-<details>
-<summary><strong>Q: Pipeline 和 VLM 模型有什么区别？</strong></summary>
-
-- **Pipeline 模式**：采用经典版面分析 + 规则提取管线，解析速度快，资源消耗低，适合大多数标准版面论文、电子书和报表。
-- **VLM 模式**：引入端到端视觉多模态大模型，对极其复杂的图文混排、手写公式、艺术字体及特殊图表有更出色的理解力。
-</details>
-
-<details>
-<summary><strong>Q: 解析结果保存在哪里？如何清理缓存？</strong></summary>
-
-解析结果按源文件内容、解析语义及 Provider 兼容标识寻址，默认存放在 `$DSH_HOME/cache/pdf-mineru/results/`。启用缓存复用时，后续阅读可复用已发布结果；同进程并发请求合并，但不同进程仍可能分别提交上游解析，不保证跨进程只计费一次。`storage.cacheEnabled=false` 仅禁用解析前的缓存复用，结果仍会不可变发布，不等同于清空缓存或强制覆盖已有结果。
-您可以在 **Plugins / 插件 → dsh-pdf-mineru** 的运维区域中：
-- 点击 **Verify Cache** 检查缓存完整性；
-- 点击 **Clear Cache** 预览，再显式确认清除。破坏性维护在存在活跃读取或解析时拒绝执行，不会为了清理而取消它们。
-</details>
-
-<details>
-<summary><strong>Q: 后台异步任务中途可以取消吗？</strong></summary>
-
-可以。DSH 会话中可通过通用的任务管理（如 `job_kill`）随时取消对任务的等待。
-</details>
-
----
-
-## 🧑‍💻 开发者指南
-
-如果您希望对插件进行二次开发或贡献代码：
+本地开发时可以安装源码目录。仓库不提交构建产物，安装前先在源码目录执行 `pnpm install && pnpm run build`：
 
 ```sh
-# 1. 安装依赖
-pnpm install
-
-# 2. 类型检查与测试
-pnpm run typecheck
-pnpm test
-
-# 3. 构建产物
-pnpm run build
-
-# 4. 在运行中的 DSH Web 中验证前端设置组件
-pnpm run verify:gui
-# 若无关插件阻止 Web shell 启动，可显式限定浏览器 fixture 的排除列表（不修改宿主配置）：
-# DSH_GUI_EXCLUDE_PLUGINS=<unrelated-plugin-id> pnpm run verify:gui
-
-# 5. （可选）本地原页验证，无上传；第二条用空PATH验证PDF.js自动回退
-pnpm run smoke:reader-local -- /path/to/sample.pdf 1 --backend=auto
-pnpm run smoke:reader-local -- /path/to/sample.pdf 1 .vitest-cache/pdfjs --backend=pdfjs
-
-# 6. （显式选择）使用真实 Token 运行在线解析，会上传文档
-MINERU_API_KEY=<token> pnpm run smoke:official-v4 -- /path/to/sample.pdf
+dsh plugin --profile web add link:/absolute/path/to/dsh-pdf-mineru
 ```
 
-GUI 验证在现有 Web 地址中注入当前构建，使用浏览器内的配置／凭据／插件清单 fixture，并隔离该测试浏览器的 HMR graph；不修改真实配置、凭据或缓存，也不代表已更新宿主安装的插件。
+### 升级
 
-> 文档入口：[PDF阅读指南](docs/model-reading.md) · [版本记录](CHANGELOG.md)。已完成的阶段性开发报告不作为当前使用契约维护，历史信息可从Git记录查阅。
+- Web：在 **Plugins / 插件** 页面找到 dsh-pdf-mineru，点击 **更新**。
+- CLI：先移除再安装：
 
-> 想要深入了解插件的架构设计、数据模型、并发请求合并、安全解包与存储隔离机制？请查阅 **[ARCHITECTURE.md](./ARCHITECTURE.md)**。
+  ```sh
+  dsh plugin --profile web remove dsh-pdf-mineru
+  dsh plugin --profile web add dsh-pdf-mineru
+  ```
 
----
+如果新版本要求更高的 DSH，请先升级宿主。旧版配置会在读取时自动转换，在设置页点击保存后才写回。多个进程共享同一缓存目录时，请先停止全部进程再升级，详见[配置与运维指南](docs/configuration.md#多进程共享-storageroot)。
 
-## 📜 许可证与致谢
+### 选择 Provider
+
+打开 **Plugins / 插件 → dsh-pdf-mineru**，在「服务与解析」标签选择服务类型。修改先进入草稿，点击 **保存** 才生效；**测试连接** 使用草稿中的地址等设置，但只使用已保存的 API Key。
+
+<p align="center">
+  <img src="./docs/assets/mineru-settings-preview.webp" width="780" alt="MinerU 设置页（Plugins → dsh-pdf-mineru）">
+</p>
+
+**A. MinerU 官方云（免部署）**
+
+1. 在 [mineru.net](https://mineru.net) 注册并创建 API Token。
+2. 选择「MinerU 云服务」，在 API Key 输入框粘贴 Token，点击 **保存**。密钥由 DSH 凭据服务保管，不写入插件配置。
+3. 点击 **测试连接** 确认可用。
+
+**B. 自部署 MinerU 4.x（V1 API）**
+
+1. 启动 MinerU 4.x 的 API 服务（常见地址 `http://localhost:8000`）。
+2. 选择「自部署 4.x」，填写服务地址；本机 HTTP 地址需在「连接选项」中开启「允许 HTTP 明文连接」。
+3. 按需选择解析档位（tier）和 OCR 模式（auto / txt / ocr），测试连接后保存。
+
+**C. 自部署 MinerU 3.x（旧版任务 API）**
+
+1. 启动 MinerU 3.x 服务（常见地址 `http://localhost:18000`）。
+2. 选择「自部署 3.x」，填写服务地址和 Pipeline/VLM 后端名称，本机 HTTP 同样需要显式允许。
+3. 测试连接后保存。
+
+协议由你显式选择，插件不会自动探测或降级到另一种协议。不要把 VLM 推理服务的地址当作 MinerU API 填入。各字段含义、YAML 写法与凭据规则见[配置与运维指南](docs/configuration.md)。
+
+### 开始对话
+
+配置完成后直接用自然语言提出需求，Agent 会自行选择工具：
+
+- “读一下 `paper.pdf` 的目录，然后找出第 3 节里所有带编号的公式。”
+- “在后台解析 `/data/annual-report.pdf`，完成后告诉我它有哪些章节和表格。”
+- “第 7 页那张表的数值看起来不对，对照原页核对一下。”
+
+相对路径按当前会话的工作目录解析；也可以直接引用会话里上传的 PDF 附件。
+
+## 模型工具一览
+
+| 工具 | 用途 |
+| --- | --- |
+| `read_pdf` | 同步读取：目录、字面检索、按块或按页精读，分段续读，以及本地原页核对（`view: "page"`） |
+| `async_parse_pdf` | 把整份文档提交为 DSH 后台任务，完成后返回结构摘要；之后用 `read_pdf` 按需阅读 |
+
+两个工具都接受 `file_path` 或 `attachment_id`（二选一）。参数、响应字段、预算与错误恢复见 [PDF 阅读契约](docs/model-reading.md)。
+
+## 原页核对的依赖
+
+原页核对在本地渲染，不上传文件，也不调用 Provider：
+
+- 优先使用 PATH 中的 Poppler（`pdfinfo`、`pdftoppm`）。
+- 找不到或无法执行 Poppler 时，自动改用随插件安装的 PDF.js 和 `@napi-rs/canvas`。Canvas 使用上游为常见 Linux、macOS、Windows 平台提供的预编译包，无需编译或安装 Poppler。
+- 安装插件时不要使用 `--no-optional`，否则会缺少 Canvas 平台包。两个后端都不可用时会提示安装 Poppler，普通文本阅读不受影响。
+
+渲染器有超时、并发和尺寸限制，但它不是操作系统级沙箱；处理不可信 PDF 时仍需宿主层面的隔离。具体限制见 [ARCHITECTURE.md](ARCHITECTURE.md#原页渲染)。
+
+## 常见问题
+
+<details>
+<summary><strong>API Key 应该放在哪里？</strong></summary>
+
+推荐在设置页输入，密钥由 DSH 凭据服务保管。也可以导出与「凭据引用名」同名的环境变量（默认 `MINERU_API_KEY`），但 DSH 中保存的值优先于环境变量。详见[凭据](docs/configuration.md#凭据)。
+</details>
+
+<details>
+<summary><strong>扫描件识别效果不好怎么办？</strong></summary>
+
+在设置页把解析方式改为 `ocr`（4.x V1 对应各 profile 的 OCR 模式）。模型工具不接受 `ocr`、`model` 等解析参数，不能让 Agent 通过工具参数切换。修改解析配置会产生新的缓存身份，下次读取会重新解析。
+</details>
+
+<details>
+<summary><strong>Pipeline 和 VLM 有什么区别？</strong></summary>
+
+两者是官方云和 3.x 旧版服务的解析模型。Pipeline 速度快、资源占用低，适合多数常规版面；VLM 使用视觉多模态模型，复杂图文混排和特殊公式效果通常更好。4.x V1 不选择模型，改用解析档位。
+</details>
+
+<details>
+<summary><strong>解析结果存在哪里？怎么清理？</strong></summary>
+
+默认在 `$DSH_HOME/cache/pdf-mineru/`。在设置页「存储」标签中可以查看统计、校验完整性和清除缓存；清除前会先显示预览，确认后才删除。有读取或解析正在进行时，清理会被拒绝。详见[存储与维护](docs/configuration.md#存储缓存与维护)。
+</details>
+
+<details>
+<summary><strong>后台任务可以取消吗？</strong></summary>
+
+可以，用 DSH 的通用任务工具（如 `job_kill`）。取消只结束这一次等待；如果别的调用也在等待同一份文档的解析，那次解析会继续完成。
+</details>
+
+<details>
+<summary><strong>保存时提示配置已被修改？</strong></summary>
+
+说明从打开设置页到保存期间，配置被其他窗口或进程改过。请按提示重新加载后再修改，插件不会覆盖别人的修改。
+</details>
+
+<details>
+<summary><strong>通过局域网地址打开 Web 时，设置页读不到配置？</strong></summary>
+
+设置与维护接口只接受回环地址访问（`localhost`、`127.x.x.x`、`[::1]`）。请在运行 DSH 的机器上通过回环地址打开 Web。模型工具不受此限制。
+</details>
+
+## 文档
+
+- [配置与运维指南](docs/configuration.md)：设置页、Provider 参考、凭据、迁移、缓存维护、多进程共享。
+- [PDF 阅读契约](docs/model-reading.md)：两个工具的参数、响应字段、预算和错误恢复。
+- [ARCHITECTURE.md](ARCHITECTURE.md)：模块边界与实现约束（面向贡献者）。
+- [CONTRIBUTING.md](CONTRIBUTING.md)：开发、测试与发布流程。
+- [CHANGELOG.md](CHANGELOG.md)：版本变更。
+
+## 许可证与致谢
 
 - 本项目基于 [MIT License](./LICENSE) 开源。
-- 感谢 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 提供的卓越插件体系。
+- 感谢 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 提供的插件体系。
 - 感谢 [OpenDataLab MinerU](https://github.com/opendatalab/MinerU) 提供的文档解析能力。
 - 感谢 [Huanlin/dsh-plugin-mineru](https://github.com/HuanLinOTO/dsh-plugin-mineru) 带来的早期设计灵感。
 - 本插件已被 [Awesome DeepSeek Harness Plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) 社区精选列表收录（[收录详情页](https://awesome-dsh-plugin.com/p/Yurzi/dsh-pdf-mineru)）。

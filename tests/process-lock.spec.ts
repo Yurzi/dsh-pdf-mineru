@@ -8,9 +8,9 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { ModuleKind, ScriptTarget, transpileModule } from 'typescript'
 import { ProcessLock, createStorageOwnerId, storageOwnerState, type ProcessLockScope } from '../src/storage/process-lock.js'
 import { StoragePaths } from '../src/storage/paths.js'
+import { tempRoot } from './support/storage-fixtures.js'
 
 let compiled: string
-const roots: string[] = []
 const workers: ChildProcess[] = []
 beforeAll(async () => {
   compiled = await mkdtemp(join(tmpdir(), 'mineru-lock-worker-'))
@@ -30,12 +30,10 @@ afterEach(async () => {
       await exited
     }
   }
-  await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })))
 })
 afterAll(async () => { await rm(compiled, { recursive: true, force: true }) })
 async function fixture(timeoutMs = 1000) {
-  const root = await mkdtemp(join(tmpdir(), 'mineru-lock-'))
-  roots.push(root)
+  const root = await tempRoot('mineru-lock-')
   const paths = new StoragePaths(root)
   return { root, paths, lock: new ProcessLock(paths, { acquireTimeoutMs: timeoutMs, pollIntervalMs: 2 }) }
 }
@@ -68,12 +66,14 @@ describe('scoped ProcessLock', () => {
     const { lock } = await fixture()
     const entered = deferred(); const release = deferred()
     let secondEntered = false
-    const first = lock.withLock(async () => { entered.resolve(); await release.promise })
+    let firstScope!: ProcessLockScope
+    const first = lock.withLock(async scope => { firstScope = scope; entered.resolve(); await release.promise })
     await entered.promise
     const second = lock.withLock(async () => { secondEntered = true })
-    await sleep(20)
-    expect(secondEntered).toBe(false)
     await lock.release() // An unrelated manual release cannot release a scoped owner.
+    // The first scope stays the only authority, so the queued invocation cannot have entered.
+    expect(lock.isHeld()).toBe(true)
+    expect(() => lock.assertScope(firstScope)).not.toThrow()
     expect(secondEntered).toBe(false)
     release.resolve()
     await Promise.all([first, second])
@@ -95,7 +95,7 @@ describe('scoped ProcessLock', () => {
   })
 
   it('bounds local contention and invalidates explicit scope tokens', async () => {
-    const { lock } = await fixture(500)
+    const { lock } = await fixture(50)
     let saved!: ProcessLockScope
     await lock.withLock(async scope => {
       saved = scope; lock.assertScope(scope)
@@ -108,16 +108,18 @@ describe('scoped ProcessLock', () => {
   })
 
   it('does not let a later lexicographically smaller claim preempt a holder', async () => {
-    const { root, lock } = await fixture()
+    const { root, lock } = await fixture(100)
     await lock.initialize()
     const id = createStorageOwnerId('c').replace(/[0-9a-f]{32}$/, 'f'.repeat(32))
     const holder = join(root, '.lock', 'claims', id)
     await mkdir(holder); await writeFile(join(holder, 'ticket'), '1')
     let entered = false
-    const pending = lock.withLock(async () => { entered = true })
-    await until(async () => (await readdir(join(root, '.lock', 'claims'))).length === 2)
-    await sleep(15); expect(entered).toBe(false)
-    await rm(holder, { recursive: true }); await pending
+    // The contender polls for its whole deadline and times out instead of entering.
+    await expect(lock.withLock(async () => { entered = true })).rejects.toMatchObject({ failure: { code: 'STORAGE_LOCKED' } })
+    expect(entered).toBe(false)
+    expect(await readdir(join(root, '.lock', 'claims'))).toEqual([id])
+    await rm(holder, { recursive: true })
+    await lock.withLock(async () => { entered = true })
     expect(entered).toBe(true)
   })
 

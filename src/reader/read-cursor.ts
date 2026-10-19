@@ -1,0 +1,136 @@
+/**
+ * read-cursor.ts — bounded, stateless continuation tokens for read_pdf partial output.
+ *
+ * A cursor binds one immutable result identity to the canonical selection that
+ * produced the text plus a UTF-16 offset into that exact projected text. The
+ * token is self-contained: the service can re-derive the selection without
+ * requiring the caller to repeat pages/focus (which are rejected when a cursor
+ * is present). No server state, no sidecar files, no signatures.
+ */
+import { MinerUError, failure } from '../domain/errors.js';
+import { FOCUS_KINDS, isBlockId, isQueryText, normalizePageRanges, type FocusKind, type ReadCursorPayload } from '../domain/selection.js';
+
+/** Cursor payload version. Bump only with an explicit compatibility rule. */
+export const READ_CURSOR_VERSION = 3 as const;
+/** Hard cap on the encoded cursor length (base64url JSON). */
+export const MAX_CURSOR_LENGTH = 2048 as const;
+/** Hard cap on encoded canonical selection complexity (pages + focus tokens). */
+export const MAX_CURSOR_SELECTION_CHARS = 1024 as const;
+
+
+function canonicalFocusList(focus: ReadonlySet<FocusKind>): FocusKind[] {
+  return [...focus].sort();
+}
+
+function parseFocusList(input: unknown): FocusKind[] {
+  if (!Array.isArray(input)) throw new TypeError('cursor focus must be an array');
+  const out: FocusKind[] = [];
+  for (const item of input) {
+    if (typeof item !== 'string') throw new TypeError('cursor focus entries must be strings');
+    const token = item.trim().toLowerCase();
+    if (!(FOCUS_KINDS as readonly string[]).includes(token)) throw new TypeError('unknown cursor focus: ' + item);
+    out.push(token as FocusKind);
+  }
+  const canonical = [...new Set(out)].sort();
+  if (canonical.length === 0 || JSON.stringify(canonical) !== JSON.stringify(input)) throw new TypeError('cursor focus is not canonical');
+  return canonical;
+}
+
+function toBase64Url(input: string): string {
+  return Buffer.from(input, 'utf8').toString('base64url');
+}
+
+function fromBase64Url(input: string): string {
+  return Buffer.from(input, 'base64url').toString('utf8');
+}
+
+/** Encode a cursor bound to one result identity, selection, and text offset. */
+export function encodeReadCursor(payload: Omit<ReadCursorPayload, 'inline_images'> & { readonly inline_images?: boolean }): string {
+  if (!Number.isSafeInteger(payload.off) || payload.off < 0) {
+    throw new TypeError('cursor offset must be a non-negative safe integer');
+  }
+  if (payload.rid.trim() === '') throw new TypeError('cursor result identity is required');
+  if (payload.inline_images !== undefined && typeof payload.inline_images !== 'boolean') throw new TypeError('cursor inline_images must be a boolean');
+  const canonical = {
+    v: READ_CURSOR_VERSION,
+    rid: payload.rid,
+    pages: payload.pages,
+    focus: [...payload.focus].sort(),
+    off: payload.off,
+    inline_images: payload.inline_images ?? true,
+    ...(payload.block === undefined ? {} : { block: payload.block }),
+    ...(payload.query === undefined ? {} : { query: payload.query }),
+    ...(payload.projection === undefined ? {} : { projection: payload.projection }),
+  };
+  const json = JSON.stringify(canonical);
+  if (json.length > MAX_CURSOR_SELECTION_CHARS + 256) {
+    throw new MinerUError(failure('INVALID_REQUEST', 'Selection is too complex to continue with a cursor; narrow pages or focus'));
+  }
+  const token = toBase64Url(json);
+  if (token.length > MAX_CURSOR_LENGTH) {
+    throw new MinerUError(failure('INVALID_REQUEST', 'Selection is too complex to continue with a cursor; narrow pages or focus'));
+  }
+  return token;
+}
+
+/** Decode and structurally validate a cursor token. Never throws MinerUError. */
+export function decodeReadCursor(token: string): ReadCursorPayload {
+  if (typeof token !== 'string' || token.trim() === '' || token.length > MAX_CURSOR_LENGTH) {
+    throw new TypeError('cursor is malformed or expired; re-read without a cursor');
+  }
+  let json: string;
+  try {
+    json = fromBase64Url(token.trim());
+  } catch {
+    throw new TypeError('cursor is malformed or expired; re-read without a cursor');
+  }
+  if (json.length > MAX_CURSOR_SELECTION_CHARS + 256) {
+    throw new TypeError('cursor is malformed or expired; re-read without a cursor');
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(json);
+  } catch {
+    throw new TypeError('cursor is malformed or expired; re-read without a cursor');
+  }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new TypeError('cursor is malformed or expired; re-read without a cursor');
+  }
+  const obj = raw as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  if (keys.some(key => !['focus', 'off', 'pages', 'rid', 'v', 'inline_images', 'block', 'query', 'projection'].includes(key))) throw new TypeError('cursor is malformed or expired; re-read without a cursor');
+  if (obj.block !== undefined && !isBlockId(obj.block)) throw new TypeError('cursor block is malformed');
+  if (obj.query !== undefined && !isQueryText(obj.query)) throw new TypeError('cursor query is malformed');
+  if (obj.block !== undefined && obj.query !== undefined) throw new TypeError('cursor selection is malformed');
+  if (obj.v !== READ_CURSOR_VERSION) throw new TypeError('cursor is expired; re-read without a cursor');
+  if (typeof obj.inline_images !== 'boolean') throw new TypeError('cursor inline_images must be a boolean');
+  if (typeof obj.rid !== 'string' || obj.rid.trim() === '') {
+    throw new TypeError('cursor is malformed or expired; re-read without a cursor');
+  }
+  if (typeof obj.pages !== 'string' || obj.pages.length > MAX_CURSOR_SELECTION_CHARS) throw new TypeError('cursor pages must be a bounded string');
+  const pages = obj.pages;
+  if (pages !== '' && normalizePageRanges(pages) !== pages) throw new TypeError('cursor selection is not canonical; re-read without a cursor');
+  const focus = parseFocusList(obj.focus);
+  if (obj.projection !== undefined && (typeof obj.projection !== 'string' || !/^[a-f0-9]{64}$/.test(obj.projection))) throw new TypeError('cursor projection is malformed');
+  if (typeof obj.block === 'string' && !obj.block.startsWith(obj.rid + ':b')) throw new TypeError('cursor block belongs to another result');
+  if ((obj.block !== undefined || obj.query !== undefined) && (focus.includes('toc') || focus.includes('artifacts'))) throw new TypeError('cursor selection cannot use toc or artifacts');
+  if (typeof obj.off !== 'number' || !Number.isSafeInteger(obj.off) || obj.off < 0) {
+    throw new TypeError('cursor is malformed or expired; re-read without a cursor');
+  }
+  return { v: READ_CURSOR_VERSION, rid: obj.rid, pages, focus, off: obj.off, inline_images: obj.inline_images,
+    ...(typeof obj.block === 'string' ? { block: obj.block } : {}),
+    ...(typeof obj.query === 'string' ? { query: obj.query } : {}),
+    ...(typeof obj.projection === 'string' ? { projection: obj.projection } : {}),
+  };
+}
+
+/** Create a cursor for the remainder of projected text starting at offset. */
+export function cursorForRemainder(
+  resultId: string,
+  pagesLabel: string | undefined,
+  focus: ReadonlySet<FocusKind>,
+  offset: number,
+  selection: { block?: string; query?: string; projection?: string; inline_images?: boolean } = {},
+): string {
+  return encodeReadCursor({ v: READ_CURSOR_VERSION, rid: resultId, pages: pagesLabel ?? '', focus: canonicalFocusList(focus), off: offset, ...selection });
+}

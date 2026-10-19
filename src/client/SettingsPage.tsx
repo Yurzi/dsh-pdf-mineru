@@ -1,568 +1,67 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
-import type { ClientConnectionRpc, RpcResult } from '@deepseek-ai/dsh-client-connection/client'
-import type { MinerUConfig } from '../config/pure.js'
-import type { ProbeView } from '../service/mineru-service.js'
-import type { MineruKey } from './locales.js'
-import {
-  activateProvider,
-  providerTypeLabelKey,
-  callRpc,
-  clearCredential,
-  credentialReference,
-  describeCredential,
-  ensureProviderProfiles,
-  resetConfigSection,
-  resetToDefaultConfig,
-  storeCredential,
-  type CredentialClient,
-  type CredentialView,
-} from './helpers.js'
-import { ProviderSection } from './sections/ProviderSection.js'
-import { DefaultsSection } from './sections/DefaultsSection.js'
-import { AdvancedSections } from './sections/AdvancedSections.js'
-import { StorageOperations } from './StorageOperations.js'
-import { DisclosureCard } from './DisclosureCard.js'
-import {
-  ActivityIcon,
-  CheckIcon,
-  RotateCcwIcon,
-  ServerIcon,
-  SlidersIcon,
-} from './icons.js'
+import type { ClientConnectionRpc } from '@deepseek-ai/dsh-client-connection/client'
+import { Button, SegmentedTabs, type SegmentedTab } from '@deepseek-ai/dsh-client-ui-primitives'
+import { ActionBar } from './components/ActionBar.js'
+import { ConnectionTab } from './components/ConnectionTab.js'
+import { StorageTab } from './components/StorageTab.js'
+import type { CredentialClient } from './helpers.js'
+import { SettingsContext } from './settings-context.js'
+import { useSettingsController, type ReadySettings } from './settings-controller.js'
 import css from './SettingsPage.module.css'
-
-export {
-  activateProvider,
-  clearCredential,
-  credentialReference,
-  describeCredential,
-  ensureProviderProfiles,
-  normalizeProviderDefaults,
-  patchActiveProvider,
-  resetConfigSection,
-  resetToDefaultConfig,
-  storeCredential,
-  updateConfigSection,
-  type CredentialClient,
-  type CredentialView,
-} from './helpers.js'
 
 export interface MineruSettingsInjected {
   readonly rpc: ClientConnectionRpc
   readonly credentials: CredentialClient
 }
 
-type SettingsPageProps = PropsRuntime<'plugins.bundle.config'> & PropsLocale<'dsh-pdf-mineru'> & MineruSettingsInjected
+export type SettingsPageProps = PropsRuntime<'plugins.bundle.config'> &
+  PropsLocale<'dsh-pdf-mineru'> &
+  MineruSettingsInjected
 
-type ConfigGetResult = RpcResult<{ readonly config: MinerUConfig }>
-type ConfigSetResult = RpcResult<{ readonly config: MinerUConfig }>
-type ProbeRpcResult = RpcResult<ProbeView>
+type TabKey = 'connection' | 'storage'
 
-interface CredentialState {
-  readonly status: 'unavailable' | 'loading' | 'ready' | 'error'
-  readonly ref?: string
-  readonly view?: CredentialView
-  readonly error?: string
-}
+export function SettingsPage({ rpc, credentials, t }: SettingsPageProps): ReactNode {
+  const settings = useSettingsController({ rpc, credentials })
+  const [tab, setTab] = useState<TabKey>('connection')
 
-export function SettingsPage({ rpc, credentials, t }: SettingsPageProps) {
-  const [draft, setDraft] = useState<MinerUConfig | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [saving, setSaving] = useState(false)
-  const [saved, setSaved] = useState(false)
-  const [error, setError] = useState<string | undefined>(undefined)
-  const [apiKeyDraft, setApiKeyDraft] = useState('')
-  const [credentialBusy, setCredentialBusy] = useState(false)
-  const [credentialRevision, setCredentialRevision] = useState(0)
-  const [credentialState, setCredentialState] = useState<CredentialState>({ status: 'unavailable' })
-  const [txtToAutoNotice, setTxtToAutoNotice] = useState(false)
-  const [testState, setTestState] = useState<{
-    status: 'idle' | 'testing' | 'healthy' | 'unhealthy' | 'error'
-    view?: ProbeView
-    error?: string
-  }>({ status: 'idle' })
-
-  const probeRevision = useRef(0)
-  const activeProviderFingerprint = JSON.stringify(draft?.providers.find(provider => provider.id === draft.activeProvider))
-  useEffect(() => {
-    probeRevision.current++
-    setTestState({ status: 'idle' })
-    return () => { probeRevision.current++ }
-  }, [activeProviderFingerprint, credentialRevision])
-
-  // Individual card disclosure states
-  const [cardsOpen, setCardsOpen] = useState<Record<string, boolean>>({
-    provider: true,
-    defaults: true,
-    storage: true,
-    polling: false,
-    retry: false,
-    output: false,
-    limits: false,
-    operations: true,
-  })
-
-  const toggleCard = useCallback((cardId: string) => {
-    setCardsOpen(prev => ({ ...prev, [cardId]: !prev[cardId] }))
-  }, [])
-
-  const allOpen = Object.values(cardsOpen).every(Boolean)
-  const toggleAllCards = useCallback(() => {
-    if (allOpen) {
-      setCardsOpen({
-        provider: false,
-        defaults: false,
-        storage: false,
-        polling: false,
-        retry: false,
-        output: false,
-        limits: false,
-        operations: false,
-      })
-    } else {
-      setCardsOpen({
-        provider: true,
-        defaults: true,
-        storage: true,
-        polling: true,
-        retry: true,
-        output: true,
-        limits: true,
-        operations: true,
-      })
-    }
-  }, [allOpen])
-
-  const refresh = useCallback(async () => {
-    setLoading(true)
-    setError(undefined)
-    try {
-      const result = await callRpc<ConfigGetResult>(rpc, 'mineru/config.get', {})
-      if (result.ok) {
-        setDraft(ensureProviderProfiles(result.value.config))
-      } else {
-        setError(result.error.message)
-      }
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setLoading(false)
-    }
-  }, [rpc])
-
-  useEffect(() => { void refresh() }, [refresh])
-
-  const activeProviderDraft = draft?.providers.find(p => p.id === draft.activeProvider) ?? draft?.providers[0]
-  const activeCredentialRef = credentialReference(activeProviderDraft)
-
-  useEffect(() => {
-    setApiKeyDraft('')
-    if (activeCredentialRef === undefined) {
-      setCredentialState({ status: 'unavailable' })
-      return undefined
-    }
-
-    let stale = false
-    setCredentialState({ status: 'loading', ref: activeCredentialRef })
-    void describeCredential(credentials, activeCredentialRef).then(
-      view => {
-        if (!stale) setCredentialState({ status: 'ready', ref: activeCredentialRef, view })
-      },
-      err => {
-        if (!stale) {
-          setCredentialState({
-            status: 'error',
-            ref: activeCredentialRef,
-            error: err instanceof Error ? err.message : String(err),
-          })
-        }
-      },
-    )
-    return () => { stale = true }
-  }, [activeCredentialRef, credentialRevision, credentials])
-
-  const save = useCallback(async () => {
-    if (draft === null) return
-    const reference = credentialReference(draft.providers.find(p => p.id === draft.activeProvider))
-    const secret = apiKeyDraft.trim()
-    setSaving(true)
-    setError(undefined)
-    setSaved(false)
-    try {
-      const result = await callRpc<ConfigSetResult>(rpc, 'mineru/config.set', { config: draft })
-      if (result.ok) {
-        setDraft(ensureProviderProfiles(result.value.config))
-        if (secret.length > 0) {
-          if (reference === undefined) throw new TypeError(t('credential.referenceRequired'))
-          await storeCredential(credentials, reference, secret)
-          setApiKeyDraft('')
-          setCredentialRevision(value => value + 1)
-        }
-        setTxtToAutoNotice(false)
-        setSaved(true)
-        setTimeout(() => setSaved(false), 2000)
-      } else {
-        setError(result.error.message)
-      }
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setSaving(false)
-    }
-  }, [apiKeyDraft, credentials, draft, rpc, t])
-
-  const clearStoredCredential = useCallback(async () => {
-    if (activeCredentialRef === undefined) return
-    setCredentialBusy(true)
-    setError(undefined)
-    setSaved(false)
-    try {
-      await clearCredential(credentials, activeCredentialRef)
-      setApiKeyDraft('')
-      setCredentialRevision(value => value + 1)
-      setTestState({ status: 'idle' })
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setCredentialBusy(false)
-    }
-  }, [activeCredentialRef, credentials])
-
-  const testActiveProvider = useCallback(async () => {
-    if (draft === null) return
-    const active = draft.providers.find(p => p.id === draft.activeProvider)
-    if (active === undefined) return
-
-    const revision = ++probeRevision.current
-    setTestState({ status: 'testing' })
-    try {
-      const result = await callRpc<ProbeRpcResult>(rpc, 'mineru/probe', { provider: active })
-      if (revision !== probeRevision.current) return
-      if (result.ok) {
-        setTestState({
-          status: result.value.available ? 'healthy' : 'unhealthy',
-          view: result.value,
-        })
-      } else {
-        setTestState({
-          status: 'error',
-          error: result.error.message,
-        })
-      }
-    } catch (err: unknown) {
-      if (revision !== probeRevision.current) return
-      setTestState({
-        status: 'error',
-        error: err instanceof Error ? err.message : String(err),
-      })
-    }
-  }, [draft, rpc])
-
-  const handleActivateProvider = useCallback((providerId: string) => {
-    if (draft === null) return
-    const next = activateProvider(draft, providerId)
-    if (draft.defaults.parseMethod === 'txt' && next.defaults.parseMethod === 'auto') {
-      setTxtToAutoNotice(true)
-    }
-    setDraft(next)
-  }, [draft])
-
-  const handleResetDefaults = useCallback(() => {
-    if (draft === null) return
-    const next = resetToDefaultConfig(draft)
-    setDraft(next)
-    setTxtToAutoNotice(false)
-  }, [draft])
-
-  if (loading) {
+  if (settings.load.kind === 'failed') {
     return (
-      <section className={css.section}>
-        <div className={css.headerArea}>
-          <h2 className={css.title}>{t('page.title')}</h2>
-          <p className={css.intro}>{t('page.intro')}</p>
+      <div className={css.page} data-plugin-detail="dsh-pdf-mineru">
+        <div className={css.notice} role="alert">
+          <p className={css.noticeText}>{t('page.loadFailed', { message: settings.load.message })}</p>
+          <Button variant="outline" size="sm" onClick={() => { void settings.reload() }}>{t('action.retry')}</Button>
         </div>
-        <div className={css.loading}>…</div>
-      </section>
+      </div>
+    )
+  }
+  // A reload keeps the current page mounted; only the first load shows a placeholder.
+  if (settings.state === null || settings.provider === undefined) {
+    return (
+      <div className={css.page} data-plugin-detail="dsh-pdf-mineru">
+        <p className={css.noticeText} role="status">{t('page.loading')}</p>
+      </div>
     )
   }
 
-  if (draft === null) {
-    return (
-      <section className={css.section}>
-        <div className={css.headerArea}>
-          <h2 className={css.title}>{t('page.title')}</h2>
-          <p className={css.intro}>{t('page.intro')}</p>
-        </div>
-        {error !== undefined && (
-          <div className={css.error} role="alert">
-            <span>{error}</span>
-            <button
-              type="button"
-              className={css.errorDismiss}
-              onClick={() => setError(undefined)}
-              aria-label={t('action.dismiss')}
-            >×</button>
-          </div>
-        )}
-        <div className={css.actionBar}>
-          <button
-            type="button"
-            className={css.secondaryButton}
-            onClick={() => void refresh()}
-          >
-            <ActivityIcon size={14} />
-            <span>{t('action.retryLoad')}</span>
-          </button>
-        </div>
-      </section>
-    )
-  }
-
-  const activeProvider = activeProviderDraft!
-  const credentialStateReady = credentialState.status === 'ready' && credentialState.ref === activeCredentialRef
-  const credentialView = credentialStateReady ? credentialState.view : undefined
-  const credentialLocked = credentialView?.writable === false
-  const credentialInputDisabled = saving || credentialBusy || activeCredentialRef === undefined || !credentialStateReady || credentialLocked
-  const credentialPlaceholder = credentialView?.configured === true
-    ? t('credential.placeholderStored')
-    : t('credential.placeholderEmpty')
-
+  const tabs: readonly [SegmentedTab<TabKey>, SegmentedTab<TabKey>] = [
+    { value: 'connection', label: t('tab.connection'), id: 'mineru-tab-connection', panelId: 'mineru-panel-connection' },
+    { value: 'storage', label: t('tab.storage'), id: 'mineru-tab-storage', panelId: 'mineru-panel-storage' },
+  ]
   return (
-    <section className={css.section}>
-      {/* Header Area */}
-      <div className={css.headerArea}>
-        <div className={css.headerTitles}>
-          <h2 className={css.title}>{t('page.title')}</h2>
-          <p className={css.intro}>{t('page.intro')}</p>
+    <SettingsContext.Provider value={{ settings: settings as ReadySettings, rpc, t }}>
+      <div className={css.page} data-plugin-detail="dsh-pdf-mineru">
+        <SegmentedTabs items={tabs} value={tab} onChange={setTab} label={t('page.tabs')} />
+        {/* Both panels stay mounted so per-tab view state survives switching; drafts live in the controller. */}
+        <div id="mineru-panel-connection" role="tabpanel" aria-labelledby="mineru-tab-connection" className={css.panel} hidden={tab !== 'connection'}>
+          <ConnectionTab />
         </div>
-
-        {/* Action Bar */}
-        <div className={css.actionBar}>
-          <button
-            type="button"
-            className={css.primaryButton}
-            disabled={saving || credentialBusy}
-            onClick={() => void save()}
-          >
-            {saving ? (
-              <span>…</span>
-            ) : saved ? (
-              <>
-                <CheckIcon size={14} />
-                <span>{t('action.saved')}</span>
-              </>
-            ) : (
-              <span>{t('action.save')}</span>
-            )}
-          </button>
-          <button
-            type="button"
-            className={css.secondaryButton}
-            disabled={testState.status === 'testing'}
-            onClick={() => void testActiveProvider()}
-          >
-            <ActivityIcon size={14} />
-            <span>{testState.status === 'testing' ? t('action.testing') : t('action.test')}</span>
-          </button>
-          <button
-            type="button"
-            className={css.secondaryButton}
-            disabled={saving || credentialBusy}
-            onClick={handleResetDefaults}
-          >
-            <RotateCcwIcon size={13} />
-            <span>{t('action.resetDefaults')}</span>
-          </button>
-          <button
-            type="button"
-            className={css.textButton}
-            onClick={toggleAllCards}
-            title={allOpen ? t('action.collapseAll') : t('action.expandAll')}
-          >
-            {allOpen ? t('action.collapseAll') : t('action.expandAll')}
-          </button>
+        <div id="mineru-panel-storage" role="tabpanel" aria-labelledby="mineru-tab-storage" className={css.panel} hidden={tab !== 'storage'}>
+          <StorageTab visible={tab === 'storage'} />
         </div>
+        <ActionBar />
       </div>
-
-      {error !== undefined && (
-        <div className={css.error} role="alert">
-          <span>{error}</span>
-          <button
-            type="button"
-            className={css.errorDismiss}
-            onClick={() => setError(undefined)}
-            aria-label={t('action.dismiss')}
-          >×</button>
-        </div>
-      )}
-
-      {/* Test Connection Result Box */}
-      {testState.status !== 'idle' && (
-        <div
-          className={`${css.testResult} ${
-            testState.status === 'healthy'
-              ? css.testResultHealthy
-              : testState.status === 'unhealthy' || testState.status === 'error'
-                ? css.testResultError
-                : css.testResultTesting
-          }`}
-          role="status"
-        >
-          {testState.status === 'testing' && (
-            <div className={css.testHeader}>
-              <span className={css.badgePulseDot} aria-hidden="true" />
-              <span>{t('action.testing')}</span>
-            </div>
-          )}
-          {testState.status === 'error' && (
-            <>
-              <div className={css.testHeader}>{t('test.error')}</div>
-              <div className={css.testDetails}>{testState.error}</div>
-            </>
-          )}
-          {(testState.status === 'healthy' || testState.status === 'unhealthy') && testState.view && (
-            <>
-              <div className={css.testHeader}>
-                {testState.status === 'healthy' ? (
-                  <CheckIcon size={15} />
-                ) : (
-                  <span className={css.badgeDot} />
-                )}
-                <span>
-                  {testState.status === 'healthy' ? t('test.healthy') : t('test.unhealthy')} — {testState.view.provider}
-                </span>
-              </div>
-              <div className={css.testDetails}>
-                <div>{t('probe.auth')}: {testState.view.authentication} | {t('probe.protocol')}: {testState.view.protocol_version}{testState.view.server_version ? ` | ${t('probe.server')}: v${testState.view.server_version}` : ''}</div>
-                {testState.view.queue && (
-                  <div>{t('probe.queue')}: {testState.view.queue.processing ?? 0} / {testState.view.queue.queued ?? 0} / {testState.view.queue.max_concurrent ?? 'N/A'}</div>
-                )}
-                {testState.view.available_tiers && <div>{t('probe.tiers')}: {testState.view.available_tiers.join(', ')}</div>}
-                {testState.view.output_formats && <div>{t('probe.formats')}: {testState.view.output_formats.join(', ')}</div>}
-                {testState.view.source_types && <div>{t('probe.sources')}: {testState.view.source_types.join(', ')}</div>}
-                {testState.view.provider === 'self-hosted-v1' && <div>{t('probe.scope')}</div>}
-                {testState.view.diagnostics && <div>{t('probe.diagnostics')}: {testState.view.diagnostics}</div>}
-              </div>
-            </>
-          )}
-        </div>
-      )}
-
-      {/* Card List */}
-      <div className={css.cardList}>
-        {/* 1. Provider Settings */}
-        <DisclosureCard
-          id="provider"
-          title={t('section.provider')}
-          subtitle={t('section.provider.desc')}
-          icon={<ServerIcon size={16} />}
-          open={cardsOpen.provider ?? true}
-          onToggle={() => toggleCard('provider')}
-          toggleTitle={cardsOpen.provider ? t('action.collapse') : t('action.expand')}
-          badge={
-            <div className={css.cardBadgeGroup}>
-              <span className={`${css.cardBadge} ${css.badgeInfo}`}>
-                {t(providerTypeLabelKey(activeProvider.type))}
-              </span>
-              <span
-                className={`${css.cardBadge} ${
-                  credentialState.status === 'loading'
-                    ? css.badgeNeutral
-                    : credentialView?.configured
-                      ? css.badgeOk
-                      : css.badgeWarn
-                }`}
-              >
-                <span className={css.badgeDot} aria-hidden="true" />
-                {credentialState.status === 'loading'
-                  ? t('credential.loading')
-                  : credentialView?.configured
-                    ? t('badge.configured')
-                    : t('badge.notConfigured')}
-              </span>
-            </div>
-          }
-        >
-          <ProviderSection
-            draft={draft}
-            setDraft={setDraft}
-            activeProvider={activeProvider}
-            activeCredentialRef={activeCredentialRef}
-            apiKeyDraft={apiKeyDraft}
-            setApiKeyDraft={setApiKeyDraft}
-            credentialStateReady={credentialStateReady}
-            credentialView={credentialView}
-            credentialLocked={credentialLocked}
-            credentialInputDisabled={credentialInputDisabled}
-            credentialPlaceholder={credentialPlaceholder}
-            credentialBusy={credentialBusy}
-            credentialStatus={credentialState.status}
-            credentialError={credentialState.error}
-            onClearCredential={() => void clearStoredCredential()}
-            onActivateProvider={handleActivateProvider}
-            t={t}
-          />
-        </DisclosureCard>
-
-        {/* 2. Defaults */}
-        <DisclosureCard
-          id="defaults"
-          title={t('section.defaults')}
-          subtitle={t(activeProvider.type === 'self-hosted-v1' ? 'section.defaults.v1.desc' : 'section.defaults.desc')}
-          icon={<SlidersIcon size={16} />}
-          open={cardsOpen.defaults ?? true}
-          onToggle={() => toggleCard('defaults')}
-          toggleTitle={cardsOpen.defaults ? t('action.collapse') : t('action.expand')}
-          badge={
-            <div className={css.cardBadgeGroup}>
-              <span className={`${css.cardBadge} ${css.badgeNeutral}`}>
-                {activeProvider.type === 'self-hosted-v1'
-                  ? (activeProvider.tier ?? t('field.tier.serverDefault')) + ' · ' + activeProvider.ocrMode
-                  : draft.defaults.model.toUpperCase() + ' · ' + draft.defaults.parseMethod + ' · ' + draft.defaults.language}
-              </span>
-            </div>
-          }
-          action={
-            <button
-              type="button"
-              className={css.resetButton}
-              title={t('action.resetSection')}
-              onClick={() => setDraft(prev => (prev === null ? prev : resetConfigSection(prev, 'defaults')))}
-            >
-              <RotateCcwIcon size={11} className={css.resetIcon} />
-              <span>{t('action.resetSection')}</span>
-            </button>
-          }
-        >
-          <DefaultsSection
-            draft={draft}
-            setDraft={setDraft}
-            activeProvider={activeProvider}
-            txtToAutoNotice={txtToAutoNotice}
-            onDismissTxtNotice={() => setTxtToAutoNotice(false)}
-            t={t}
-          />
-        </DisclosureCard>
-
-        {/* 3, 4, 5, 6, 7. Storage, Polling, Retry, Output, Limits */}
-        <AdvancedSections
-          draft={draft}
-          setDraft={setDraft}
-          cardsOpen={cardsOpen}
-          onToggleCard={toggleCard}
-          t={t}
-        />
-
-        {/* 8. Storage Operations */}
-        <StorageOperations
-          rpc={rpc}
-          open={cardsOpen.operations ?? true}
-          onToggle={() => toggleCard('operations')}
-          t={t}
-        />
-      </div>
-    </section>
+    </SettingsContext.Provider>
   )
 }

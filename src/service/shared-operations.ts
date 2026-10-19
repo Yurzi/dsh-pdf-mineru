@@ -36,20 +36,17 @@ export class SharedOperation {
   readonly controller = new AbortController()
   private readonly outcome = deferred<SharedOutcome>()
   private settled = false
-  private outcomeValue: SharedOutcome | undefined
   private waiters = 0
 
   constructor(readonly cacheKey: CacheKey) {
     void this.outcome.promise.catch(() => undefined)
   }
 
-  get settledValue(): SharedOutcome | undefined { return this.outcomeValue }
   get waiterCount(): number { return this.waiters }
 
   resolve(value: SharedOutcome): void {
     if (this.settled) return
     this.settled = true
-    this.outcomeValue = value
     this.outcome.resolve(value)
   }
 
@@ -127,19 +124,6 @@ export class SharedOperationRegistry {
     return true
   }
 
-  acquire(
-    cacheKey: CacheKey, authority: ProviderConfigId, timeoutMs: number,
-    runner: (operation: SharedOperation) => Promise<SharedOutcome>,
-  ): { readonly operation: SharedOperation; readonly created: boolean } {
-    const reserved = this.reserve(cacheKey, authority, timeoutMs)
-    if (reserved.created) this.start(reserved.operation, runner)
-    return reserved
-  }
-
-  get(cacheKey: CacheKey, authority: ProviderConfigId): SharedOperation | undefined {
-    return this.operations.get(`${cacheKey}:${authority}`)
-  }
-
   activeOperationIds(): ReadonlySet<OperationId> {
     return new Set([...this.operations.values()].map(operation => operation.id))
   }
@@ -151,13 +135,13 @@ export class SharedOperationRegistry {
   dispose(): void {
     this.disposed = true
     const error = new MinerUError(failure('CANCELLED', 'MinerU plugin disposed', true))
-    for (const operation of [...this.operations.values()]) {
+    for (const operation of this.operations.values()) {
       if (!this.release(operation, error)) operation.abort(error)
     }
   }
 
   async shutdown(): Promise<void> {
     this.dispose()
-    await Promise.allSettled([...this.runners])
+    await Promise.allSettled(this.runners)
   }
 }

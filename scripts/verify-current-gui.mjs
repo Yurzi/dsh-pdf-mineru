@@ -88,7 +88,7 @@ const config = {
 }
 
 const storageArea = (byteUsage, logicalEntryCount) => ({
-  byteUsage, byteUsageSaturated: false, logicalEntryCount, regularFileCount: logicalEntryCount,
+  byteUsage, logicalEntryCount, regularFileCount: logicalEntryCount,
   directoryCount: logicalEntryCount, skippedSymlinkCount: 0, unexpectedEntryCount: 0,
   unreadableEntryCount: 0, depthLimitCount: 0, complete: true, truncated: false,
 })
@@ -103,20 +103,11 @@ const integrityScan = {
   scan: { limit: 10000, scanned: 2, truncated: false, diagnosticsLimit: 50, diagnosticsTruncated: false },
   diagnostics: [],
 }
-const gcPreview = {
-  generatedAt: Date.now(), dryRun: true, referencePolicy: 'no-plugin-job-retention', eligible: true,
-  candidateCount: 2, candidateBytes: 4096, candidateBytesSaturated: false,
-  candidates: [{ cacheKey: 'a'.repeat(64), resultId: 'mr_' + 'a'.repeat(32), byteUsage: 2048, byteUsageSaturated: false }],
-  candidatesTruncated: true, candidateTotalsComplete: true, referencedResultCount: 0,
-  invalidResultCount: 0, unsafeResultCount: 0,
-  jobReferences: { complete: true, sessionJobCount: 0, activeJobCount: 0, referencedCacheKeyCount: 0 },
-  scan: { limit: 10000, scanned: 2, truncated: false, diagnosticsLimit: 50, diagnosticsTruncated: false }, diagnostics: [],
-}
 const cacheClearReport = dryRun => ({
   generatedAt: Date.now(), dryRun, eligible: true, activeJobCount: 0, activeOperationCount: 0, activeAccessCount: 0,
   ...(dryRun ? { confirmationToken: 'cache-clear-preview-token' } : {}),
-  plannedCount: 2, plannedBytes: 4096, plannedBytesSaturated: false,
-  deletedCount: dryRun ? 0 : 2, deletedBytes: dryRun ? 0 : 4096, deletedBytesSaturated: false,
+  plannedCount: 2, plannedBytes: 4096,
+  deletedCount: dryRun ? 0 : 2, deletedBytes: dryRun ? 0 : 4096,
   skippedCount: 0,
   jobScan: { complete: true, sessionJobCount: 3, activeJobCount: 0, referencedCacheKeyCount: 1 },
   scan: { limit: 10000, scanned: 2, truncated: false, diagnosticsLimit: 50, diagnosticsTruncated: false },
@@ -126,10 +117,10 @@ const cacheClearReport = dryRun => ({
 const quarantineReport = {
   generatedAt: Date.now(),
   entries: [
-    { id: 'entry_corrupt_1', byteUsage: 256, byteUsageSaturated: false, regularFileCount: 1, directoryCount: 1, modifiedAt: Date.now() },
-    { id: 'entry_corrupt_2', byteUsage: 256, byteUsageSaturated: false, regularFileCount: 1, directoryCount: 1, modifiedAt: Date.now() },
+    { id: 'entry_corrupt_1', byteUsage: 256, regularFileCount: 1, directoryCount: 1, modifiedAt: Date.now() },
+    { id: 'entry_corrupt_2', byteUsage: 256, regularFileCount: 1, directoryCount: 1, modifiedAt: Date.now() },
   ],
-  totalCount: 2, totalBytes: 512, totalBytesSaturated: false, truncated: false,
+  totalCount: 2, totalBytes: 512, truncated: false,
   skippedSymlinkCount: 0, unexpectedEntryCount: 0, unreadableEntryCount: 0,
 }
 
@@ -211,8 +202,6 @@ function isKnownExternalError(text) {
 }
 const rpcCalls = []
 const pluginManagerCalls = []
-// rc.1 PluginInventorySnapshot / BundleInfo / PluginInfo, scoped to this browser.
-// The injected client must not depend on MinerU being installed in the live profile.
 const fixturePluginEntry = {
   entryId: 'gui-fixture:mineru', moduleName: 'dsh-pdf-mineru', enabled: true, fiberPhase: 'active',
 }
@@ -224,6 +213,9 @@ const fixtureBundle = {
 }
 let configGetCalls = 0
 let failConfigLoad = true
+let serverConfig = config
+let serverRevision = 1
+let conflictNextSave = false
 const credentialCalls = []
 let credentialConfigured = true
 let bundleIntercepts = 0
@@ -241,6 +233,7 @@ page.on('pageerror', error => {
     errors.push(error.message)
   }
 })
+
 await page.route(
   url => url.origin === webUrl.origin && url.pathname === webUrl.pathname && url.search === '',
   async route => {
@@ -259,15 +252,10 @@ await page.route(
     return route.fulfill({ status: 200, contentType: 'text/javascript; charset=utf-8', body: bundle })
   },
 )
-// Freeze the injected boot graph for this browser only. The live HMR stream's
-// initial graph would restore the installed revision/dependencies (and excluded
-// plugins), remounting the page during draft tests. HTTP 204 stops EventSource
-// reconnects; the host and other browser clients retain their normal HMR stream.
 await page.route(
   url => url.origin === webUrl.origin && url.pathname === '/plugins/events',
   route => route.fulfill({ status: 204 }),
 )
-// Never forward manager writes (enable/disable/install/remove) to the live host.
 await page.route(
   url => url.origin === webUrl.origin
     && (url.pathname.startsWith('/api/pluginManager/') || url.pathname.startsWith('/api/pluginInventory/')),
@@ -347,9 +335,20 @@ await page.route('**/dsh-pdf-mineru-api/**', async route => {
     configGetCalls++
     result = failConfigLoad
       ? { ok: false, error: { code: 'mineru/unavailable', message: 'Fixture configuration load failure', details: {} } }
-      : { ok: true, value: { config } }
+      : { ok: true, value: { config: serverConfig, revision: serverRevision } }
   }
-  else if (endpoint === 'mineru/config.set') result = { ok: true, value: { config: payload.config } }
+  else if (endpoint === 'mineru/config.set') {
+    if (conflictNextSave || payload.expected_revision !== serverRevision) {
+      conflictNextSave = false
+      // Simulates another window saving first: the stored revision moves on.
+      serverRevision++
+      result = { ok: false, error: { code: 'mineru/conflict', message: 'settings revision changed', details: {} } }
+    } else {
+      serverConfig = payload.config
+      serverRevision++
+      result = { ok: true, value: { config: serverConfig, revision: serverRevision } }
+    }
+  }
   else if (endpoint === 'mineru/probe') result = {
     ok: true, value: { available: true, provider: payload.provider.type, authentication: 'valid',
       protocol_version: payload.provider.type === 'official-v4' ? 'v4' : payload.provider.type === 'self-hosted-v1' ? 'v1' : 'v2',
@@ -358,16 +357,15 @@ await page.route('**/dsh-pdf-mineru-api/**', async route => {
   }
   else if (endpoint === 'mineru/storage.stats') result = { ok: true, value: storageStats }
   else if (endpoint === 'mineru/storage.integrity.scan') result = { ok: true, value: integrityScan }
-  else if (endpoint === 'mineru/storage.gc.preview') result = { ok: true, value: gcPreview }
   else if (endpoint === 'mineru/storage.cache.clear') result = { ok: true, value: cacheClearReport(payload.dry_run !== false) }
   else if (endpoint === 'mineru/storage.quarantine.list') result = { ok: true, value: quarantineReport }
   else if (endpoint === 'mineru/storage.quarantine.cleanup') result = {
     ok: true,
     value: {
       generatedAt: Date.now(), dryRun: payload.dry_run !== false, requestedCount: payload.entry_ids.length,
-      plannedCount: payload.entry_ids.length, plannedBytes: 256, plannedBytesSaturated: false,
+      plannedCount: payload.entry_ids.length, plannedBytes: 256,
       deletedCount: payload.dry_run === false ? payload.entry_ids.length : 0,
-      deletedBytes: payload.dry_run === false ? 256 : 0, deletedBytesSaturated: false,
+      deletedBytes: payload.dry_run === false ? 256 : 0,
       missingCount: 0, skippedCount: 0, entries: quarantineReport.entries.filter(entry => payload.entry_ids.includes(entry.id)),
     },
   }
@@ -379,7 +377,7 @@ await page.route('**/dsh-pdf-mineru-api/**', async route => {
 })
 
 await page.goto(webUrl.toString(), { waitUntil: 'domcontentloaded', timeout: 30_000 })
-await page.waitForTimeout(1000)
+await page.waitForTimeout(3000)
 await page.getByRole('button', { name: 'Settings', exact: true }).click().catch(async error => {
   console.error(JSON.stringify({ errors, failedRequests, unrelatedPluginErrors: [...unrelatedPluginErrors], bundleIntercepts, buttons: await page.getByRole('button').allTextContents() }, null, 2))
   await browser.close()
@@ -407,7 +405,7 @@ await bundleCard.getByRole('button', { name: /^View / }).click().catch(async err
   await browser.close()
   throw error
 })
-const bundleDetail = page.locator('[data-plugin-detail="dsh-pdf-mineru"]')
+const bundleDetail = page.locator('[data-plugin-detail="dsh-pdf-mineru"]').first()
 await bundleDetail.waitFor({ timeout: 5000 })
 const bundleConfig = bundleDetail.locator('section[data-plugin-config]')
 await bundleConfig.getByRole('alert').filter({ hasText: 'Fixture configuration load failure' }).waitFor({ timeout: 5000 }).catch(async error => {
@@ -415,199 +413,227 @@ await bundleConfig.getByRole('alert').filter({ hasText: 'Fixture configuration l
   throw error
 })
 failConfigLoad = false
-await page.getByRole('button', { name: 'Retry Loading', exact: true }).click()
-await page.waitForTimeout(1500)
-if (await page.getByText('Provider Settings', { exact: true }).count() === 0) {
+await bundleConfig.getByRole('button', { name: 'Try again', exact: true }).click()
+const mineru = bundleConfig.locator('[data-plugin-detail="dsh-pdf-mineru"]')
+const serviceSection = mineru.locator('[data-section=service]')
+await serviceSection.waitFor({ timeout: 10_000 }).catch(async error => {
   console.error(JSON.stringify({ bundleIntercepts, rpcCalls, credentialCalls, errors, body: (await page.locator('body').innerText()).slice(0, 8000) }, null, 2))
-}
-await bundleConfig.getByText('Provider Settings', { exact: true }).waitFor({ timeout: 10_000 })
-if (await bundleConfig.getByRole('heading', { name: 'MinerU Configuration', exact: true }).count() !== 1) {
-  throw new Error('custom MinerU page was not mounted once in its bundle configuration slot')
-}
+  throw error
+})
+if (await mineru.count() !== 1) throw new Error('custom MinerU page was not mounted once in its bundle configuration slot')
 if (bundleIntercepts !== 1) throw new Error(`workspace bundle was fetched ${bundleIntercepts} times during desktop boot: ${JSON.stringify(bundleRequests)}`)
-async function openCardFor(control) {
-  const card = control.locator('xpath=ancestor::*[@data-card-id][1]')
-  const toggle = card.locator('[data-card-toggle]').first()
-  if (await toggle.getAttribute('aria-expanded') === 'false') await toggle.click()
+
+const actionBar = mineru.locator('[data-action-bar]')
+const savedNotice = mineru.locator('[data-action-bar=saved]')
+const saveButton = actionBar.getByRole('button', { name: 'Save', exact: true })
+if (await actionBar.count() !== 0) throw new Error('action bar is shown for a clean draft')
+
+// Screenshots capture the whole settings page: grow the viewport by the scroll overflow.
+async function shot(name, { full = true } = {}) {
+  await page.waitForTimeout(250)
+  const viewport = page.viewportSize()
+  if (!full) {
+    await page.screenshot({ path: join(screenshotDir, name), animations: 'disabled' })
+    return
+  }
+  const overflow = await mineru.evaluate(element => {
+    for (let node = element.parentElement; node !== null; node = node.parentElement) {
+      const style = getComputedStyle(node)
+      if (/(auto|scroll)/.test(style.overflowY) && node.scrollHeight > node.clientHeight) {
+        node.scrollTop = 0
+        return node.scrollHeight - node.clientHeight
+      }
+    }
+    return 0
+  })
+  await page.setViewportSize({ width: viewport.width, height: Math.min(viewport.height + overflow + 24, 6000) })
+  await page.waitForTimeout(250)
+  await page.screenshot({ path: join(screenshotDir, name), animations: 'disabled' })
+  await page.setViewportSize(viewport)
+  await page.waitForTimeout(150)
 }
-const credentialInput = page.getByLabel('API Key', { exact: true })
+
+const credentialInput = mineru.locator('#mineru-api-key')
 await credentialInput.waitFor({ timeout: 5000 })
 if (await credentialInput.getAttribute('type') !== 'password') throw new Error('API key control is not a password input')
 if (await credentialInput.inputValue() !== '') throw new Error('credential value was restored into the browser')
-if (await page.getByRole('button', { name: 'Clear API Key', exact: true }).count() !== 1) throw new Error('credential clear control is missing')
-await page.getByText('Provider Settings', { exact: true }).scrollIntoViewIfNeeded()
-await page.screenshot({ path: join(screenshotDir, 'mineru-current-settings-credential-desktop.png'), fullPage: true, animations: 'disabled' })
-const providerGroup = page.getByRole('radiogroup', { name: 'Active Provider', exact: true })
-const selfHostedProvider = providerGroup.locator('input[value=mp_self_hosted]')
+if (await page.getByLabel('API key', { exact: true }).count() !== 1) throw new Error('API key input has no accessible label')
+await mineru.getByRole('button', { name: 'Remove key', exact: true }).waitFor({ timeout: 5000 })
+
+const providerGroup = mineru.getByRole('radiogroup', { name: 'Provider', exact: true })
+const legacyProvider = providerGroup.locator('input[value=mp_self_hosted]')
 const officialProvider = providerGroup.locator('input[value=mp_official]')
 const v1Provider = providerGroup.locator('input[value=mp_self_hosted_v1]')
-if (!await selfHostedProvider.isChecked()) throw new Error('initial active provider mismatch')
+if (!await legacyProvider.isChecked()) throw new Error('initial active provider mismatch')
 if (await providerGroup.getByRole('radio').count() !== 3) throw new Error('legacy single-provider config was not completed with all three profiles')
-if (await page.getByText('Pipeline Backend Map', { exact: true }).count() !== 1) throw new Error('self-hosted fields are missing')
-const baseUrlInput = page.getByLabel('API Base URL')
+await shot('mineru-connection-desktop.png')
+
+const optionsToggle = serviceSection.getByRole('button', { name: 'Connection options', exact: true })
+if (await optionsToggle.getAttribute('aria-expanded') !== 'false') throw new Error('connection options are not initially collapsed')
+await optionsToggle.click()
+if (await mineru.locator('#mineru-backend-vlm').inputValue() !== 'vlm-engine') throw new Error('legacy backend fields are missing')
+
+const baseUrlInput = mineru.locator('#mineru-base-url')
+const parseMethod = mineru.locator('#mineru-parse-method')
+const txtNotice = mineru.locator('#mineru-parse-method-note')
 await baseUrlInput.fill('http://gpu-server:18000')
-await openCardFor(page.getByLabel('Default Parse Method'))
-await page.getByLabel('Default Parse Method').selectOption('txt')
-if (await page.getByLabel('Parse Tier', {exact:true}).count() !== 0) throw new Error('V1 tier leaked into legacy profile')
-await v1Provider.locator('..').click()
-if (await page.getByLabel('Default Parse Method').count() !== 0 || await page.getByLabel('Default Model', {exact:true}).count() !== 0 || await page.getByText('Pipeline Backend Map', {exact:true}).count() !== 0 || await page.getByText('Enable Formula Extraction', {exact:true}).count() !== 0) throw new Error('legacy controls leaked into V1')
-await page.getByLabel('Parse Tier', {exact:true}).selectOption('advanced')
-await page.getByLabel('OCR Mode (V1)', {exact:true}).selectOption('txt')
+await parseMethod.selectOption('txt')
+if (await mineru.locator('#mineru-tier').count() !== 0) throw new Error('V1 tier leaked into legacy profile')
+await actionBar.getByText('Unsaved changes', { exact: true }).waitFor({ timeout: 5000 })
+await shot('mineru-dirty-desktop.png', { full: false })
+
+// V1 profile: protocol-specific parsing controls and an independent draft.
+await v1Provider.check()
+if (await parseMethod.count() !== 0 || await mineru.locator('#mineru-model').count() !== 0 || await mineru.locator('#mineru-backend-vlm').count() !== 0 || await mineru.getByText('Formulas', { exact: true }).count() !== 0) throw new Error('legacy controls leaked into V1')
+await mineru.locator('#mineru-tier').selectOption('advanced')
+await mineru.locator('#mineru-ocr-mode').selectOption('txt')
 await baseUrlInput.fill('http://v1-gpu:8000')
-await page.getByLabel('Deployment / model revision', {exact:true}).fill('4.0.10-review')
-await page.getByRole('button', {name:'Test Active Provider',exact:true}).click()
-await page.getByText('Available tiers: flash, basic, standard, advanced', {exact:true}).waitFor()
-await selfHostedProvider.locator('..').click()
-if (await page.getByText(/Connection Healthy/).count() !== 0) throw new Error('stale V1 probe result remained after switching')
-if (await page.getByLabel('Default Parse Method').inputValue() !== 'txt') throw new Error('V1 profile changed shared legacy defaults')
+await mineru.locator('#mineru-version').fill('4.0.10-review')
+await serviceSection.getByRole('button', { name: 'Test connection', exact: true }).click()
+await serviceSection.getByText('Tiers: flash, basic, standard, advanced', { exact: true }).waitFor()
+
+// Back to legacy: stale probe disappears, shared defaults and base URL are intact, no cloud notice.
+await legacyProvider.check()
+if (await serviceSection.getByText('Connected', { exact: true }).count() !== 0) throw new Error('stale V1 probe result remained after switching')
+if (await parseMethod.inputValue() !== 'txt') throw new Error('V1 profile changed shared legacy defaults')
 if (await baseUrlInput.inputValue() !== 'http://gpu-server:18000') throw new Error('V1 switch discarded legacy draft')
-await v1Provider.locator('..').click()
-if (await page.getByLabel('Parse Tier', {exact:true}).inputValue() !== 'advanced' || await page.getByLabel('OCR Mode (V1)', {exact:true}).inputValue() !== 'txt' || await baseUrlInput.inputValue() !== 'http://v1-gpu:8000') throw new Error('V1 draft was reset by profile switching')
-await page.screenshot({path:join(screenshotDir,'mineru-v1-settings-desktop.png'),fullPage:true,animations:'disabled'})
-await officialProvider.locator('..').click()
-if (!await officialProvider.isChecked()) throw new Error('official provider radio did not activate')
-if (await page.getByLabel('Default Parse Method').inputValue() !== 'auto') throw new Error('official provider did not normalize txt to auto')
-await page.getByText('Official v4 provider does not support txt extraction mode; parse method was automatically adjusted to auto.', { exact: true }).waitFor({ timeout: 5000 })
-if (await page.getByText('Supported Cloud Models', { exact: true }).count() !== 1) throw new Error('official fields are missing')
-if (await page.getByText('Pipeline Backend Map', { exact: true }).count() !== 0) throw new Error('self-hosted fields leaked into official profile')
+if (await txtNotice.count() !== 0) throw new Error('provider notice shown outside its provider')
+
+await v1Provider.check()
+if (await mineru.locator('#mineru-tier').inputValue() !== 'advanced' || await mineru.locator('#mineru-ocr-mode').inputValue() !== 'txt' || await baseUrlInput.inputValue() !== 'http://v1-gpu:8000') throw new Error('V1 draft was reset by profile switching')
+await shot('mineru-v1-desktop.png')
+
+// Official cloud: txt normalizes to auto with an inline note scoped to this provider.
+await officialProvider.check()
+if (await parseMethod.inputValue() !== 'auto') throw new Error('official provider did not normalize txt to auto')
+await txtNotice.getByText("MinerU Cloud can't use the text layer, so this switched to Auto.", { exact: true }).waitFor({ timeout: 5000 })
+if (await mineru.getByText('Enabled models', { exact: true }).count() !== 1) throw new Error('official fields are missing')
+if (await mineru.locator('#mineru-backend-vlm').count() !== 0) throw new Error('self-hosted fields leaked into official profile')
 if (await baseUrlInput.inputValue() !== 'https://mineru.net/api/v4') throw new Error('official profile did not retain its independent base URL')
-if (await page.getByLabel('Default Parse Method').locator('option[value=txt]').count() !== 0) throw new Error('official mode exposes unsupported txt method')
-await page.getByRole('button', { name: 'Test Active Provider', exact: true }).click()
-await page.getByText(/Connection Healthy/).waitFor({ timeout: 5000 })
+if (await parseMethod.locator('option[value=txt]').count() !== 0) throw new Error('official mode exposes unsupported txt method')
+await serviceSection.getByRole('button', { name: 'Test connection', exact: true }).click()
+await serviceSection.getByText('Connected', { exact: true }).waitFor({ timeout: 5000 })
+await shot('mineru-official-desktop.png')
+
+// Keyboard: arrow keys walk the native radio group (official is first, so Left wraps to legacy).
 await officialProvider.focus()
 await page.keyboard.press('ArrowLeft')
-if (!await selfHostedProvider.isChecked()) throw new Error('provider radio arrow navigation did not activate self-hosted profile')
-if (await baseUrlInput.inputValue() !== 'http://gpu-server:18000') throw new Error('self-hosted profile was reset after switching providers')
-const providerToggle = page.locator('[data-card-toggle=provider]')
-await providerToggle.focus()
-await page.keyboard.press('Enter')
-if (await providerToggle.getAttribute('aria-expanded') !== 'false' || await baseUrlInput.isVisible()) throw new Error('keyboard collapse did not hide provider fields')
-await page.keyboard.press('Space')
-if (await providerToggle.getAttribute('aria-expanded') !== 'true' || !await baseUrlInput.isVisible()) throw new Error('keyboard expansion did not restore provider fields')
-if (await baseUrlInput.inputValue() !== 'http://gpu-server:18000') throw new Error('disclosure discarded the provider draft')
-for (const id of ['polling', 'retry', 'output', 'limits']) {
-  if (await page.locator(`[data-card-toggle=${id}]`).getAttribute('aria-expanded') !== 'false') throw new Error(`${id} is not initially collapsed`)
-}
-const attemptsInput = page.getByLabel('Maximum Attempts')
-await openCardFor(attemptsInput)
-await attemptsInput.fill('')
-if (await attemptsInput.inputValue() !== '') throw new Error('numeric input discarded an intermediate empty draft')
-await attemptsInput.blur()
-if (await attemptsInput.inputValue() !== '3') throw new Error('numeric input did not restore the last valid value on blur')
+if (!await legacyProvider.isChecked()) throw new Error('provider radio arrow navigation did not activate the legacy profile')
+if (await baseUrlInput.inputValue() !== 'http://gpu-server:18000') throw new Error('legacy profile was reset after switching providers')
+if (await txtNotice.count() !== 0) throw new Error('cloud txt notice survived switching away from the cloud provider')
+await optionsToggle.click()
+
+// Advanced disclosure: unit fields, inline validation, restore defaults inside the section.
+const advancedToggle = mineru.locator('[data-section=advanced]').getByRole('button', { name: 'Advanced', exact: true })
+if (await advancedToggle.getAttribute('aria-expanded') !== 'false') throw new Error('advanced is not initially collapsed')
+await advancedToggle.click()
+if (await advancedToggle.getAttribute('aria-expanded') !== 'true') throw new Error('advanced did not expand')
+const attemptsInput = page.getByLabel('Attempts per request', { exact: true })
+await attemptsInput.fill('0')
+await mineru.getByText('Enter a value from 1 to 10.', { exact: true }).waitFor({ timeout: 5000 })
+if (await attemptsInput.getAttribute('aria-invalid') !== 'true') throw new Error('invalid number is not marked aria-invalid')
 await attemptsInput.fill('4')
-await page.locator('[data-card-toggle=retry]').click()
-await page.locator('[data-card-toggle=retry]').click()
-if (await attemptsInput.inputValue() !== '4') throw new Error('disclosure discarded the numeric draft')
-const inlineImagesInput = page.getByLabel('Max Inlined Images')
-await openCardFor(inlineImagesInput)
+if (await mineru.getByText('Enter a value from 1 to 10.', { exact: true }).count() !== 0) throw new Error('validation error stayed after a valid value')
+const inlineImagesInput = page.getByLabel('Images per read', { exact: true })
 if (await inlineImagesInput.inputValue() !== '6') throw new Error('initial inline image budget mismatch')
 await inlineImagesInput.fill('9')
+if (await page.getByLabel('Status check interval', { exact: true }).inputValue() !== '2') throw new Error('poll interval is not shown in seconds')
+if (await mineru.locator('[data-section=advanced]').getByRole('button', { name: 'Restore defaults', exact: true }).isDisabled()) throw new Error('restore defaults is disabled for edited values')
+
+// Credential and Save: explicit only, key cleared after storing, bar disappears once clean.
 await credentialInput.fill('gui-verifier-secret')
 if (rpcCalls.some(call => call.endpoint === 'mineru/config.set') || credentialCalls.some(call => call.method !== 'describe')) {
   throw new Error('bundle configuration auto-saved an unsubmitted draft')
 }
-await page.getByRole('button', { name: 'Save Configuration', exact: true }).click()
-await page.getByRole('button', { name: 'Saved', exact: true }).waitFor({ timeout: 5000 })
-await page.getByText('A credential is configured. Saving with this field blank keeps it unchanged.', { exact: false }).waitFor({ timeout: 5000 })
+await shot('mineru-dirty-advanced-desktop.png', { full: false })
+await saveButton.click()
+await savedNotice.waitFor({ timeout: 5000 })
+if (await saveButton.count() !== 0) throw new Error('save control remained after saving a clean draft')
 if (await credentialInput.inputValue() !== '') throw new Error('credential input retained the submitted secret')
-await page.getByRole('button', { name: 'Clear API Key', exact: true }).click()
-await page.getByText('No credential is configured. Enter a key and save the configuration to store it.', { exact: true }).waitFor({ timeout: 5000 })
-await openCardFor(page.getByRole('button', { name: 'Refresh Statistics', exact: true, includeHidden: true }))
-await page.getByRole('button', { name: 'Refresh Statistics', exact: true }).click()
-await page.getByText('Incomplete storage scan: marked totals are lower bounds, not exact sizes or counts.', { exact: true }).waitFor()
-await page.getByText('Published Results', { exact: true }).waitFor({ timeout: 5000 })
-await page.getByRole('button', { name: 'Verify Cache', exact: true }).click()
-await page.getByText('Valid: 2', { exact: true }).waitFor({ timeout: 5000 })
-await page.getByRole('button', { name: 'Preview GC', exact: true }).click()
-await page.getByText('Complete Preview', { exact: true }).waitFor({ timeout: 5000 })
-await page.getByRole('button', { name: 'Clear Cache', exact: true }).click()
-await page.getByText('Ready to Clear', { exact: true }).waitFor({ timeout: 5000 })
-await page.getByRole('button', { name: 'Preview GC', exact: true }).click()
-if (await page.getByRole('button', { name: 'Confirm Clear', exact: true }).count() !== 0) throw new Error('cache clear confirmation stayed armed after another operation')
-await page.getByRole('button', { name: 'Clear Cache', exact: true }).click()
-await page.getByRole('button', { name: 'Confirm Clear', exact: true }).click()
-await page.getByText('Deleted: 2', { exact: true }).waitFor({ timeout: 5000 })
-await page.getByRole('button', { name: 'List Quarantine', exact: true }).click()
-await page.getByText('entry_corrupt_1', { exact: true }).waitFor({ timeout: 5000 })
-await page.getByLabel('entry_corrupt_1').check()
-await page.getByRole('button', { name: 'Preview Cleanup', exact: true }).click()
-await page.getByText('Planned: 1', { exact: true }).waitFor({ timeout: 5000 })
-await page.getByRole('button', { name: 'Delete Selected', exact: true }).click()
-await page.getByRole('button', { name: 'Confirm Delete', exact: true }).click()
-await page.getByText('Deleted: 1', { exact: true }).waitFor({ timeout: 5000 })
-await page.getByText('Storage Operations', { exact: true }).evaluate(element => element.scrollIntoView({ block: 'center' }))
-await page.screenshot({ path: join(screenshotDir, 'mineru-current-settings-desktop.png'), fullPage: true, animations: 'disabled' })
+await savedNotice.waitFor({ state: 'detached', timeout: 6000 })
+if (await actionBar.count() !== 0) throw new Error('action bar stayed after the saved notice')
+await serviceSection.getByRole('button', { name: 'Remove key', exact: true }).click()
+await serviceSection.getByText('Not set', { exact: true }).waitFor({ timeout: 5000 })
 
+// Revision conflict: the stale draft cannot be saved; Reload restores the stored settings.
+conflictNextSave = true
+await baseUrlInput.fill('http://stale-edit:18000')
+await saveButton.click()
+await actionBar.getByText('Settings were changed elsewhere. Reload to continue.', { exact: true }).waitFor({ timeout: 5000 })
+if (await saveButton.count() !== 0) throw new Error('conflicted draft can still be saved')
+await shot('mineru-conflict-desktop.png', { full: false })
+await actionBar.getByRole('button', { name: 'Reload', exact: true }).click()
+await page.waitForFunction(
+  () => [...document.querySelectorAll('input')].some(input => input.value === 'http://gpu-server:18000'),
+  undefined, { timeout: 5000 },
+).catch(() => { throw new Error('reload after conflict kept the stale draft') })
+if (await baseUrlInput.inputValue() !== 'http://gpu-server:18000') throw new Error('reload after conflict kept the stale draft')
+await actionBar.waitFor({ state: 'detached', timeout: 5000 }).catch(() => { throw new Error('action bar remained after reloading') })
+
+// Storage tab.
+await mineru.getByRole('tab', { name: 'Storage', exact: true }).click()
+const maintenance = mineru.locator('[data-section=maintenance]')
+await maintenance.getByText('The scan stopped early; totals are minimums.', { exact: true }).waitFor({ timeout: 5000 })
+await maintenance.getByText('Parsed results', { exact: true }).waitFor({ timeout: 5000 })
+await maintenance.getByRole('button', { name: 'Check', exact: true }).click()
+await maintenance.getByText('2 OK · 0 damaged · 0 missing · 0 unreadable', { exact: true }).waitFor({ timeout: 5000 })
+
+await maintenance.getByRole('button', { name: 'Clear…', exact: true }).click()
+const dialog = page.getByRole('dialog')
+await dialog.getByText('Results to delete: 2 (4.00 KiB).', { exact: true }).waitFor({ timeout: 5000 })
+if (rpcCalls.some(call => call.endpoint === 'mineru/storage.cache.clear' && call.payload?.dry_run === false)) throw new Error('cache clear deleted before confirmation')
+await shot('mineru-clear-dialog-desktop.png', { full: false })
+await dialog.getByRole('button', { name: 'Delete', exact: true }).click()
+await maintenance.getByText('Deleted 2 results (4.00 KiB).', { exact: true }).waitFor({ timeout: 5000 })
+
+await maintenance.getByRole('button', { name: 'Review', exact: true }).click()
+await maintenance.getByLabel('entry_corrupt_1', { exact: true }).check()
+await maintenance.getByRole('button', { name: 'Delete selected…', exact: true }).click()
+await dialog.getByText('Selected: 1 (256 B). They will be permanently deleted.', { exact: true }).waitFor({ timeout: 5000 })
+await dialog.getByRole('button', { name: 'Delete', exact: true }).click()
+await maintenance.getByText('Removed from quarantine: 1', { exact: true }).waitFor({ timeout: 5000 })
+
+const limitsToggle = mineru.locator('[data-section=limits]').getByRole('button', { name: 'Safety limits', exact: true })
+if (await limitsToggle.getAttribute('aria-expanded') !== 'false') throw new Error('limits is not initially collapsed')
+await limitsToggle.click()
+if (await mineru.locator('[data-limit]').count() !== 7) throw new Error('security limit values are missing')
+if (await mineru.locator('[data-section=limits] input').count() !== 0) throw new Error('restart-only security limits are rendered as inputs')
+await shot('mineru-storage-desktop.png')
+
+await mineru.getByRole('tab', { name: 'Service & parsing', exact: true }).click()
+if (await baseUrlInput.inputValue() !== 'http://gpu-server:18000') throw new Error('tab switch discarded saved settings')
 const desktopMetrics = await page.evaluate(() => ({
   scrollWidth: document.documentElement.scrollWidth,
   clientWidth: document.documentElement.clientWidth,
 }))
+
+// Mobile.
 await page.setViewportSize({ width: 390, height: 844 })
-await page.waitForTimeout(500)
-await page.getByText('Provider Settings', { exact: true }).waitFor({ timeout: 5000 }).catch(async error => {
-  await page.screenshot({ path: join(screenshotDir, 'mineru-mobile-failure.png'), fullPage: true, animations: 'disabled' })
-  throw error
-})
+await serviceSection.waitFor({ timeout: 5000 })
 if (bundleIntercepts !== 1) throw new Error(`workspace bundle was unexpectedly refetched ${bundleIntercepts} times`)
-const mobileCredentialInput = page.getByLabel('API Key', { exact: true })
-await mobileCredentialInput.waitFor({ timeout: 5000 })
-if (await mobileCredentialInput.inputValue() !== '') throw new Error('credential value was restored into the mobile browser')
-await page.getByText('Provider Settings', { exact: true }).scrollIntoViewIfNeeded()
-await page.screenshot({ path: join(screenshotDir, 'mineru-current-settings-credential-mobile.png'), fullPage: true, animations: 'disabled' })
-await page.getByRole('button', { name: 'List Quarantine', exact: true }).click()
-await page.getByText('entry_corrupt_1', { exact: true }).waitFor({ timeout: 5000 })
-await page.getByText('Storage & Cache', { exact: true }).scrollIntoViewIfNeeded()
-await page.screenshot({ path: join(screenshotDir, 'mineru-current-settings-mobile.png'), fullPage: true, animations: 'disabled' })
-const providerHeadingBox = await page.getByText('Provider Settings', { exact: true }).boundingBox()
-const mineruSection = bundleConfig.getByRole('heading', { name: 'MinerU Configuration', exact: true }).locator('xpath=ancestor::section[1]')
-const sectionBox = await mineruSection.boundingBox()
-const layoutDiagnostics = await page.evaluate(() => {
-  const heading = text => [...document.querySelectorAll('h3')].find(element => element.textContent?.trim() === text)
-  const rect = element => {
-    if (!element) return null
-    const box = element.getBoundingClientRect()
-    const style = getComputedStyle(element)
-    return {
-      x: box.x, y: box.y, width: box.width, height: box.height, display: style.display, flex: style.flex,
-      gap: style.gap, flexDirection: style.flexDirection, flexWrap: style.flexWrap, alignContent: style.alignContent,
-      minHeight: style.minHeight, maxHeight: style.maxHeight,
-    }
-  }
-  const storage = heading('Storage & Cache')?.parentElement
-  const operations = heading('Storage Operations')?.parentElement
-  const polling = heading('Polling & Timeouts')?.parentElement
-  const ttl = [...document.querySelectorAll('input')].find(input => input.previousElementSibling?.textContent?.trim() === 'Staging Cleanup TTL (ms)')
-  const cache = [...document.querySelectorAll('input[type=checkbox]')].find(input => input.parentElement?.textContent?.includes('Enable Global Cache'))
-  const matchingFlexRules = element => {
-    if (!element) return []
-    const matches = []
-    const visit = (rules, source) => {
-      for (const rule of rules) {
-        if ('cssRules' in rule) { try { visit(rule.cssRules, source) } catch {} }
-        if ('selectorText' in rule && rule.style?.flexDirection) {
-          try { if (element.matches(rule.selectorText)) matches.push({ source, selector: rule.selectorText, flexDirection: rule.style.flexDirection }) } catch {}
-        }
-      }
-    }
-    for (const sheet of document.styleSheets) { try { visit(sheet.cssRules, sheet.href ?? 'inline') } catch {} }
-    return matches
-  }
-  const storageRow = storage?.querySelector('[class*=row]')
-  return {
-    storage: rect(storage), operations: rect(operations), polling: rect(polling),
-    ttl: rect(ttl), cache: rect(cache), storageChildren: storage ? [...storage.children].map(rect) : [],
-    storageRows: storage ? [...storage.querySelectorAll('[class*=row]')].map(row => ({ row: rect(row), children: [...row.children].map(rect) })) : [],
-    storageRowFlexRules: matchingFlexRules(storageRow),
-  }
-})
-const visibleControlBoxes = await mineruSection.locator('input:visible, select:visible, button:visible').evaluateAll(elements => elements.map(element => {
+if (await credentialInput.inputValue() !== '') throw new Error('credential value was restored into the mobile browser')
+await shot('mineru-connection-mobile.png')
+
+await baseUrlInput.fill('http://mobile-edit:18000')
+await actionBar.waitFor({ timeout: 5000 })
+const barBox = await actionBar.boundingBox()
+if (barBox === null || barBox.height > 56) throw new Error(`mobile action bar is not one compact row: ${JSON.stringify(barBox)}`)
+await serviceSection.scrollIntoViewIfNeeded()
+await shot('mineru-dirty-mobile.png', { full: false })
+await actionBar.getByRole('button', { name: 'Discard', exact: true }).click()
+if (await baseUrlInput.inputValue() !== 'http://gpu-server:18000') throw new Error('discard did not restore the saved value')
+if (await actionBar.count() !== 0) throw new Error('action bar remained after discarding')
+
+await mineru.getByRole('tab', { name: 'Storage', exact: true }).click()
+await shot('mineru-storage-mobile.png')
+const sectionBox = await mineru.boundingBox()
+const visibleControlBoxes = await mineru.locator('input:visible, select:visible, button:visible').evaluateAll(elements => elements.map(element => {
   const box = element.getBoundingClientRect()
   return { tag: element.tagName, text: (element.textContent ?? '').trim().slice(0, 80), x: box.x, right: box.right, width: box.width }
 }))
 const mobileMetrics = await page.evaluate(() => ({
   scrollWidth: document.documentElement.scrollWidth,
   clientWidth: document.documentElement.clientWidth,
-  bodyText: document.body.innerText.slice(0, 5000),
 }))
 if (mobileMetrics.scrollWidth > mobileMetrics.clientWidth) throw new Error('mobile settings page has horizontal overflow')
 const clippedControls = visibleControlBoxes.filter(box => box.x < 0 || box.right > 391)
@@ -615,73 +641,72 @@ if (clippedControls.length > 0) throw new Error(`mobile controls are clipped des
 if (sectionBox === null || sectionBox.x < 0 || sectionBox.x + sectionBox.width > 390) {
   throw new Error(`mobile MinerU section is outside the viewport: ${JSON.stringify(sectionBox)}`)
 }
-if (providerHeadingBox === null || providerHeadingBox.x < 0 || providerHeadingBox.x + providerHeadingBox.width > 390) {
-  throw new Error(`mobile Provider Settings heading is outside the viewport: ${JSON.stringify(providerHeadingBox)}`)
-}
-await page.getByRole('button', { name: 'Expand All', exact: true }).click()
-if (await page.locator('[data-card-toggle][aria-expanded=false]').count() !== 0) throw new Error('expand all left a panel closed')
-const limitsInputs = page.locator('[data-card-id=limits] input')
-if (await limitsInputs.count() !== 7) throw new Error('security limit fields are missing')
-for (const input of await limitsInputs.all()) {
-  if (!await input.isDisabled()) throw new Error('restart-only security limit is editable')
-}
-const expandedControlBoxes = await mineruSection.locator('input:visible, select:visible, button:visible').evaluateAll(elements => elements.map(element => {
-  const box = element.getBoundingClientRect()
-  return { x: box.x, right: box.right }
-}))
-if (expandedControlBoxes.some(box => box.x < 0 || box.right > 391)) throw new Error('expanded advanced controls exceed the mobile viewport')
-await page.getByRole('button', { name: 'Collapse All', exact: true }).click()
-if (await page.locator('[data-card-toggle][aria-expanded=true]').count() !== 0) throw new Error('collapse all left a panel open')
-await page.getByRole('heading', { name: 'MinerU Configuration', exact: true }).scrollIntoViewIfNeeded()
-await page.screenshot({ path: join(screenshotDir, 'mineru-current-settings-overview-mobile.png'), fullPage: true, animations: 'disabled' })
-await providerToggle.click()
-if (await baseUrlInput.inputValue() !== 'http://gpu-server:18000') throw new Error('collapse all discarded saved settings')
-// Exercise the host's dark palette locally without persisting a user preference.
-const lightInputBackground = await credentialInput.evaluate(element => getComputedStyle(element).backgroundColor)
+
+// Dark theme.
+const getInputBg = element => getComputedStyle(element.closest('span') ?? element).backgroundColor
+await mineru.getByRole('tab', { name: 'Service & parsing', exact: true }).click()
+const lightInputBackground = await credentialInput.evaluate(getInputBg)
 await page.evaluate(() => {
   document.body.setAttribute('data-ds-dark-theme', '')
   document.documentElement.style.colorScheme = 'dark'
 })
-await page.getByText('Provider Settings', { exact: true }).scrollIntoViewIfNeeded()
-await page.screenshot({ path: join(screenshotDir, 'mineru-current-settings-dark-mobile.png'), fullPage: true, animations: 'disabled' })
-const darkInputBackground = await credentialInput.evaluate(element => getComputedStyle(element).backgroundColor)
+await shot('mineru-connection-dark-mobile.png')
+const darkInputBackground = await credentialInput.evaluate(getInputBg)
 if (lightInputBackground === darkInputBackground) throw new Error('input surface does not respond to the host dark palette')
 await page.setViewportSize({ width: 1440, height: 1000 })
-await page.screenshot({ path: join(screenshotDir, 'mineru-current-settings-dark-desktop.png'), fullPage: true, animations: 'disabled' })
-await providerToggle.click()
-await page.getByRole('heading', { name: 'MinerU Configuration', exact: true }).scrollIntoViewIfNeeded()
+await shot('mineru-connection-dark-desktop.png')
+await baseUrlInput.fill('http://dark-edit:18000')
+await actionBar.waitFor({ timeout: 5000 })
+await shot('mineru-dirty-dark-desktop.png', { full: false })
+await actionBar.getByRole('button', { name: 'Discard', exact: true }).click()
+await mineru.getByRole('tab', { name: 'Storage', exact: true }).click()
+await shot('mineru-storage-dark-desktop.png')
+await page.setViewportSize({ width: 390, height: 844 })
+await shot('mineru-storage-dark-mobile.png')
+await page.setViewportSize({ width: 1440, height: 1000 })
 await page.evaluate(() => {
   document.body.removeAttribute('data-ds-dark-theme')
   document.documentElement.style.colorScheme = 'light'
 })
-await page.screenshot({ path: join(screenshotDir, 'mineru-current-settings-overview-desktop.png'), fullPage: true, animations: 'disabled' })
+
 if (errors.length > 0) throw new Error(`browser errors: ${errors.join('; ')}; failed requests: ${JSON.stringify(failedRequests)}`)
 if (!credentialCalls.some(call => call.method === 'set' && call.ref === 'MINERU_API_KEY')) throw new Error('credential set did not use the Remote positional API')
 if (!credentialCalls.some(call => call.method === 'unset' && call.ref === 'MINERU_API_KEY')) throw new Error('credential unset did not use the Remote positional API')
 const probe = rpcCalls.find(call => call.endpoint === 'mineru/probe' && call.payload?.provider?.type === 'official-v4')
 if (probe?.payload?.provider?.type !== 'official-v4') throw new Error('draft probe did not carry official provider')
 const save = rpcCalls.find(call => call.endpoint === 'mineru/config.set')
+if (save?.payload?.expected_revision !== 1) throw new Error('save was not bound to the loaded revision')
 if (save?.payload?.config?.providers?.length !== 3) throw new Error('save did not carry all three provider profiles')
-const savedSelfHosted = save?.payload?.config?.providers?.find(provider => provider.type === 'self-hosted-legacy-v2')
-const savedOfficial = save?.payload?.config?.providers?.find(provider => provider.type === 'official-v4')
-if (savedSelfHosted?.baseURL !== 'http://gpu-server:18000') throw new Error('save reset the self-hosted profile')
+const savedLegacy = save.payload.config.providers.find(provider => provider.type === 'self-hosted-legacy-v2')
+const savedOfficial = save.payload.config.providers.find(provider => provider.type === 'official-v4')
+const savedV1 = save.payload.config.providers.find(provider => provider.type === 'self-hosted-v1')
+if (savedLegacy?.baseURL !== 'http://gpu-server:18000') throw new Error('save reset the legacy profile')
 if (savedOfficial?.baseURL !== 'https://mineru.net/api/v4') throw new Error('save reset the official profile')
-const savedV1 = save?.payload?.config?.providers?.find(provider => provider.type === 'self-hosted-v1')
 if (savedV1?.tier !== 'advanced' || savedV1?.ocrMode !== 'txt' || savedV1?.baseURL !== 'http://v1-gpu:8000' || savedV1?.configuredVersion !== '4.0.10-review') throw new Error('save lost V1 settings')
-if ('models' in savedSelfHosted || 'tier' in savedSelfHosted || 'modelMap' in savedOfficial || 'modelMap' in savedV1 || 'models' in savedV1) throw new Error('provider-specific fields leaked across profiles')
-if (save?.payload?.config?.retry?.maxAttempts !== 4) throw new Error('save did not carry retry policy')
-if (save?.payload?.config?.output?.maxInlineImages !== 9) throw new Error('save did not carry inline image budget')
-const cacheClearPreviewCall = rpcCalls.find(call => call.endpoint === 'mineru/storage.cache.clear' && call.payload?.dry_run === true)
-if (cacheClearPreviewCall === undefined) throw new Error('cache clear preview was not requested')
+if ('models' in savedLegacy || 'tier' in savedLegacy || 'modelMap' in savedOfficial || 'modelMap' in savedV1 || 'models' in savedV1) throw new Error('provider-specific fields leaked across profiles')
+if (save.payload.config.retry.maxAttempts !== 4) throw new Error('save did not carry retry policy')
+if (save.payload.config.output.maxInlineImages !== 9) throw new Error('save did not carry inline image budget')
+const conflicted = rpcCalls.filter(call => call.endpoint === 'mineru/config.set')[1]
+if (conflicted?.payload?.expected_revision !== 2) throw new Error('second save did not carry the refreshed revision')
+
 const cacheClearDeleteCall = rpcCalls.find(call => call.endpoint === 'mineru/storage.cache.clear' && call.payload?.dry_run === false)
 if (cacheClearDeleteCall?.payload?.confirm !== true) throw new Error('cache clear deletion did not carry explicit confirmation')
 if (cacheClearDeleteCall?.payload?.confirmation_token !== 'cache-clear-preview-token') throw new Error('cache clear deletion was not bound to its preview')
 const cleanupPreviewCall = rpcCalls.find(call => call.endpoint === 'mineru/storage.quarantine.cleanup' && call.payload?.dry_run === true)
-if (cleanupPreviewCall?.payload?.entry_ids?.[0] !== 'entry_corrupt_1') throw new Error('cleanup preview did not carry selected entry')
+if (JSON.stringify(cleanupPreviewCall?.payload?.entry_ids) !== '["entry_corrupt_1"]') throw new Error('cleanup preview did not carry the selected entry')
 const cleanupDeleteCall = rpcCalls.find(call => call.endpoint === 'mineru/storage.quarantine.cleanup' && call.payload?.dry_run === false)
-if (cleanupDeleteCall?.payload?.confirm !== true) throw new Error('cleanup deletion did not carry explicit confirmation')
+if (cleanupDeleteCall?.payload?.confirm !== true || JSON.stringify(cleanupDeleteCall.payload.entry_ids) !== '["entry_corrupt_1"]') throw new Error('cleanup deletion was not limited to the previewed entries')
+
+const screenshots = [
+  'mineru-connection-desktop.png', 'mineru-dirty-desktop.png', 'mineru-v1-desktop.png', 'mineru-official-desktop.png',
+  'mineru-dirty-advanced-desktop.png', 'mineru-conflict-desktop.png', 'mineru-clear-dialog-desktop.png', 'mineru-storage-desktop.png',
+  'mineru-connection-mobile.png', 'mineru-dirty-mobile.png', 'mineru-storage-mobile.png',
+  'mineru-connection-dark-mobile.png', 'mineru-connection-dark-desktop.png', 'mineru-dirty-dark-desktop.png',
+  'mineru-storage-dark-desktop.png', 'mineru-storage-dark-mobile.png',
+].map(name => join(screenshotDir, name))
 console.log(JSON.stringify({
-  providerSwitch: true, draftProbe: true, save: true, credentialUi: true, maintenance: true, errors, desktopMetrics, mobileMetrics, sectionBox, providerHeadingBox, layoutDiagnostics, visibleControlBoxes,
+  providerSwitch: true, scopedNotices: true, draftProbe: true, save: true, conflict: true, credentialUi: true, maintenance: true,
+  errors, desktopMetrics, mobileMetrics, sectionBox, mobileActionBar: barBox,
   rpcEndpoints: rpcCalls.map(call => call.endpoint),
   credentialCalls,
   pluginManagerCalls,
@@ -690,18 +715,7 @@ console.log(JSON.stringify({
   unrelatedPluginErrors: [...unrelatedPluginErrors],
   excludedPluginIds: [...excludedPluginIds],
   bundleIntercepts,
-  bundleRequests,
   hmrIsolated: true,
-  screenshots: [
-    join(screenshotDir, 'mineru-v1-settings-desktop.png'),
-    join(screenshotDir, 'mineru-current-settings-credential-desktop.png'),
-    join(screenshotDir, 'mineru-current-settings-desktop.png'),
-    join(screenshotDir, 'mineru-current-settings-credential-mobile.png'),
-    join(screenshotDir, 'mineru-current-settings-mobile.png'),
-    join(screenshotDir, 'mineru-current-settings-overview-mobile.png'),
-    join(screenshotDir, 'mineru-current-settings-overview-desktop.png'),
-    join(screenshotDir, 'mineru-current-settings-dark-mobile.png'),
-    join(screenshotDir, 'mineru-current-settings-dark-desktop.png'),
-  ],
+  screenshots,
 }, null, 2))
 await browser.close()

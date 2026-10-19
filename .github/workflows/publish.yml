@@ -22,14 +22,12 @@ jobs:
           runtime: node@22
           cache: true
 
-      - name: Type check
-        run: pnpm run typecheck
+      - name: Verify tag matches package version
+        run: test "v$(node -p 'require("./package.json").version')" = "$GITHUB_REF_NAME"
 
-      - name: Run tests
-        run: pnpm test
-
-      - name: Build package
-        run: pnpm run build
+      # check builds before testing: package-level tests load the built lib/.
+      - name: Check
+        run: pnpm run check
 
       - name: Publish to npm
         run: pnpm publish --access public --no-git-checks --provenance

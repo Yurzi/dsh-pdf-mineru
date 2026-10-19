@@ -1,173 +1,90 @@
 # dsh-pdf-mineru Agent Guide
 
+Standing orders for anyone changing this plugin. The module map and implementation detail live in [ARCHITECTURE.md](ARCHITECTURE.md); setup, scripts, tests, manual verification and releases live in [CONTRIBUTING.md](CONTRIBUTING.md); the model reader contract lives in [docs/model-reading.md](docs/model-reading.md).
+
 ## Architecture
 
-The plugin exposes two model tools (`read_pdf` and `async_parse_pdf`) over one versioned MinerU domain. Keep this dependency direction:
+Two model tools (`read_pdf`, `async_parse_pdf`) sit on one versioned MinerU domain. Keep this dependency direction ([details](ARCHITECTURE.md#模块地图)):
 
 ```text
-tools -> DSH JobRegistry (async ownership, cancellation, completion)
-  -> MinerUService
-    -> RequestNormalizer
-  -> ResultRepository
-  -> SharedOperationRegistry
-  -> ProviderRegistry
-    -> SelfHostedV1Provider
-    -> SelfHostedLegacyV2Provider
-    -> OfficialV4Provider
-
-loopback RPC -> StorageMaintenanceService -> ResultRepository / ProcessLock
+tools -> ReaderService -> ParseService -> SharedOperationRegistry
+                                       -> createProvider -> providers/<type>
+                                       -> ResultRepository
+loopback RPC -> settings persistence / ParseService.probe / StorageMaintenanceService
 ```
 
-Reader details and usage contracts live in [docs/model-reading.md](docs/model-reading.md). Content reads flow through `document-index` (stable pre-selection identities and faithful normalization) and `read-delivery` (bounded chunks and cursor-v3); original-page verification uses `page-renderer` locally without a Provider.
-
-Providers adapt upstream protocols only. They never register tools, inspect DSH Sessions, choose cache paths, resolve credentials, or generate model prose. Tools never call fetch, parse ZIP files, or construct storage paths.
+- Tools never call fetch, parse ZIP files, construct storage paths, or import service/storage/providers directly.
+- Providers adapt upstream protocols only: they never register tools, inspect DSH Sessions, choose cache paths, resolve credentials, or generate model prose.
+- storage imports no service or provider implementation; domain, config, contracts and source are leaves.
+- The client imports only `contracts/`, `config/model` and `domain/ids`.
+- Add Provider types through `PROVIDER_TYPES`/`PROVIDER_TRAITS`; do not branch on provider type in service or reader code.
 
 ## Domain contracts
 
-- Plugin domain IDs use validated branded strings: `mr_`, `mf_`, `mp_`, and `mo_`; native background IDs are issued by DSH as `mineru-N`.
-- Canonical request, cache key spec, and result manifest are independently versioned.
-- Canonical requests persist file ID/name/bytes/SHA-256, never the local source path. `PreparedSourceFile.path` is ephemeral.
-- ProviderJobRef is transient inside provider execution and contains task/batch IDs and dataId/fileId/name mappings. Never add upload, CDN, status, or result URLs.
-- Result manifests contain normalized relative artifact paths. Resolve absolute paths only in ResultRepository.
-- Published results are immutable and single-file. Batch support must fan out cache keys and manifests per source file.
+- Plugin IDs are validated branded strings (`mr_`, `mf_`, `mp_`, `mo_`). Native job IDs are issued by DSH; never parse or document their format as a contract.
+- Canonical request, cache key spec and result manifest are independently versioned. Canonical requests persist file ID/name/bytes/SHA-256, never the local path; `PreparedSourceFile.path` is ephemeral.
+- ProviderJobRef is transient and holds task/batch IDs and dataId/fileId/name mappings. Never add upload, CDN, status or result URLs.
+- Manifests hold normalized relative artifact paths; only ResultRepository resolves absolute paths. Published results are immutable and single-file; batch support fans out cache keys and manifests per file.
+- Preserve `parseMethod` in cache semantics: `txt` is not `auto`. Official v4 rejects `txt`.
 
-## Session and concurrency rules
+## Session and concurrency
 
-- Every tool requires `exec.agent.session`; native DSH jobs use `agent.session.id` (SessionId) as owner. The registry resolves the registered live Agent, enforces controller admission before starting work, and owns teardown/archive admission.
-- `async_parse_pdf` registers `kind: mineru` with `ctx.jobs.start`; generic `job_output`, `job_list`, and `job_kill` own async control.
-- `read_pdf` returns results directly and never creates a plugin Job.
-- SharedOperation owns the producer AbortController. Waiter cancellation, including native `job_kill`, only stops that invocation's wait.
-- Native job hooks settle with a non-rejecting `done: Promise<JobOutcome>`; summaries/errors use `result`, not the removed `output` field or `readOutput`. The host consumes the final result once and owns notifications/wakeups. Set `outputLimitBytes: 48_000`.
-- Invocation-local `ParseProgress` phases go through `JobHandle.updateProgress`, never duplicated ring appends. Progress has no paths, credentials, provider refs or invented percentages; observer failures must not alter parsing or cancellation.
+- Every tool requires `exec.agent.session`. Resolve `file_path` once at the tool boundary against `ctx.workingDirectory.ensure(agent, signal)`; services and renderers receive absolute paths only. `async_parse_pdf` resolves its path and config snapshot before `jobs.start`.
+- `async_parse_pdf` uses `ctx.jobs.start` with `kind: mineru`, `owner: agent.session.id`, `toolCall: { callId, rootCallId }` and `outputLimitBytes: 48_000`. Generic `job_output`/`job_list`/`job_kill` own control; `read_pdf` never creates a job.
+- Job hooks settle a non-rejecting `done: Promise<JobOutcome>` with `result`. Phases go through `JobHandle.updateProgress` and contain no paths, credentials, provider refs or invented percentages; observer failures never alter parsing or cancellation.
+- SharedOperation owns the producer AbortController. Waiter cancellation, including `job_kill`, stops only that invocation's wait.
+- Each invocation reads one config snapshot and passes it down; never re-read live config mid-operation.
 
 ## Source selection
 
-- Preserve `file_path`; add mutually exclusive `attachment_id` to both tools, including content, cursor continuation and page view. Both fields are optional in schemas; runtime requires exactly one. Callers should retain the same selector field and value on continuation; cursor-v3 validates the existing result/projection identity, not selector spelling.
-- Accept full `sha256:<64hex>` content IDs or 8–64 hexadecimal digest prefixes, optionally prefixed with `sha256:`. Match unique content IDs, not reference count; reject ambiguous prefixes.
-- Resolve only real file refs exposed by the current session’s `deriveMessages()`, including flat content in first-class `role: "tool"` messages. Do not restore the removed nested `tool-result` block protocol. Compacted-out refs are outside this visible surface. Pass the exact matched ref to `fileHostPath`; never reconstruct refs or scan global storage.
-- DSH owns stored attachments. Missing host path capability is `UNSUPPORTED_OPTION`; do not materialize streams, infer storage paths, or add integrity/storage/Provider contracts. Feed the resolved path into existing source handling.
+- `file_path` and `attachment_id` are both optional in schemas; runtime requires exactly one, for content, cursor continuation, page view and async parse. Cursor-v3 validates result/projection identity, not selector spelling.
+- Accept full `sha256:<64hex>` IDs or 8–64 hex prefixes (optional `sha256:`). Match unique content IDs; reject ambiguous prefixes.
+- Resolve only file refs visible through the current session's `deriveMessages()`, including flat content in `role: "tool"` messages. Do not restore nested `tool-result` blocks. Pass the exact matched ref to `fileHostPath`; never reconstruct refs, scan global storage, or materialize streams. Missing host-path capability is `UNSUPPORTED_OPTION`.
 
 ## Reader invariants
 
-- `complete` ends the selected parsed text, not OCR fidelity or visual coverage. Report physical page counts with their source; content-list counts are lower bounds, not proof that later pages do not exist.
-- Cursor-v3 continuation is cache-only and binds result/selection, exact projection and artifact digests, reader/index versions, offset, and caller inline-image intent. Never start a Provider on a continuation miss. Omitted `inline_images` inherits intent; an explicit boolean overrides it.
-- Keep block diagnostics and formula verification advisories scoped to delivered blocks; document/selection notices appear initially. Preserve parsing provenance separately from reader/index versions, and mark budget-shortened metadata with `metadata_shortened`.
-- Preserve original `document_label`; attachment ordinal (`figure` compatibility field) is not a paper figure number. Default output is 12,000 characters overall, at most 8,000 body characters and 48,000 UTF-8 bytes per JSON/native response. Image count defaults to 6 but is configurable from 0–100, with separate byte limits.
-- Original-page view verifies an optional source SHA-256 against a temporary streaming snapshot before rendering. Poppler-first/PDF.js-fallback share one snapshot, deadline and semaphore slot. Renderer time/concurrency/dimension/output limits are not an OS sandbox or a hard process-memory limit; deployment isolation remains necessary for hostile PDFs.
+- `complete` ends the selected parsed text, not OCR fidelity or visual coverage. Report page counts with their source; content-list counts are lower bounds.
+- Cursor-v3 continuation is cache-only and binds result/selection, exact projection and artifact digests, reader/index versions, offset and inline-image intent. Never start a Provider on a continuation miss. Omitted `inline_images` inherits intent; an explicit boolean overrides it.
+- Scope block diagnostics and formula hints to delivered blocks; document/selection notices appear initially. Keep parsing provenance separate from reader/index versions; mark budget-shortened metadata with `metadata_shortened`.
+- Preserve original `document_label`; the attachment ordinal (`figure`) is not a paper figure number. Budgets are defined once in [model-reading](docs/model-reading.md#预算); change them there and in code together.
+- `presentationMeta` stays a compact summary; evidence lives only in the canonical result value.
+- Original-page view verifies optional SHA-256 against a temporary streaming snapshot before rendering. Poppler-first/PDF.js-fallback share one snapshot, deadline and semaphore slot. Renderer limits are not an OS sandbox or a hard memory limit; hostile PDFs still need deployment isolation. Never import heavy PDF/native dependencies into the host bundle or execute PDF scripting/network actions.
 
 ## Security invariants
 
-- Resolve credentials once per Provider call and never cache or persist their values.
-- Authenticated requests always use `redirect: error`.
-- Official presigned PUT has an explicitly empty headers object. CDN requests have no auth headers.
+- Resolve credentials once per Provider call; never cache or persist their values. A mounted DSH credential service decides alone; read `process.env` only when no credential service exists.
+- Authenticated requests always use `redirect: error`. Official presigned PUT has an explicitly empty headers object; CDN requests carry no auth headers.
 - Hash source files as streams and re-stat them immediately before upload.
 - ZIP extraction uses yauzl lazy entries, validates metadata first, then streams each entry through staging limits. Do not reintroduce whole-archive or whole-entry accumulation.
 - storageRoot mutations use scoped ProcessLock; plugins register tools without lifetime lock holding.
 - Result publication is staging validation followed by same-filesystem atomic rename. EXDEV is an error, not a copy fallback.
-- Retry only idempotent GET and official PUT with a fresh source stream. Never auto-retry official batch-allocation POST or self-hosted multipart POST.
-- Retry diagnostics contain only typed operation/status/count fields, never error messages, URLs, headers, bodies, credentials, or local paths.
-- Destructive storage maintenance acquires scoped ProcessLock, never follows symlinks, defaults to read-only/dry-run, and blocks destructive work while SharedOperations or storage readers are active.
-- Destructive maintenance stays loopback-only and requires explicit confirmation. Never expose maintenance as a model tool.
+- Retry only idempotent GET and upload PUT with a fresh source stream. Never auto-retry official batch-allocation POST, self-hosted multipart POST, or V1 create/complete/job POSTs.
+- Retry diagnostics contain only typed operation/status/count fields, never error messages, URLs, headers, bodies, credentials or local paths.
+- Destructive storage maintenance acquires scoped ProcessLock, never follows symlinks, defaults to read-only/dry-run, and blocks while SharedOperations or storage readers are active.
+- Admin RPC (config, probe, maintenance) requires an owner principal first, then a loopback Host authority; neither replaces the other. Destructive maintenance requires explicit confirmation, and cache clear requires the preview's confirmation token. Never expose maintenance as a model tool.
 
-## Main files
+## Compatibility and settings
 
-- `src/domain/*`: IDs, requests, provider states, results, failures, strict boundary parsers.
-- `src/providers/provider.ts`, `src/providers/retry.ts`: shared Provider/ArtifactSink contracts and bounded retry policy.
-- `src/providers/self-hosted-legacy-v2.ts`: explicit legacy multipart `/tasks` Provider for MinerU 3.x; only `modelMap`, never V1 tier/OCR fields or automatic protocol detection.
-- `src/providers/self-hosted-v1.ts`: explicit MinerU 4.x V1 Provider; `tier` and per-profile `ocrMode`, health/tiers discovery before uploads, no modelMap fallback. Upload sessions, parse jobs, bounded result-archive download and canonical artifact normalization stay Provider-local.
-- `src/providers/official-v4.ts`: official API, bare PUT, status, and collection adapter.
-- `src/providers/safe-zip.ts`: bounded ZIP scanner/extractor.
-- `src/storage/*`: validated paths, process lock, ResultRepository, staging sink, and privileged maintenance service.
-- `src/service/mineru-service.ts`: direct-result use-case orchestration and same-process operation coalescing.
-- `src/service/document-index.ts`, `read-delivery.ts`: stable pre-selection block identity, faithful known-span normalization, bounded model projection and cursor-v3 delivery with inherited image intent and delivered-block diagnostics.
-- `src/service/page-renderer.ts`: local original-page verification via Poppler-first/PDF.js-fallback subprocesses and temporary streaming snapshots; owns the shared deadline, semaphore and cleanup, never calls a Provider or retains sources.
-- `src/service/pdfjs-backend.ts`, `pdfjs-worker.mjs`: fixed Node subprocess protocol, package-local resources and bounded Canvas rendering. Do not import heavy PDF/native dependencies into the host bundle or execute PDF scripting/network actions.
-- `src/adapters/dsh-document-source.ts`: tool-only source selection and visible DSH file-reference to host-path adaptation; no file copying or storage ownership.
-- `src/tools.ts`: two defineTool schemas (`read_pdf` and `async_parse_pdf`), native DSH job adaptation, and pure renderers.
-- `src/rpc.ts`, `src/loopback-rpc.ts`, `src/client/*`: loopback config/maintenance RPC, caller-local guarded native transport registration, and Provider-aware settings cards. Presentation changes must preserve draft state across disclosure, bilingual labels, DSH theme tokens, keyboard access, and maintenance preview/confirmation boundaries.
-- `src/observability.ts`: typed, non-throwing structured diagnostic events.
-- `scripts/smoke-reader-cache.mjs`: explicit offline replay of the known rx033 review PDF and existing cached manifest through the built reader/tool chain; rejects network fetches, not a fresh extraction or generic arbitrary-PDF smoke.
-- `scripts/smoke-reader-local.mjs`: explicit full-tool-chain local page smoke, automatic backend or forced missing-Poppler path, no upload.
-- `scripts/copy-page-worker.mjs`: copies the unbundled ESM worker to lib after build; package.files must retain it. PDF.js resources remain in the production dependency package.
-- `scripts/smoke-reader-package.mjs`: checks an installed pack artifact from an unrelated cwd with an empty PATH.
-- `scripts/smoke-official-v4.mjs`: explicit live smoke through the built plugin tool chain.
-- `scripts/verify-current-gui.mjs`: isolated current-bundle verification in the existing DSH Web shell, with browser-only RPC/credential/plugin-inventory fixtures and a frozen HMR graph (`/plugins/events` returns 204 only in the test browser). Assert bundle-detail placement and absence from global Settings. Optional `DSH_GUI_EXCLUDE_PLUGINS` is an explicit comma-separated browser-fixture-only exclusion list for unrelated boot blockers; it must be reported, never excludes MinerU, and never changes the host profile.
+- `engines.dsh` alone decides DSH compatibility. Keep DSH peers equal to it and dev pins at its exact lower bound ([upgrade steps](CONTRIBUTING.md#upgrading-the-dsh-baseline)). Use published host types, not ambient replacements.
+- Register the config page only in `plugins.bundle.config`, keyed by `dsh-pdf-mineru`, via the public plugin-manager slot contract. No global `settings.section`; do not require the optional `form` prop.
+- Settings uses Config `.volatile()` fields and `settings.configure({ auto: false }, ctx.fiber)`. Never write settings during activation; DSH owns legacy document import.
+- Saves are explicit and complete: validate the whole domain config, keep `storageRoot`/`limits` equal to runtime, write live values through `settings.replace` with the actual Loader entry id, and use `ConfigEditor.edit` only for an explicit save of a still-historical raw entry. Failed persistence publishes nothing.
+- Saves are revision-aware: `config.get`/`config.set` carry the host revision; a stale save fails with `mineru/conflict`. Never auto-save drafts or let native forms bypass maintenance confirmation.
+- Config is schemaVersion 3 with ordered in-memory 1→2→3 migrations (missing version = 2). Migration never infers HTTP consent or protocol, never exposes old values, and Standard Schema wraps the migrated result. Unknown future versions and cross-protocol fields are errors. Do not reintroduce flat config or deprecated tool aliases.
+- V1 uses per-profile `ocrMode` and optional `tier`, ignores shared legacy/cloud defaults without altering their draft values, and reports provenance model `null`.
 
-## Compatibility
+## Code conventions
 
-Require DSH >= `0.2.0-rc.2`; keep engines and runtime peers aligned, pin development DSH packages to the exact baseline, and use `dsh-ptc-runtime` rather than the removed `dsh-code-runtime`. Use published Client/SlotRegistry/locale/settings types, not ambient replacements. Register the custom config page only in `plugins.bundle.config`, keyed by package name `dsh-pdf-mineru`, using the public `dsh-client-ui-plugin-manager/client` contract and `slots.inject` declaration lifecycle. Do not restore a duplicate `settings.section` entry or require the optional generic `form` prop. Settings uses Config `.volatile()` references and `settings.configure({ auto: false }, ctx.fiber)`, never the removed register/get/watch scope. Save complete live values through `settings.replace` using the actual Loader entry id; ordinary storageRoot/retainSources/limits fields stay outside form writes. Exception: an explicit user save of a still-historical raw entry uses the public ConfigEditor.edit transaction to persist the entire validated migrated snapshot, including repaired ordinary fields; do not silently preserve bad raw values via Settings.replace. Fixed runtime storageRoot/limits must still match, and failed persistence must not publish new runtime settings. Validate complete domain config at the Standard Schema boundary before persistence. Do not mutate settings during activation; DSH owns legacy document import. Keep the custom draft/confirmation settings flow; native generic forms must not bypass maintenance confirmation or silently auto-save drafts.
-
-Current runtime config uses schemaVersion 3 and only canonical Provider types `self-hosted-v1`, `self-hosted-legacy-v2` and `official-v4`. Keep ordered 1→2→3 input migrations in parseConfigWithMigration (missing version means 2); migrate historical self-hosted-v2 to legacy and remove old tier. Fill missing/invalid historical values with safe defaults, preserve valid coupled values and input immutability, and never infer HTTP consent or expose old values in migration metadata. Unknown future versions and current cross-protocol fields remain errors. Standard Schema wraps the migrated result, never the original obsolete discriminator. Loading/activation/read paths only convert in memory; never write profiles until explicit user save. V1 uses per-profile `ocrMode` and optional `tier`, ignores shared legacy/cloud defaults without modifying their draft values, and reports provenance model as null rather than claiming a pipeline/vlm engine. Shared internal V1 language/formula/table placeholders are cache normalization only, not upstream switches. Configuration must preserve explicit save, per-profile drafts and probe-result invalidation; discovery does not promise parsing quality. Do not reintroduce flat-config migration or deprecated tool aliases. Preserve `parseMethod` in cache semantics: `txt` is not equivalent to `auto`. Official v4 rejects `txt` because its `is_ocr` field cannot represent that distinction.
-
-## Commands
-
-```sh
-pnpm install
-pnpm run typecheck
-pnpm test
-pnpm run build
-git diff --check
-pnpm run verify:gui
-
-# Explicit local-only real-PDF smoke; no upload, pdfjs mode empties PATH only for this smoke.
-pnpm run smoke:reader-local -- /absolute/path/sample.pdf 1 --backend=auto
-pnpm run smoke:reader-local -- /absolute/path/sample.pdf 1 .vitest-cache/pdfjs --backend=pdfjs
-
-# Explicit offline known-fixture cache replay (requires a current build and matching cached artifacts).
-# Optional third argument: output-directory for local evidence, not committed reports.
-pnpm run smoke:reader-cache -- /absolute/path/rx033.pdf /absolute/path/manifest.json
-
-# Explicit live test only; never run by default.
-MINERU_API_KEY=<token> pnpm run smoke:official-v4 -- /absolute/path/sample.pdf
-```
-
-Tests must remain mock/fixture based by default and cover failure, cancellation, retry exhaustion, Retry-After, unsafe POST non-retry, security, concurrency, persistence, maintenance fail-closed behavior, confirmations, and render/output limits. TypeScript ESM relative imports include `.js`; the standalone renderer entry is explicitly `.mjs`. Rebuild after worker edits: the host watch command alone does not copy the standalone worker. Every object in a tool schema declares `additionalProperties`.
+- TypeScript ESM relative imports include `.js`; the PDF.js worker is a standalone `.mjs` copied by the build.
+- Every object in a tool schema declares `additionalProperties`.
+- Run `pnpm run check` and `git diff --check`; run `pnpm run verify:gui` when the client changes.
 
 ## Documentation maintenance
 
-Maintain durable current-state docs: README.md for setup/quick use, ARCHITECTURE.md for implementation boundaries, [docs/model-reading.md](docs/model-reading.md) for the model reader contract and validation, AGENTS.md for contributor rules, and CHANGELOG.md for versioned changes. Update them together when behavior changes; preserve unrelated storage, Provider, and security contracts.
+- One home per fact: README (users, setup), docs/configuration.md (settings, providers, storage operations), docs/model-reading.md (reader contract), ARCHITECTURE.md (module map and implementation boundaries), CONTRIBUTING.md (workflow), AGENTS.md (standing orders), CHANGELOG.md (history). Link instead of restating.
+- Document current state only; version history belongs in CHANGELOG. Prose names no DSH version except the README requirement line, which mirrors `engines.dsh`.
+- Do not add plans, session logs, acceptance dumps or interim reports under docs/. Keep evidence and release-note drafts in ignored local directories.
 
-Do not add or retain transient implementation plans, session logs, acceptance dumps, or interim improvement/reliability reports under docs/. Fold lasting facts into the maintained guides and remove obsolete reports and their links. Keep smoke output, screenshots, and one-off release-note bodies outside tracked documentation (for example in ignored local evidence directories).
+## Release
 
-## Release Workflow and Notes Template
-
-### Release Steps
-
-The following commands are the authorized release operator’s workflow, not permission for an agent doing documentation or verification to commit, push, publish, or create a release. Obtain explicit authorization for those side effects.
-
-1. **Version Bump**: Update `"version"` in `package.json`.
-2. **Update maintained docs**: Add a `## X.Y.Z` CHANGELOG.md section following Keep a Changelog categories (`### Added`, `### Changed`, `### Fixed`, `### Removed`), and reconcile README.md, ARCHITECTURE.md, AGENTS.md, and docs/model-reading.md with current behavior. Remove obsolete interim reports rather than publishing them.
-3. **Verification**: Run `pnpm run build && pnpm run typecheck && pnpm test && git diff --check && pnpm run verify:gui`.
-4. **Review, Commit & Annotated Tag**: Review the complete diff and stage only intended release files (including any reviewed source/test/doc changes and obsolete-doc deletions); do not blindly stage unrelated workspace edits. Ensure the package version and tag agree.
-   ```sh
-   git add package.json CHANGELOG.md README.md ARCHITECTURE.md AGENTS.md docs/model-reading.md
-   # Stage any other reviewed release changes explicitly before committing.
-   git commit -m "release: vX.Y.Z"
-   git tag -a vX.Y.Z -m "vX.Y.Z"
-   git push origin main
-   git push origin vX.Y.Z
-   ```
-   **The tag push is the publish trigger:** the existing `.github/workflows/publish.yml` runs on pushed `v*` tags, typechecks, tests, builds, and publishes to npm with provenance. Inspect its outcome; do not add another publish workflow or run a duplicate manual npm/pnpm publish. Pushing main alone and creating GitHub release notes are not this workflow’s trigger.
-5. **Create GitHub Release via gh CLI**: Use the already-pushed tag and a reviewed notes file kept outside tracked docs.
-   ```sh
-   gh release create vX.Y.Z --verify-tag --title "vX.Y.Z" --notes-file <file>
-   ```
-
-### GitHub Release Notes Template
-
-Omit the `# [Version]` title header from the body as GitHub renders the release title automatically. Each entry must annotate its commit link. Omit sections (`## Added`, `## Fixed`, `## Changed`, `## Removed`) if there are no corresponding items for that release. Use the actual release commits and previous/current tags in links; do not publish placeholders or a transient verification transcript.
-
-```markdown
-[Overview paragraph summarizing the release]
-
-## Added
-- [Feature description] ([short_sha](https://github.com/Yurzi/dsh-pdf-mineru/commit/full_sha))
-
-## Fixed
-- [Bug fix description] ([short_sha](https://github.com/Yurzi/dsh-pdf-mineru/commit/full_sha))
-
-## Changed
-- [Change description] ([short_sha](https://github.com/Yurzi/dsh-pdf-mineru/commit/full_sha))
-
-Full Changelog: https://github.com/Yurzi/dsh-pdf-mineru/compare/v[Previous]...v[Current]
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md#release). Never commit, tag, push, publish or create a release without explicit authorization.

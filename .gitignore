@@ -1,6 +1,8 @@
 node_modules/
+lib/
 .pnpm-store/
-*.tsbuildinfo
-*.tgz
-coverage/
 .vitest-cache/
+coverage/
+*.tgz
+*.tsbuildinfo
+.DS_Store

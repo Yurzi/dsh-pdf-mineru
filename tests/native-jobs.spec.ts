@@ -1,109 +1,115 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import { Context } from '@deepseek-ai/cordis'
-import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
-import LocalJobRegistry from '@deepseek-ai/dsh-jobs-local'
-import { Session, SessionId } from '@deepseek-ai/dsh-session'
-import { JobId, type JobEvent } from '@deepseek-ai/dsh-jobs'
-import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
-import { registerTools } from '../src/tools.js'
-import type { MinerUService, ParseSummaryView } from '../src/service/mineru-service.js'
+import type { JobEvent } from '@deepseek-ai/dsh-jobs'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { SessionId } from '@deepseek-ai/dsh-session'
+import { describe, expect, it, vi } from 'vitest'
 import { MinerUError, failure } from '../src/domain/errors.js'
+import { toolHarness, type ToolHarnessOptions, type ToolReader } from './support/tool-harness.js'
+import { summaryView } from './support/views.js'
 
-const cleanups: Array<() => Promise<void>> = []
-afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup() })
-const summary: ParseSummaryView = {
-  state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_native',
-  files: [{ file_id: 'mf_native', name: 'paper.pdf', artifacts: [] }], content_status: 'not_requested',
-}
-
-async function harness(ensureParsed: MinerUService['ensureParsed'], controller = true) {
-  const ctx = new Context()
-  cleanups.push(() => ctx.fiber.dispose())
-  await ctx.plugin(AgentRegistry)
-  await ctx.plugin(LocalJobRegistry, {})
-  if (controller) ctx.jobs.attachController('mineru-test-controller')
-  const owner = ctx.plugin(() => {})
-  const session = Session.create(SessionId('mineru-owner'))
-  // The agent loop is outside this test; registry, Session and owner lifecycle are real.
-  const agent = { id: session.id, session, ctx: owner.ctx, options: {}, status: 'idle' } as Agent
-  await ctx.agents.register(agent)
-  const definitions = new Map<string, ToolDefinition>()
-  ctx.provide('tools', { register: (tool: ToolDefinition) => {
-    definitions.set(tool.name, tool)
-    return () => { definitions.delete(tool.name) }
-  } })
-  const dispose = registerTools(ctx, () => ({ ensureParsed }) as MinerUService)
-  cleanups.push(dispose)
+// Registry, Session, owner lifecycle and admission are the published LocalJobRegistry/AgentRegistry.
+async function harness(summarize: ToolReader['summarize'], options: ToolHarnessOptions = {}) {
+  const h = await toolHarness({ ...options, reader: { summarize } })
   const events: JobEvent[] = []
-  ctx.jobs.events.subscribe({ owner: session.id }, event => events.push(event))
-  const exec = { name: 'async_parse_pdf', callId: 'native-call', arguments: {}, signal: new AbortController().signal, agent } as ToolRunContext
-  const submit = async () => {
-    const value = await definitions.get('async_parse_pdf')!.execute({ file_path: '/paper.pdf' }, exec) as { job_id: string }
-    return JobId(value.job_id)
-  }
-  return { ctx, owner, session, events, submit, dispose }
+  h.ctx.jobs.events.subscribe({ owner: h.session.id }, event => events.push(event))
+  return { ...h, events }
 }
 
-describe('MinerU with the published 0.2.0-rc.2 job registry', () => {
-  it('delivers progress and a final result once, with owner-fenced reads', async () => {
-    const h = await harness(async (_session, _input, _signal, progress) => {
+describe('async_parse_pdf with the published job registry', () => {
+  it('delivers progress and one final result with owner-fenced reads', async () => {
+    const h = await harness(async (_path, _config, _signal, progress) => {
       progress?.('preparing')
-      await Promise.resolve() // subsequent progress occurs after the registration commit
+      await Promise.resolve() // later progress arrives after the registration commit
       progress?.('summarizing')
-      return summary
+      return summaryView({ files: [{ file_id: 'mf_native', name: 'paper.pdf', artifacts: [] }] })
     })
-    const id = await h.submit()
+    const id = await h.submit({ file_path: '/paper.pdf' })
     await h.ctx.jobs.wait(id, 1000, h.session.id)
-    expect(h.ctx.jobs.get(id, h.session.id)).toMatchObject({ status: 'completed', outputLimitBytes: 48_000 })
+    expect(h.ctx.jobs.get(id, h.session.id)).toMatchObject({ kind: 'mineru', status: 'completed', outputLimitBytes: 48_000 })
     expect(h.events[0]?.type).toBe('registered')
     expect(h.events.some(event => event.type === 'progress' && event.job.progress === 'summarizing')).toBe(true)
     expect(() => h.ctx.jobs.read(id, SessionId('foreign'))).toThrow()
     expect(h.ctx.jobs.list(SessionId('foreign'))).toEqual([])
     const read = h.ctx.jobs.read(id, h.session.id)
-    expect(read.result).toContain('MinerU Document Parse Summary')
     expect(read.result).toContain('paper.pdf')
-    expect(read.chunks).toEqual([]) // progress is not duplicated into the output ring
+    expect(read.chunks).toEqual([]) // progress is never duplicated into the output ring
     expect(h.ctx.jobs.read(id, h.session.id).result).toBeUndefined()
   })
 
-  it('refuses work before invoking the service if no job controller is attached', async () => {
-    const ensureParsed = vi.fn(async () => summary)
-    const h = await harness(ensureParsed, false)
-    await expect(h.submit()).rejects.toThrow()
-    expect(ensureParsed).not.toHaveBeenCalled()
+  it('refuses before invoking the reader when no job controller is attached', async () => {
+    const summarize = vi.fn(async () => summaryView())
+    const h = await harness(summarize, { jobController: false })
+    await expect(h.submit({ file_path: '/paper.pdf' })).rejects.toThrow()
+    expect(summarize).not.toHaveBeenCalled()
     expect(h.ctx.jobs.list(h.session.id)).toEqual([])
   })
 
-  it('delivers failed final results through the new result field', async () => {
+  it('settles failures with the MinerU code in detail and result', async () => {
     const h = await harness(async () => { throw new MinerUError(failure('FILE_TOO_LARGE', 'Input exceeds limit')) })
-    const id = await h.submit()
+    const id = await h.submit({ file_path: '/paper.pdf' })
     await h.ctx.jobs.wait(id, 1000, h.session.id)
-    expect(h.ctx.jobs.read(id, h.session.id)).toMatchObject({
-      result: '[FILE_TOO_LARGE] Input exceeds limit', job: { status: 'failed', detail: 'FILE_TOO_LARGE' },
-    })
+    const read = h.ctx.jobs.read(id, h.session.id)
+    expect(read.job).toMatchObject({ status: 'failed', detail: 'FILE_TOO_LARGE' })
+    expect(read.result).toMatch(/^\[FILE_TOO_LARGE\]/)
   })
 
-  it.each(['kill', 'owner', 'plugin'] as const)('cancels the invocation and awaits cleanup on %s', async mode => {
+  it.each(['kill', 'owner', 'plugin'] as const)('aborts the invocation and awaits its cleanup on %s', async mode => {
     let signal: AbortSignal | undefined
     let cleaned = false
-    const h = await harness(async (_session, _input, invocationSignal) => {
+    const h = await harness(async (_path, _config, invocationSignal) => {
       signal = invocationSignal
       try {
-        await new Promise<void>((_resolve, reject) => {
-          invocationSignal.addEventListener('abort', () => reject(invocationSignal.reason), { once: true })
-        })
+        await new Promise<void>((_resolve, reject) => invocationSignal.addEventListener('abort', () => reject(invocationSignal.reason), { once: true }))
       } finally { cleaned = true }
-      return summary
+      return summaryView()
     })
-    const id = await h.submit()
+    const id = await h.submit({ file_path: '/paper.pdf' })
+    await vi.waitFor(() => expect(signal).toBeDefined())
     if (mode === 'owner') await h.owner.dispose()
     else if (mode === 'plugin') await h.dispose()
     else h.ctx.jobs.kill(id, h.session.id, 'stop this waiter')
     if (mode !== 'owner') {
       await h.ctx.jobs.wait(id, 1000, h.session.id)
-      expect(h.ctx.jobs.get(id, h.session.id).status).toBe('killed')
+      expect(h.ctx.jobs.get(id, h.session.id)).toMatchObject({ status: 'killed' })
     }
     expect(signal?.aborted).toBe(true)
     expect(cleaned).toBe(true)
+  })
+
+  it.each([
+    { callId: ToolCallId('native-call'), rootCallId: ToolCallId('native-root') },
+    { callId: ToolCallId('root:ptc:1'), rootCallId: ToolCallId('root') },
+  ])('records the exact creating invocation: %j', async toolCall => {
+    const h = await harness(async () => summaryView())
+    const id = await h.submit({ file_path: '/paper.pdf' }, h.exec({ name: 'async_parse_pdf', ...toolCall }))
+    await h.ctx.jobs.wait(id, 1000, h.session.id)
+    const event = h.session.snapshotEvents().find(entry => entry.type === 'job/registered')
+    expect(event?.data).toMatchObject({ jobId: id, owner: h.session.id, toolCall })
+  })
+
+  it('starts no job when the invocation is cancelled while the source path resolves', async () => {
+    const summarize = vi.fn(async () => summaryView())
+    const h = await harness(summarize)
+    const controller = new AbortController()
+    h.ensure.mockImplementationOnce(async () => { controller.abort(); return '/workspace' })
+    await expect(h.submit({ file_path: 'paper.pdf' }, h.exec({ name: 'async_parse_pdf', signal: controller.signal }))).rejects.toThrow()
+    expect(h.ctx.jobs.list(h.session.id)).toEqual([])
+    expect(summarize).not.toHaveBeenCalled()
+  })
+
+  it('pins the submit-time directory before registration and never resolves it inside the job', async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const summarize = vi.fn<ToolReader['summarize']>(async () => { await gate; return summaryView() })
+    const h = await harness(summarize)
+    h.setDirectory('/workspace/submit-time')
+    const start = vi.spyOn(h.ctx.jobs, 'start')
+    const exec = h.exec({ name: 'async_parse_pdf' })
+    const id = await h.submit({ file_path: 'paper.pdf' }, exec)
+    h.setDirectory('/workspace/later')
+    release()
+    await h.ctx.jobs.wait(id, 1000, h.session.id)
+    expect(h.ensure).toHaveBeenCalledExactlyOnceWith(exec.agent, exec.signal)
+    expect(h.ensure.mock.invocationCallOrder[0]).toBeLessThan(start.mock.invocationCallOrder[0]!)
+    expect(summarize.mock.calls[0]?.[0]).toBe('/workspace/submit-time/paper.pdf')
   })
 })

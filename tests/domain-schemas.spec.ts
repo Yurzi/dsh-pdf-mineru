@@ -1,16 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
-  parseArtifactKind,
   parseArtifactRef,
   parseCanonicalParseRequest,
   parseCanonicalSourceFile,
   parseMinerUResultManifest,
-  parseParsedDocumentManifest,
   parseResultProducer,
 } from '../src/domain/schemas.js'
 import { asCacheKey, asFileId, asProviderConfigId, asResultId } from '../src/domain/ids.js'
-import { CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, type ArtifactKind } from '../src/domain/request.js'
-import { MINERU_RESULT_MANIFEST_SCHEMA_VERSION } from '../src/domain/result.js'
 import type { CanonicalParseRequest } from '../src/domain/request.js'
 import type { MinerUResultManifest } from '../src/domain/result.js'
 
@@ -78,9 +74,7 @@ const validResultManifest: MinerUResultManifest = {
 describe('Domain Schemas Runtime Parsers', () => {
   describe('CanonicalParseRequest', () => {
     it('successfully parses a valid CanonicalParseRequest round-trip', () => {
-      const parsed = parseCanonicalParseRequest(validCanonicalRequest)
-      expect(parsed).toEqual(validCanonicalRequest)
-      expect(parsed.schemaVersion).toBe(CANONICAL_PARSE_REQUEST_SCHEMA_VERSION)
+      expect(parseCanonicalParseRequest(validCanonicalRequest)).toEqual(validCanonicalRequest)
     })
 
     it('accepts Unicode display names but rejects path separators', () => {
@@ -94,10 +88,8 @@ describe('Domain Schemas Runtime Parsers', () => {
       })).toThrow(/path separators/)
     })
 
-    it('rejects unknown schemaVersion', () => {
-      expect(() => parseCanonicalParseRequest({ ...validCanonicalRequest, schemaVersion: 2 })).toThrow(/schemaVersion/)
-      expect(() => parseCanonicalParseRequest({ ...validCanonicalRequest, schemaVersion: 0 })).toThrow(/schemaVersion/)
-      expect(() => parseCanonicalParseRequest({ ...validCanonicalRequest, schemaVersion: '1' })).toThrow(/schemaVersion/)
+    it.each([2, 0, '1'])('rejects unknown schemaVersion %j', schemaVersion => {
+      expect(() => parseCanonicalParseRequest({ ...validCanonicalRequest, schemaVersion })).toThrow(/schemaVersion/)
     })
 
     it('rejects additional/unknown properties in request root or sub-objects', () => {
@@ -134,7 +126,7 @@ describe('Domain Schemas Runtime Parsers', () => {
       expect(() =>
         parseCanonicalParseRequest({
           ...validCanonicalRequest,
-          requiredArtifacts: ['markdown', 'invalid-kind' as unknown as ArtifactKind],
+          requiredArtifacts: ['markdown', 'invalid-kind'],
         }),
       ).toThrow(/invalid artifact kind/)
 
@@ -167,10 +159,7 @@ describe('Domain Schemas Runtime Parsers', () => {
 
   describe('MinerUResultManifest & ArtifactRef', () => {
     it('successfully parses valid MinerUResultManifest round-trip', () => {
-      const parsed = parseMinerUResultManifest(validResultManifest)
-      expect(parsed).toEqual(validResultManifest)
-      expect(parsed.schemaVersion).toBe(MINERU_RESULT_MANIFEST_SCHEMA_VERSION)
-      expect(parsed.files).toHaveLength(1)
+      expect(parseMinerUResultManifest(validResultManifest)).toEqual(validResultManifest)
     })
 
     it('rejects unknown schemaVersion in MinerUResultManifest', () => {
@@ -193,29 +182,12 @@ describe('Domain Schemas Runtime Parsers', () => {
       ).toThrow(/exactly one ParsedDocumentManifest/)
     })
 
-    it('rejects malicious or out-of-bounds artifact relativePath', () => {
-      const makeRef = (relativePath: string) => ({
-        kind: 'markdown',
-        relativePath,
-        mediaType: 'text/markdown',
-        bytes: 100,
-        sha256: SHA256_A,
-      })
-
-      // Absolute paths
-      expect(() => parseArtifactRef(makeRef('/full.md'))).toThrow(/must be a relative path/)
-      expect(() => parseArtifactRef(makeRef('/etc/passwd'))).toThrow(/must be a relative path/)
-
-      // Directory traversal
-      expect(() => parseArtifactRef(makeRef('../full.md'))).toThrow(/must be a relative path/)
-      expect(() => parseArtifactRef(makeRef('images/../../full.md'))).toThrow(/traversal/)
-      expect(() => parseArtifactRef(makeRef('images/./full.md'))).toThrow(/traversal/)
-      expect(() => parseArtifactRef(makeRef('..'))).toThrow(/traversal/)
-
-      // Backslashes and control characters
-      expect(() => parseArtifactRef(makeRef('images\\img.png'))).toThrow(/invalid path separators/)
-      expect(() => parseArtifactRef(makeRef('full\0.md'))).toThrow(/control characters/)
-      expect(() => parseArtifactRef(makeRef('images//img.png'))).toThrow(/invalid path separators/)
+    it.each([
+      ['/full.md', /relative path/], ['/etc/passwd', /relative path/], ['../full.md', /relative path/],
+      ['images/../../full.md', /traversal/], ['images/./full.md', /traversal/], ['..', /traversal/],
+      ['images\\img.png', /path separators/], ['images//img.png', /path separators/], ['full\0.md', /control characters/],
+    ])('rejects unsafe artifact relativePath %j', (relativePath, reason) => {
+      expect(() => parseArtifactRef({ kind: 'markdown', relativePath, mediaType: 'text/markdown', bytes: 100, sha256: SHA256_A })).toThrow(reason)
     })
 
     it('rejects URLs and secrets inside ResultProducer or ArtifactRef', () => {

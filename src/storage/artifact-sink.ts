@@ -19,7 +19,7 @@ import { throwMinerU } from '../domain/errors.js'
 import type { ArtifactKind } from '../domain/request.js'
 import type { ArtifactRef } from '../domain/result.js'
 import { assertSafeArtifactRelativePath, assertSafeFileName, parseArtifactKind, parseArtifactRef } from '../domain/schemas.js'
-import type { ArtifactInput, ArtifactSink, ArtifactWriteOptions, TemporaryArtifact } from '../providers/provider.js'
+import type { ArtifactInput, ArtifactSink, ArtifactWriteOptions, TemporaryArtifact } from './artifact-port.js'
 import type { StoragePaths } from './paths.js'
 
 function toNodeReadable(input: ArtifactInput): Readable {

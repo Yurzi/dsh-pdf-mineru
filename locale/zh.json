@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "MinerU PDF 阅读",
+    "description": "通过 MinerU（官方云或自部署服务）解析 PDF，按需分段阅读可核验的文档证据，支持后台解析与本地原页核对。"
+  }
+}

@@ -1,37 +1,23 @@
-/**
- * rpc.ts — host-side RPC handler for MinerU config CRUD and draft probe.
- *
- * Endpoints (on the `/dsh-pdf-mineru-api` channel, loopback authority):
- *   - `mineru/config.get`  payload: {} → { config: MinerUConfig }
- *   - `mineru/config.set`  payload: { config: unknown } → { config: MinerUConfig }
- *   - `mineru/probe`       payload: { provider?: unknown } → ProbeView
- *
- * Security:
- *   - Authority: strictly 'loopback'
- *   - Credential values and tokens are never returned or leaked in responses/errors.
- *   - Errors sanitized via sanitizeDiagnostic and mapped to allowlisted actionable error codes.
- */
+/** Owner-only config, probe, and maintenance RPC behind loopback Host authority. */
 
 import type { Context } from '@deepseek-ai/cordis'
-import type { ConnectionRpcResult } from '@deepseek-ai/dsh-client-connection'
+import type { PeerScope } from '@deepseek-ai/dsh-typert-protocol'
+import { RPC_CHANNEL, RPC_ENDPOINTS, type ConfigResponse, type RpcEndpoint, type RpcResult } from './contracts/rpc.js'
 import { registerLoopbackRpc } from './loopback-rpc.js'
-import type { MinerUConfig } from './config.js'
-import { parseConfig, parseConfigWithMigration } from './config.js'
 import { MinerUError, type MinerUErrorCode, sanitizeDiagnostic } from './domain/errors.js'
-import type { ProbeView } from './service/mineru-service.js'
-import type { StorageMaintenanceService } from './storage/maintenance-service.js'
+import type { ProbeView } from './contracts/probe.js'
+import type { StorageMaintenanceService } from './storage/maintenance/service.js'
 
 export interface MineruRpcDeps {
-  readonly getConfig: () => MinerUConfig
-  readonly setConfig: (value: unknown) => Promise<MinerUConfig>
+  readonly settings: {
+    current(): ConfigResponse
+    /** Validates and persists; a stale expectedRevision fails with SETTINGS_CONFLICT. */
+    save(value: unknown, expectedRevision?: number): Promise<ConfigResponse>
+  }
   readonly probe: (providerDraft: unknown | undefined, signal: AbortSignal) => Promise<ProbeView>
   readonly maintenance: Pick<StorageMaintenanceService,
-    'getStatistics' | 'scanIntegrity' | 'listQuarantine' | 'cleanupQuarantine' | 'gcDryRun' | 'clearCache'>
+    'getStatistics' | 'scanIntegrity' | 'listQuarantine' | 'cleanupQuarantine' | 'clearCache'>
 }
-
-export type RpcResult<T> = ConnectionRpcResult<T>
-
-export const RPC_CHANNEL = '/dsh-pdf-mineru-api'
 
 const MINERU_TO_RPC_ERROR_CODE: Readonly<Record<MinerUErrorCode, string>> = {
   INVALID_REQUEST: 'mineru/invalid-argument',
@@ -59,6 +45,7 @@ const MINERU_TO_RPC_ERROR_CODE: Readonly<Record<MinerUErrorCode, string>> = {
   UNAUTHENTICATED_SESSION: 'mineru/unauthenticated',
   JOB_NOT_FOUND: 'mineru/not-found',
   STORAGE_LOCKED: 'mineru/storage-locked',
+  SETTINGS_CONFLICT: 'mineru/conflict',
 }
 
 function ok<T>(value: T): RpcResult<T> {
@@ -99,7 +86,7 @@ export function mapRpcError(err: unknown): { code: string; message: string } {
     const code = MINERU_TO_RPC_ERROR_CODE[err.failure.code] ?? 'mineru/internal'
     return {
       code,
-      message: sanitizeDiagnostic(err.failure.message),
+      message: err.failure.message,
     }
   }
   if (err instanceof TypeError) {
@@ -123,124 +110,98 @@ export function mapRpcError(err: unknown): { code: string; message: string } {
 
 export function registerRpc(ctx: Context, deps: MineruRpcDeps): () => void | Promise<void> {
   ctx.logger?.info('dsh-pdf-mineru: registering RPC channel /dsh-pdf-mineru-api')
+  const handlers: Record<RpcEndpoint, (payload: Record<string, unknown>, signal: AbortSignal) => Promise<RpcResult<unknown>>> = {
+    [RPC_ENDPOINTS.configGet]: async (_payload, _signal) => {
+      return ok(deps.settings.current())
+    },
+    [RPC_ENDPOINTS.configSet]: async (p, _signal) => {
+      if (!Object.hasOwn(p, 'config') || p.config === undefined || p.config === null) {
+        throw new TypeError('payload.config must be a non-null configuration object')
+      }
+      const expected = p.expected_revision
+      if (expected !== undefined && (!Number.isSafeInteger(expected) || (expected as number) < 0)) {
+        throw new TypeError('expected_revision must be a non-negative safe integer')
+      }
+      return ok(await deps.settings.save(p.config, expected as number | undefined))
+    },
+    [RPC_ENDPOINTS.probe]: async (p, signal) => {
+      const view = await deps.probe(p.provider, signal)
+      return ok(view)
+    },
+    [RPC_ENDPOINTS.storageStats]: async (_payload, signal) => {
+      const report = await deps.maintenance.getStatistics(signal)
+      ctx.logger?.info('dsh-pdf-mineru', { phase: 'maintenance', operation: 'stats' })
+      return ok(report)
+    },
+    [RPC_ENDPOINTS.storageIntegrityScan]: async (p, signal) => {
+      const isolateInvalid = optionalBoolean(p, 'isolate_invalid', false)
+      if (isolateInvalid && p.confirm !== true) {
+        throw new TypeError('confirm must be true when isolating invalid results')
+      }
+      const report = await deps.maintenance.scanIntegrity({
+        resultLimit: optionalLimit(p, 'result_limit'),
+        diagnosticLimit: optionalLimit(p, 'diagnostic_limit'),
+        isolateInvalid,
+        signal,
+      })
+      ctx.logger?.info('dsh-pdf-mineru', {
+        phase: 'maintenance', operation: isolateInvalid ? 'integrity-isolate' : 'integrity-scan',
+        scanned: report.scan.scanned, quarantined: report.quarantinedCount,
+      })
+      return ok(report)
+    },
+    [RPC_ENDPOINTS.storageQuarantineList]: async (p, signal) => {
+      return ok(await deps.maintenance.listQuarantine({ limit: optionalLimit(p, 'limit'), signal }))
+    },
+    [RPC_ENDPOINTS.storageQuarantineCleanup]: async (p, signal) => {
+      if (!Array.isArray(p.entry_ids) || p.entry_ids.some(entry => typeof entry !== 'string')) {
+        throw new TypeError('entry_ids must be an array of strings')
+      }
+      const dryRun = optionalBoolean(p, 'dry_run', true)
+      if (!dryRun && p.confirm !== true) {
+        throw new TypeError('confirm must be true when deleting quarantine entries')
+      }
+      const report = await deps.maintenance.cleanupQuarantine({
+        entryIds: p.entry_ids as string[], dryRun, signal,
+      })
+      ctx.logger?.info('dsh-pdf-mineru', {
+        phase: 'maintenance', operation: dryRun ? 'quarantine-cleanup-preview' : 'quarantine-cleanup',
+        requested: report.requestedCount, deleted: report.deletedCount, bytes: report.deletedBytes,
+      })
+      return ok(report)
+    },
+    [RPC_ENDPOINTS.storageCacheClear]: async (p, signal) => {
+      const dryRun = optionalBoolean(p, 'dry_run', true)
+      if (!dryRun && p.confirm !== true) {
+        throw new TypeError('confirm must be true when clearing published cache results')
+      }
+      if (!dryRun && (typeof p.confirmation_token !== 'string' || p.confirmation_token.length === 0)) {
+        throw new TypeError('confirmation_token from a cache clear preview is required')
+      }
+      const report = await deps.maintenance.clearCache({
+        resultLimit: optionalLimit(p, 'result_limit'),
+        diagnosticLimit: optionalLimit(p, 'diagnostic_limit'),
+        dryRun,
+        ...(typeof p.confirmation_token === 'string' ? { confirmationToken: p.confirmation_token } : {}),
+        signal,
+      })
+      ctx.logger?.info('dsh-pdf-mineru', {
+        phase: 'maintenance', operation: dryRun ? 'cache-clear-preview' : 'cache-clear',
+        eligible: report.eligible, planned: report.plannedCount,
+        deleted: report.deletedCount, bytes: report.deletedBytes,
+      })
+      return ok(report)
+    },
+  }
   return registerLoopbackRpc(
     ctx, RPC_CHANNEL,
-    async (endpoint: string, payload: unknown, signal: AbortSignal): Promise<RpcResult<unknown>> => {
+    async (endpoint: string, payload: unknown, signal: AbortSignal, peer: PeerScope): Promise<RpcResult<unknown>> => {
+      if (peer.principal.kind !== 'owner') {
+        return { ok: false, error: { code: 'mineru/forbidden', message: 'Owner access required', details: {} } }
+      }
       try {
-        switch (endpoint) {
-          case 'mineru/config.get': {
-            payloadRecord(payload)
-            return ok({ config: deps.getConfig() })
-          }
-
-          case 'mineru/config.set': {
-            const p = payloadRecord(payload)
-            if (!Object.hasOwn(p, 'config') || p.config === undefined || p.config === null) {
-              throw new TypeError('payload.config must be a non-null configuration object')
-            }
-            const saved = await deps.setConfig(parseConfigWithMigration(p.config).config)
-            return ok({ config: saved })
-          }
-
-          case 'mineru/probe': {
-            const p = payloadRecord(payload)
-            const view = await deps.probe(p.provider, signal)
-            return ok(view)
-          }
-
-          case 'mineru/storage.stats': {
-            payloadRecord(payload)
-            const report = await deps.maintenance.getStatistics(signal)
-            ctx.logger?.info('dsh-pdf-mineru', { phase: 'maintenance', operation: 'stats' })
-            return ok(report)
-          }
-
-          case 'mineru/storage.integrity.scan': {
-            const p = payloadRecord(payload)
-            const isolateInvalid = optionalBoolean(p, 'isolate_invalid', false)
-            if (isolateInvalid && p.confirm !== true) {
-              throw new TypeError('confirm must be true when isolating invalid results')
-            }
-            const report = await deps.maintenance.scanIntegrity({
-              resultLimit: optionalLimit(p, 'result_limit'),
-              diagnosticLimit: optionalLimit(p, 'diagnostic_limit'),
-              isolateInvalid,
-              signal,
-            })
-            ctx.logger?.info('dsh-pdf-mineru', {
-              phase: 'maintenance', operation: isolateInvalid ? 'integrity-isolate' : 'integrity-scan',
-              scanned: report.scan.scanned, quarantined: report.quarantinedCount,
-            })
-            return ok(report)
-          }
-
-          case 'mineru/storage.quarantine.list': {
-            const p = payloadRecord(payload)
-            return ok(await deps.maintenance.listQuarantine({ limit: optionalLimit(p, 'limit'), signal }))
-          }
-
-          case 'mineru/storage.quarantine.cleanup': {
-            const p = payloadRecord(payload)
-            if (!Array.isArray(p.entry_ids) || p.entry_ids.some(entry => typeof entry !== 'string')) {
-              throw new TypeError('entry_ids must be an array of strings')
-            }
-            const dryRun = optionalBoolean(p, 'dry_run', true)
-            if (!dryRun && p.confirm !== true) {
-              throw new TypeError('confirm must be true when deleting quarantine entries')
-            }
-            const report = await deps.maintenance.cleanupQuarantine({
-              entryIds: p.entry_ids as string[], dryRun, signal,
-            })
-            ctx.logger?.info('dsh-pdf-mineru', {
-              phase: 'maintenance', operation: dryRun ? 'quarantine-cleanup-preview' : 'quarantine-cleanup',
-              requested: report.requestedCount, deleted: report.deletedCount, bytes: report.deletedBytes,
-            })
-            return ok(report)
-          }
-
-          case 'mineru/storage.cache.clear': {
-            const p = payloadRecord(payload)
-            const dryRun = optionalBoolean(p, 'dry_run', true)
-            if (!dryRun && p.confirm !== true) {
-              throw new TypeError('confirm must be true when clearing published cache results')
-            }
-            if (!dryRun && (typeof p.confirmation_token !== 'string' || p.confirmation_token.length === 0)) {
-              throw new TypeError('confirmation_token from a cache clear preview is required')
-            }
-            const report = await deps.maintenance.clearCache({
-              resultLimit: optionalLimit(p, 'result_limit'),
-              diagnosticLimit: optionalLimit(p, 'diagnostic_limit'),
-              dryRun,
-              ...(typeof p.confirmation_token === 'string' ? { confirmationToken: p.confirmation_token } : {}),
-              signal,
-            })
-            ctx.logger?.info('dsh-pdf-mineru', {
-              phase: 'maintenance', operation: dryRun ? 'cache-clear-preview' : 'cache-clear',
-              eligible: report.eligible, planned: report.plannedCount,
-              deleted: report.deletedCount, bytes: report.deletedBytes,
-            })
-            return ok(report)
-          }
-
-          case 'mineru/storage.gc.preview': {
-            const p = payloadRecord(payload)
-            const report = await deps.maintenance.gcDryRun({
-              resultLimit: optionalLimit(p, 'result_limit'),
-              candidateLimit: optionalLimit(p, 'candidate_limit'),
-              diagnosticLimit: optionalLimit(p, 'diagnostic_limit'),
-              signal,
-            })
-            ctx.logger?.info('dsh-pdf-mineru', {
-              phase: 'maintenance', operation: 'gc-preview', eligible: report.eligible,
-              candidates: report.candidateCount, bytes: report.candidateBytes,
-            })
-            return ok(report)
-          }
-
-          default: {
-            return fail(`unknown endpoint: ${endpoint}`, 'mineru/not-found')
-          }
-        }
+        if (!Object.hasOwn(handlers, endpoint)) return fail(`unknown endpoint: ${endpoint}`, 'mineru/not-found')
+        return await handlers[endpoint as RpcEndpoint](payloadRecord(payload), signal)
       } catch (err: unknown) {
         const { code, message } = mapRpcError(err)
         return { ok: false, error: { code, message, details: {} } }

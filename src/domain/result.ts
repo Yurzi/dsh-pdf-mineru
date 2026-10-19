@@ -1,5 +1,4 @@
-import type { CacheKey, MinerUFileId, MinerUResultId, ProviderConfigId } from './ids.js'
-import type { MinerUProviderId } from './errors.js'
+import type { CacheKey, MinerUFileId, MinerUProviderId, MinerUResultId, ProviderConfigId } from './ids.js'
 import type { ArtifactKind, CanonicalParseRequest } from './request.js'
 
 export const MINERU_RESULT_MANIFEST_SCHEMA_VERSION = 1 as const

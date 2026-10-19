@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "MinerU PDF Reader",
+    "description": "Parse PDFs with MinerU (official cloud or self-hosted) and read them as bounded, verifiable evidence, with background parsing and local page checks."
+  }
+}

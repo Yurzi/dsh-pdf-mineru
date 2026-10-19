@@ -1,500 +1,183 @@
-import { describe, it, expect, afterEach } from 'vitest'
-import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
-import { createWriteStream } from 'node:fs'
-import { Readable } from 'node:stream'
-import { tmpdir } from 'node:os'
+import { describe, it, expect } from 'vitest'
+import { readdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { ZipFile } from 'yazl'
-import { asFileId, type MinerUFileId } from '../src/domain/ids.js'
+import { asFileId } from '../src/domain/ids.js'
 import type { ArtifactKind } from '../src/domain/request.js'
-import type { ArtifactRef } from '../src/domain/result.js'
-import type {
-  ArtifactInput,
-  ArtifactSink,
-  ArtifactWriteOptions,
-  TemporaryArtifact,
-} from '../src/providers/provider.js'
-import type { SafeZipLimits } from '../src/providers/official-v4-types.js'
-import { extractSafeZip, readAllZipEntries, validateJsonFile } from '../src/providers/safe-zip.js'
+import { extractSafeZip, validateJsonFile, type ExtractZipTargetFile, type SafeZipLimits } from '../src/providers/http/safe-zip.js'
+import { RecordingSink, TEST_LIMITS, tempDir, zip, type ZipEntrySpec } from './support/provider-context.js'
 
-const SHA256_DUMMY = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+const FILE_1: ExtractZipTargetFile = { fileId: asFileId('mf_0123456789abcdef0123456789_0'), dataId: 'data_doc1', name: 'doc1.pdf' }
+const FILE_2: ExtractZipTargetFile = { fileId: asFileId('mf_fedcba9876543210fedcba9876_1'), dataId: 'data_doc2', name: 'doc2.pdf' }
+const ALL_ARTIFACTS: readonly ArtifactKind[] = ['markdown', 'layout', 'model-output', 'content-list', 'images']
 
-class MockArtifactSink implements ArtifactSink {
-  readonly written: Array<{
-    fileId: MinerUFileId
-    kind: ArtifactKind
-    input: ArtifactInput
-    options: ArtifactWriteOptions
-  }> = []
-
-  async writeArtifact(
-    fileId: MinerUFileId,
-    kind: ArtifactKind,
-    input: ArtifactInput,
-    options: ArtifactWriteOptions,
-  ): Promise<ArtifactRef> {
-    let stored: ArtifactInput = input
-    if (typeof input !== 'string' && !(input instanceof Uint8Array)) {
-      const readable = input instanceof Readable
-        ? input
-        : Readable.fromWeb(input as import('node:stream/web').ReadableStream<Uint8Array>)
-      const chunks: Buffer[] = []
-      for await (const chunk of readable) chunks.push(Buffer.from(chunk as Uint8Array))
-      stored = Buffer.concat(chunks)
-    }
-    this.written.push({ fileId, kind, input: stored, options })
-    const bytes = typeof stored === 'string'
-      ? Buffer.byteLength(stored)
-      : stored instanceof Uint8Array
-        ? stored.byteLength
-        : 0
-
-    return {
-      kind,
-      relativePath: `files/${String(fileId)}/${options.relativeName ?? 'artifact.bin'}`,
-      mediaType: options.mediaType,
-      bytes,
-      sha256: SHA256_DUMMY,
-    }
+/** Writes an archive to its own directory; `rename` patches raw entry names (same byte length) yazl refuses to write. */
+async function archive(
+  entries: Readonly<Record<string, string | Uint8Array>> | readonly ZipEntrySpec[],
+  rename?: readonly [placeholder: string, hostile: string],
+): Promise<{ readonly dir: string; readonly zipPath: string }> {
+  const dir = await tempDir('mineru-zip-')
+  const zipPath = join(dir, 'archive.zip')
+  let bytes = await zip(entries)
+  if (rename !== undefined) {
+    const [placeholder, hostile] = rename
+    const from = Buffer.from(placeholder)
+    const to = Buffer.from(hostile)
+    if (from.length !== to.length) throw new Error('rename must preserve byte length')
+    bytes = Buffer.from(bytes)
+    for (let at = bytes.indexOf(from); at >= 0; at = bytes.indexOf(from, at + from.length)) to.copy(bytes, at)
   }
-
-  async writeTemporary(name: string, input: ArtifactInput, maxBytes: number): Promise<TemporaryArtifact> {
-    return {
-      path: `/tmp/${name}`,
-      bytes: 100,
-      sha256: SHA256_DUMMY,
-    }
-  }
+  await writeFile(zipPath, bytes)
+  return { dir, zipPath }
 }
 
-describe('safe-zip', () => {
-  const tempDirs: string[] = []
+async function extract(
+  zipPath: string,
+  options: { files?: readonly ExtractZipTargetFile[]; required?: readonly ArtifactKind[]; limits?: Partial<SafeZipLimits>; signal?: AbortSignal } = {},
+) {
+  const sink = new RecordingSink()
+  const result = extractSafeZip({
+    zipPath, sink,
+    files: options.files ?? [FILE_1],
+    requiredArtifacts: options.required ?? ['markdown'],
+    limits: { ...TEST_LIMITS, ...options.limits },
+    signal: options.signal ?? new AbortController().signal,
+  })
+  return { sink, result }
+}
 
-  async function createTempZip(populate: (zip: ZipFile) => void): Promise<string> {
-    const dir = await mkdtemp(join(tmpdir(), 'mineru-zip-test-'))
-    tempDirs.push(dir)
-    const zipPath = join(dir, 'test.zip')
+/** The archive was rejected before anything reached the sink, and no staged entry was left behind. */
+async function expectNothingStaged(dir: string, sink: RecordingSink): Promise<void> {
+  expect(sink.written).toEqual([])
+  expect(await readdir(dir)).toEqual(['archive.zip'])
+}
 
-    return new Promise((resolve, reject) => {
-      const zip = new ZipFile()
-      const out = createWriteStream(zipPath)
-      out.on('close', () => resolve(zipPath))
-      out.on('error', reject)
-      zip.outputStream.pipe(out)
-
-      populate(zip)
-      zip.end()
+describe('extractSafeZip archive layouts', () => {
+  it('extracts and normalizes every artifact kind from a root layout', async () => {
+    const { dir, zipPath } = await archive({
+      'full.md': '# Full Markdown',
+      'layout.json': '{"layout":"blocks"}',
+      'model.json': '{"model":"vlm"}',
+      'content_list.json': '[1,2,3]',
+      'images/fig 0.png': 'PNG_FAKE_DATA',
     })
-  }
-
-  async function patchZipEntryName(zipPath: string, placeholder: string, replacement: string): Promise<void> {
-    if (placeholder.length !== replacement.length) {
-      throw new Error('Placeholder and replacement must have identical byte length for zip patch')
-    }
-    const buf = await readFile(zipPath)
-    const pBuf = Buffer.from(placeholder, 'utf8')
-    const rBuf = Buffer.from(replacement, 'utf8')
-
-    let offset = 0
-    let matchCount = 0
-    while ((offset = buf.indexOf(pBuf, offset)) !== -1) {
-      rBuf.copy(buf, offset)
-      offset += pBuf.length
-      matchCount++
-    }
-    if (matchCount === 0) {
-      throw new Error(`Placeholder "${placeholder}" not found in zip bytes`)
-    }
-    await writeFile(zipPath, buf)
-  }
-
-  function defaultLimits(overrides: Partial<SafeZipLimits> = {}): SafeZipLimits {
-    return {
-      maxZipEntries: 100,
-      maxZipEntryBytes: 10 * 1024 * 1024,
-      maxZipTotalBytes: 50 * 1024 * 1024,
-      maxZipCompressionRatio: 50,
-      ...overrides,
-    }
-  }
-
-  afterEach(async () => {
-    await Promise.all(tempDirs.splice(0).map(d => rm(d, { recursive: true, force: true })))
+    const { sink, result } = await extract(zipPath, { required: ALL_ARTIFACTS })
+    const [collected] = await result
+    expect(collected).toMatchObject({ fileId: FILE_1.fileId, name: 'doc1.pdf' })
+    expect(collected?.failure).toBeUndefined()
+    expect(new Set(collected?.artifacts.map(artifact => artifact.kind))).toEqual(new Set(ALL_ARTIFACTS))
+    expect(sink.artifact('markdown')?.toString()).toBe('# Full Markdown')
+    expect(sink.written.find(entry => entry.kind === 'images')?.options.relativeName).toBe('images/fig_0.png')
+    expect(await readdir(dir)).toEqual(['archive.zip'])
   })
 
-  describe('Single-file root layout', () => {
-    it('extracts all standard artifacts from root layout', async () => {
-      const zipPath = await createTempZip(zip => {
-        zip.addBuffer(Buffer.from('# Full Markdown\nContent here', 'utf8'), 'full.md')
-        zip.addBuffer(Buffer.from(JSON.stringify({ layout: 'blocks' }), 'utf8'), 'layout.json')
-        zip.addBuffer(Buffer.from(JSON.stringify({ model: 'vlm' }), 'utf8'), 'model.json')
-        zip.addBuffer(Buffer.from(JSON.stringify({ list: [1, 2, 3] }), 'utf8'), 'content_list.json')
-        zip.addBuffer(Buffer.from('PNG_FAKE_DATA', 'utf8'), 'images/fig_0.png')
-      })
-
-      const fileId = asFileId('mf_0123456789abcdef0123456789_0')
-      const targetFile = { fileId, dataId: 'data_doc1', name: 'doc1.pdf' }
-      const sink = new MockArtifactSink()
-
-      const results = await extractSafeZip({
-        zipPath,
-        sink,
-        files: [targetFile],
-        requiredArtifacts: ['markdown', 'layout', 'model-output', 'content-list', 'images'],
-        limits: defaultLimits(),
-        signal: new AbortController().signal,
-      })
-
-      expect(results).toHaveLength(1)
-      expect(results[0]?.fileId).toBe(fileId)
-      expect(results[0]?.failure).toBeUndefined()
-      expect(results[0]?.artifacts).toHaveLength(5)
-
-      const kinds = results[0]?.artifacts.map(a => a.kind)
-      expect(kinds).toContain('markdown')
-      expect(kinds).toContain('layout')
-      expect(kinds).toContain('model-output')
-      expect(kinds).toContain('content-list')
-      expect(kinds).toContain('images')
-    })
-
-
-    it('rejects normalized output collisions before writing artifacts', async () => {
-      const zipPath = await createTempZip(zip => {
-        zip.addBuffer(Buffer.from('{}'), 'layout.json')
-        zip.addBuffer(Buffer.from('{}'), 'middle.json')
-        zip.addBuffer(Buffer.from('a'), 'images/a/b.png')
-        zip.addBuffer(Buffer.from('b'), 'images/a_b.png')
-      })
-      const fileId = asFileId('mf_0123456789abcdef0123456789_0')
-      const sink = new MockArtifactSink()
-      await expect(extractSafeZip({
-        zipPath, sink, files: [{ fileId, dataId: 'data_doc1', name: 'doc1.pdf' }],
-        requiredArtifacts: ['layout', 'images'], limits: defaultLimits(),
-        signal: new AbortController().signal,
-      })).rejects.toMatchObject({ failure: { code: 'RESULT_ARCHIVE_INVALID' } })
-      expect(sink.written).toHaveLength(0)
-    })
-
-    it('writes fallback images/index.json when images are required but absent in zip', async () => {
-      const zipPath = await createTempZip(zip => {
-        zip.addBuffer(Buffer.from('# Full Markdown\nNo images', 'utf8'), 'full.md')
-      })
-
-      const fileId = asFileId('mf_0123456789abcdef0123456789_0')
-      const targetFile = { fileId, dataId: 'data_doc1', name: 'doc1.pdf' }
-      const sink = new MockArtifactSink()
-
-      const results = await extractSafeZip({
-        zipPath,
-        sink,
-        files: [targetFile],
-        requiredArtifacts: ['markdown', 'images'],
-        limits: defaultLimits(),
-        signal: new AbortController().signal,
-      })
-
-      expect(results).toHaveLength(1)
-      expect(results[0]?.failure).toBeUndefined()
-      expect(results[0]?.artifacts).toHaveLength(2)
-
-      const imgRef = results[0]?.artifacts.find(a => a.kind === 'images')
-      expect(imgRef).toBeDefined()
-      expect(imgRef?.relativePath).toContain('images/index.json')
-    })
-
-    it('replicates root artifacts to all associated target files sharing the same ZIP URL', async () => {
-      const zipPath = await createTempZip(zip => {
-        zip.addBuffer(Buffer.from('# Shared Document', 'utf8'), 'full.md')
-      })
-
-      const fileId1 = asFileId('mf_0123456789abcdef0123456789_0')
-      const fileId2 = asFileId('mf_fedcba9876543210fedcba9876_1')
-      const targetFiles = [
-        { fileId: fileId1, dataId: 'data_doc1', name: 'doc1.pdf' },
-        { fileId: fileId2, dataId: 'data_doc2', name: 'doc2.pdf' },
-      ]
-      const sink = new MockArtifactSink()
-
-      const results = await extractSafeZip({
-        zipPath,
-        sink,
-        files: targetFiles,
-        requiredArtifacts: ['markdown'],
-        limits: defaultLimits(),
-        signal: new AbortController().signal,
-      })
-
-      expect(results).toHaveLength(2)
-      expect(results[0]?.fileId).toBe(fileId1)
-      expect(results[1]?.fileId).toBe(fileId2)
-      expect(results[0]?.artifacts).toHaveLength(1)
-      expect(results[1]?.artifacts).toHaveLength(1)
-    })
+  it('writes an empty images index when images are required but absent', async () => {
+    const { zipPath } = await archive({ 'full.md': '# No images' })
+    const { sink, result } = await extract(zipPath, { required: ['markdown', 'images'] })
+    const [collected] = await result
+    expect(collected?.failure).toBeUndefined()
+    const index = sink.written.find(entry => entry.kind === 'images')
+    expect(index?.options.relativeName).toBe('images/index.json')
+    expect(JSON.parse(index!.content.toString())).toEqual({ images: [] })
   })
 
-  describe('Multi-file subfolder layout', () => {
-    it('extracts files matched by dataId top-level directory', async () => {
-      const zipPath = await createTempZip(zip => {
-        zip.addBuffer(Buffer.from('# Doc 1', 'utf8'), 'data_doc1/full.md')
-        zip.addBuffer(Buffer.from(JSON.stringify({ doc: 1 }), 'utf8'), 'data_doc1/layout.json')
-        zip.addBuffer(Buffer.from('# Doc 2', 'utf8'), 'data_doc2/full.md')
-        zip.addBuffer(Buffer.from(JSON.stringify({ doc: 2 }), 'utf8'), 'data_doc2/layout.json')
-      })
-
-      const fileId1 = asFileId('mf_0123456789abcdef0123456789_0')
-      const fileId2 = asFileId('mf_fedcba9876543210fedcba9876_1')
-      const targetFiles = [
-        { fileId: fileId1, dataId: 'data_doc1', name: 'doc1.pdf' },
-        { fileId: fileId2, dataId: 'data_doc2', name: 'doc2.pdf' },
-      ]
-      const sink = new MockArtifactSink()
-
-      const results = await extractSafeZip({
-        zipPath,
-        sink,
-        files: targetFiles,
-        requiredArtifacts: ['markdown', 'layout'],
-        limits: defaultLimits(),
-        signal: new AbortController().signal,
-      })
-
-      expect(results).toHaveLength(2)
-      expect(results[0]?.fileId).toBe(fileId1)
-      expect(results[0]?.failure).toBeUndefined()
-      expect(results[1]?.fileId).toBe(fileId2)
-      expect(results[1]?.failure).toBeUndefined()
-    })
-
-    it('extracts files matched by fileId top-level directory', async () => {
-      const fileId1 = asFileId('mf_0123456789abcdef0123456789_0')
-      const zipPath = await createTempZip(zip => {
-        zip.addBuffer(Buffer.from('# FileId Doc', 'utf8'), `${String(fileId1)}/full.md`)
-      })
-
-      const targetFiles = [
-        { fileId: fileId1, dataId: 'data_custom_1', name: 'doc1.pdf' },
-      ]
-      const sink = new MockArtifactSink()
-
-      const results = await extractSafeZip({
-        zipPath,
-        sink,
-        files: targetFiles,
-        requiredArtifacts: ['markdown'],
-        limits: defaultLimits(),
-        signal: new AbortController().signal,
-      })
-
-      expect(results).toHaveLength(1)
-      expect(results[0]?.failure).toBeUndefined()
-      expect(results[0]?.artifacts).toHaveLength(1)
-    })
-
-    it('does NOT match by file_name when subfolder differs from dataId and fileId', async () => {
-      const zipPath = await createTempZip(zip => {
-        zip.addBuffer(Buffer.from('# Wrong name Doc', 'utf8'), 'doc1/full.md')
-      })
-
-      const fileId = asFileId('mf_0123456789abcdef0123456789_0')
-      const targetFiles = [
-        { fileId, dataId: 'data_doc1', name: 'doc1.pdf' },
-      ]
-      const sink = new MockArtifactSink()
-
-      const results = await extractSafeZip({
-        zipPath,
-        sink,
-        files: targetFiles,
-        requiredArtifacts: ['markdown'],
-        limits: defaultLimits(),
-        signal: new AbortController().signal,
-      })
-
-      expect(results).toHaveLength(1)
-      expect(results[0]?.failure).toBeDefined()
-      expect(results[0]?.failure?.code).toBe('REMOTE_PARSE_FAILED')
-    })
+  it('replicates root artifacts to every target file sharing the archive', async () => {
+    const { zipPath } = await archive({ 'full.md': '# Shared Document' })
+    const { result } = await extract(zipPath, { files: [FILE_1, FILE_2] })
+    const collected = await result
+    expect(collected.map(file => file.fileId)).toEqual([FILE_1.fileId, FILE_2.fileId])
+    expect(collected.map(file => file.artifacts.length)).toEqual([1, 1])
   })
 
-  describe('JSON validation', () => {
-    it('throws RESULT_ARCHIVE_INVALID if layout.json contains malformed JSON', async () => {
-      const zipPath = await createTempZip(zip => {
-        zip.addBuffer(Buffer.from('{ malformed json ...', 'utf8'), 'layout.json')
-      })
-
-      const fileId = asFileId('mf_0123456789abcdef0123456789_0')
-      const targetFiles = [{ fileId, dataId: 'data_doc1', name: 'doc1.pdf' }]
-      const sink = new MockArtifactSink()
-
-      await expect(
-        extractSafeZip({
-          zipPath,
-          sink,
-          files: targetFiles,
-          requiredArtifacts: ['layout'],
-          limits: defaultLimits(),
-          signal: new AbortController().signal,
-        }),
-      ).rejects.toThrowError(/Invalid JSON/i)
+  it.each([
+    ['dataId', (file: ExtractZipTargetFile) => file.dataId],
+    ['fileId', (file: ExtractZipTargetFile) => String(file.fileId)],
+  ])('routes structured archives by %s top-level directory', async (_label, prefix) => {
+    const { zipPath } = await archive({
+      [`${prefix(FILE_1)}/full.md`]: '# Doc 1',
+      [`${prefix(FILE_2)}/full.md`]: '# Doc 2',
     })
+    const { sink, result } = await extract(zipPath, { files: [FILE_1, FILE_2] })
+    expect((await result).map(file => file.failure)).toEqual([undefined, undefined])
+    expect(sink.written.map(entry => [entry.fileId, entry.content.toString()])).toEqual([
+      [FILE_1.fileId, '# Doc 1'], [FILE_2.fileId, '# Doc 2'],
+    ])
   })
 
-  describe('Security defenses', () => {
-    it('checks the actual staged JSON size before streaming validation', async () => {
-      const dir = await mkdtemp(join(tmpdir(), 'mineru-json-size-'))
-      tempDirs.push(dir)
-      const path = join(dir, 'layout.json')
-      await writeFile(path, '{"ok":true}          ')
-      await expect(validateJsonFile(path, 8)).rejects.toMatchObject({ failure: { code: 'RESULT_TOO_LARGE' } })
-    })
+  it('never guesses a directory from the source file name', async () => {
+    const { zipPath } = await archive({ 'doc1/full.md': '# Wrong directory' })
+    const { sink, result } = await extract(zipPath)
+    const [collected] = await result
+    expect(collected?.failure?.code).toBe('REMOTE_PARSE_FAILED')
+    expect(sink.written).toEqual([])
+  })
 
+  it('rejects normalized output collisions before writing any artifact', async () => {
+    const { dir, zipPath } = await archive({ 'layout.json': '{}', 'middle.json': '{}', 'images/a/b.png': 'a', 'images/a_b.png': 'b' })
+    const { sink, result } = await extract(zipPath, { required: ['layout', 'images'] })
+    await expect(result).rejects.toMatchObject({ failure: { code: 'RESULT_ARCHIVE_INVALID' } })
+    await expectNothingStaged(dir, sink)
+  })
 
-    it('rejects invalid JSON artifact in archive', async () => {
-      const dir = await mkdtemp(join(tmpdir(), 'mineru-json-invalid-'))
-      tempDirs.push(dir)
-      const path = join(dir, 'invalid.json')
-      await writeFile(path, '{"invalid":')
-      await expect(validateJsonFile(path)).rejects.toMatchObject({
-        failure: { code: 'RESULT_ARCHIVE_INVALID' },
-      })
-    })
+  it('rejects malformed JSON artifacts and removes the staged entry', async () => {
+    const { dir, zipPath } = await archive({ 'layout.json': '{ malformed json ...' })
+    const { sink, result } = await extract(zipPath, { required: ['layout'] })
+    await expect(result).rejects.toMatchObject({ failure: { code: 'RESULT_ARCHIVE_INVALID' } })
+    await expectNothingStaged(dir, sink)
+  })
+})
 
-    it('respects abort signal during JSON validation', async () => {
-      const dir = await mkdtemp(join(tmpdir(), 'mineru-json-abort-'))
-      tempDirs.push(dir)
-      const path = join(dir, 'valid.json')
-      await writeFile(path, '{"ok":true}')
-      const controller = new AbortController()
-      controller.abort(new DOMException('Aborted by user', 'AbortError'))
-      await expect(validateJsonFile(path, undefined, controller.signal)).rejects.toThrowError(/Aborted by user/i)
-    })
+describe('extractSafeZip security', () => {
+  it.each([
+    ['parent traversal', '.._evil.txt', '../evil.txt'],
+    ['nested traversal segment', 'a/.._b.txt', 'a/../b.txt'],
+    ['dot prefix', 'D_evil.txt', './evil.txt'],
+    ['absolute path', 'ABSO_evil.txt', '/evil.txt    '],
+    ['Windows drive prefix', 'DRIV_evil.txt', 'C:/evil.txt  '],
+    ['backslash separator', 'BSLH_evil.txt', 'dir\\evil.txt '],
+    ['NUL byte', 'NULX_file.txt', 'file\0.txt    '],
+  ])('rejects an entry name with a %s', async (_label, placeholder, hostile) => {
+    const { dir, zipPath } = await archive({ 'full.md': '# Benign', [placeholder]: 'evil' }, [placeholder, hostile])
+    const { sink, result } = await extract(zipPath)
+    await expect(result).rejects.toMatchObject({ failure: { code: 'RESULT_ARCHIVE_INVALID' } })
+    await expectNothingStaged(dir, sink)
+  })
 
-    it('rejects zip containing path traversal ("../evil.txt")', async () => {
-      const zipPath = await createTempZip(zip => {
-        zip.addBuffer(Buffer.from('evil', 'utf8'), '.._evil.txt')
-      })
-      await patchZipEntryName(zipPath, '.._evil.txt', '../evil.txt')
+  it.each<[string, readonly ZipEntrySpec[], Partial<SafeZipLimits>, string]>([
+    ['symlink entries', [{ name: 'full.md', content: '/etc/passwd', mode: 0o120777 }], {}, 'RESULT_ARCHIVE_INVALID'],
+    ['too many entries', Array.from({ length: 11 }, (_, i) => ({ name: `images/${String(i)}.png`, content: 'png' })), { maxZipEntries: 10 }, 'RESULT_ARCHIVE_INVALID'],
+    ['an oversized entry', [{ name: 'full.md', content: 'A'.repeat(5000) }], { maxZipEntryBytes: 1000 }, 'RESULT_TOO_LARGE'],
+    ['an oversized total', ['full.md', 'images/1.png', 'images/2.png'].map(name => ({ name, content: 'A'.repeat(2000) })), { maxZipTotalBytes: 3000 }, 'RESULT_TOO_LARGE'],
+    ['a compression bomb', [{ name: 'full.md', content: Buffer.alloc(1024 * 1024) }], { maxZipCompressionRatio: 10 }, 'RESULT_ARCHIVE_INVALID'],
+  ])('rejects %s before staging', async (_label, entries, limits, code) => {
+    const { dir, zipPath } = await archive(entries)
+    const { sink, result } = await extract(zipPath, { required: ['markdown', 'images'], limits })
+    await expect(result).rejects.toMatchObject({ failure: { code } })
+    await expectNothingStaged(dir, sink)
+  })
 
-      await expect(
-        readAllZipEntries(zipPath, defaultLimits(), new AbortController().signal),
-      ).rejects.toThrowError(/traversal|relative path/i)
-    })
+  it('honors an aborted signal before reading the archive', async () => {
+    const { dir, zipPath } = await archive({ 'full.md': '# Markdown' })
+    const controller = new AbortController()
+    controller.abort()
+    const { sink, result } = await extract(zipPath, { signal: controller.signal })
+    await expect(result).rejects.toMatchObject({ failure: { code: 'CANCELLED' } })
+    await expectNothingStaged(dir, sink)
+  })
+})
 
-    it('rejects zip containing absolute path ("/evil.txt")', async () => {
-      const zipPath = await createTempZip(zip => {
-        zip.addBuffer(Buffer.from('evil', 'utf8'), 'ABSO_evil.txt')
-      })
-      await patchZipEntryName(zipPath, 'ABSO_evil.txt', '/evil.txt    ')
-
-      await expect(
-        readAllZipEntries(zipPath, defaultLimits(), new AbortController().signal),
-      ).rejects.toThrowError(/absolute/i)
-    })
-
-    it('rejects zip containing Windows drive prefix ("C:/evil.txt")', async () => {
-      const zipPath = await createTempZip(zip => {
-        zip.addBuffer(Buffer.from('evil', 'utf8'), 'DRIV_evil.txt')
-      })
-      await patchZipEntryName(zipPath, 'DRIV_evil.txt', 'C:/evil.txt  ')
-
-      await expect(
-        readAllZipEntries(zipPath, defaultLimits(), new AbortController().signal),
-      ).rejects.toThrowError(/Windows drive prefix|absolute/i)
-    })
-
-    it('rejects zip containing backslash ("dir\\evil.txt")', async () => {
-      const zipPath = await createTempZip(zip => {
-        zip.addBuffer(Buffer.from('evil', 'utf8'), 'BSLH_evil.txt')
-      })
-      await patchZipEntryName(zipPath, 'BSLH_evil.txt', 'dir\\evil.txt ')
-
-      await expect(
-        readAllZipEntries(zipPath, defaultLimits(), new AbortController().signal),
-      ).rejects.toThrowError(/backslash/i)
-    })
-
-    it('rejects zip containing NUL byte ("file\0.txt")', async () => {
-      const zipPath = await createTempZip(zip => {
-        zip.addBuffer(Buffer.from('evil', 'utf8'), 'NULX_file.txt')
-      })
-      await patchZipEntryName(zipPath, 'NULX_file.txt', 'file\0.txt    ')
-
-      await expect(
-        readAllZipEntries(zipPath, defaultLimits(), new AbortController().signal),
-      ).rejects.toThrowError(/NUL byte/i)
-    })
-
-    it('rejects zip containing symlink entries', async () => {
-      const zipPath = await createTempZip(zip => {
-        // Mode 0o120777 indicates a symbolic link in UNIX file attributes
-        zip.addBuffer(Buffer.from('/etc/passwd', 'utf8'), 'symlink_entry', { mode: 0o120777 })
-      })
-
-      await expect(
-        readAllZipEntries(zipPath, defaultLimits(), new AbortController().signal),
-      ).rejects.toThrowError(/Symbolic links/i)
-    })
-
-    it('rejects zip exceeding maxZipEntries limit', async () => {
-      const zipPath = await createTempZip(zip => {
-        for (let i = 0; i < 15; i++) {
-          zip.addBuffer(Buffer.from(`content ${i}`, 'utf8'), `file_${i}.txt`)
-        }
-      })
-
-      await expect(
-        readAllZipEntries(zipPath, defaultLimits({ maxZipEntries: 10 }), new AbortController().signal),
-      ).rejects.toThrowError(/entries/i)
-    })
-
-    it('rejects zip exceeding maxZipEntryBytes limit', async () => {
-      const largeContent = Buffer.alloc(5000, 'A')
-      const zipPath = await createTempZip(zip => {
-        zip.addBuffer(largeContent, 'large.txt')
-      })
-
-      await expect(
-        readAllZipEntries(zipPath, defaultLimits({ maxZipEntryBytes: 1000 }), new AbortController().signal),
-      ).rejects.toThrowError(/entry/i)
-    })
-
-    it('rejects zip exceeding maxZipTotalBytes limit', async () => {
-      const content = Buffer.alloc(2000, 'A')
-      const zipPath = await createTempZip(zip => {
-        zip.addBuffer(content, 'file1.txt')
-        zip.addBuffer(content, 'file2.txt')
-        zip.addBuffer(content, 'file3.txt')
-      })
-
-      await expect(
-        readAllZipEntries(zipPath, defaultLimits({ maxZipTotalBytes: 3000 }), new AbortController().signal),
-      ).rejects.toThrowError(/total/i)
-    })
-
-    it('rejects zip exceeding compression ratio (Zip Bomb protection)', async () => {
-      // Create a 1MB buffer of zeros which compresses into ~1KB (ratio > 500)
-      const bombData = Buffer.alloc(1024 * 1024, 0)
-      const zipPath = await createTempZip(zip => {
-        zip.addBuffer(bombData, 'bomb.txt')
-      })
-
-      await expect(
-        readAllZipEntries(zipPath, defaultLimits({ maxZipCompressionRatio: 10 }), new AbortController().signal),
-      ).rejects.toThrowError(/compression ratio/i)
-    })
-
-    it('honors abort signal during extraction', async () => {
-      const zipPath = await createTempZip(zip => {
-        zip.addBuffer(Buffer.from('# Markdown', 'utf8'), 'full.md')
-      })
-
-      const controller = new AbortController()
-      controller.abort()
-
-      await expect(
-        readAllZipEntries(zipPath, defaultLimits(), controller.signal),
-      ).rejects.toThrowError(/cancelled/i)
-    })
+describe('validateJsonFile', () => {
+  it('checks the actual staged size, JSON syntax and cancellation', async () => {
+    const dir = await tempDir('mineru-json-')
+    const valid = join(dir, 'valid.json')
+    const invalid = join(dir, 'invalid.json')
+    await writeFile(valid, '{"ok":true}          ')
+    await writeFile(invalid, '{"invalid":')
+    await expect(validateJsonFile(valid)).resolves.toBeUndefined()
+    await expect(validateJsonFile(valid, 8)).rejects.toMatchObject({ failure: { code: 'RESULT_TOO_LARGE' } })
+    await expect(validateJsonFile(invalid)).rejects.toMatchObject({ failure: { code: 'RESULT_ARCHIVE_INVALID' } })
+    const controller = new AbortController()
+    const reason = new DOMException('Aborted by user', 'AbortError')
+    controller.abort(reason)
+    await expect(validateJsonFile(valid, undefined, controller.signal)).rejects.toBe(reason)
   })
 })

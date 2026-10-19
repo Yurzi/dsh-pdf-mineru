@@ -16,12 +16,6 @@ export type ArtifactKind = typeof ARTIFACT_KINDS[number]
 export type MinerUModel = 'pipeline' | 'vlm'
 export type ParseMethod = 'auto' | 'txt' | 'ocr'
 
-export const FOCUS_KINDS = ['all', 'text', 'table', 'image', 'toc', 'artifacts'] as const
-export type FocusKind = typeof FOCUS_KINDS[number]
-
-/** Public page selection: a single page, a range string, or an array of page numbers. */
-export type PageSelection = number | string | readonly number[]
-
 export interface ParseSemantics {
   readonly model: MinerUModel
   readonly ocr: boolean
@@ -63,29 +57,6 @@ export interface PreparedParseRequest {
   readonly sources: readonly PreparedSourceFile[]
 }
 
-export interface ReadCursorInput {
-  /** Opaque continuation token from a previous partial read. */
-  readonly cursor?: string
-  /** Exact stable block identifier returned by read_pdf. */
-  readonly block_id?: string
-  /** Case-insensitive literal search within the selected document blocks. */
-  readonly query?: string
-}
-
-export interface ParseRequestInput extends ReadCursorInput {
-  readonly file_path?: string
-  readonly model?: MinerUModel
-  readonly ocr?: boolean
-  readonly language?: string
-  readonly formula?: boolean
-  readonly table?: boolean
-  readonly pages?: PageSelection
-  readonly focus?: FocusKind | readonly FocusKind[]
-  readonly artifacts?: readonly ArtifactKind[]
-  readonly inline_images?: boolean
-  readonly poll_timeout_ms?: number
-}
-
 export interface ParseDefaults {
   readonly model: MinerUModel
   readonly ocr: boolean
@@ -93,156 +64,6 @@ export interface ParseDefaults {
   readonly language: string
   readonly formula: boolean
   readonly table: boolean
-}
-
-interface PageInterval { start: number; end: number }
-
-function parsePageRangeTokens(input: string): PageInterval[] {
-  const intervals: PageInterval[] = []
-  for (const token of input.split(',')) {
-    const trimmed = token.trim()
-    if (trimmed === '') continue
-    const match = /^(\d+)(?:-(\d+))?$/.exec(trimmed)
-    if (match === null) throw new TypeError(`Invalid page range token: ${trimmed}`)
-    const start = Number(match[1])
-    const end = match[2] === undefined ? start : Number(match[2])
-    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start || end > 99999) {
-      throw new TypeError(`Invalid page range token: ${trimmed}`)
-    }
-    intervals.push({ start, end })
-  }
-  if (intervals.length === 0) throw new TypeError('Page range cannot be empty')
-  return intervals
-}
-
-export function normalizePageRanges(input: string): string {
-  const intervals = parsePageRangeTokens(input)
-  intervals.sort((left, right) => left.start - right.start || left.end - right.end)
-  const merged: PageInterval[] = []
-  for (const current of intervals) {
-    const previous = merged.at(-1)
-    if (previous !== undefined && current.start <= previous.end + 1) previous.end = Math.max(previous.end, current.end)
-    else merged.push({ ...current })
-  }
-  return merged.map(({ start, end }) => start === end ? String(start) : `${String(start)}-${String(end)}`).join(',')
-}
-
-export interface PageNarrowing {
-  readonly pagesSet: Set<number> | undefined
-  readonly pagesLabel: string
-  /** Pages requested but outside 1..totalPages; reported, never silently replaced. */
-  readonly outOfRange: readonly number[]
-  /** True when the request asked for pages but none overlap the document. */
-  readonly fullyOutOfRange: boolean
-}
-
-function renderPageLabel(pages: ReadonlySet<number>): string {
-  const sorted = [...pages].sort((a, b) => a - b)
-  const intervals: Array<{ start: number; end: number }> = []
-  for (const p of sorted) {
-    const last = intervals.at(-1)
-    if (last !== undefined && p === last.end + 1) {
-      last.end = p
-    } else {
-      intervals.push({ start: p, end: p })
-    }
-  }
-  return intervals.map((seg) => seg.start === seg.end ? String(seg.start) : String(seg.start) + "-" + String(seg.end)).join(",")
-}
-
-export function narrowPageSelection(
-  requested: ReadonlySet<number> | undefined,
-  totalPages: number | undefined,
-): PageNarrowing {
-  if (requested === undefined) {
-    if (totalPages === undefined) {
-      return { pagesSet: undefined, pagesLabel: "", outOfRange: [], fullyOutOfRange: false }
-    }
-    const maxBound = Math.max(1, totalPages)
-    const pagesLabel = maxBound > 1 ? "1-" + String(maxBound) : "1"
-    return { pagesSet: undefined, pagesLabel, outOfRange: [], fullyOutOfRange: false }
-  }
-  if (totalPages === undefined) {
-    return {
-      pagesSet: new Set(requested),
-      pagesLabel: renderPageLabel(requested),
-      outOfRange: [],
-      fullyOutOfRange: false,
-    }
-  }
-  const maxBound = Math.max(1, totalPages)
-  const valid = new Set<number>()
-  const outOfRange: number[] = []
-  for (const p of requested) {
-    if (p >= 1 && p <= maxBound) valid.add(p)
-    else outOfRange.push(p)
-  }
-  outOfRange.sort((a, b) => a - b)
-  if (valid.size === 0) {
-    return { pagesSet: new Set<number>(), pagesLabel: "", outOfRange, fullyOutOfRange: true }
-  }
-  return { pagesSet: valid, pagesLabel: renderPageLabel(valid), outOfRange, fullyOutOfRange: false }
-}
-export function normalizePageSelection(input: unknown): Set<number> | undefined {
-  if (input === undefined || input === null) return undefined
-  if (typeof input === 'number') {
-    if (!Number.isSafeInteger(input) || input < 1 || input > 99999) {
-      throw new TypeError(`Invalid page number: ${String(input)}`)
-    }
-    return new Set([input])
-  }
-  if (Array.isArray(input)) {
-    if (input.length === 0) throw new TypeError('Page selection cannot be empty')
-    const set = new Set<number>()
-    for (const item of input) {
-      if (typeof item === 'number') {
-        if (!Number.isSafeInteger(item) || item < 1 || item > 99999) {
-          throw new TypeError(`Invalid page number: ${String(item)}`)
-        }
-        set.add(item)
-      } else {
-        throw new TypeError(`Invalid page selection item: ${String(item)}`)
-      }
-    }
-    return set
-  }
-  if (typeof input === 'string') {
-    if (input.trim() === '') throw new TypeError('Page range cannot be empty')
-    const intervals = parsePageRangeTokens(input)
-    const set = new Set<number>()
-    for (const { start, end } of intervals) {
-      for (let p = start; p <= end; p++) set.add(p)
-    }
-    return set
-  }
-  throw new TypeError(`Invalid page selection: ${String(input)}`)
-}
-
-function parseFocusToken(item: unknown): FocusKind {
-  if (typeof item !== 'string') throw new TypeError(`Invalid focus option: ${String(item)}`)
-  let trimmed = item.trim().toLowerCase()
-  if (trimmed === 'outline') trimmed = 'toc'
-  if (trimmed === 'artifact') trimmed = 'artifacts'
-  if (!FOCUS_KINDS.includes(trimmed as FocusKind)) {
-    throw new TypeError(`Invalid focus option: ${String(item)}`)
-  }
-  return trimmed as FocusKind
-}
-
-export function normalizeFocusSelection(input: unknown): Set<FocusKind> {
-  if (input === undefined || input === null) return new Set(['all'])
-  if (typeof input === 'string') {
-    return new Set([parseFocusToken(input)])
-  }
-  if (Array.isArray(input)) {
-    if (input.length === 0) return new Set(['all'])
-    const set = new Set<FocusKind>()
-    for (const item of input) {
-      set.add(parseFocusToken(item))
-    }
-    return set
-  }
-  throw new TypeError(`Invalid focus option: ${String(input)}`)
 }
 
 export function normalizeArtifactKinds(kinds: readonly ArtifactKind[]): readonly ArtifactKind[] {

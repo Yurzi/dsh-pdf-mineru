@@ -1,6 +1,4 @@
-import type { MinerUFileId } from './ids.js'
-
-export type MinerUProviderId = 'self-hosted-v1' | 'self-hosted-legacy-v2' | 'official-v4'
+import type { MinerUFileId, MinerUProviderId } from './ids.js'
 
 export type MinerUErrorCode =
   | 'INVALID_REQUEST'
@@ -28,6 +26,7 @@ export type MinerUErrorCode =
   | 'UNAUTHENTICATED_SESSION'
   | 'JOB_NOT_FOUND'
   | 'STORAGE_LOCKED'
+  | 'SETTINGS_CONFLICT'
 
 export interface MinerUFailure {
   readonly code: MinerUErrorCode
@@ -40,9 +39,15 @@ export interface MinerUFailure {
 }
 
 export class MinerUError extends Error {
-  constructor(public readonly failure: MinerUFailure, options?: ErrorOptions) {
+  readonly http?: { status: number; retryAfterMs?: number }
+
+  constructor(
+    public readonly failure: MinerUFailure,
+    options?: ErrorOptions & { http?: { status: number; retryAfterMs?: number } },
+  ) {
     super(failure.message, options)
     this.name = 'MinerUError'
+    this.http = options?.http
   }
 }
 
@@ -52,7 +57,7 @@ export function sanitizeDiagnostic(input: string, secrets: readonly string[] = [
     if (secret !== '') sanitized = sanitized.split(secret).join('[REDACTED]')
   }
   return sanitized
-    .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, 'Bearer [REDACTED]')
+    .replace(/Bearer\s+[A-Za-z0-9._~+/-]+/gi, 'Bearer [REDACTED]')
     .replace(/https?:\/\/[^\s<>"']+/gi, raw => {
       try {
         const url = new URL(raw)

@@ -19,10 +19,10 @@ import type { ArtifactRef, MinerUResultManifest, ResultProducer } from '../domai
 import { parseMinerUResultManifest } from '../domain/schemas.js'
 import { canonicalJson, computeCacheKey } from '../domain/cache-key.js'
 import { computeFileSha256 } from '../utils/crypto.js'
-import type { ArtifactInput, ArtifactSink, ArtifactWriteOptions, TemporaryArtifact } from '../providers/provider.js'
+import type { ArtifactInput, ArtifactSink, ArtifactWriteOptions, TemporaryArtifact } from './artifact-port.js'
 import { StagingArtifactSink } from './artifact-sink.js'
 import type { StoragePaths } from './paths.js'
-import { ProcessLock, type ProcessLockScope } from './process-lock.js'
+import type { ProcessLock, ProcessLockScope } from './process-lock.js'
 import { listUseRecords } from './access-gate.js'
 
 const DEFAULT_MAX_JSON_VALIDATION_BYTES = 64 * 1024 * 1024
@@ -233,7 +233,7 @@ export class ResultTransaction implements ArtifactSink {
       throw new TypeError('Result manifests are single-file and must use the transaction request file')
     }
     const cacheKey = computeCacheKey(this.request, file, this.producer.compatibilityKey)
-    return parseMinerUResultManifest({
+    return {
       schemaVersion: 1,
       id: resultIdForCacheKey(cacheKey),
       cacheKey,
@@ -242,7 +242,7 @@ export class ResultTransaction implements ArtifactSink {
       producer: this.producer,
       files: [{ fileId: file.fileId, name: file.name, artifacts }],
       createdAt: Date.now(),
-    })
+    }
   }
 
   async abort(): Promise<void> {
@@ -265,7 +265,7 @@ export class ResultRepository {
   constructor(
     public readonly paths: StoragePaths,
     options: ResultRepositoryOptions = {},
-    public readonly lock?: ProcessLock,
+    public readonly lock: ProcessLock,
   ) {
     this.maxJsonValidationBytes = options.maxJsonValidationBytes ?? DEFAULT_MAX_JSON_VALIDATION_BYTES
     this.maxManifestBytes = options.maxManifestBytes ?? DEFAULT_MAX_MANIFEST_BYTES
@@ -273,7 +273,7 @@ export class ResultRepository {
       throw new TypeError('maxManifestBytes must be a positive safe integer')
     }
     this.maxArtifactBytes = options.maxArtifactBytes
-    this.mutationLock = lock ?? new ProcessLock(paths)
+    this.mutationLock = lock
   }
 
   beginTransaction(
@@ -552,13 +552,6 @@ export class ResultRepository {
 
   manifestAbsolutePath(cacheKey: CacheKey | string): string {
     return this.paths.manifestFile(cacheKey)
-  }
-
-  async quarantine(sourcePath: string, reason = 'quarantine'): Promise<string> {
-    await this.mutationLock.initialize()
-    return await this.mutationLock.withLock(scope =>
-      this.quarantineScoped(this.mutationLock, scope, sourcePath, reason),
-    )
   }
 
   /** Mutation helper for callers already holding the exact authority lock. */

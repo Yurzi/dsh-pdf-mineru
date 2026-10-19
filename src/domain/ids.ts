@@ -1,11 +1,14 @@
 type Brand<T, Name extends string> = T & { readonly __brand: Name }
 
+/** Canonical Provider protocol types; provider enums, parsers and discriminants derive from this list. */
+export const PROVIDER_TYPES = ['self-hosted-v1', 'self-hosted-legacy-v2', 'official-v4'] as const
+export type MinerUProviderId = typeof PROVIDER_TYPES[number]
+
 export type MinerUResultId = Brand<string, 'MinerUResultId'>
 export type MinerUFileId = Brand<string, 'MinerUFileId'>
 export type ProviderConfigId = Brand<string, 'ProviderConfigId'>
 export type CacheKey = Brand<string, 'CacheKey'>
 export type OperationId = Brand<string, 'OperationId'>
-export type SessionId = Brand<string, 'SessionId'>
 
 const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const PREFIXED_ID = /^(?:mr|mf|mp|mo)_[A-Za-z0-9][A-Za-z0-9._-]{0,123}$/
@@ -29,10 +32,6 @@ export const asResultId = (value: string): MinerUResultId => assertPrefixedId(va
 export const asFileId = (value: string): MinerUFileId => assertPrefixedId(value, 'mf') as MinerUFileId
 export const asProviderConfigId = (value: string): ProviderConfigId => assertPrefixedId(value, 'mp') as ProviderConfigId
 export const asOperationId = (value: string): OperationId => assertPrefixedId(value, 'mo') as OperationId
-
-export function asSessionId(value: string): SessionId {
-  return assertSafePathSegment(value, 'sessionId') as SessionId
-}
 
 export function asCacheKey(value: string): CacheKey {
   if (!CACHE_KEY.test(value)) throw new TypeError('cache key must be a lowercase SHA-256 digest')

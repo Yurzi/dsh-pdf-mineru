@@ -1,102 +1,81 @@
-import { afterEach, describe, expect, it } from 'vitest'
-import type { Context } from '@deepseek-ai/cordis'
-import { jsonSchemaToTs, jsonSchemaToPy, renderToolsSdkPy, ToolArgsError, validateJsonSchemaValue, type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools'
-import { registerTools } from '../src/tools.js'
+import { jsonSchemaToTs, renderToolsSdkPy, ToolArgsError, validateJsonSchemaValue, type JsonSchemaNode } from '@deepseek-ai/dsh-tools'
+import { describe, expect, it } from 'vitest'
+import { toolHarness } from './support/tool-harness.js'
+import { resultView } from './support/views.js'
 
-// Deliberately use the real defineTool compiler, unlike the execution mocks.
-const disposers: Array<() => Promise<void>> = []
-afterEach(async () => { await Promise.all(disposers.splice(0).map(dispose => dispose())) })
+// The real defineTool compiler; no tool body runs except where stated.
+const definitions = async () => (await toolHarness()).definitions
 
-function definitions(): Map<string, ToolDefinition> {
-  const registered = new Map<string, ToolDefinition>()
-  const ctx = {
-    tools: {
-      register(definition: ToolDefinition) { registered.set(definition.name, definition); return () => undefined },
-      schemas: () => [],
-    },
-    get: () => undefined,
-  } as unknown as Context
-  disposers.push(registerTools(ctx, () => { throw new Error('Schema checks must not execute a provider') }))
-  return registered
+/** Every object node in a compiled schema, with its path. */
+function* objectNodes(node: unknown, path: string): Generator<[string, Record<string, unknown>]> {
+  if (node === null || typeof node !== 'object') return
+  const record = node as Record<string, unknown>
+  if (record.type === 'object' || (Array.isArray(record.type) && record.type.includes('object'))) yield [path, record]
+  for (const [key, child] of Object.entries(record)) {
+    if (key === 'properties' && child !== null && typeof child === 'object') {
+      for (const [name, property] of Object.entries(child)) yield* objectNodes(property, path + '.' + name)
+    } else if (key === 'items' || key === 'additionalProperties') yield* objectNodes(child, path + '[]')
+  }
+  for (const key of ['oneOf', 'anyOf'] as const) {
+    const variants = record[key]
+    if (Array.isArray(variants)) for (const [index, variant] of variants.entries()) yield* objectNodes(variant, path + '.' + key + '[' + String(index) + ']')
+  }
 }
 
-describe('real DSH schema compilation', () => {
-  it.each(['read_pdf', 'async_parse_pdf'])('%s exposes optional source fields and enforces exactly one at runtime', async name => {
-    const tool = definitions().get(name)!
+describe('compiled tool schemas', () => {
+  it.each(['read_pdf', 'async_parse_pdf'])('%s declares additionalProperties on every object and closes every output object', async name => {
+    const tool = (await definitions()).get(name)!
+    const outputs = [...objectNodes(tool.output.schema, name + '.output')]
+    expect(outputs.length).toBeGreaterThan(name === 'read_pdf' ? 5 : 0)
+    for (const [path, node] of outputs) expect(node.additionalProperties, path).toBe(false)
+    for (const [path, node] of objectNodes(tool.parameters, name + '.parameters')) {
+      if (path !== name + '.parameters') expect(node, path).toHaveProperty('additionalProperties')
+    }
+  })
+
+  it.each(['read_pdf', 'async_parse_pdf'])('%s keeps both source fields optional and enforces exactly one at runtime', async name => {
+    const h = await toolHarness()
+    const tool = h.tool(name as 'read_pdf' | 'async_parse_pdf')
     expect(tool.parameters.required ?? []).not.toContain('file_path')
     expect(tool.parameters.required ?? []).not.toContain('attachment_id')
-    for (const source of [{ file_path: '/source.pdf' }, { attachment_id: 'sha256:12345678' }]) {
-      expect(validateJsonSchemaValue(tool.parameters, source, 'args')).toEqual([])
-    }
-    const exec = { callId: 'schema-check', name, arguments: {}, signal: new AbortController().signal, agent: { session: {} } } as unknown as ToolRunContext
+    expect(jsonSchemaToTs(tool.parameters as JsonSchemaNode)).toMatch(/file_path\?: string[\s\S]*attachment_id\?: string|attachment_id\?: string[\s\S]*file_path\?: string/)
     for (const args of [{}, { file_path: '/source.pdf', attachment_id: 'sha256:12345678' }]) {
-      await expect(tool.execute(args, exec)).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
+      await expect(tool.execute(args, h.exec())).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
     }
-    expect(jsonSchemaToTs(tool.parameters)).toContain('file_path?: string')
-    expect(jsonSchemaToTs(tool.parameters)).toContain('attachment_id?: string')
-    await expect(tool.execute({ attachment_id: '12345678', unexpected: true }, exec)).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
   })
 
-  it('declares cursor as optional and rejects empty successful output values', () => {
-    const tool = definitions().get('read_pdf')!
-    expect(tool.parameters.properties?.cursor).toMatchObject({ type: 'string' })
-    expect(tool.parameters.required ?? []).not.toContain('cursor')
-    expect(validateJsonSchemaValue(tool.output.schema, {}, 'value').length).toBeGreaterThan(0)
-  })
+  it.each([['complete', null], ['not_requested', null], ['partial', 'opaque-token']] as const)(
+    'requires an explicit nullable output cursor (%s)', async (content_status, cursor) => {
+      const schema = (await definitions()).get('read_pdf')!.output.schema
+      const value = resultView({ content_status, cursor })
+      expect(validateJsonSchemaValue(schema, value, 'value')).toEqual([])
+      const { cursor: _omitted, ...missing } = value
+      expect(validateJsonSchemaValue(schema, missing, 'value')).not.toEqual([])
+      expect(validateJsonSchemaValue(schema, { ...value, cursor: 123 }, 'value')).not.toEqual([])
+      expect(validateJsonSchemaValue(schema, {}, 'value')).not.toEqual([])
+    })
 
-  it.each([
-    ['complete', null],
-    ['not_requested', null],
-    ['partial', 'opaque-token'],
-  ] as const)('requires an explicit nullable output cursor for %s', (content_status, cursor) => {
-    const tool = definitions().get('read_pdf')!
-    const value = {
-      state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_fixture',
-      files: [], content_status, cursor, manifest_path: '/cache/manifest.json', output_limit_chars: 2000,
-    }
-    expect(tool.output.schema.required).toContain('cursor')
-    expect(validateJsonSchemaValue(tool.output.schema, value, 'value')).toEqual([])
-    const { cursor: _cursor, ...missingCursor } = value
-    expect(validateJsonSchemaValue(tool.output.schema, missingCursor, 'value').length).toBeGreaterThan(0)
-    expect(validateJsonSchemaValue(tool.output.schema, { ...value, cursor: 123 }, 'value').length).toBeGreaterThan(0)
-  })
-
-  it('generates a required string-or-null cursor in the model-facing output type', () => {
-    const tool = definitions().get('read_pdf')!
-    const outputType = jsonSchemaToTs(tool.output.schema)
-    expect(outputType).toMatch(/cursor: string \| null/)
-    expect(outputType).not.toContain('cursor?:')
-    expect(jsonSchemaToTs(tool.parameters)).toContain('cursor?: string')
-  })
-
-  it('projects both tools into the upstream Python PTC SDK without losing source or cursor contracts', () => {
-    const tools = [...definitions().values()]
+  it('generates a required string-or-null output cursor and an optional input cursor for PTC SDKs', async () => {
+    const tools = [...(await definitions()).values()]
+    const read = tools.find(tool => tool.name === 'read_pdf')!
+    expect(jsonSchemaToTs(read.output.schema)).toMatch(/cursor: string \| null/)
+    expect(jsonSchemaToTs(read.parameters as JsonSchemaNode)).toContain('cursor?: string')
     const sdk = renderToolsSdkPy(tools.map(tool => ({ name: tool.name, description: tool.description, parameters: tool.parameters, output: tool.output.schema })))
-    expect(sdk).toContain('async def read_pdf')
-    expect(sdk).toContain('async def async_parse_pdf')
-    expect(sdk).toContain('attachment_id: NotRequired[str]')
-    expect(sdk).toContain('file_path: NotRequired[str]')
-    expect(sdk).toContain('cursor: str | None')
-    expect(jsonSchemaToPy({ oneOf: [{ type: 'string' }, { type: 'null' }] })).toBe('str | None')
-  })
-
-  it('rejects null input cursor before entering the tool body rather than restarting', async () => {
-    const tool = definitions().get('read_pdf')!
-    const args = { file_path: '/source.pdf', cursor: null }
-    const exec: ToolRunContext = { callId: 'schema-check', name: 'read_pdf', arguments: args, signal: new AbortController().signal }
-    await expect(tool.execute(args, exec)).rejects.toBeInstanceOf(ToolArgsError)
-  })
-
-  it('enforces the immediate native background job contract', () => {
-    const tool = definitions().get('async_parse_pdf')!
-    expect(validateJsonSchemaValue(tool.output.schema, { job_id: 'mineru-1', state: 'running' }, 'value')).toEqual([])
-    expect(validateJsonSchemaValue(tool.output.schema, { state: 'running' }, 'value').length).toBeGreaterThan(0)
-    expect(validateJsonSchemaValue(tool.output.schema, { job_id: 'mineru-1', state: 'running', task_id: 'remote-task' }, 'value').length).toBeGreaterThan(0)
-  })
-
-  it('keeps plugin-authored model schemas in English', () => {
-    for (const tool of definitions().values()) {
-      expect(JSON.stringify({ description: tool.description, parameters: tool.parameters })).not.toMatch(/[\u3400-\u9fff]/u)
+    for (const expected of ['async def read_pdf', 'async def async_parse_pdf', 'attachment_id: NotRequired[str]', 'file_path: NotRequired[str]', 'cursor: str | None']) {
+      expect(sdk).toContain(expected)
     }
+  })
+
+  it('rejects a null input cursor at the schema boundary instead of restarting the read', async () => {
+    const h = await toolHarness()
+    await expect(h.read({ file_path: '/source.pdf', cursor: null })).rejects.toBeInstanceOf(ToolArgsError)
+    expect(h.reader.readContent).not.toHaveBeenCalled()
+  })
+
+  it('accepts only the immediate native job handle as async output', async () => {
+    const schema = (await definitions()).get('async_parse_pdf')!.output.schema
+    expect(validateJsonSchemaValue(schema, { job_id: 'opaque-job', state: 'running' }, 'value')).toEqual([])
+    expect(validateJsonSchemaValue(schema, { state: 'running' }, 'value')).not.toEqual([])
+    expect(validateJsonSchemaValue(schema, { job_id: 'opaque-job', state: 'running', task_id: 'remote-task' }, 'value')).not.toEqual([])
   })
 })

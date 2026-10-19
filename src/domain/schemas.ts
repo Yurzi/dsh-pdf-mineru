@@ -10,16 +10,17 @@
  */
 
 import {
+  PROVIDER_TYPES,
   asCacheKey,
   asFileId,
   asProviderConfigId,
   asResultId,
+  type MinerUProviderId,
 } from './ids.js'
 import {
   ARTIFACT_KINDS,
   CANONICAL_PARSE_REQUEST_SCHEMA_VERSION,
   normalizeArtifactKinds,
-  normalizePageRanges,
   type ArtifactKind,
   type CanonicalParseRequest,
   type CanonicalSourceFile,
@@ -34,11 +35,11 @@ import {
   type ResultProducer,
   type MinerUResultManifest,
 } from './result.js'
-import type { MinerUProviderId } from './errors.js'
+import { normalizePageRanges } from './selection.js'
 
 export const VALID_MODELS = new Set<MinerUModel>(['pipeline', 'vlm'])
 export const VALID_PARSE_METHODS = new Set<ParseMethod>(['auto', 'txt', 'ocr'])
-export const VALID_PROVIDERS = new Set<MinerUProviderId>(['self-hosted-v1', 'self-hosted-legacy-v2', 'official-v4'])
+export const VALID_PROVIDERS: ReadonlySet<string> = new Set<MinerUProviderId>(PROVIDER_TYPES)
 export const VALID_ARTIFACT_KINDS = new Set<ArtifactKind>(ARTIFACT_KINDS)
 
 const SHA256_HEX = /^[a-f0-9]{64}$/
@@ -101,6 +102,7 @@ export function assertNoUrlOrSecret(value: string, label: string): string {
 export function assertSafeFileName(value: unknown, label = 'file name'): string {
   assertNonEmptyString(value, label)
   const str = value as string
+  // oxlint-disable-next-line no-control-regex -- deliberately rejects control characters
   if (str.length > 255 || /[\u0000-\u001f\u007f]/.test(str)) {
     throw new TypeError(`${label} contains control characters or exceeds 255 characters`)
   }
@@ -300,7 +302,7 @@ export function parseResultProducer(input: unknown): ResultProducer {
   assertNoAdditionalProperties(obj, ['providerId', 'providerConfigId', 'compatibilityKey'], 'ResultProducer')
 
   const providerId = obj['providerId']
-  if (typeof providerId !== 'string' || !VALID_PROVIDERS.has(providerId as MinerUProviderId)) {
+  if (typeof providerId !== 'string' || !VALID_PROVIDERS.has(providerId)) {
     throw new TypeError(`invalid ResultProducer.providerId: "${String(providerId)}"`)
   }
 

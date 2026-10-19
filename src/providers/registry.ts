@@ -1,44 +1,24 @@
-import { MinerUError, failure } from '../domain/errors.js'
-import type { ProviderConfigId } from '../domain/ids.js'
-import type { MinerUConfig, ProviderConfig } from '../config.js'
-import { providerById } from '../config.js'
-import { SelfHostedLegacyV2Provider } from './self-hosted-legacy-v2.js'
-import { SelfHostedV1Provider } from './self-hosted-v1.js'
-import { OfficialV4Provider } from './official-v4.js'
-import type { MinerUProvider, ProviderOptions } from './provider.js'
+import type { ProviderConfig } from '../config/model.js'
+import { SelfHostedLegacyV2Provider } from './self-hosted-legacy-v2/index.js'
+import { SelfHostedV1Provider } from './self-hosted-v1/index.js'
+import { OfficialV4Provider } from './official-v4/index.js'
+import type { MinerUProvider } from './contract.js'
 
-export interface ResolvedProvider {
-  readonly provider: MinerUProvider
-  readonly config: ProviderConfig
+export type ProviderFactory = (config: ProviderConfig) => MinerUProvider
+
+type ProviderFactories = {
+  readonly [Type in ProviderConfig['type']]: (config: Extract<ProviderConfig, { type: Type }>) => MinerUProvider
 }
 
-export class ProviderRegistry {
-  constructor(
-    private readonly getConfig: () => MinerUConfig,
-    private readonly options?: ProviderOptions,
-  ) {}
+const providerFactories: ProviderFactories = {
+  'self-hosted-v1': config => new SelfHostedV1Provider(config),
+  'self-hosted-legacy-v2': config => new SelfHostedLegacyV2Provider(config),
+  'official-v4': config => new OfficialV4Provider(config),
+}
 
-  active(): ResolvedProvider {
-    const config = this.getConfig()
-    return this.resolve(config.activeProvider)
-  }
-
-  resolve(configId: ProviderConfigId): ResolvedProvider {
-    const config = providerById(this.getConfig(), configId)
-    if (config === undefined) {
-      throw new MinerUError(failure('PROVIDER_CONFIG_MISSING', `MinerU provider config ${configId} is no longer available`))
-    }
-    return { config, provider: this.create(config) }
-  }
-
-  create(config: ProviderConfig): MinerUProvider {
-    switch (config.type) {
-      case 'self-hosted-v1':
-        return new SelfHostedV1Provider(config, this.options)
-      case 'self-hosted-legacy-v2':
-        return new SelfHostedLegacyV2Provider(config, this.options)
-      case 'official-v4':
-        return new OfficialV4Provider(config, this.options)
-    }
-  }
+/** Build the protocol adapter for one validated provider profile. */
+export const createProvider: ProviderFactory = config => {
+  // The discriminator selects the factory for this exact config variant.
+  const create = providerFactories[config.type] as ProviderFactory
+  return create(config)
 }

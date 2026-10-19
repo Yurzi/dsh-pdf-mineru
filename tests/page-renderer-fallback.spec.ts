@@ -1,107 +1,50 @@
 import { createHash } from 'node:crypto'
-import { testPng } from './fixtures/png.js'
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { readFile, rm, writeFile } from 'node:fs/promises'
+import { describe, expect, it, vi } from 'vitest'
 import {
   MAX_RENDERED_PNG_BYTES,
   createPdfPageRenderer,
   type PdfPageProcessRequest,
-  type PdfPageProcessResult,
   type PdfPageProcessRunner,
-  type RenderPdfPageInput,
-} from '../src/service/page-renderer.js'
+} from '../src/reader/page/page-renderer.js'
+import { testPng } from './fixtures/png.js'
+import { processResult, renderRoot, snapshotPath, unavailable, writeBackendPng } from './support/render-fixtures.js'
 
-function processResult(
-  stdout: Uint8Array | string = '',
-  options: { stderr?: Uint8Array | string; exitCode?: number | null } = {},
-): PdfPageProcessResult {
-  const stderr = options.stderr ?? ''
-  return {
-    exitCode: options.exitCode ?? 0,
-    signal: null,
-    stdout: typeof stdout === 'string' ? Buffer.from(stdout) : stdout,
-    stderr: typeof stderr === 'string' ? Buffer.from(stderr) : stderr,
-  }
+const original = Buffer.from('%PDF-1.7\nimmutable input\n%%EOF\n')
+
+/** Poppler is missing; the PDF.js worker writes the given PNG and reports metadata. */
+const pdfjsOnly = (png: Uint8Array = testPng(), metadata = '{"page_count":3}', exitCode = 0): PdfPageProcessRunner => async request => {
+  if (request.command === 'pdfinfo') throw unavailable('ENOENT')
+  await writeBackendPng(request, png)
+  return processResult(metadata, { exitCode })
 }
 
-const png = testPng
-
-function unavailable(code: 'ENOENT' | 'EACCES' | 'EPERM' | 'ENOEXEC' | 'ENOSYS', detail = 'private executable detail'): Error {
-  return Object.assign(new Error(detail), { code })
-}
-
-function popplerOutput(request: PdfPageProcessRequest): string {
-  const prefix = request.args.at(-1)
-  if (prefix === undefined) throw new Error('pdftoppm output prefix is missing')
-  return prefix + '.png'
-}
-
-function pdfjsPaths(request: PdfPageProcessRequest): { snapshot: string; output: string } {
-  const tail = request.args.slice(-4)
-  if (tail.length !== 4) throw new Error('pdfjs argument tail is incomplete')
-  return { snapshot: tail[0]!, output: tail[1]! }
-}
-
-async function writeBackendPng(request: PdfPageProcessRequest, bytes = png()): Promise<void> {
-  if (request.command === 'pdftoppm') await writeFile(popplerOutput(request), bytes)
-  else if (request.command === 'pdfjs') await writeFile(pdfjsPaths(request).output, bytes)
-  else throw new Error('Unexpected render command: ' + request.command)
+/** A runner that never settles until its signal aborts. */
+const hangingRunner = (calls: PdfPageProcessRequest[]): PdfPageProcessRunner => request => {
+  calls.push(request)
+  return new Promise((_resolve, reject) => {
+    request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true })
+  })
 }
 
 describe('PDF page renderer automatic fallback', () => {
-  let root: string
-  let sourcePath: string
-  const original = Buffer.from('%PDF-1.7\nimmutable input\n%%EOF\n')
-
-  beforeEach(async () => {
-    root = await mkdtemp(join(tmpdir(), 'mineru-page-fallback-test-'))
-    sourcePath = join(root, 'fallback.pdf')
-    await writeFile(sourcePath, original)
-  })
-
-  afterEach(async () => {
-    await rm(root, { recursive: true, force: true })
-  })
-
-  function input(overrides: Partial<RenderPdfPageInput> = {}): RenderPdfPageInput {
-    return {
-      file_path: sourcePath,
-      page: 2,
-      maxFileBytes: 1024 * 1024,
-      signal: new AbortController().signal,
-      ...overrides,
-    }
-  }
-
-  async function expectClean(): Promise<void> {
-    expect(await readdir(root)).toEqual(['fallback.pdf'])
-  }
+  const fx = renderRoot('fallback.pdf', original)
+  const input = fx.input
+  const expectClean = (): Promise<void> => fx.expectOnly()
 
   it.each(['header-only', 'missing-IEND', 'bad-CRC', 'trailing-bytes'])('rejects incomplete or corrupt PNG containers: %s', async corruption => {
-    let bytes = png()
+    let bytes = testPng()
     if (corruption === 'header-only') bytes = bytes.subarray(0, 24)
     if (corruption === 'missing-IEND') bytes = bytes.subarray(0, bytes.length - 12)
     if (corruption === 'bad-CRC') bytes[bytes.length - 1]! ^= 1
     if (corruption === 'trailing-bytes') bytes = Buffer.concat([bytes, Buffer.from([0])])
-    const runProcess: PdfPageProcessRunner = async request => {
-      if (request.command === 'pdfinfo') throw unavailable('ENOENT')
-      await writeBackendPng(request, bytes)
-      return processResult('{"page_count":3}')
-    }
-    await expect(createPdfPageRenderer({ runProcess, temporaryRoot: root })(input())).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
+    await expect(createPdfPageRenderer({ runProcess: pdfjsOnly(bytes), temporaryRoot: fx.root })(input())).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
     await expectClean()
   })
 
   it.each([false, true])('keeps caller cancellation during cleanup, including cleanup failure=%s', async failCleanup => {
     const controller = new AbortController()
-    const runProcess: PdfPageProcessRunner = async request => {
-      if (request.command === 'pdfinfo') throw unavailable('ENOENT')
-      await writeBackendPng(request)
-      return processResult('{"page_count":3}')
-    }
-    const render = createPdfPageRenderer({ runProcess, temporaryRoot: root,
+    const render = createPdfPageRenderer({ runProcess: pdfjsOnly(), temporaryRoot: fx.root,
       removeTemporaryDirectory: async path => {
         controller.abort()
         await rm(path, { recursive: true, force: true })
@@ -121,10 +64,11 @@ describe('PDF page renderer automatic fallback', () => {
       await writeBackendPng(request)
       return processResult('{"page_count":3}')
     }
-    const render = createPdfPageRenderer({ runProcess, temporaryRoot: root, runtimeMs: 200,
+    const render = createPdfPageRenderer({ runProcess, temporaryRoot: fx.root, runtimeMs: 100,
       removeTemporaryDirectory: async path => {
         cleanupEnteredBeforeDeadline = signal?.aborted === false
-        await new Promise(resolve => setTimeout(resolve, 250))
+        // Cleanup outlives the 100 ms operation deadline.
+        await new Promise(resolve => setTimeout(resolve, 150))
         await rm(path, { recursive: true, force: true })
       },
     })
@@ -134,10 +78,8 @@ describe('PDF page renderer automatic fallback', () => {
   })
 
   it.each(['output-io', 'signal'])('reports Poppler %s as execution failure without fallback', async mode => {
-    const runProcess = vi.fn<PdfPageProcessRunner>(async () => ({ ...processResult(),
-      exitCode: mode === 'output-io' ? 2 : null, signal: mode === 'signal' ? 'SIGKILL' : null,
-    }))
-    await expect(createPdfPageRenderer({ runProcess, temporaryRoot: root })(input())).rejects.toMatchObject({ failure: { code: 'PROVIDER_UNAVAILABLE' } })
+    const runProcess = vi.fn<PdfPageProcessRunner>(async () => processResult('', mode === 'output-io' ? { exitCode: 2 } : { exitCode: null, signal: 'SIGKILL' }))
+    await expect(createPdfPageRenderer({ runProcess, temporaryRoot: fx.root })(input())).rejects.toMatchObject({ failure: { code: 'PROVIDER_UNAVAILABLE' } })
     expect(runProcess).toHaveBeenCalledTimes(1)
     await expectClean()
   })
@@ -152,7 +94,7 @@ describe('PDF page renderer automatic fallback', () => {
       await writeBackendPng(request)
       return processResult(request.command === 'pdfjs' ? '{"page_count":3}' : '')
     }
-    const render = createPdfPageRenderer({ runProcess, temporaryRoot: root })
+    const render = createPdfPageRenderer({ runProcess, temporaryRoot: fx.root })
     expect((await render(input())).renderer).toBe('pdfjs')
     installed = true
     expect((await render(input())).renderer).toBe('poppler')
@@ -160,12 +102,7 @@ describe('PDF page renderer automatic fallback', () => {
   })
 
   it.each(['{}', '{"page_count":0}', '{"page_count":1000001}', '{"page_count":3,"path":"private"}', 'not-json'])('rejects malformed worker metadata: %s', async metadata => {
-    const runProcess: PdfPageProcessRunner = async request => {
-      if (request.command === 'pdfinfo') throw unavailable('ENOENT')
-      await writeBackendPng(request)
-      return processResult(metadata)
-    }
-    await expect(createPdfPageRenderer({ runProcess, temporaryRoot: root })(input())).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
+    await expect(createPdfPageRenderer({ runProcess: pdfjsOnly(testPng(), metadata), temporaryRoot: fx.root })(input())).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
     await expectClean()
   })
 
@@ -181,7 +118,7 @@ describe('PDF page renderer automatic fallback', () => {
       throw new Error('pdfjs must not run while Poppler is available')
     }
 
-    const rendered = await createPdfPageRenderer({ runProcess, temporaryRoot: root })(input())
+    const rendered = await createPdfPageRenderer({ runProcess, temporaryRoot: fx.root })(input())
 
     expect(rendered.renderer).toBe('poppler')
     expect(calls.map(call => call.command)).toEqual(['pdfinfo', 'pdftoppm'])
@@ -198,18 +135,15 @@ describe('PDF page renderer automatic fallback', () => {
       if (request.command === missing) throw unavailable('ENOENT')
       if (request.command === 'pdfinfo') return processResult('Pages: 3\n')
       if (request.command === 'pdfjs') {
-        const tail = request.args.slice(-4)
-        expect(tail).toHaveLength(4)
-        expect(tail[0]).toMatch(/source\.pdf$/)
-        expect(tail[1]).toMatch(/page\.png$/)
-        expect(tail.slice(2)).toEqual(['2', String(input().maxFileBytes)])
+        expect(snapshotPath(request)).toMatch(/source\.pdf$/)
+        expect(request.args.slice(-3)).toEqual([expect.stringMatching(/page\.png$/), '2', String(input().maxFileBytes)])
         await writeBackendPng(request)
         return processResult(JSON.stringify({ page_count: 3 }))
       }
       throw new Error('Unexpected command ' + request.command)
     }
 
-    const rendered = await createPdfPageRenderer({ runProcess, temporaryRoot: root })(input())
+    const rendered = await createPdfPageRenderer({ runProcess, temporaryRoot: fx.root })(input())
 
     expect(rendered.renderer).toBe('pdfjs')
     expect(rendered.page_count).toBe(3)
@@ -227,7 +161,7 @@ describe('PDF page renderer automatic fallback', () => {
       return processResult('{"page_count":3}')
     }
 
-    await expect(createPdfPageRenderer({ runProcess, temporaryRoot: root })(input())).resolves.toMatchObject({
+    await expect(createPdfPageRenderer({ runProcess, temporaryRoot: fx.root })(input())).resolves.toMatchObject({
       renderer: 'pdfjs', page_count: 3,
     })
     expect(calls.map(call => call.command)).toEqual(['pdfinfo', 'pdfjs'])
@@ -241,14 +175,11 @@ describe('PDF page renderer automatic fallback', () => {
       throw unavailable('ENOENT', request.command === 'pdfjs' ? leakedPdfjs : leakedPoppler)
     }
 
-    const error = await createPdfPageRenderer({ runProcess, temporaryRoot: root })(input())
-      .then(() => undefined, reason => reason)
+    const error = await createPdfPageRenderer({ runProcess, temporaryRoot: fx.root })(input())
+      .then(() => undefined, (reason: unknown) => reason)
 
-    expect(error).toMatchObject({ failure: { code: 'UNSUPPORTED_OPTION' } })
-    expect(error.failure.message).toMatch(/Poppler|pdfjs/i)
-    expect(error.failure.message).not.toContain(leakedPoppler)
-    expect(error.failure.message).not.toContain(leakedPdfjs)
-    expect(error.failure.message).not.toContain(root)
+    expect(error).toMatchObject({ failure: { code: 'UNSUPPORTED_OPTION', message: expect.stringMatching(/Poppler|pdfjs/i) } })
+    for (const secret of [leakedPoppler, leakedPdfjs, fx.root]) expect(JSON.stringify(error) + String(error)).not.toContain(secret)
     await expectClean()
   })
 
@@ -290,7 +221,7 @@ describe('PDF page renderer automatic fallback', () => {
     },
   ])('does not fall back for $name', async ({ runner, expected }) => {
     const wrapped = vi.fn<PdfPageProcessRunner>(runner)
-    await expect(createPdfPageRenderer({ runProcess: wrapped, temporaryRoot: root })(input())).rejects.toMatchObject({
+    await expect(createPdfPageRenderer({ runProcess: wrapped, temporaryRoot: fx.root })(input())).rejects.toMatchObject({
       failure: { code: expected },
     })
     expect(wrapped.mock.calls.some(([request]) => request.command === 'pdfjs')).toBe(false)
@@ -304,7 +235,7 @@ describe('PDF page renderer automatic fallback', () => {
       throw Object.assign(new Error('generic process failure'), { code: 'EINVAL' })
     }
 
-    await expect(createPdfPageRenderer({ runProcess, temporaryRoot: root })(input())).rejects.toMatchObject({
+    await expect(createPdfPageRenderer({ runProcess, temporaryRoot: fx.root })(input())).rejects.toMatchObject({
       failure: { code: 'PROVIDER_UNAVAILABLE' },
     })
     expect(calls.map(call => call.command)).toEqual(['pdfinfo'])
@@ -314,14 +245,8 @@ describe('PDF page renderer automatic fallback', () => {
   it('does not fall back after caller cancellation', async () => {
     const controller = new AbortController()
     const calls: PdfPageProcessRequest[] = []
-    const runProcess: PdfPageProcessRunner = request => {
-      calls.push(request)
-      return new Promise((_resolve, reject) => {
-        request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true })
-      })
-    }
-    const pending = createPdfPageRenderer({ runProcess, temporaryRoot: root })(input({ signal: controller.signal }))
-    while (calls.length === 0) await new Promise(resolve => setImmediate(resolve))
+    const pending = createPdfPageRenderer({ runProcess: hangingRunner(calls), temporaryRoot: fx.root })(input({ signal: controller.signal }))
+    await vi.waitFor(() => expect(calls).toHaveLength(1))
     controller.abort()
 
     await expect(pending).rejects.toMatchObject({ failure: { code: 'CANCELLED' } })
@@ -331,14 +256,7 @@ describe('PDF page renderer automatic fallback', () => {
 
   it('does not fall back when the whole-operation deadline expires', async () => {
     const calls: PdfPageProcessRequest[] = []
-    const runProcess: PdfPageProcessRunner = request => {
-      calls.push(request)
-      return new Promise((_resolve, reject) => {
-        request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true })
-      })
-    }
-
-    await expect(createPdfPageRenderer({ runProcess, temporaryRoot: root, runtimeMs: 20 })(input())).rejects.toMatchObject({
+    await expect(createPdfPageRenderer({ runProcess: hangingRunner(calls), temporaryRoot: fx.root, runtimeMs: 20 })(input())).rejects.toMatchObject({
       failure: { code: 'PROVIDER_UNAVAILABLE' },
     })
     expect(calls.map(call => call.command)).toEqual(['pdfinfo'])
@@ -351,23 +269,22 @@ describe('PDF page renderer automatic fallback', () => {
       calls.push(request)
       if (request.command === 'pdfinfo') return processResult('Pages: 3\n')
       if (request.command === 'pdftoppm') {
-        await writeFile(sourcePath, 'replacement bytes')
+        await writeFile(fx.sourcePath, 'replacement bytes')
         throw unavailable('ENOENT')
       }
-      const { snapshot } = pdfjsPaths(request)
-      expect(await readFile(snapshot)).toEqual(original)
+      expect(await readFile(snapshotPath(request))).toEqual(original)
       await writeBackendPng(request)
       return processResult('{"page_count":3}')
     }
 
-    const rendered = await createPdfPageRenderer({ runProcess, temporaryRoot: root })(input())
+    const rendered = await createPdfPageRenderer({ runProcess, temporaryRoot: fx.root })(input())
 
     expect(rendered).toMatchObject({
       renderer: 'pdfjs',
       sha256: createHash('sha256').update(original).digest('hex'),
     })
     expect(calls.map(call => call.command)).toEqual(['pdfinfo', 'pdftoppm', 'pdfjs'])
-    expect(await readFile(sourcePath, 'utf8')).toBe('replacement bytes')
+    expect(await readFile(fx.sourcePath, 'utf8')).toBe('replacement bytes')
     await expectClean()
   })
 
@@ -375,14 +292,15 @@ describe('PDF page renderer automatic fallback', () => {
     const timeouts: number[] = []
     const runProcess: PdfPageProcessRunner = async request => {
       timeouts.push(request.timeoutMs)
-      await new Promise(resolve => setTimeout(resolve, 20))
+      // Let measurable time pass so each process receives a strictly smaller remainder.
+      await new Promise(resolve => setTimeout(resolve, 5))
       if (request.command === 'pdfinfo') return processResult('Pages: 3\n')
       if (request.command === 'pdftoppm') throw unavailable('ENOENT')
       await writeBackendPng(request)
       return processResult('{"page_count":3}')
     }
 
-    await createPdfPageRenderer({ runProcess, temporaryRoot: root, runtimeMs: 1000 })(input())
+    await createPdfPageRenderer({ runProcess, temporaryRoot: fx.root, runtimeMs: 1000 })(input())
 
     expect(timeouts).toHaveLength(3)
     expect(timeouts[1]!).toBeLessThan(timeouts[0]!)
@@ -404,14 +322,12 @@ describe('PDF page renderer automatic fallback', () => {
       await writeBackendPng(request)
       return processResult('{"page_count":3}')
     }
-    const render = createPdfPageRenderer({ runProcess, temporaryRoot: root, maxConcurrency: 2 })
+    const render = createPdfPageRenderer({ runProcess, temporaryRoot: fx.root, maxConcurrency: 2 })
     const pending = [render(input()), render(input()), render(input())]
 
-    while (gates.length < 2) await new Promise(resolve => setImmediate(resolve))
-    expect(peakFallbacks).toBe(2)
-    expect(gates).toHaveLength(2)
+    await vi.waitFor(() => expect(gates).toHaveLength(2))
     gates.splice(0).forEach(release => release())
-    while (gates.length < 1) await new Promise(resolve => setImmediate(resolve))
+    await vi.waitFor(() => expect(gates).toHaveLength(1))
     gates.splice(0).forEach(release => release())
 
     await expect(Promise.all(pending)).resolves.toEqual(expect.arrayContaining([
@@ -422,13 +338,7 @@ describe('PDF page renderer automatic fallback', () => {
   })
 
   it('rejects an invalid PNG from fallback and cleans all private files', async () => {
-    const runProcess: PdfPageProcessRunner = async request => {
-      if (request.command === 'pdfinfo') throw unavailable('ENOENT')
-      await writeBackendPng(request, Buffer.from('not a PNG'))
-      return processResult('{"page_count":3}')
-    }
-
-    await expect(createPdfPageRenderer({ runProcess, temporaryRoot: root })(input())).rejects.toMatchObject({
+    await expect(createPdfPageRenderer({ runProcess: pdfjsOnly(Buffer.from('not a PNG')), temporaryRoot: fx.root })(input())).rejects.toMatchObject({
       failure: { code: 'INVALID_REQUEST' },
     })
     await expectClean()
@@ -440,13 +350,7 @@ describe('PDF page renderer automatic fallback', () => {
     [22, 'RESULT_TOO_LARGE'],
     [23, 'PROVIDER_UNAVAILABLE'],
   ] as const)('maps pdfjs worker exit %i without accepting partial output', async (exitCode, expectedCode) => {
-    const runProcess: PdfPageProcessRunner = async request => {
-      if (request.command === 'pdfinfo') throw unavailable('ENOENT')
-      await writeBackendPng(request)
-      return processResult('{"page_count":3}', { exitCode })
-    }
-
-    await expect(createPdfPageRenderer({ runProcess, temporaryRoot: root })(input())).rejects.toMatchObject({
+    await expect(createPdfPageRenderer({ runProcess: pdfjsOnly(testPng(), '{"page_count":3}', exitCode), temporaryRoot: fx.root })(input())).rejects.toMatchObject({
       failure: { code: expectedCode },
     })
     await expectClean()
@@ -456,19 +360,11 @@ describe('PDF page renderer automatic fallback', () => {
     const removeTemporaryDirectory = vi.fn(async (path: string) => {
       throw new Error('cleanup failed at ' + path)
     })
-    const runProcess: PdfPageProcessRunner = async request => {
-      if (request.command === 'pdfinfo') throw unavailable('ENOENT')
-      await writeBackendPng(request)
-      return processResult('{"page_count":3}')
-    }
+    const error = await createPdfPageRenderer({ runProcess: pdfjsOnly(), temporaryRoot: fx.root, removeTemporaryDirectory })(input())
+      .then(() => undefined, (reason: unknown) => reason)
 
-    const error = await createPdfPageRenderer({ runProcess, temporaryRoot: root, removeTemporaryDirectory })(input())
-      .then(() => undefined, reason => reason)
-
-    expect(error).toMatchObject({
-      failure: { code: 'PROVIDER_UNAVAILABLE', message: 'Failed to remove temporary PDF page-rendering data' },
-    })
-    expect(error.failure.message).not.toContain(root)
+    expect(error).toMatchObject({ failure: { code: 'PROVIDER_UNAVAILABLE', retryable: true } })
+    expect(JSON.stringify(error) + String(error)).not.toContain(fx.root)
     expect(removeTemporaryDirectory).toHaveBeenCalledTimes(1)
   })
 
@@ -482,7 +378,7 @@ describe('PDF page renderer automatic fallback', () => {
       return processResult('{"page_count":3}')
     }
 
-    await createPdfPageRenderer({ runProcess, temporaryRoot: root })(input())
+    await createPdfPageRenderer({ runProcess, temporaryRoot: fx.root })(input())
     expect(requests.map(request => request.command)).toEqual(['pdfinfo', 'pdfjs'])
     await expectClean()
   })

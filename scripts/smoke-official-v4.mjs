@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import { chmod, lstat, mkdtemp, readdir, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, resolve } from 'node:path'
+import { resolve } from 'node:path'
 
 function usage() {
   console.log(`Usage:
@@ -81,11 +81,12 @@ async function makeWritable(path) {
 function createContext(definitions) {
   const discard = () => undefined
   return {
+    workingDirectory: { ensure: async () => process.cwd() },
     tools: {
       register(definition) { definitions.push(definition); return discard },
       schemas() { return [] },
     },
-    get() { return undefined },
+    get(name) { return name === 'settings' ? { configure: () => discard } : undefined },
     inject() { return discard },
     effect() { return discard },
     on() { return discard },

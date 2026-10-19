@@ -1,16 +1,6 @@
-import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ConnectionRpcHandler } from '@deepseek-ai/dsh-client-connection'
-
-interface HttpRoute {
-  readonly kind: string
-  readonly path: string
-  readonly handler: (request: IncomingMessage, response: ServerResponse) => void | Promise<void>
-}
-
-interface RouteRegistrar {
-  register(route: HttpRoute): () => void | Promise<void>
-}
+import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 
 /** Accept only a bare loopback Host authority, never URL parts or trusted LAN names. */
 function isLoopbackAuthority(host: string | string[] | undefined): boolean {
@@ -20,20 +10,13 @@ function isLoopbackAuthority(host: string | string[] | undefined): boolean {
   return !match[1]!.startsWith('127.') || match[1]!.split('.').every(part => Number(part) <= 255)
 }
 
-/**
- * Retain channel-local loopback policy on 0.2.0-rc.2, whose native rpc.handle no longer
- * accepts an authority option. Only this caller's route registration is wrapped;
- * the real Connection still owns authentication, envelopes, and cancellation.
- */
+/** Guard this caller’s Host authority; Connection owns authentication and transport. */
 export function registerLoopbackRpc(ctx: Context, channel: string, handler: ConnectionRpcHandler): () => Promise<void> {
-  // Read through the injected service before extending the caller. Cordis 4's
-  // service getter shadows dependency lookup to the Connection provider, which
-  // need not inject webServer on 0.2.0-rc.2. A local Context metadata override makes
-  // the narrow registrar visible there without changing any global service.
-  const webServer = (ctx as Context & { webServer: RouteRegistrar }).webServer
+  // Capture before extending: service lookup shadows the caller’s dependencies.
+  const webServer = ctx.webServer
   const scoped = ctx.extend({
     webServer: {
-      register(route: HttpRoute) {
+      register(route: WebRoute) {
         return webServer.register({
           ...route,
           handler(request, response) {
@@ -46,7 +29,7 @@ export function registerLoopbackRpc(ctx: Context, channel: string, handler: Conn
           },
         })
       },
-    } satisfies RouteRegistrar,
+    } satisfies Pick<Context['webServer'], 'register'>,
   })
   return scoped.connection.rpc.handle(channel, handler)
 }

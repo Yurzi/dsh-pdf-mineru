@@ -8,18 +8,16 @@ import { AttachmentId, type AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { HostConnectionService, serverResponseSchema } from '@deepseek-ai/dsh-client-connection'
+import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as mineru from '../src/index.js'
-import { defaultMinerUConfig } from '../src/config.js'
-import { RPC_CHANNEL } from '../src/rpc.js'
+import { defaultMinerUConfig } from '../src/config/parse.js'
+import { RPC_CHANNEL } from '../src/contracts/rpc.js'
+import { nonOwnerPeer } from './support/rpc-harness.js'
 
-// Intentionally no module mocks: strict Cordis service tracing and the installed
-// 0.2.0-rc.2 connection adapter are the behavior under test, not a fake ctx.inject.
-interface Route {
-  kind: string
-  path: string
-  handler(req: IncomingMessage, res: ServerResponse): Promise<void>
-}
+// Real Cordis service tracing and Connection transport; no module mocks.
+type Route = WebRoute
+type BrowserAuth = ConstructorParameters<typeof HostConnectionService>[2]
 
 const cleanups: Array<() => Promise<void>> = []
 afterEach(async () => {
@@ -54,8 +52,9 @@ async function hostFixture(trustedHosts: readonly string[] = []) {
   // Provide services through Cordis, never assign properties onto the root:
   // own properties would bypass the strict injected-service lookup.
   ctx.provide('tools', { register: registerTool })
-  ctx.provide('settings', { configure: configureSettings, replace: vi.fn(async () => undefined) })
+  ctx.provide('settings', { configure: configureSettings, replace: vi.fn(async () => undefined), describe: () => [] })
   ctx.provide('jobs', { start: startJob })
+  ctx.provide('workingDirectory', { ensure: vi.fn(async () => root) })
 
   const routes = new Map<string, Route>()
   const routeDisposers: Array<ReturnType<typeof vi.fn>> = []
@@ -76,10 +75,13 @@ async function hostFixture(trustedHosts: readonly string[] = []) {
   // store, credentials, listening socket, or live provider is used. Host/Origin
   // validation and the HTTP-to-Fetch RPC bridge remain the real implementation.
   const isAuthenticated = vi.fn(() => true)
+  const browserAuth = {
+    isAuthenticated, authenticateApi: vi.fn(() => undefined),
+  } satisfies Pick<BrowserAuth, 'isAuthenticated' | 'authenticateApi'>
+  let connection!: HostConnectionService
   const provideConnection = () => ctx.plugin((owner: Context) => {
-    new HostConnectionService(owner, trustedHosts, {
-      isAuthenticated,
-    } as unknown as ConstructorParameters<typeof HostConnectionService>[2])
+    // BrowserAuth is a class with private state; the stub satisfies its used public surface above.
+    connection = new HostConnectionService(owner, trustedHosts, browserAuth as Pick<BrowserAuth, keyof typeof browserAuth> as BrowserAuth)
   })
   const settle = async () => {
     // A plugin's await() does not await its ctx.inject children. Walk every
@@ -103,7 +105,7 @@ async function hostFixture(trustedHosts: readonly string[] = []) {
   return {
     ctx, config, errors, definitions, registerTool, toolDisposers, removePresentation,
     configureSettings, routes, registerRoute, routeDisposers, isAuthenticated,
-    provideWebServer, provideConnection, settle, start, expectTools,
+    provideWebServer, provideConnection, getConnection: () => connection, settle, start, expectTools,
   }
 }
 
@@ -132,14 +134,14 @@ async function request(route: Route, options: { host?: string | string[] | null;
   }
 }
 
-describe('installed host compatibility (0.2.0-rc.2 RPC injection)', () => {
+describe('installed host compatibility', () => {
   it.each([false, true])('injects optional sibling attachments (late=%s), clears removed services, and retains tools', async late => {
     const host = await hostFixture()
     const message = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'file', attachment: { attachmentId: AttachmentId('sha256:' + 'a'.repeat(64)), name: 'paper.pdf', bytes: 100 } }] })
     const ref = message.content[0]!.type === 'file' ? message.content[0]!.attachment : undefined
-    const fileHostPath = vi.fn(() => join(host.config.storage.storageRoot, 'absent.pdf'))
+    const fileHostPath = vi.fn<AttachmentStore['fileHostPath']>(() => join(host.config.storage.storageRoot, 'absent.pdf'))
     const provide = () => host.ctx.plugin((owner: Context) => {
-      owner.provide('attachments', { fileHostPath } as unknown as AttachmentStore)
+      owner.provide('attachments', { fileHostPath } satisfies Pick<AttachmentStore, 'fileHostPath'>)
     })
     let provider = late ? undefined : provide()
     if (provider) await provider.await()
@@ -188,9 +190,9 @@ describe('installed host compatibility (0.2.0-rc.2 RPC injection)', () => {
     expect(response.status).toBe(200)
     expect(JSON.parse(response.body)).toEqual({
       type: 'server-response', rpcId: 'fixture-rpc',
-      result: { ok: true, value: { config: host.config } },
+      result: { ok: true, value: { config: host.config, revision: null } },
     })
-    // 0.2.0-rc.2 enforces trust inside the connection handler, not a route.authority
+    // The host enforces trust inside the connection handler, not a route.authority
     // field. With no extra trusted hosts, a non-loopback authority is refused.
     expect(await request(route, { host: 'remote.example:3080' })).toEqual({ status: 403, body: 'forbidden' })
     expect(host.isAuthenticated).toHaveBeenCalledOnce()
@@ -324,22 +326,28 @@ describe('installed host compatibility (0.2.0-rc.2 RPC injection)', () => {
     expect(host.errors).toEqual([])
   })
 
-  it.each([
-    { label: 'old connection-only', inject: ['connection'] },
-    { label: 'plain connection + webServer', inject: ['connection', 'webServer'] },
-  ])('negative control: $label scope fails without the caller-local registrar', async ({ inject }) => {
+  it('rejects a real non-owner Peer through the registered HTTP handler', async () => {
     const host = await hostFixture()
     host.provideWebServer()
     await host.provideConnection().await()
-    // Reproduce both the old missing dependency and Cordis's provider-shadow
-    // lookup with both dependencies declared. Root-owned services hide these
-    // failures; the scoped registrar is necessary even for the latter case.
-    const legacy = host.ctx.inject(inject, ctx => {
-      return ctx.connection.rpc.handle(RPC_CHANNEL, async () => ({ ok: true, value: {} }))
-    })
-    const failure = await legacy.await().then(() => undefined, error => error as Error)
-    expect(failure?.message).toBe('cannot get property "webServer" without inject')
-    expect(host.registerRoute).not.toHaveBeenCalled()
-    await legacy.dispose()
+    await host.start()
+    const connection = host.getConnection()
+    const peer = connection.createPeer({ principal: nonOwnerPeer().principal })
+    try {
+      // Bind transport admission to a peer minted by the real Connection service.
+      const admission = vi.spyOn(connection, 'admit').mockReturnValue({ peer })
+      const response = await request(host.routes.get(RPC_CHANNEL)!, { endpoint: 'mineru/config.set' })
+      expect(response.status).toBe(200)
+      expect(serverResponseSchema.parse(JSON.parse(response.body))).toEqual({
+        type: 'server-response', rpcId: 'fixture-rpc',
+        result: { ok: false, error: { code: 'mineru/forbidden', message: 'Owner access required', details: {} } },
+      })
+      admission.mockRestore()
+      const ownerResponse = await request(host.routes.get(RPC_CHANNEL)!)
+      expect(serverResponseSchema.parse(JSON.parse(ownerResponse.body)).result.ok).toBe(true)
+      expect(host.errors).toEqual([])
+    } finally {
+      await peer.dispose()
+    }
   })
 })

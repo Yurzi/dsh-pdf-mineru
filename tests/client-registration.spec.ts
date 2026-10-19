@@ -1,6 +1,25 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { SlotCore } from '@deepseek-ai/dsh-client-ui-slots'
 import { describe, expect, it, vi } from 'vitest'
+
+vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({
+  Button: () => null,
+  Input: () => null,
+  Switch: () => null,
+  SegmentedControl: () => null,
+  SegmentedTabs: () => null,
+  StateDot: () => null,
+  Tag: () => null,
+  Modal: () => null,
+  PathLabel: () => null,
+  Checkbox: () => null,
+  IconCheckOutlineRegular: () => null,
+  IconRefreshOutlineRegular: () => null,
+  IconChevronDownOutlineRegular: () => null,
+  IconCheckCircleOutlineRegular: () => null,
+  IconTrashOutlineRegular: () => null,
+}))
+
 import { apply } from '../src/client/index.js'
 import { SettingsPage } from '../src/client/SettingsPage.js'
 import { en, NS, zh } from '../src/client/locales.js'
@@ -26,7 +45,7 @@ function fixture() {
   const declare = () => core.register({
     name: 'root',
     children: { 'plugins.bundle.config': { kind: 'keyed', scope: 'root' } },
-  }, () => null)
+  }, (_props: { renderSlot: unknown }) => null)
   return { core, ctx, declare, inject, registerLocale, removeLocale, effects, rpc, credentials }
 }
 

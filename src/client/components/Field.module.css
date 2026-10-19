@@ -1,0 +1,251 @@
+/* Shared settings layout: section heading, card, and hairline-separated rows. */
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sectionHead {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 4px;
+}
+
+.sectionTitle {
+  margin: 0;
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-primary);
+}
+
+.sectionHint,
+.hint,
+.note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.card {
+  container-type: inline-size;
+  box-sizing: border-box;
+  padding: 4px 16px;
+  border: 0.5px solid var(--dsw-alias-settings-card-stroke);
+  border-radius: var(--dsw-radius-xl);
+  background: var(--dsw-alias-settings-card-fill);
+}
+
+.row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px 16px;
+  padding: 12px 0;
+}
+
+.card > * + *,
+.group > * + * {
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+}
+
+.footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding: 12px 0;
+}
+
+.group {
+  display: flex;
+  flex-direction: column;
+}
+
+.stacked {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.label {
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-primary);
+}
+
+.control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.stacked .control {
+  justify-content: flex-start;
+}
+
+.note {
+  flex-basis: 100%;
+  text-align: end;
+  color: var(--dsw-alias-state-warn-label);
+}
+
+.stacked .note {
+  text-align: start;
+}
+
+.error {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 12px;
+  line-height: 18px;
+  text-align: end;
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.input {
+  flex: 1 1 240px;
+  box-sizing: border-box;
+  min-width: 0;
+}
+
+.selectWrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.select {
+  appearance: none;
+  box-sizing: border-box;
+  min-width: 200px;
+  height: 32px;
+  padding: 0 32px 0 10px;
+  border: 0.5px solid var(--dsw-alias-border-l4);
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-layer-1);
+  font: inherit;
+  font-size: 14px;
+  line-height: 22px;
+  color: var(--dsw-alias-label-primary);
+  cursor: pointer;
+}
+
+.select:focus-visible {
+  outline: none;
+  border-color: var(--dsw-alias-state-business-primary);
+}
+
+.selectIcon {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  pointer-events: none;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.number {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.numberInput {
+  width: 112px;
+  box-sizing: border-box;
+}
+
+.unit {
+  min-width: 48px;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.sectionToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 -4px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: var(--dsw-radius-sm);
+  background: none;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.disclosure {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 4px;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: var(--dsw-radius-sm);
+  background: none;
+  font: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+}
+
+.disclosure:hover {
+  color: var(--dsw-alias-label-primary);
+}
+
+.sectionToggle:focus-visible,
+.disclosure:focus-visible {
+  outline: var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+  outline-offset: 1px;
+}
+
+.chevron {
+  transform: rotate(-90deg);
+  transition: transform 160ms ease;
+}
+
+.sectionToggle[aria-expanded='true'] .chevron,
+.disclosure[aria-expanded='true'] .chevron {
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chevron {
+    transition: none;
+  }
+}
+
+@container (max-width: 480px) {
+  .row:not(.compact) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .row:not(.compact) .control {
+    justify-content: flex-start;
+  }
+
+  .selectWrap,
+  .select {
+    width: 100%;
+  }
+
+  .note,
+  .error {
+    text-align: start;
+  }
+}

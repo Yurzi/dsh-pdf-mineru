@@ -1,0 +1,142 @@
+/** Bounded model delivery, independent of provider/cache representation. */
+import { createHash } from 'node:crypto'
+import { MinerUError, failure } from '../domain/errors.js'
+import type { FocusKind, ReadCursorPayload } from '../domain/selection.js'
+import { safeStringSlice, truncateAtCleanBoundary } from '../utils/text.js'
+import { cursorForRemainder } from './read-cursor.js'
+import { formatResultProse } from './prose.js'
+import type { ImageCandidateView, ProjectedBlockRange, ReadDiagnostic, ResultView, ShortenedMetadata, VerificationHint } from './views.js'
+
+/** Below DSH console object's 10,000-character string preview limit. */
+export const MAX_MODEL_MARKDOWN_CHARS = 8000
+export const MAX_MODEL_RESPONSE_BYTES = 48000
+
+export function boundedWarnings(warnings: readonly string[]): string[] {
+  const unique = [...new Set(warnings)]
+  const result = unique.slice(0, 8).map(warning => safeStringSlice(warning, 240))
+  if (unique.length > 8) result.push('[DIAGNOSTICS_SHORTENED] More quality warnings exist; narrow pages or block_id.')
+  return result
+}
+
+export function fitsReadBudget(view: ResultView): boolean {
+  const json = JSON.stringify(view)
+  const prose = formatResultProse(view)
+  return json.length <= view.output_limit_chars && prose.length <= view.output_limit_chars
+    && Buffer.byteLength(json, 'utf8') <= MAX_MODEL_RESPONSE_BYTES && Buffer.byteLength(prose, 'utf8') <= MAX_MODEL_RESPONSE_BYTES
+}
+
+/** Last-resort metadata degradation never changes text, status, cursor, or image records. */
+export function compactReadMetadata(value: ResultView): ResultView {
+  let view = value
+  for (const key of ['summary', 'provenance', 'verification_hints', 'diagnostics', 'warnings'] as const) {
+    if (fitsReadBudget(view)) break
+    if (view[key] === undefined) continue
+    const { [key]: _removed, ...rest } = view
+    view = { ...rest, metadata_shortened: [...new Set([...(view.metadata_shortened ?? []), key])] }
+  }
+  return view
+}
+
+/**
+ * Final response ladder after images are attached: drop image candidate records,
+ * then summary/outline, then artifact records, then compact metadata.
+ */
+export function fitToBudget(value: ResultView): ResultView {
+  let fitted = value
+  const warn = (message: string): void => { fitted = { ...fitted, warnings: boundedWarnings([message, ...(fitted.warnings ?? [])]) } }
+  if (fitsReadBudget(fitted)) return fitted
+  if (fitted.ordered_images?.length) {
+    const removed = fitted.ordered_images.length
+    const attached = fitted.inlined_images?.length ?? 0
+    const { ordered_images: _ordered, ...rest } = fitted
+    fitted = { ...rest, visuals: { listed: attached, attached, omitted: 0, scope: 'chunk' } }
+    warn('[VISUAL_METADATA_SHORTENED] Removed ' + removed + ' image candidate records to fit; ' + attached + ' attachments remain. Use block IDs to inspect omitted candidates.')
+    if (fitsReadBudget(fitted)) return fitted
+  }
+  if (fitted.summary !== undefined || fitted.toc !== undefined) {
+    const { summary: _summary, toc: _toc, ...rest } = fitted
+    fitted = { ...rest, metadata_shortened: [...new Set([...(rest.metadata_shortened ?? []), 'summary' as const])] }
+    warn('[SUMMARY_SHORTENED] Summary metadata was omitted to fit the response; request a narrower selection.')
+    if (fitsReadBudget(fitted)) return fitted
+  }
+  if (fitted.files.some(file => file.artifacts.length > 0)) {
+    fitted = { ...fitted, files: fitted.files.map(file => ({ ...file, artifacts: [], ...(file.artifacts.length ? { artifacts_truncated: true } : {}) })) }
+    warn('[ARTIFACT_METADATA_SHORTENED] Artifact records were omitted to fit the response; use focus: artifacts separately.')
+    if (fitsReadBudget(fitted)) return fitted
+  }
+  fitted = compactReadMetadata(fitted)
+  if (fitsReadBudget(fitted)) return fitted
+  throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds the output budget; narrow the selection or increase maxInlineChars'))
+}
+
+/** An artifact-only listing is the requested content: shorten its records silently, then compact. */
+export function fitArtifactListing(view: ResultView): ResultView {
+  if (fitsReadBudget(view)) return view
+  const compacted = compactReadMetadata({
+    ...view, files: view.files.map(file => ({ ...file, artifacts: [], ...(file.artifacts.length > 0 ? { artifacts_truncated: true } : {}) })),
+  })
+  if (!fitsReadBudget(compacted)) throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds configured model output limit'))
+  return compacted
+}
+
+export function deliverReadChunk(options: {
+  base: ResultView; text: string; focus: ReadonlySet<FocusKind>; images: readonly ImageCandidateView[];
+  cursor?: ReadCursorPayload; selection?: { block?: string; query?: string }; ranges?: readonly ProjectedBlockRange[]; identity?: string; signal?: AbortSignal; inlineImages?: boolean;
+  diagnosticsForBlocks?: (ids: ReadonlySet<string>) => readonly ReadDiagnostic[];
+  verificationHints?: readonly VerificationHint[]; scopeDiagnostics?: readonly ReadDiagnostic[];
+}): ResultView {
+  const { base, text, focus, images, cursor, selection, ranges = [] } = options
+  options.signal?.throwIfAborted()
+  const projection = createHash('sha256').update(text).update('\0').update(options.identity ?? '').digest('hex')
+  if (cursor !== undefined && cursor.projection !== projection) throw new MinerUError(failure('INVALID_REQUEST', 'Cursor projection changed or expired; restart without a cursor'))
+  const offset = cursor?.off ?? 0
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > text.length ||
+    (offset > 0 && offset < text.length && /[\uD800-\uDBFF]/.test(text[offset - 1]!) && /[\uDC00-\uDFFF]/.test(text[offset]!))) {
+    throw new MinerUError(failure('INVALID_REQUEST', 'Cursor is outside the projection or splits a Unicode character; start over without a cursor'))
+  }
+  if (ranges.some(range => offset > range.start && offset < range.locator_end)) throw new MinerUError(failure('INVALID_REQUEST', 'Cursor splits a generated block locator; restart without a cursor'))
+  const activeBlock = ranges.find(range => offset >= range.locator_end && offset < range.end)
+  const remaining = text.slice(offset)
+  let target = Math.min(MAX_MODEL_MARKDOWN_CHARS, remaining.length, Math.max(0, base.output_limit_chars))
+  for (;;) {
+    options.signal?.throwIfAborted()
+    let content = target >= remaining.length ? remaining : truncateAtCleanBoundary(remaining, target).text
+    // A locator before a very long paragraph is not a useful whole chunk.
+    if (content.length < target / 2) content = safeStringSlice(remaining, target)
+    const splitLocator = ranges.find(range => range.start < offset + content.length && range.locator_end > offset + content.length)
+    if (splitLocator) content = content.slice(0, Math.max(0, splitLocator.start - offset))
+    if (remaining.length > 0 && content.length === 0) throw new MinerUError(failure('RESULT_TOO_LARGE', 'Output budget cannot make reading progress; increase maxInlineChars'))
+    const partial = offset + content.length < text.length
+    // Only emit figures whose locator starts in this chunk. Later figures are not
+    // attached early and preceding figures are not replayed on every continuation.
+    const chunkBlockIds = new Set(ranges.filter(range => range.start >= offset && range.start < offset + content.length).map(range => range.block_id))
+    const chunkImages = images.filter(image => image.block_id ? chunkBlockIds.has(image.block_id) : offset === 0)
+    const activeIds = new Set(ranges.filter(range => range.start < offset + content.length && range.end > offset).map(range => range.block_id))
+    const diagnostics = [...(offset === 0 ? options.scopeDiagnostics ?? [] : []), ...(options.diagnosticsForBlocks?.(activeIds) ?? [])]
+    const hints = (options.verificationHints ?? []).filter(hint => activeIds.has(hint.block_id))
+    const shortened: ShortenedMetadata[] = [...(diagnostics.length > 6 ? ['diagnostics' as const] : []), ...(hints.length > 4 ? ['verification_hints' as const] : [])]
+    const warnings = boundedWarnings([
+      ...(offset === 0 ? base.warnings ?? [] : []),
+      ...(chunkImages.length > 20 ? ['[VISUAL_METADATA_SHORTENED] Use block_id to inspect images not listed in this chunk.'] : []),
+    ])
+    const { warnings: _scopeWarnings, provenance: _provenance, ...chunkBase } = base
+    const view: ResultView = {
+      ...chunkBase, ...(offset === 0 && base.provenance ? { provenance: base.provenance } : {}), markdown_content: content, content_status: partial ? 'partial' : 'complete',
+      ...(partial && base.files.some(file => file.artifacts.length > 0) ? { files: base.files.map(file => ({ ...file, artifacts: [], artifacts_truncated: true })) } : {}),
+      cursor: partial ? cursorForRemainder(base.result_id, base.pages, focus, offset + content.length, { ...selection, projection, inline_images: options.inlineImages ?? cursor?.inline_images ?? true }) : null,
+      ...(chunkImages.length ? { ordered_images: chunkImages.slice(0, 20).map(image => ({ ...image, ...(image.caption ? { caption: safeStringSlice(image.caption, 256) } : {}) })) } : {}),
+      ...(warnings.length ? { warnings } : {}),
+      ...(diagnostics.length ? { diagnostics: diagnostics.slice(0, 6) } : {}),
+      ...(hints.length ? { verification_hints: hints.slice(0, 4) } : {}),
+      ...(shortened.length ? { metadata_shortened: shortened } : {}),
+      ...(activeBlock ? { continuation_block: { block_id: activeBlock.block_id, ...(activeBlock.page === undefined ? {} : { page: activeBlock.page }), ...(activeBlock.document_label ? { document_label: activeBlock.document_label } : {}) } } : {}),
+    }
+    if (fitsReadBudget(view)) return view
+    if (target <= 256) {
+      const compact = compactReadMetadata(view)
+      if (fitsReadBudget(compact)) return compact
+    }
+    if (target === 0) throw new MinerUError(failure('RESULT_TOO_LARGE', 'Result metadata exceeds model output budget'))
+    target = Math.max(0, Math.floor(Math.min(target, content.length) * 0.75))
+  }
+}

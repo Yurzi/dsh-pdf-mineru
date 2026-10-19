@@ -1,11 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import type { ContentListBlock } from '../src/service/result-presenter.js'
-import {
-  collectBlockDiagnostics,
-  DOCUMENT_INDEX_VERSION,
-  extractDocumentLabel,
-  normalizeDocumentBlocks,
-} from '../src/service/document-index.js'
+import type { ContentListBlock } from '../src/reader/views.js'
+import { collectBlockDiagnostics, extractDocumentLabel, normalizeDocumentBlocks } from '../src/reader/document-index.js'
+
+/** Content lists arrive as parsed JSON; hostile shapes are expressed as JSON, not typed literals. */
+const fromJson = (blocks: readonly unknown[]): ContentListBlock[] => JSON.parse(JSON.stringify(blocks))
 
 describe('document index', () => {
   it('assigns result-bound identities before selection and retains caption labels', () => {
@@ -214,18 +212,18 @@ describe('document index', () => {
 
   it('sanitizes unknown types, captions, footnotes, paths, and supplied labels without coercion', () => {
     const secret = 'PRIVATE_METADATA_'.repeat(1_000)
-    const result = normalizeDocumentBlocks([
+    const result = normalizeDocumentBlocks(fromJson([
       { type: secret, text: 'Known flat text still survives.' },
       {
         type: 'image',
         document_label: 'Figure 999',
-        caption: { secret } as unknown as string,
-        footnote: ['safe footnote', { secret }] as unknown as string[],
-        chart_caption: ['safe chart caption', { secret }] as unknown as string[],
-        chart_footnote: { secret } as unknown as string,
-        img_path: { secret } as unknown as string,
-        image_path: null as unknown as string,
-        path: ['not', 'a path'] as unknown as string,
+        caption: { secret },
+        footnote: ['safe footnote', { secret }],
+        chart_caption: ['safe chart caption', { secret }],
+        chart_footnote: { secret },
+        img_path: { secret },
+        image_path: null,
+        path: ['not', 'a path'],
       },
       {
         type: 'image',
@@ -233,7 +231,7 @@ describe('document index', () => {
         img_footnote: ['alias footnote'],
         img_path: 'images/figure-3.png',
       },
-    ], 'mr_metadata')
+    ]), 'mr_metadata')
 
     expect(result.blocks[0]?.type).toBe(secret)
     expect(result.blocks[0]?.text).toBe('Known flat text still survives.')
@@ -256,11 +254,13 @@ describe('document index', () => {
 
   it('emits typed bounded warnings without leaking document strings', () => {
     const secret = 'PRIVATE_DOCUMENT_TEXT_'.repeat(1_000)
-    const malformed: ContentListBlock[] = Array.from({ length: 40 }, (_, index) => ({
-      type: 'text',
-      lines: [{ spans: [{ type: index % 2 === 0 ? 'future_node' : 'inline_equation', content: index % 2 === 0 ? secret : { secret } }] }],
-    }))
-    malformed.push({ type: 'text', text: { secret } })
+    const malformed = fromJson([
+      ...Array.from({ length: 40 }, (_, index) => ({
+        type: 'text',
+        lines: [{ spans: [{ type: index % 2 === 0 ? 'future_node' : 'inline_equation', content: index % 2 === 0 ? secret : { secret } }] }],
+      })),
+      { type: 'text', text: { secret } },
+    ])
 
     const result = normalizeDocumentBlocks(malformed, 'mr_warn')
     expect(result.warnings).toHaveLength(20)
@@ -271,25 +271,25 @@ describe('document index', () => {
     expect(result.blocks.at(-1)?.text).toBeUndefined()
     expect(JSON.stringify(result.blocks.at(-1))).not.toContain('[object Object]')
   })
-})
 
-it('keeps late critical gaps visible and scopes warnings without renumbering blocks', () => {
-  const blocks = [...Array.from({ length: 40 }, () => ({ type: 'unrecognized', text: 'kept' })), { type: 'text', text: '包含 个任务', page_idx: 10 }]
-  const all = normalizeDocumentBlocks(blocks, 'mr_test')
-  expect(all.warnings[0]).toContain('POSSIBLE_TEXT_GAP')
-  expect(all.warnings.length).toBeLessThanOrEqual(20)
-  const selected = normalizeDocumentBlocks(blocks, 'mr_test', new Set([41]))
-  expect(selected.blocks[40]?.block_id).toBe('mr_test:b41')
-  expect(selected.warnings).toHaveLength(1)
-  expect(selected.warnings[0]).toContain('block 41')
-})
+  it('keeps late critical gaps visible and scopes warnings without renumbering blocks', () => {
+    const blocks = [...Array.from({ length: 40 }, () => ({ type: 'unrecognized', text: 'kept' })), { type: 'text', text: '包含 个任务', page_idx: 10 }]
+    const all = normalizeDocumentBlocks(blocks, 'mr_test')
+    expect(all.warnings[0]).toContain('POSSIBLE_TEXT_GAP')
+    expect(all.warnings.length).toBeLessThanOrEqual(20)
+    const selected = normalizeDocumentBlocks(blocks, 'mr_test', new Set([41]))
+    expect(selected.blocks[40]?.block_id).toBe('mr_test:b41')
+    expect(selected.warnings).toHaveLength(1)
+    expect(selected.warnings[0]).toContain('block 41')
+  })
 
-it('accepts known page metadata and reference text without hiding empty content', () => {
-  const blocks = ['header', 'footer', 'page_number', 'page_footnote', 'ref_text'].map(type => ({ type, text: 'kept', page_idx: 0 }))
-  const result = normalizeDocumentBlocks(blocks, 'mr_metadata')
-  expect(result.warnings).toEqual([])
-  expect(result.blocks.map(block => block.text)).toEqual(['kept', 'kept', 'kept', 'kept', 'kept'])
-  expect(normalizeDocumentBlocks([{ type: 'header' }], 'mr_metadata').warnings).toEqual([expect.stringContaining('EMPTY_CONTENT')])
+  it('accepts known page metadata and reference text without hiding empty content', () => {
+    const blocks = ['header', 'footer', 'page_number', 'page_footnote', 'ref_text'].map(type => ({ type, text: 'kept', page_idx: 0 }))
+    const result = normalizeDocumentBlocks(blocks, 'mr_metadata')
+    expect(result.warnings).toEqual([])
+    expect(result.blocks.map(block => block.text)).toEqual(['kept', 'kept', 'kept', 'kept', 'kept'])
+    expect(normalizeDocumentBlocks([{ type: 'header' }], 'mr_metadata').warnings).toEqual([expect.stringContaining('EMPTY_CONTENT')])
+  })
 })
 
 describe('MinerU list projection', () => {
@@ -305,7 +305,6 @@ describe('MinerU list projection', () => {
 
     const result = normalizeDocumentBlocks([source], 'mr_refs')
 
-    expect(DOCUMENT_INDEX_VERSION).toBe(2)
     expect(result.blocks[0]?.text).toBe(listItems.join('\n'))
     expect(result.blocks[0]?.list_items).toBe(listItems)
     expect(result.blocks[0]?.sub_type).toBe('ref_text')
@@ -368,7 +367,7 @@ describe('MinerU list projection', () => {
 
 describe('structured block diagnostics', () => {
   it('uses stable source-bound IDs and diagnoses only selected original-order blocks', () => {
-    const untouched = {} as ContentListBlock
+    const untouched: ContentListBlock = {}
     Object.defineProperty(untouched, 'type', {
       get: () => { throw new Error('unselected block was inspected') },
     })
@@ -448,4 +447,3 @@ describe('narrow observed text-gap signals', () => {
     expect(result.blocks.slice(0, 3).map(block => block.text).join('')).not.toContain('B')
   })
 })
-

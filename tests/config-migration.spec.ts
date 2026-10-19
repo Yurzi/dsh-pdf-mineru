@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { isVolatile } from '@deepseek-ai/cosmokit'
 import { Config } from '../src/index.js'
-import { defaultMinerUConfig, parseConfig, parseConfigWithMigration } from '../src/config.js'
+import { defaultMinerUConfig, parseConfig } from '../src/config/parse.js'
+import { parseConfigWithMigration } from '../src/config/migrate.js'
 
 function oldConfig(schemaVersion?: number, tier?: unknown) {
   const base = defaultMinerUConfig()
@@ -64,10 +65,8 @@ describe('self-hosted provider configuration migration', () => {
   })
 
   it('migrates inactive old profiles without selecting a different provider or changing order', () => {
-    const input = oldConfig()
-    const other = {...input.providers[0],id:'mp_secondary'}
-    input.providers.push(other)
-    input.activeProvider = 'mp_official'
+    const old = oldConfig()
+    const input = {...old,activeProvider:'mp_official',providers:[...old.providers,{...old.providers[0],id:'mp_secondary'}]}
     const parsed = parseConfigWithMigration(input)
     expect(parsed.config.activeProvider).toBe('mp_official')
     expect(parsed.config.defaults.parseMethod).toBe('auto')
@@ -88,6 +87,23 @@ describe('self-hosted provider configuration migration', () => {
     Object.assign(input.providers[0]!,patch)
     expect(() => parseConfigWithMigration(input)).toThrow()
     expect(() => parseConfig(input)).toThrow()
+  })
+
+  it('repairs invalid obsolete schema-1 values while current-version unknown fields stay strict', () => {
+    const base = defaultMinerUConfig()
+    const parsed = parseConfigWithMigration({...base,schemaVersion:1,
+      defaults:{...base.defaults,artifacts:['unknown']},limits:{...base.limits,maxFilesPerRequest:0}})
+    expect(parsed.config.defaults).not.toHaveProperty('artifacts')
+    expect(parsed.config.limits).not.toHaveProperty('maxFilesPerRequest')
+    expect(parsed.defaultedFields).toEqual(expect.arrayContaining(['defaults.artifacts','limits.maxFilesPerRequest']))
+    expect(() => parseConfig({...base,defaults:{...base.defaults,artifacts:['markdown']}})).toThrow(/unsupported property artifacts/)
+  })
+
+  it.each([undefined,null,1,'','unknown',['self','hosted'].join('-')])('defaults invalid schema-1 provider type %j to legacy without guessing elsewhere', type => {
+    const base = defaultMinerUConfig()
+    const value = {...base,providers:[{...base.providers[0],type}]}
+    expect(() => parseConfigWithMigration(value)).toThrow(/provider.type/)
+    expect(parseConfigWithMigration({...value,schemaVersion:1}).config.providers[0]?.type).toBe('self-hosted-legacy-v2')
   })
 
   it.each([0,4,99])('does not migrate unsupported schema version %s', version => {

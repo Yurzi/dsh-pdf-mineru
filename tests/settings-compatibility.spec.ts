@@ -1,17 +1,11 @@
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { readFile } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
-import { boot, initProfile, readProfilePatches, type ProfileContext } from '@deepseek-ai/dsh-app-boot'
-import Timer from '@deepseek-ai/cordis-plugin-timer'
-import Hmr from '@deepseek-ai/dsh-hmr'
-import ConfigEditor from '@deepseek-ai/dsh-config-editor'
-import Settings from '@deepseek-ai/dsh-settings'
-import { afterEach, expect, it, vi } from 'vitest'
-import * as mineru from '../src/index.js'
-import { defaultMinerUConfig, parseConfig, parseConfigWithMigration } from '../src/config.js'
+import { expect, it, vi } from 'vitest'
+import { loaderFixture } from './support/loader-fixture.js'
+import { defaultMinerUConfig, parseConfig } from '../src/config/parse.js'
+import { parseConfigWithMigration } from '../src/config/migrate.js'
 import { activateProvider, patchActiveProvider, resetConfigSection } from '../src/client/helpers.js'
-import type { ConnectionRpcHandler } from '../src/loopback-rpc.js'
+import type { ConnectionRpcHandler } from '@deepseek-ai/dsh-client-connection'
 
 // Only transport is replaced. Loader, SettingsForms, ConfigEditor, schema
 // validation, volatile commits and profile persistence are the published SDK.
@@ -19,92 +13,8 @@ vi.mock('../src/loopback-rpc.js', () => ({
   registerLoopbackRpc: (ctx: Context, channel: string, handler: ConnectionRpcHandler) => ctx.connection.rpc.handle(channel, handler),
 }))
 
-const cleanups: Array<() => Promise<void>> = []
-afterEach(async () => {
-  for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
-})
-
-async function fixture({ legacy = false, oldSelfHosted = false, damagedLegacy = false, hmr = true, sparse = false, entryPatch = false, plugin = mineru, transport = true }: {
-  oldSelfHosted?: boolean
-  damagedLegacy?: boolean
-  entryPatch?: boolean
-  legacy?: boolean
-  hmr?: boolean
-  sparse?: boolean
-  plugin?: typeof mineru
-  transport?: boolean
-} = {}) {
-  const home = await realpath(await mkdtemp(join(tmpdir(), 'mineru-settings-')))
-  cleanups.push(() => rm(home, { recursive: true, force: true }))
-  const dir = join(home, 'profiles', 'test')
-  initProfile(dir, ['test-bundle'])
-  const bundle = join(dir, 'node_modules', 'test-bundle')
-  await mkdir(bundle, { recursive: true })
-  await writeFile(join(home, 'package.json'), '{"name":"test-installation"}\n')
-  await writeFile(join(bundle, 'package.json'), JSON.stringify({
-    name: 'test-bundle', version: '1.0.0', dsh: { bundle: { patch: 'cordis.patch.yml' } },
-  }))
-  const defaults = defaultMinerUConfig()
-  const config = {
-    ...defaults,
-    storage: { ...defaults.storage, storageRoot: join(home, 'store') },
-    output: { ...defaults.output, maxInlineImages: 12 },
-    ...(oldSelfHosted ? { schemaVersion: 2, providers: defaults.providers.map(provider => provider.type === 'self-hosted-legacy-v2'
-      ? { ...provider, type: 'self-hosted-v2', tier: 'standard' } : provider) } : {}),
-    ...(damagedLegacy ? {limits:{...defaults.limits,maxFileBytes:'bad'},storage:{...defaults.storage,storageRoot:join(home,'store'),retainSources:true}} : {}),
-    ...(legacy ? {
-      schemaVersion: 1,
-      defaults: { ...defaults.defaults, artifacts: ['markdown'] },
-      limits: { ...defaults.limits, maxFilesPerRequest: 1 },
-    } : {}),
-  }
-  await writeFile(join(bundle, 'cordis.patch.yml'), JSON.stringify([{ insert: [
-    { id: 'config-editor', name: 'cordis:editor' },
-    { id: 'settings', name: 'cordis:settings' },
-    { id: 'mineru-custom', name: 'cordis:mineru', config: sparse ? { schemaVersion: config.schemaVersion, activeProvider: config.activeProvider, providers: config.providers, storage: { storageRoot: config.storage.storageRoot } } : config },
-  ] }]))
-  await writeFile(join(dir, 'cordis.yml'), '[]\n')
-  if (entryPatch) {
-    await writeFile(join(dir, 'cordis.patch.yml'), JSON.stringify([{ id: 'mineru-custom', disabled: false }]))
-  }
-  const profile: ProfileContext = {
-    name: 'test', startedBundles: ['test-bundle'], dir, patchPath: join(dir, 'cordis.patch.yml'),
-    installAnchor: join(home, 'package.json'), cwd: home, home, overlays: [], telemetryDisabledEnv: undefined,
-  }
-  const start = async () => {
-    let rpc!: ConnectionRpcHandler
-    const registerTool = vi.fn(() => () => undefined)
-    const ctx = await boot('test', join(dir, 'cordis.yml'), readProfilePatches('test', profile), ctx => {
-      ctx.provide('profileContext', profile)
-      ctx.provide('appReady', { onReady: (listener: () => void) => { listener(); return () => {} } })
-      ctx.provide('tools', { register: registerTool, schemas: () => [] })
-      ctx.provide('jobs', { start: () => { throw new Error('No jobs expected') } })
-      if (transport) {
-        ctx.provide('webServer', {})
-        ctx.provide('connection', { rpc: { handle: (_channel: string, handler: ConnectionRpcHandler) => {
-          rpc = handler
-          return () => undefined
-        } } })
-      }
-      Object.assign(ctx.loader.builtins, { editor: ConfigEditor, settings: Settings, mineru: plugin })
-    })
-    cleanups.push(() => ctx.fiber.dispose())
-    if (hmr) {
-      await ctx.plugin(Timer)
-      await ctx.plugin(Hmr, { root: [], ignored: [], debounce: 0 }).await()
-      await ctx.hmr.runExclusive(async () => {})
-    }
-    const entry = [...ctx.loader.entries()].find(entry => entry.options.id === 'mineru-custom')!
-    expect(entry.fiber).toBeDefined()
-    expect(registerTool).toHaveBeenCalledTimes(2)
-    const call = (endpoint: string, payload: unknown = {}) => rpc(endpoint, payload, new AbortController().signal)
-    return { ctx, entry, registerTool, call }
-  }
-  return { ...await start(), start, profile, config }
-}
-
 it('activates with native settings, saves by entry id, updates without remount and restores after restart', async () => {
-  const host = await fixture()
+  const host = await loaderFixture()
   expect('register' in host.ctx.settings).toBe(false)
   const descriptor = host.ctx.settings.describe().find(row => row.ns === 'mineru-custom')!
   expect(descriptor.autoGenerate).toBe(false)
@@ -128,7 +38,7 @@ it('activates with native settings, saves by entry id, updates without remount a
 })
 
 it('preserves bundle inheritance when a profile overrides only non-config entry options', async () => {
-  const host = await fixture({ entryPatch: true })
+  const host = await loaderFixture({ entryPatch: true })
   const descriptor = host.ctx.settings.describe().find(row => row.ns === 'mineru-custom')!
   expect(descriptor.value).toMatchObject({ output: { maxInlineImages: 12 } })
   const inherited = host.ctx.configEditor.configuration().find(row => row.entry === host.entry)!
@@ -146,7 +56,7 @@ it('preserves bundle inheritance when a profile overrides only non-config entry 
 })
 
 it('rejects invalid domain values and ordinary field writes before persistence', async () => {
-  const host = await fixture()
+  const host = await loaderFixture()
   const before = await readFile(host.profile.patchPath, 'utf8')
   for (const patch of [
     { output: { maxInlineImages: 101 } },
@@ -160,7 +70,7 @@ it('rejects invalid domain values and ordinary field writes before persistence',
 })
 
 it('rejects cross-type provider fields at native persistence and RPC boundaries without changing state', async () => {
-  const host = await fixture()
+  const host = await loaderFixture()
   const fiber = host.entry.fiber
   const before = await readFile(host.profile.patchPath, 'utf8')
   const [legacy, official, v1] = host.config.providers
@@ -185,7 +95,7 @@ it('rejects cross-type provider fields at native persistence and RPC boundaries 
 })
 
 it('persists independent V1 OCR drafts and defaults resets without remounting or losing shared defaults', async () => {
-  const host = await fixture()
+  const host = await loaderFixture()
   const fiber = host.entry.fiber
   const base = parseConfig(host.config)
   const v1 = base.providers.find(p => p.type === 'self-hosted-v1')!
@@ -220,7 +130,7 @@ it('persists independent V1 OCR drafts and defaults resets without remounting or
 })
 
 it('normalizes Provider-based v1 on activation without profile writes', async () => {
-  const host = await fixture({ legacy: true })
+  const host = await loaderFixture({ legacy: true })
   expect(await host.call('mineru/config.get')).toMatchObject({ ok: true, value: { config: { schemaVersion: 3 } } })
   const response = await host.call('mineru/config.get') as { value: { config: unknown } }
   expect(await host.call('mineru/config.set', { config: response.value.config })).toMatchObject({ ok: true })
@@ -228,7 +138,7 @@ it('normalizes Provider-based v1 on activation without profile writes', async ()
 })
 
 it.each([false,true])('loads old self-hosted profiles, saves canonical values and restarts (schema1=%s)', async legacy => {
-  const host = await fixture({oldSelfHosted:true,legacy})
+  const host = await loaderFixture({oldSelfHosted:true,legacy})
   const expected = parseConfigWithMigration(host.config).config
   const fiber = host.entry.fiber
   expect(expected.providers[0]).toMatchObject({id:'mp_self_hosted',type:'self-hosted-legacy-v2'})
@@ -254,7 +164,7 @@ it.each([false,true])('loads old self-hosted profiles, saves canonical values an
 })
 
 it.each([true,false])('persists repaired ordinary fields atomically only on explicit save (hmr=%s)', async hmr => {
-  const host = await fixture({oldSelfHosted:true,damagedLegacy:true,hmr})
+  const host = await loaderFixture({oldSelfHosted:true,damagedLegacy:true,hmr})
   const expected = parseConfigWithMigration(host.config).config
   expect(expected.storage.retainSources).toBe(false)
   expect(expected.limits.maxFileBytes).toBe(defaultMinerUConfig().limits.maxFileBytes)
@@ -277,8 +187,38 @@ it.each([true,false])('persists repaired ordinary fields atomically only on expl
   expect(await restored.call('mineru/config.get')).toMatchObject({ok:true,value:{config:next}})
 })
 
+it('reports the host Settings revision and refuses stale saves on the replace path', async () => {
+  const host = await loaderFixture()
+  const read = await host.call('mineru/config.get') as { ok: true; value: { revision: number } }
+  const revision = read.value.revision
+  expect(revision).toBe(host.ctx.settings.describe().find(row => row.ns === 'mineru-custom')!.revision)
+  const first = { ...host.config, output: { ...host.config.output, maxInlineImages: 5 } }
+  const saved = await host.call('mineru/config.set', { config: first, expected_revision: revision }) as { ok: true; value: { revision: number } }
+  expect(saved).toMatchObject({ ok: true, value: { config: first } })
+  expect(saved.value.revision).toBeGreaterThan(revision)
+  const before = await readFile(host.profile.patchPath, 'utf8')
+  const stale = { ...host.config, output: { ...host.config.output, maxInlineImages: 4 } }
+  expect(await host.call('mineru/config.set', { config: stale, expected_revision: revision }))
+    .toMatchObject({ ok: false, error: { code: 'mineru/conflict' } })
+  expect(await readFile(host.profile.patchPath, 'utf8')).toBe(before)
+  expect(await host.call('mineru/config.get')).toMatchObject({ ok: true, value: { config: first, revision: saved.value.revision } })
+})
+
+it('compares the descriptor revision before an explicit historical-entry save', async () => {
+  const host = await loaderFixture({ oldSelfHosted: true })
+  const expected = parseConfigWithMigration(host.config).config
+  const read = await host.call('mineru/config.get') as { ok: true; value: { revision: number } }
+  const before = await readFile(host.profile.patchPath, 'utf8')
+  expect(await host.call('mineru/config.set', { config: expected, expected_revision: read.value.revision + 1 }))
+    .toMatchObject({ ok: false, error: { code: 'mineru/conflict' } })
+  expect(await readFile(host.profile.patchPath, 'utf8')).toBe(before)
+  expect(await host.call('mineru/config.set', { config: expected, expected_revision: read.value.revision }))
+    .toMatchObject({ ok: true, value: { config: expected } })
+  expect(await readFile(host.profile.patchPath, 'utf8')).toContain('self-hosted-legacy-v2')
+})
+
 it('saves configuration on a host without HMR', async () => {
-  const host = await fixture({ hmr: false })
+  const host = await loaderFixture({ hmr: false })
   const next = { ...host.config, output: { ...host.config.output, maxInlineImages: 7 } }
   expect(await host.call('mineru/config.set', { config: next }))
     .toMatchObject({ ok: true, value: { config: next } })
@@ -286,21 +226,11 @@ it('saves configuration on a host without HMR', async () => {
 })
 
 it('updates initially omitted live sections without remounting', async () => {
-  const host = await fixture({ sparse: true })
+  const host = await loaderFixture({ sparse: true })
   const fiber = host.entry.fiber
   const next = { ...host.config, output: { ...host.config.output, maxInlineImages: 7 } }
   expect(await host.call('mineru/config.set', { config: next }))
     .toMatchObject({ ok: true, value: { config: next } })
   expect(host.entry.fiber).toBe(fiber)
-  expect(host.registerTool).toHaveBeenCalledTimes(2)
-})
-
-it('activates the built bundle against native SettingsForms', async () => {
-  const built = await import('../lib/index.js')
-  const host = await fixture({ plugin: built, transport: false })
-  const getDescriptor = () => host.ctx.settings.describe().find(row => row.ns === 'mineru-custom')!
-  expect(getDescriptor().autoGenerate).toBe(false)
-  await host.ctx.settings.update('mineru-custom', { output: { maxInlineImages: 8 } })
-  expect(getDescriptor().value).toMatchObject({ output: { maxInlineImages: 8 } })
   expect(host.registerTool).toHaveBeenCalledTimes(2)
 })

@@ -1,366 +1,217 @@
-import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import { isJsonValue, snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
-import { defaultMinerUConfig, type MinerUConfig, type ProviderConfig } from '../src/config.js'
-import { failure } from '../src/domain/errors.js'
-import { asCacheKey, asProviderConfigId } from '../src/domain/ids.js'
-import type { CanonicalParseRequest, PreparedSourceFile } from '../src/domain/request.js'
-import type {
-  ArtifactSink,
-  MinerUProvider,
-  ProviderCallContext,
-  ProviderCapabilities,
-  ProviderCollection,
-  ProviderCompatibilityContext,
-  ProviderJobRef,
-  ProviderJobSnapshot,
-  ProviderProbeResult,
-  ProviderRetryOptions,
-  ProviderSubmission,
-} from '../src/providers/provider.js'
-import { ProviderRegistry } from '../src/providers/registry.js'
-import {
-  MinerUService,
-  type ParseDocumentView,
-  type ResultView,
-  type ServiceSession,
-  truncateAtCleanBoundary,
-  safeStringSlice,
-  extractMarkdownHeadings,
-  formatTocMarkdown,
-  formatSingleSummaryProse,
-  type DocumentHeading,
-} from '../src/service/mineru-service.js'
+import { chmod, readFile, writeFile } from 'node:fs/promises'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
-import { registerTools, renderResult } from '../src/tools.js'
-import { cursorForRemainder, decodeReadCursor } from '../src/service/read-cursor.js'
-import { formatResultProse } from '../src/service/result-presenter.js'
-import { SharedOperationRegistry } from '../src/service/shared-operations.js'
-import { ResultRepository } from '../src/storage/result-repository.js'
-import { StoragePaths } from '../src/storage/paths.js'
-import type { MinerUDiagnosticEvent } from '../src/observability.js'
+import { describe, expect, it, vi } from 'vitest'
+import { asCacheKey } from '../src/domain/ids.js'
+import type { MinerUResultManifest } from '../src/domain/result.js'
+import { DOCUMENT_INDEX_VERSION } from '../src/reader/document-index.js'
+import { extractMarkdownHeadings, formatTocMarkdown } from '../src/reader/projection.js'
+import { READ_CURSOR_VERSION, cursorForRemainder, decodeReadCursor } from '../src/reader/read-cursor.js'
+import type { ContentListBlock, DocumentHeading } from '../src/reader/views.js'
+import { renderResult } from '../src/tools/render.js'
+import { safeStringSlice, truncateAtCleanBoundary } from '../src/utils/text.js'
+import { readerHarness, type FakeProvider } from './support/reader-harness.js'
+import { toolHarness } from './support/tool-harness.js'
 
-function waitSignal(promise: Promise<void>, signal: AbortSignal): Promise<void> {
-  signal.throwIfAborted()
-  return new Promise((resolve, reject) => {
-    const onAbort = (): void => reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
-    signal.addEventListener('abort', onAbort, { once: true })
-    void promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
-  })
-}
+const renderedText = (view: Parameters<typeof renderResult>[0]): string =>
+  renderResult(view).map(block => block.type === 'text' ? block.text : '').join('')
 
-async function waitFor(predicate: () => boolean, message: string): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt++) {
-    if (predicate()) return
-    await new Promise(resolve => setTimeout(resolve, 2))
-  }
-  throw new Error(message)
-}
-
-class MockProvider implements MinerUProvider {
-  readonly id = 'self-hosted-legacy-v2' as const
-  readonly capabilities: ProviderCapabilities = {
-    models: ['pipeline', 'vlm'],
-    parseMethods: ['auto', 'txt', 'ocr'],
-    supportsOcr: true,
-    supportsLanguage: true,
-    supportsFormula: true,
-    supportsTable: true,
-    supportsPageRanges: true,
-    supportedArtifacts: ['markdown', 'layout', 'model-output', 'content-list', 'images'],
-    maxFilesPerSubmission: 10,
-    maxFileBytes: 200 * 1024 * 1024,
-  }
-  submitCount = 0
-  inspectCount = 0
-  collectCount = 0
-  complete = false
-  completeAfterInspect: number | undefined
-  readonly failedNames = new Set<string>()
-  readonly submittedRequests: CanonicalParseRequest[] = []
-  markdown = '# parsed\n'
-  readonly markdownByFileName = new Map<string, string>()
-  readonly extraArtifactsByFileName = new Map<string, Array<{ kind: 'layout' | 'images' | 'model-output' | 'content-list'; content: string }>>()
-  omitMarkdown = false
-  submitGate: Promise<void> = Promise.resolve()
-  retryOptions?: ProviderRetryOptions
-
-  probe(_context: ProviderCallContext): Promise<ProviderProbeResult> {
-    return Promise.resolve({ available: true, provider: this.id, authentication: 'not-configured', protocolVersion: 'v2' })
-  }
-
-  compatibilityKey(_request: CanonicalParseRequest, _context: ProviderCompatibilityContext): Promise<string> {
-    return Promise.resolve('self-hosted-legacy-v2:test:v1:pipeline')
-  }
-
-  async submit(
-    request: CanonicalParseRequest, _sources: readonly PreparedSourceFile[], context: ProviderCallContext,
-  ): Promise<ProviderSubmission> {
-    this.submitCount++
-    this.retryOptions = context.retry
-    this.submittedRequests.push(request)
-    const ref: ProviderJobRef = {
-      provider: this.id,
-      taskId: `upstream-task-${String(this.submitCount)}`,
-      files: request.files.map(file => ({ dataId: `data_${file.fileId}`, fileId: file.fileId, name: file.name })),
-    }
-    await context.onAccepted?.(ref)
-    await waitSignal(this.submitGate, context.signal)
-    return {
-      ref,
-      state: 'processing',
-      files: request.files.map(file => ({ fileId: file.fileId, state: 'processing' })),
-    }
-  }
-
-  inspect(ref: ProviderJobRef, _context: ProviderCallContext): Promise<ProviderJobSnapshot> {
-    this.inspectCount++
-    if (this.completeAfterInspect !== undefined && this.inspectCount >= this.completeAfterInspect) this.complete = true
-    const files = ref.files.map(file => {
-      if (this.failedNames.has(file.name)) {
-        return {
-          fileId: file.fileId,
-          state: 'failed' as const,
-          failure: failure('REMOTE_PARSE_FAILED', `Mock parse failed for ${file.name}`, false, { provider: this.id, fileId: file.fileId }),
-        }
-      }
-      return { fileId: file.fileId, state: this.complete ? 'completed' as const : 'processing' as const }
+describe('ParseService publication', () => {
+  it('maps a provider probe without creating parse state', async () => {
+    const h = await readerHarness()
+    await expect(h.parser.probe(h.config, new AbortController().signal)).resolves.toEqual({
+      available: true, provider: h.provider.id, authentication: 'not-configured', protocol_version: 'fake',
     })
-    const state = files.every(file => file.state === 'completed')
-      ? 'completed'
-      : files.every(file => file.state === 'failed')
-        ? 'failed'
-        : files.every(file => file.state === 'completed' || file.state === 'failed')
-          ? 'partially-completed'
-          : 'processing'
-    return Promise.resolve({ state, files })
-  }
-
-  async collect(
-    ref: ProviderJobRef, _request: CanonicalParseRequest, sink: ArtifactSink, _context: ProviderCallContext,
-  ): Promise<ProviderCollection> {
-    this.collectCount++
-    const files: Array<ProviderCollection['files'][number]> = []
-    for (const file of ref.files) {
-      if (this.failedNames.has(file.name)) {
-        files.push({
-          fileId: file.fileId,
-          name: file.name,
-          artifacts: [],
-          failure: failure('REMOTE_PARSE_FAILED', `Mock parse failed for ${file.name}`, false, { provider: this.id, fileId: file.fileId }),
-        })
-        continue
-      }
-      const artifacts: any[] = []
-      if (!this.omitMarkdown) {
-        const mdText = this.markdownByFileName.get(file.name) ?? this.markdown
-        const markdown = await sink.writeArtifact(file.fileId, 'markdown', mdText, { mediaType: 'text/markdown' })
-        artifacts.push(markdown)
-      }
-      const extras = this.extraArtifactsByFileName.get(file.name)
-      if (extras) {
-        for (const extra of extras) {
-          const art = await sink.writeArtifact(file.fileId, extra.kind, extra.content, { mediaType: 'application/json' })
-          artifacts.push(art)
-        }
-      }
-      for (const kind of _request.requiredArtifacts) {
-        if (!artifacts.some(a => a.kind === kind)) {
-          if (kind === 'content-list') {
-            const art = await sink.writeArtifact(file.fileId, kind, '[]', { mediaType: 'application/json' })
-            artifacts.push(art)
-          } else if (kind === 'layout') {
-            const art = await sink.writeArtifact(file.fileId, kind, '{"pdf_info":[]}', { mediaType: 'application/json' })
-            artifacts.push(art)
-          } else if (kind === 'model-output') {
-            const art = await sink.writeArtifact(file.fileId, kind, '{}', { mediaType: 'application/json' })
-            artifacts.push(art)
-          } else if (kind === 'images') {
-            const png1x1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64')
-            const art = await sink.writeArtifact(file.fileId, kind, png1x1, { mediaType: 'image/png' })
-            artifacts.push(art)
-          }
-        }
-      }
-      files.push({ fileId: file.fileId, name: file.name, artifacts })
-    }
-    return { files }
-  }
-}
-
-class MockProviderRegistry extends ProviderRegistry {
-  constructor(getConfig: () => MinerUConfig, private readonly mock: MockProvider) { super(getConfig) }
-  override create(_config: ProviderConfig): MinerUProvider { return this.mock }
-}
-
-interface Harness {
-  readonly root: string
-  readonly file: string
-  readonly fileTwo: string
-  readonly fileThree: string
-  readonly provider: MockProvider
-  readonly config: MinerUConfig
-  readonly results: ResultRepository
-  readonly operations: SharedOperationRegistry
-  readonly diagnostics: MinerUDiagnosticEvent[]
-  readonly service: MinerUService
-}
-
-const harnesses: Harness[] = []
-
-function session(id: string): ServiceSession {
-  return { header: { id } }
-}
-
-function asResult(value: ParseDocumentView): ResultView {
-  if ('kind' in value) throw new TypeError('Expected a single result view')
-  return value
-}
-
-async function harness(): Promise<Harness> {
-  const root = await mkdtemp(join(tmpdir(), 'mineru-service-'))
-  const file = join(root, 'input.pdf')
-  const fileTwo = join(root, 'input-two.pdf')
-  const fileThree = join(root, 'input-three.pdf')
-  await Promise.all([
-    writeFile(file, '%PDF-1.4 service fixture'),
-    writeFile(fileTwo, '%PDF-1.4 service fixture two'),
-    writeFile(fileThree, '%PDF-1.4 service fixture three'),
-  ])
-  const base = defaultMinerUConfig()
-  const config: MinerUConfig = {
-    ...base,
-    storage: { ...base.storage, storageRoot: join(root, 'store') },
-    polling: { ...base.polling, pollIntervalMs: 2, pollTimeoutMs: 100, operationTimeoutMs: 5000 },
-    output: { maxInlineChars: 2048, maxInlineImages: 6 },
-  }
-  const paths = new StoragePaths(config.storage.storageRoot)
-  const results = new ResultRepository(paths, { maxArtifactBytes: config.limits.maxZipEntryBytes })
-  const operations = new SharedOperationRegistry()
-  const provider = new MockProvider()
-  const providers = new MockProviderRegistry(() => config, provider)
-  const diagnostics: MinerUDiagnosticEvent[] = []
-  const service = new MinerUService({
-    getConfig: () => config,
-    providers,
-    results,
-    operations,
-    diagnostics: event => diagnostics.push(event),
-    resolveCredential: () => Promise.resolve(undefined),
+    expect(h.provider.submitCount).toBe(0)
+    expect(h.operations.activeOperationCount()).toBe(0)
   })
-  const result = { root, file, fileTwo, fileThree, provider, config, results, operations, diagnostics, service }
-  harnesses.push(result)
-  return result
-}
 
-async function makeWritable(path: string): Promise<void> {
-  await chmod(path, 0o755).catch(() => undefined)
-  let entries
-  try { entries = await readdir(path, { withFileTypes: true }) } catch { return }
-  for (const entry of entries) {
-    const child = join(path, entry.name)
-    if (entry.isDirectory()) await makeWritable(child)
-    else await chmod(child, 0o644).catch(() => undefined)
-  }
-}
+  it('publishes once, then serves the cache without another Provider call or job id', async () => {
+    const h = await readerHarness()
+    const first = await h.read()
+    expect(first).toMatchObject({ state: 'completed', source: 'provider', cache_hit: false })
+    const second = await h.read()
+    expect(second).toMatchObject({ state: 'completed', source: 'cache', cache_hit: true, result_id: first.result_id })
+    for (const view of [first, second]) expect(view).not.toHaveProperty('job_id')
+    expect(h.provider.submitCount).toBe(1)
+    expect(h.provider.retry).toMatchObject({ maxRetries: h.config.retry.maxAttempts - 1, initialDelayMs: h.config.retry.baseDelayMs })
 
-afterEach(async () => {
-  const completed = harnesses.splice(0)
-  await Promise.all(completed.map(async item => {
-    await item.operations.shutdown()
-    await makeWritable(item.root)
-    await rm(item.root, { recursive: true, force: true })
-  }))
+    // Provider retry hooks become typed diagnostics without local paths.
+    h.provider.retry?.onRetry?.({ provider: h.provider.id, operation: 'inspect', attempt: 1, maxRetries: 2, delayMs: 500, reason: 'transport' })
+    expect(h.diagnostics).toContainEqual(expect.objectContaining({ phase: 'provider-retry', providerOperation: 'inspect', maxAttempts: 3 }))
+    expect(h.diagnostics).toContainEqual(expect.objectContaining({ phase: 'cache-hit' }))
+    expect(JSON.stringify(h.diagnostics)).not.toContain(h.root)
+  })
+
+  it('releases a created reservation when the second cache check fails', async () => {
+    const h = await readerHarness()
+    const original = h.results.get.bind(h.results)
+    let reads = 0
+    const get = vi.spyOn(h.results, 'get').mockImplementation(async (...args) => {
+      if (++reads === 2) throw new Error('second cache read failed')
+      return await original(...args)
+    })
+    await expect(h.read()).rejects.toThrow('second cache read failed')
+    expect(h.operations.activeOperationCount()).toBe(0)
+    expect(h.provider.submitCount).toBe(0)
+
+    get.mockRestore()
+    expect((await h.read()).state).toBe('completed')
+    expect(h.provider.submitCount).toBe(1)
+  })
+
+  it.each([
+    { name: 'remote file failure', script: (p: FakeProvider) => { p.failedNames.add('input.pdf') }, code: 'REMOTE_PARSE_FAILED' },
+    { name: 'missing required Markdown', script: (p: FakeProvider) => { p.omitMarkdown = true }, code: 'PROVIDER_UNAVAILABLE' },
+  ])('fails closed on $name without publishing', async ({ script, code }) => {
+    const h = await readerHarness()
+    script(h.provider)
+    await expect(h.read()).rejects.toMatchObject({ failure: { code } })
+    expect(h.operations.activeOperationCount()).toBe(0)
+    // Nothing was cached: the next request starts a fresh producer.
+    await expect(h.read()).rejects.toMatchObject({ failure: { code } })
+    expect(h.provider.submitCount).toBe(2)
+  })
 })
 
-describe('MinerUService bounded parse synopsis', () => {
-  it('reports bounded invocation phases for a producer and skips waiting on a cache hit', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    const phases: string[] = []
-    const input = { file_path: h.file }
-    await h.service.ensureParsed(session('progress'), input, new AbortController().signal, phase => { phases.push(phase) })
-    expect(phases).toEqual(['preparing', 'waiting-for-parse', 'reading-result', 'summarizing'])
-    phases.length = 0
-    await h.service.ensureParsed(session('cached-progress'), input, new AbortController().signal, phase => { phases.push(phase) })
-    expect(phases).toEqual(['preparing', 'reading-result', 'summarizing'])
-    // A failing observer is not a parse failure and cannot restart a Provider.
-    await expect(h.service.ensureParsed(session('throwing-progress'), input, new AbortController().signal, () => { throw new Error('observer failed') })).resolves.toMatchObject({ cache_hit: true })
+describe('shared producer', () => {
+  it('coalesces concurrent reads to one upstream producer', async () => {
+    const h = await readerHarness()
+    const gate = h.provider.holdSubmit()
+    const first = h.read()
+    await gate.entered
+    const second = h.read()
+    const [operation] = h.operations.reserved
+    await vi.waitFor(() => expect(operation!.waiterCount).toBe(2))
+    gate.release()
+    const views = await Promise.all([first, second])
+    expect(new Set(views.map(view => view.source))).toEqual(new Set(['provider', 'shared-operation']))
+    expect(h.operations.reserved).toHaveLength(1)
     expect(h.provider.submitCount).toBe(1)
   })
 
-  it('publishes oversized Markdown without body projection or the read response budget', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    h.provider.markdown = '# Large document\n' + 'x'.repeat(64 * 1024 * 1024)
-    Object.assign(h.config.output, { maxInlineChars: 1 })
-    const input = { file_path: h.file }
-    const result = await h.service.ensureParsed(session('summary-large'), input, new AbortController().signal)
-    expect(result.content_status).toBe('not_requested')
-    expect(result).not.toHaveProperty('markdown_content')
-    expect(result.summary).toBeUndefined()
-    expect(formatSingleSummaryProse(result)).not.toMatch(/Total Pages|Tables|Figures/)
-    await expect(h.service.parseDocument(session('read-large'), input, new AbortController().signal, null))
-      .rejects.toMatchObject({ failure: { code: 'RESULT_TOO_LARGE' } })
+  it('does not cancel the shared producer when one waiting caller aborts', async () => {
+    const h = await readerHarness()
+    const gate = h.provider.holdSubmit()
+    const kept = h.read()
+    await gate.entered
+    const controller = new AbortController()
+    const cancelled = h.read({}, { signal: controller.signal })
+    const [operation] = h.operations.reserved
+    await vi.waitFor(() => expect(operation!.waiterCount).toBe(2))
+    controller.abort(new DOMException('Caller stopped waiting', 'AbortError'))
+    await expect(cancelled).rejects.toMatchObject({ name: 'AbortError' })
+    expect(operation!.waiterCount).toBe(1)
+    expect(operation!.controller.signal.aborted).toBe(false)
+    gate.release()
+    expect((await kept).state).toBe('completed')
     expect(h.provider.submitCount).toBe(1)
-  }, 15000)
+  })
+
+  it('throws POLL_TIMEOUT and lets a later caller rejoin the running producer', async () => {
+    const h = await readerHarness()
+    const gate = h.provider.holdSubmit()
+    await expect(h.read({ poll_timeout_ms: 10 })).rejects.toMatchObject({ failure: { code: 'POLL_TIMEOUT', retryable: true } })
+    const [operation] = h.operations.reserved
+    expect(operation!.controller.signal.aborted).toBe(false)
+
+    const rejoined = h.read()
+    await vi.waitFor(() => expect(operation!.waiterCount).toBe(1))
+    gate.release()
+    expect(await rejoined).toMatchObject({ state: 'completed', source: 'shared-operation' })
+    expect(h.operations.reserved).toHaveLength(1)
+    expect(h.provider.submitCount).toBe(1)
+  })
+
+  it('holds the shared storage lease for both the reader and the producer it started', async () => {
+    const h = await readerHarness()
+    const gate = h.provider.holdSubmit()
+    const summary = h.summarize()
+    await gate.entered
+    expect(h.accessGate.activeReaderCount).toBe(2)
+    gate.release()
+    await expect(summary).resolves.toMatchObject({ source: 'provider' })
+    expect(h.accessGate.activeReaderCount).toBe(0)
+  })
+})
+
+describe('parse synopsis', () => {
+  it('reports bounded invocation phases and skips waiting on a cache hit', async () => {
+    const h = await readerHarness()
+    const phases: string[] = []
+    await h.summarize({ onProgress: phase => { phases.push(phase) } })
+    expect(phases).toEqual(['preparing', 'waiting-for-parse', 'reading-result', 'summarizing'])
+    phases.length = 0
+    await h.summarize({ onProgress: phase => { phases.push(phase) } })
+    expect(phases).toEqual(['preparing', 'reading-result', 'summarizing'])
+    // A failing observer is not a parse failure and cannot restart a Provider.
+    await expect(h.summarize({ onProgress: () => { throw new Error('observer failed') } })).resolves.toMatchObject({ cache_hit: true })
+    expect(h.provider.submitCount).toBe(1)
+  })
+
+  it('summarizes Markdown above the reader bound without reading it, while content reads fail closed', async () => {
+    const h = await readerHarness()
+    await h.summarize()
+    // Report the published Markdown above the reader's 64 MiB bound without writing 64 MiB.
+    const original = h.results.get.bind(h.results)
+    vi.spyOn(h.results, 'get').mockImplementation(async (...args): Promise<MinerUResultManifest | undefined> => {
+      const manifest = await original(...args)
+      if (manifest === undefined) return undefined
+      const [file] = manifest.files
+      return { ...manifest, files: [{ ...file, artifacts: file.artifacts.map(item => item.kind === 'markdown' ? { ...item, bytes: 64 * 1024 * 1024 + 1 } : item) }] }
+    })
+    const result = await h.summarize()
+    expect(result).toMatchObject({ content_status: 'not_requested', cache_hit: true })
+    expect(result).not.toHaveProperty('markdown_content')
+    await expect(h.read()).rejects.toMatchObject({ failure: { code: 'RESULT_TOO_LARGE' } })
+    expect(h.provider.submitCount).toBe(1)
+  })
 
   it('returns unknown counts when there is no structured index', async () => {
-    const h = await harness()
-    h.provider.complete = true
+    const h = await readerHarness()
     h.provider.markdown = '# Heading\n<table><tr><td>Table</td></tr></table>\n![Figure](figure.png)'
-    const result = await h.service.ensureParsed(session('summary-no-index'), { file_path: h.file, artifacts: ['markdown'] }, new AbortController().signal)
+    const result = await h.summarize()
+    expect(result.state).toBe('completed')
     expect(result.summary).toBeUndefined()
     expect(result).not.toHaveProperty('markdown_content')
-    expect(result.state).toBe('completed')
   })
 
   it('skips an index above the synopsis budget without making parsed content unreadable', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    h.provider.extraArtifactsByFileName.set('input.pdf', [{ kind: 'content-list', content: JSON.stringify([
-      { type: 'text', page_idx: 0, text: 'x'.repeat(2 * 1024 * 1024) },
-    ]) }])
-    const result = await h.service.ensureParsed(session('summary-index-budget'), { file_path: h.file }, new AbortController().signal)
+    const h = await readerHarness()
+    h.provider.contentList = [{ type: 'text', page_idx: 0, text: 'x'.repeat(2 * 1024 * 1024) }]
+    const result = await h.summarize()
     expect(result.summary).toBeUndefined()
-    expect(formatSingleSummaryProse(result)).toContain('synopsis budget')
-    const read = await h.service.parseDocument(session('read-index'), { file_path: h.file, focus: 'text' }, new AbortController().signal, null)
+    expect(result.warnings).toHaveLength(1)
+    const read = await h.read({ focus: 'text' })
     expect(read.markdown_content).toMatch(/^\[mr_[^\]]+:b1 · Page 1\]\n\nx+/)
     expect(read.content_status).toBe('partial')
     expect(h.provider.submitCount).toBe(1)
   })
 
   it('degrades malformed optional summary metadata but does not hide cache corruption', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    h.provider.extraArtifactsByFileName.set('input.pdf', [{ kind: 'content-list', content: '{}' }])
-    const input = { file_path: h.file }
-    const result = await h.service.ensureParsed(session('summary-malformed'), input, new AbortController().signal)
+    const h = await readerHarness()
+    h.provider.contentList = '{}'
+    const result = await h.summarize()
     expect(result.summary).toBeUndefined()
     expect(result.warnings).toHaveLength(1)
-    await expect(h.service.parseDocument(session('read-malformed'), input, new AbortController().signal, null))
-      .rejects.toThrow('Malformed content-list')
-    const stored = JSON.parse(await readFile(result.manifest_path!, 'utf8'))
+    await expect(h.read()).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
+
+    const stored: { cacheKey: string } = JSON.parse(await readFile(result.manifest_path!, 'utf8'))
     const key = asCacheKey(stored.cacheKey)
     const manifest = (await h.results.get(key))!
-    const artifact = manifest.files[0].artifacts.find(item => item.kind === 'markdown')!
-    const path = h.results.resolveArtifactAbsolutePath(key, artifact.relativePath)
+    const markdown = manifest.files[0].artifacts.find(item => item.kind === 'markdown')!
+    const path = h.results.resolveArtifactAbsolutePath(key, markdown.relativePath)
     await chmod(path, 0o600)
     await writeFile(path, 'changed cached body')
-    await expect(h.service.ensureParsed(session('summary-corrupt'), input, new AbortController().signal))
-      .rejects.toMatchObject({ failure: { code: 'CACHE_CORRUPT' } })
+    await expect(h.summarize()).rejects.toMatchObject({ failure: { code: 'CACHE_CORRUPT' } })
   })
 
-  it('bounds synopsis headings and titles while preserving known counts and page coordinates', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    h.provider.extraArtifactsByFileName.set('input.pdf', [{ kind: 'content-list', content: JSON.stringify([
+  it('bounds synopsis headings and titles while preserving known counts', async () => {
+    const h = await readerHarness()
+    h.provider.contentList = [
       ...Array.from({ length: 40 }, (_, page_idx) => ({ type: 'text', text_level: 1, page_idx, text: 'Title ' + '😀'.repeat(300) })),
       { type: 'table', page_idx: 39, table_body: '<table></table>' },
-    ]) }])
-    const result = await h.service.ensureParsed(session('summary-outline'), { file_path: h.file }, new AbortController().signal)
+    ]
+    const result = await h.summarize()
     expect(result.summary).toMatchObject({ page_count: 40, table_count: 1 })
     expect(result.summary!.toc).toHaveLength(20)
     for (const heading of result.summary!.toc!) {
@@ -368,970 +219,295 @@ describe('MinerUService bounded parse synopsis', () => {
       expect(heading.title.isWellFormed()).toBe(true)
       expect(heading.line).toBeUndefined()
     }
-    expect(formatSingleSummaryProse(result)).toContain('Outline shortened')
-    expect(formatSingleSummaryProse(result).length).toBeLessThan(8192)
+    // The shortened outline is announced rather than presented as complete.
+    expect(result.warnings).toHaveLength(1)
   })
 })
 
-describe('MinerUService direct parsing', () => {
-  it('maps a provider probe without creating parse state', async () => {
-    const h = await harness()
-
-    await expect(h.service.probe(new AbortController().signal)).resolves.toEqual({
-      available: true,
-      provider: 'self-hosted-legacy-v2',
-      authentication: 'not-configured',
-      protocol_version: 'v2',
-    })
+describe('content reads', () => {
+  it.each([
+    { name: 'a short document', markdown: '# Complete Document Content\nFull text delivered.' },
+    { name: 'a valid empty document', markdown: '' },
+  ])('delivers $name completely without a cursor', async ({ markdown }) => {
+    const h = await readerHarness()
+    h.provider.markdown = markdown
+    const view = await h.read()
+    expect(view).toMatchObject({ state: 'completed', content_status: 'complete', cursor: null, markdown_content: markdown })
   })
 
-  it('publishes once, then returns a cache result without another provider call or job id', async () => {
-    const h = await harness()
-    h.provider.complete = true
+  it('omits secondary artifacts unless focus requests them', async () => {
+    const h = await readerHarness()
+    h.provider.markdown = '# Essential Text\nContent'
+    h.provider.extras = [{ kind: 'layout', content: JSON.stringify({ data: 'layout' }) }]
+    const text = await h.read()
+    expect(text.markdown_content).toContain('Essential Text')
+    expect(text.files[0]!.artifacts).toEqual([])
+    expect(text).not.toHaveProperty('markdown_path')
+    expect(text).not.toHaveProperty('manifest_path')
 
-    const first = asResult(await h.service.parseDocument(
-      session('session-cache'), { file_path: h.file }, new AbortController().signal, null,
-    ))
-    expect(first).toMatchObject({ state: 'completed', source: 'provider', cache_hit: false })
-    expect('job_id' in first).toBe(false)
-    expect(h.provider.submitCount).toBe(1)
-
-    const second = asResult(await h.service.parseDocument(
-      session('session-cache'), { file_path: h.file }, new AbortController().signal, null,
-    ))
-    expect(second).toMatchObject({
-      state: 'completed',
-      source: 'cache',
-      cache_hit: true,
-      result_id: first.result_id,
-    })
-    expect('job_id' in second).toBe(false)
-    expect(h.provider.submitCount).toBe(1)
-    expect(h.provider.retryOptions).toMatchObject({ maxRetries: 2, initialDelayMs: 500, maxDelayMs: 10000 })
-
-    h.provider.retryOptions?.onRetry?.({
-      provider: 'self-hosted-legacy-v2', operation: 'inspect', attempt: 1, maxRetries: 2,
-      delayMs: 500, reason: 'transport',
-    })
-    expect(h.diagnostics.some(event => event.phase === 'provider-retry'
-      && event.providerOperation === 'inspect' && event.maxAttempts === 3)).toBe(true)
-    expect(h.diagnostics.some(event => event.phase === 'cache-hit' && event.jobId === undefined)).toBe(true)
-    expect(JSON.stringify(h.diagnostics)).not.toContain(h.file)
-    expect(JSON.stringify(h.diagnostics)).not.toContain(h.root)
+    const artifacts = await h.read({ focus: 'artifacts' })
+    expect(artifacts).toMatchObject({ content_status: 'not_requested', cursor: null })
+    expect(artifacts.markdown_content).toBeUndefined()
+    expect(artifacts.files[0]!.artifacts.map(item => item.kind)).toEqual(expect.arrayContaining(['markdown', 'layout', 'images']))
   })
 
-  it('does not coalesce live operations across provider credential authorities', async () => {
-    const registry = new SharedOperationRegistry()
-    const cacheKey = asCacheKey('a'.repeat(64))
-    let release!: () => void
-    const gate = new Promise<void>(resolve => { release = resolve })
-    const runner = async () => { await gate; return { state: 'failed' as const } }
-    const first = registry.acquire(cacheKey, asProviderConfigId('mp_account_a'), 5000, runner)
-    const second = registry.acquire(cacheKey, asProviderConfigId('mp_account_b'), 5000, runner)
-    const duplicate = registry.acquire(cacheKey, asProviderConfigId('mp_account_a'), 5000, runner)
-
-    expect(first.created).toBe(true)
-    expect(second.created).toBe(true)
-    expect(duplicate.created).toBe(false)
-    expect(duplicate.operation).toBe(first.operation)
-    expect(second.operation).not.toBe(first.operation)
-
-    release()
-    await Promise.all([
-      first.operation.waitForOutcome(new AbortController().signal),
-      second.operation.waitForOutcome(new AbortController().signal),
-    ])
-    await registry.shutdown()
+  it('prioritizes text over secondary artifacts when the budget is tight', async () => {
+    const h = await readerHarness({ output: { maxInlineChars: 2048 } })
+    h.provider.markdown = '# Essential Text\n' + 'Important content.\n'.repeat(50)
+    h.provider.images = Array.from({ length: 30 }, (_, index) => ({ relativeName: 'images/i' + String(index) + '.png' }))
+    const view = await h.read({ focus: ['all', 'artifacts'] })
+    expect(view.markdown_content).toContain('Essential Text')
+    expect(view.files[0]!.artifacts_truncated).toBe(true)
+    expect(JSON.stringify(view).length).toBeLessThanOrEqual(2048)
   })
 
-  it('releases an unstarted reservation so the same key can be retried', async () => {
-    const registry = new SharedOperationRegistry()
-    const cacheKey = asCacheKey('b'.repeat(64))
-    const authority = asProviderConfigId('mp_release_test')
-    const first = registry.reserve(cacheKey, authority, 5000)
-    const waiting = first.operation.waitForOutcome(new AbortController().signal)
-
-    expect(registry.release(first.operation, new Error('setup failed'))).toBe(true)
-    await expect(waiting).rejects.toThrow('setup failed')
-    expect(registry.activeOperationCount()).toBe(0)
-    expect(registry.reserve(cacheKey, authority, 5000).created).toBe(true)
-    await registry.shutdown()
+  it('throws RESULT_TOO_LARGE when metadata alone exceeds the configured limit', async () => {
+    const h = await readerHarness({ output: { maxInlineChars: 50 } })
+    await expect(h.read()).rejects.toMatchObject({ failure: { code: 'RESULT_TOO_LARGE' } })
   })
 
-  it('cleans a created reservation when the second cache check fails', async () => {
-    const h = await harness()
-    const original = h.results.get.bind(h.results)
-    let reads = 0
-    const get = vi.spyOn(h.results, 'get').mockImplementation(async (cacheKey, artifacts, signal) => {
-      reads++
-      if (reads === 2) throw new Error('second cache read failed')
-      return await original(cacheKey, artifacts, signal)
-    })
-
-    try {
-      await expect(h.service.parseDocument(
-        session('session-reserve-failure'), { file_path: h.file }, new AbortController().signal, null,
-      )).rejects.toThrow('second cache read failed')
-      expect(h.operations.activeOperationCount()).toBe(0)
-    } finally {
-      get.mockRestore()
-    }
-
-    h.provider.complete = true
-    const retried = asResult(await h.service.parseDocument(
-      session('session-reserve-retry'), { file_path: h.file }, new AbortController().signal, null,
-    ))
-    expect(retried.state).toBe('completed')
-    expect(h.provider.submitCount).toBe(1)
-  })
-
-  it('coalesces concurrent parses to one upstream producer', async () => {
-    const h = await harness()
-    let release!: () => void
-    h.provider.submitGate = new Promise(resolve => { release = resolve })
-
-    const firstPromise = h.service.parseDocument(
-      session('session-one'), { file_path: h.file }, new AbortController().signal, null,
-    )
-    await waitFor(() => h.provider.submitCount === 1, 'first producer did not start')
-    const secondPromise = h.service.parseDocument(
-      session('session-two'), { file_path: h.file }, new AbortController().signal, null,
-    )
-    await new Promise(resolve => setTimeout(resolve, 5))
-    expect(h.provider.submitCount).toBe(1)
-
-    h.provider.complete = true
-    release()
-    const [first, second] = [
-      asResult(await firstPromise),
-      asResult(await secondPromise),
-    ]
-    expect(new Set([first.source, second.source])).toEqual(new Set(['provider', 'shared-operation']))
-    expect(h.provider.submitCount).toBe(1)
-    expect('job_id' in first).toBe(false)
-    expect('job_id' in second).toBe(false)
-  })
-
-  it('does not cancel a shared producer when one direct caller aborts', async () => {
-    const h = await harness()
-    let release!: () => void
-    h.provider.submitGate = new Promise(resolve => { release = resolve })
-
-    const kept = h.service.parseDocument(
-      session('session-keep'), { file_path: h.file }, new AbortController().signal, null,
-    )
-    await waitFor(() => h.provider.submitCount === 1, 'shared producer did not start')
-    const controller = new AbortController()
-    const cancelled = h.service.parseDocument(
-      session('session-cancelled'), { file_path: h.file }, controller.signal, null,
-    )
-    await new Promise(resolve => setTimeout(resolve, 5))
-    controller.abort(new DOMException('Caller stopped waiting', 'AbortError'))
-
-    await expect(cancelled).rejects.toMatchObject({ name: 'AbortError' })
-    h.provider.complete = true
-    release()
-    expect(asResult(await kept).state).toBe('completed')
-    expect(h.provider.submitCount).toBe(1)
-  })
-
-  it('throws POLL_TIMEOUT and lets a later direct call rejoin the producer', async () => {
-    const h = await harness()
-    let release!: () => void
-    h.provider.submitGate = new Promise(resolve => { release = resolve })
-
-    await expect(h.service.parseDocument(
-      session('session-timeout'), { file_path: h.file }, new AbortController().signal, 10,
-    )).rejects.toMatchObject({ failure: { code: 'POLL_TIMEOUT' } })
-    expect(h.provider.submitCount).toBe(1)
-
-    const rejoined = h.service.parseDocument(
-      session('session-rejoin'), { file_path: h.file }, new AbortController().signal, null,
-    )
-    await new Promise(resolve => setTimeout(resolve, 5))
-    h.provider.complete = true
-    release()
-
-    expect(asResult(await rejoined)).toMatchObject({ state: 'completed', source: 'shared-operation' })
-    expect(h.provider.submitCount).toBe(1)
-  })
-
-
-
-  it('bounds canonical result JSON and preview metadata together', async () => {
-    const h = await harness()
-    h.provider.markdown = 'x'.repeat(20000)
-    h.provider.complete = true
-
-    const parsed = asResult(await h.service.parseDocument(
-      session('session-limit'), { file_path: h.file }, new AbortController().signal, null,
-    ))
-    expect(parsed.state).toBe('completed')
-    expect(JSON.stringify(parsed).length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
-    expect(parsed.content_status).toBe('partial')
-    expect(parsed.markdown_content).toBeDefined()
-    expect('job_id' in parsed).toBe(false)
+  it('bounds JSON and rendered output together and advertises a cursor for the remainder', async () => {
+    const h = await readerHarness({ output: { maxInlineChars: 2048 } })
+    h.provider.markdown = '# Full Story\n' + 'Paragraph here.\n'.repeat(1500)
+    const view = await h.read()
+    expect(view.content_status).toBe('partial')
+    expect(typeof view.cursor).toBe('string')
+    expect(JSON.stringify(view).length).toBeLessThanOrEqual(2048)
+    expect(renderedText(view).length).toBeLessThanOrEqual(2048)
   })
 
   it('continues selected Unicode text through read_pdf with exact advancing chunks and bounded output', async () => {
-    const h = await harness()
-    h.provider.complete = true
+    const h = await readerHarness({ output: { maxInlineChars: 2048 } })
     // Long unbroken astral runs force cuts within text, not just at paragraph boundaries.
     // Quotes, backslashes, and newlines also exercise JSON escaping overhead.
-    const selectedBlocks = [
-      '😀'.repeat(1600) + ' first end',
-      '第二段 "quoted" \\ path\n' + '🧪界'.repeat(1200) + ' final end',
-    ]
-    let expectedText = ''
+    const selectedBlocks = ['😀'.repeat(1600) + ' first end', '第二段 "quoted" \\ path\n' + '🧪界'.repeat(1200) + ' final end']
     h.provider.markdown = 'UNSELECTED raw Markdown must not leak into continuation'
-    h.provider.extraArtifactsByFileName.set('input.pdf', [{
-      kind: 'content-list',
-      content: JSON.stringify([
-        { type: 'text', text: 'UNSELECTED first page', page_idx: 0 },
-        { type: 'text', text: selectedBlocks[0], page_idx: 1 },
-        { type: 'table', table_body: 'UNSELECTED table on selected page', page_idx: 1 },
-        { type: 'text', text: selectedBlocks[1], page_idx: 2 },
-        { type: 'text', text: 'UNSELECTED last page', page_idx: 3 },
-      ]),
-    }])
-    let readTool: any
-    const ctx = {
-      tools: {
-        register: (definition: any) => {
-          if (definition.name === 'read_pdf') readTool = definition
-          return () => undefined
-        },
-        schemas: () => [],
-      },
-      get: () => undefined,
-    } as any
-    const dispose = registerTools(ctx, () => h.service, undefined, () => h.config.output)
-    const exec = { agent: { session: session('continuation') }, signal: new AbortController().signal } as any
+    h.provider.contentList = [
+      { type: 'text', text: 'UNSELECTED first page', page_idx: 0 },
+      { type: 'text', text: selectedBlocks[0], page_idx: 1 },
+      { type: 'table', table_body: 'UNSELECTED table on selected page', page_idx: 1 },
+      { type: 'text', text: selectedBlocks[1], page_idx: 2 },
+      { type: 'text', text: 'UNSELECTED last page', page_idx: 3 },
+    ]
+    const t = await toolHarness({ reader: { readContent: h.reader.readContent.bind(h.reader) }, config: () => h.config })
+    const schema = t.tool('read_pdf').output.schema
+    const limit = h.config.output.maxInlineChars
     let args: Record<string, unknown> = { file_path: h.file, pages: '2-3', focus: 'text', inline_images: false }
     const chunks: string[] = []
     const cursors = new Set<string>()
     let offset = 0
-    let resultId: string | undefined
-    let finalView: ResultView | undefined
-    try {
-      // Bound the loop so a stuck or cycling cursor fails deterministically.
-      for (let attempt = 0; attempt < 100; attempt++) {
-        const view = await readTool.execute(args, exec) as ResultView
-        resultId ??= view.result_id
-        expectedText ||= `[${resultId}:b2 · Page 2]\n\n${selectedBlocks[0]}\n\n[${resultId}:b4 · Page 3]\n\n${selectedBlocks[1]}`
-        expect(view.result_id).toBe(resultId)
-        expect(view.pages).toBe('2-3')
-        expect(view.source).toBe(attempt === 0 ? 'provider' : 'cache')
-        expect(view.cache_hit).toBe(attempt > 0)
-        expect(validateJsonSchemaValue(readTool.output.schema, view, 'value')).toEqual([])
-        expect(isJsonValue(view)).toBe(true)
-        const chunk = view.markdown_content!
-        expect(typeof chunk).toBe('string')
-        expect(chunk.length).toBeGreaterThan(0)
-        expect(chunk).not.toMatch(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/)
-        expect(Buffer.from(chunk, 'utf8').toString('utf8')).toBe(chunk)
-        expect(chunk).toBe(expectedText.slice(offset, offset + chunk.length))
-        chunks.push(chunk)
-        const nextOffset = offset + chunk.length
-        const limit = h.config.output.maxInlineChars
-        expect(view.output_limit_chars).toBe(limit)
-        expect(chunk.length).toBeLessThanOrEqual(limit)
-        expect(JSON.stringify(view).length).toBeLessThanOrEqual(limit)
-        const prose = formatResultProse(view)
-        expect(prose.length).toBeLessThanOrEqual(limit)
-        const rendered = readTool.output.render(args, view)
-        expect(rendered).toEqual(renderResult(view))
-        expect(rendered[0]?.text).toBe(prose)
-        expect(prose).toContain(chunk)
-        expect(prose).not.toContain('[Output truncated to limit]')
-        const meta = readTool.output.presentationMeta(args, view)
-        expect(JSON.stringify(meta).length).toBeLessThanOrEqual(limit)
-        expect(meta.cursor).toBe(view.cursor)
-        if (view.content_status === 'complete') {
-          expect(view.cursor).toBeNull()
-          expect(nextOffset).toBe(expectedText.length)
-          finalView = view
-          break
-        }
-        expect(view.content_status).toBe('partial')
-        expect(typeof view.cursor).toBe('string')
-        expect(view.cursor!.length).toBeGreaterThan(0)
-        const cursor = view.cursor!
-        expect(cursors.has(cursor)).toBe(false)
-        cursors.add(cursor)
-        const decoded = decodeReadCursor(cursor)
-        expect(decoded).toMatchObject({ rid: resultId, pages: '2-3', focus: ['text'], off: nextOffset })
-        expect(decoded.off).toBeGreaterThan(offset)
-        expect(decoded.off).toBeLessThan(expectedText.length)
-        expect(expectedText.slice(0, decoded.off)).not.toMatch(/[\uD800-\uDBFF]$/)
-        expect(expectedText.slice(decoded.off)).not.toMatch(/^[\uDC00-\uDFFF]/)
-        offset = decoded.off
-        // The cursor alone must restore both pages and focus on every continuation.
-        args = { file_path: h.file, cursor }
+    let expectedText = ''
+    let complete = false
+    // Bound the loop so a stuck or cycling cursor fails deterministically.
+    for (let attempt = 0; attempt < 100 && !complete; attempt++) {
+      const view = await t.read(args)
+      const resultId = view.result_id
+      expectedText ||= '[' + resultId + ':b2 · Page 2]\n\n' + selectedBlocks[0] + '\n\n[' + resultId + ':b4 · Page 3]\n\n' + selectedBlocks[1]
+      expect(view).toMatchObject({ pages: '2-3', source: attempt === 0 ? 'provider' : 'cache', output_limit_chars: limit })
+      expect(validateJsonSchemaValue(schema, view, 'value')).toEqual([])
+      const chunk = view.markdown_content!
+      expect(chunk.length).toBeGreaterThan(0)
+      expect(chunk).not.toMatch(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/)
+      expect(chunk).toBe(expectedText.slice(offset, offset + chunk.length))
+      expect(JSON.stringify(view).length).toBeLessThanOrEqual(limit)
+      const rendered = renderedText(view)
+      expect(rendered.length).toBeLessThanOrEqual(limit)
+      expect(rendered).toContain(chunk)
+      chunks.push(chunk)
+      if (view.content_status === 'complete') {
+        expect(view.cursor).toBeNull()
+        expect(offset + chunk.length).toBe(expectedText.length)
+        complete = true
+        continue
       }
-      expect(finalView?.content_status).toBe('complete')
-      expect(finalView?.cursor).toBeNull()
-      expect(chunks.length).toBeGreaterThan(2)
-      expect(chunks.join('')).toBe(expectedText)
-      expect(h.provider.submitCount).toBe(1)
-      expect(h.provider.collectCount).toBe(1)
-    } finally {
-      await dispose()
+      expect(view.content_status).toBe('partial')
+      const cursor = view.cursor!
+      expect(cursors.has(cursor)).toBe(false)
+      cursors.add(cursor)
+      const decoded = decodeReadCursor(cursor)
+      expect(decoded).toMatchObject({ rid: resultId, pages: '2-3', focus: ['text'], off: offset + chunk.length })
+      offset = decoded.off
+      // The cursor alone must restore both pages and focus on every continuation.
+      args = { file_path: h.file, cursor }
     }
-  })
-
-  it('rejects continuation for another result and selection overrides without reparsing', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    h.provider.markdown = '😀'.repeat(3000)
-    const signal = new AbortController().signal
-    const owner = session('invalid-continuation')
-    const first = await h.service.parseDocument(owner, { file_path: h.file }, signal, null)
-    expect(first.content_status).toBe('partial')
-    const cursor = first.cursor!
-    const payload = decodeReadCursor(cursor)
-    const wrongIdentity = cursorForRemainder('mr_other_result', undefined, new Set(['all']), payload.off)
-    await expect(h.service.parseDocument(owner, { file_path: h.file, cursor: wrongIdentity }, signal, null))
-      .rejects.toThrow(/result identity does not match/)
-    for (const selection of [{ pages: 1 }, { focus: 'text' }]) {
-      await expect(h.service.parseDocument(owner, { file_path: h.file, cursor, ...selection }, signal, null))
-        .rejects.toThrow(/pages and focus must be omitted/)
-    }
-    // Even a structurally valid token cannot resume halfway through a surrogate pair.
-    const splitCharacter = cursorForRemainder(first.result_id, undefined, new Set(['all']), 1, { projection: decodeReadCursor(first.cursor!).projection })
-    await expect(h.service.parseDocument(owner, { file_path: h.file, cursor: splitCharacter }, signal, null))
-      .rejects.toThrow(/splits a Unicode character/)
+    expect(complete).toBe(true)
+    expect(chunks.length).toBeGreaterThan(2)
+    expect(chunks.join('')).toBe(expectedText)
     expect(h.provider.submitCount).toBe(1)
     expect(h.provider.collectCount).toBe(1)
   })
 
-  it('populates markdown_content and content_status correctly on complete document', async () => {
-    const h = await harness()
-    h.provider.markdown = '# Complete Document Content\nFull text delivered.'
-    h.provider.complete = true
-
-    const parsed = asResult(await h.service.parseDocument(
-      session('session-direct-content'), { file_path: h.file }, new AbortController().signal, null,
-    ))
-    expect(parsed.state).toBe('completed')
-    expect(parsed.content_status).toBe('complete')
-    expect(parsed.cursor).toBeNull()
-    expect(parsed.markdown_content).toBe('# Complete Document Content\nFull text delivered.')
-    expect(parsed.read_offset_line).toBeUndefined()
-    expect('job_id' in parsed).toBe(false)
+  it('rejects continuation for another result or a split character without reparsing', async () => {
+    const h = await readerHarness({ output: { maxInlineChars: 2048 } })
+    h.provider.markdown = '😀'.repeat(3000)
+    const first = await h.read()
+    expect(first.content_status).toBe('partial')
+    const payload = decodeReadCursor(first.cursor!)
+    const wrongIdentity = cursorForRemainder('mr_other_result', undefined, new Set(['all']), payload.off)
+    await expect(h.read({ cursor: wrongIdentity })).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST', message: expect.stringMatching(/result identity does not match/) } })
+    // Even a structurally valid token cannot resume halfway through a surrogate pair.
+    const splitCharacter = cursorForRemainder(first.result_id, undefined, new Set(['all']), 1, { projection: payload.projection })
+    await expect(h.read({ cursor: splitCharacter })).rejects.toThrow(/splits a Unicode character/)
+    expect(h.provider.submitCount).toBe(1)
+    expect(h.provider.collectCount).toBe(1)
   })
 
-  it('handles valid empty markdown file with complete status', async () => {
-    const h = await harness()
-    h.provider.markdown = ''
-    h.provider.complete = true
-
-    const parsed = asResult(await h.service.parseDocument(
-      session('session-empty-md'), { file_path: h.file }, new AbortController().signal, null,
-    ))
-    expect(parsed.state).toBe('completed')
-    expect(parsed.content_status).toBe('complete')
-    expect(parsed.cursor).toBeNull()
-    expect(parsed.markdown_content).toBe('')
-    expect(parsed.read_offset_line).toBeUndefined()
-  })
-
-  it('handles request without markdown artifact and marks not_requested without claiming complete text', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    h.provider.extraArtifactsByFileName.set('input.pdf', [{ kind: 'layout', content: '{"pages":[]}' }])
-
-    const parsed = asResult(await h.service.parseDocument(
-      session('session-no-md'),
-      { file_path: h.file, artifacts: ['layout'] },
-      new AbortController().signal,
-      null,
-    ))
-    expect(parsed.state).toBe('completed')
-    expect(parsed.content_status).toBe('not_requested')
-    expect(parsed.cursor).toBeNull()
-    expect(parsed.markdown_content).toBeUndefined()
-    expect(parsed.read_offset_line).toBeUndefined()
-    const rendered = renderResult(parsed)[0]?.text ?? ''
-    expect(rendered).not.toContain('Status: Content complete')
-    expect(rendered).not.toContain('delivered above')
-    expect(rendered).toContain('Status: Markdown content was not requested')
-  })
-
-  it('fails if markdown was requested but provider did not produce it', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    h.provider.omitMarkdown = true
-    h.provider.extraArtifactsByFileName.set('input.pdf', [{ kind: 'layout', content: '{"pages":[]}' }])
-
-    await expect(h.service.parseDocument(
-      session('session-missing-md'),
-      { file_path: h.file, artifacts: ['markdown'] },
-      new AbortController().signal,
-      null,
-    )).rejects.toMatchObject({ failure: { code: 'PROVIDER_UNAVAILABLE' } })
-  })
-
-  it('truncates text cleanly at paragraph and newline boundaries without splitting surrogate pairs', () => {
-    const text = 'First line\nSecond line\nThird line'
-    const cut = truncateAtCleanBoundary(text, 22)
-    expect(cut.truncated).toBe(true)
-    expect(cut.text).toBe('First line\n')
-    expect(cut.resumeLine).toBe(2)
-
-    const paraText = 'Paragraph 1\n\nParagraph 2\n\nParagraph 3'
-    const paraCut = truncateAtCleanBoundary(paraText, 16)
-    expect(paraCut.truncated).toBe(true)
-    expect(paraCut.text).toBe('Paragraph 1\n\n')
-    expect(paraCut.resumeLine).toBe(3)
-
-    const lineCut = truncateAtCleanBoundary(paraText, 25)
-    expect(lineCut.truncated).toBe(true)
-    expect(lineCut.text).toBe('Paragraph 1\n\nParagraph 2\n')
-    expect(lineCut.resumeLine).toBe(4)
-
-    const chText = '第一段中文\n第二段中文内容更长一些\n第三段'
-    const chCut = truncateAtCleanBoundary(chText, 16)
-    expect(chCut.truncated).toBe(true)
-    expect(chCut.text).toBe('第一段中文\n')
-    expect(chCut.resumeLine).toBe(2)
-
-    const emojiText = 'A🚀B\nC🌟D'
-    const brokenSlice = emojiText.slice(0, 2)
-    expect(brokenSlice.length).toBe(2)
-    const safeSlice = safeStringSlice(emojiText, 2)
-    expect(safeSlice).toBe('A')
-  })
-
-  describe('extractMarkdownHeadings', () => {
-    it('returns empty array for empty string or text without headings', () => {
-      expect(extractMarkdownHeadings('')).toEqual([])
-      expect(extractMarkdownHeadings('Just plain text\nAnother line\nNo hashes here')).toEqual([])
-    })
-
-    it('extracts levels 1 through 6 with 1-based line numbers and trimmed titles', () => {
-      const text = [
-        '# Main Title',
-        'Intro text',
-        '## Section 1 ',
-        'Paragraph',
-        '### Subsection 1.1',
-        '#### Heading 4',
-        '##### Heading 5',
-        '###### Heading 6',
-      ].join('\n')
-
-      const headings = extractMarkdownHeadings(text)
-      expect(headings).toEqual([
-        { level: 1, title: 'Main Title', line: 1 },
-        { level: 2, title: 'Section 1', line: 3 },
-        { level: 3, title: 'Subsection 1.1', line: 5 },
-        { level: 4, title: 'Heading 4', line: 6 },
-        { level: 5, title: 'Heading 5', line: 7 },
-        { level: 6, title: 'Heading 6', line: 8 },
-      ])
-    })
-
-    it('ignores invalid heading syntax and handles CRLF line endings', () => {
-      const text = [
-        '####### Seven Hashes (not a heading)',
-        '#NoSpaceAfterHash',
-        '### \t Tab after hash',
-        '###    ',
-        '# Valid Heading\r\n## Second Heading\r\n',
-      ].join('\r\n')
-
-      const headings = extractMarkdownHeadings(text)
-      expect(headings).toEqual([
-        { level: 3, title: 'Tab after hash', line: 3 },
-        { level: 1, title: 'Valid Heading', line: 5 },
-        { level: 2, title: 'Second Heading', line: 6 },
-      ])
-    })
-
-    it('retains all headings when count <= 25', () => {
-      const lines: string[] = []
-      for (let i = 1; i <= 25; i++) {
-        lines.push(`## Section ${i}`)
-      }
-      const headings = extractMarkdownHeadings(lines.join('\n'))
-      expect(headings).toHaveLength(25)
-      expect(headings[0]).toEqual({ level: 2, title: 'Section 1', line: 1 })
-      expect(headings[24]).toEqual({ level: 2, title: 'Section 25', line: 25 })
-    })
-
-    it('preserves all heading levels beyond old summary caps without truncation', () => {
-      const lines: string[] = []
-      for (let i = 1; i <= 30; i++) lines.push(`# Title ${i}`)
-      for (let i = 1; i <= 10; i++) lines.push(`## Subtitle ${i}`)
-      for (let i = 1; i <= 10; i++) lines.push(`#### LowLevel ${i}`)
-
-      const headings = extractMarkdownHeadings(lines.join('\n'))
-      expect(headings).toHaveLength(50)
-      expect(headings[0]!.title).toBe('Title 1')
-      expect(headings[19]!.title).toBe('Title 20')
-      expect(headings.filter(h => h.level === 4)).toHaveLength(10)
-    })
-  })
-
-
-
-  it('omits secondary artifacts by default when focus does not include artifacts', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    h.provider.extraArtifactsByFileName.set('input.pdf', [
-      { kind: 'layout', content: JSON.stringify({ data: 'x'.repeat(100) }) },
-      { kind: 'images', content: JSON.stringify({ data: 'y'.repeat(100) }) },
-    ])
-    h.provider.markdown = '# Essential Text\nContent'
-
-    const parsed = asResult(await h.service.parseDocument(
-      session('session-default-no-artifacts'),
-      { file_path: h.file },
-      new AbortController().signal,
-      null,
-    ))
-
-    expect(parsed.state).toBe('completed')
-    expect(parsed.markdown_content).toContain('Essential Text')
-    expect(parsed.files[0]?.artifacts).toEqual([])
-    expect(parsed.markdown_path).toBeUndefined()
-    expect(parsed.manifest_path).toBeUndefined()
-    expect(parsed.files[0]?.artifacts_truncated).toBeUndefined()
-    const rendered = renderResult(parsed)
-    expect(rendered[0]?.text).not.toContain('Artifacts:')
-  })
-
-  it('delivers secondary artifacts and marks not_requested when focus is artifacts only', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    h.provider.extraArtifactsByFileName.set('input.pdf', [
-      { kind: 'layout', content: JSON.stringify({ data: 'layout data' }) },
-      { kind: 'images', content: JSON.stringify({ data: 'image data' }) },
-    ])
-    h.provider.markdown = '# Essential Text\nContent'
-
-    const parsed = asResult(await h.service.parseDocument(
-      session('session-artifacts-only'),
-      { file_path: h.file, focus: 'artifacts' },
-      new AbortController().signal,
-      null,
-    ))
-
-    expect(parsed.state).toBe('completed')
-    expect(parsed.content_status).toBe('not_requested')
-    expect(parsed.cursor).toBeNull()
-    expect(parsed.markdown_content).toBeUndefined()
-    expect(parsed.files[0]?.artifacts.some(a => a.kind === 'layout')).toBe(true)
-    expect(parsed.files[0]?.artifacts.some(a => a.kind === 'images')).toBe(true)
-    const rendered = renderResult(parsed)
-    expect(rendered[0]?.text).toContain('Artifacts:')
-    expect(rendered[0]?.text).toContain('Status: Markdown content was not requested')
-  })
-
-  it('prioritizes text over secondary artifacts when budget is tight', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    h.provider.extraArtifactsByFileName.set('input.pdf', [
-      { kind: 'layout', content: JSON.stringify({ data: 'x'.repeat(1000) }) },
-      { kind: 'images', content: JSON.stringify({ data: 'y'.repeat(1000) }) },
-    ])
-    h.provider.markdown = '# Essential Text\n' + 'Important content.\n'.repeat(50)
-
-    const parsed = asResult(await h.service.parseDocument(
-      session('session-priority'),
-      { file_path: h.file, focus: ['all', 'artifacts'] },
-      new AbortController().signal,
-      null,
-    ))
-
-    expect(parsed.state).toBe('completed')
-    expect(parsed.markdown_content).toBeDefined()
-    expect(parsed.markdown_content).toContain('Essential Text')
-    expect(parsed.files[0]?.artifacts_truncated).toBe(true)
-    expect(JSON.stringify(parsed).length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
-  })
-
-  it('throws RESULT_TOO_LARGE when metadata alone exceeds the configured limit', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    const tinyConfig: MinerUConfig = {
-      ...h.config,
-      output: { maxInlineChars: 50, maxInlineImages: 6 },
-    }
-    const tinyService = new MinerUService({
-      getConfig: () => tinyConfig,
-      providers: new MockProviderRegistry(() => tinyConfig, h.provider),
-      results: h.results,
-      operations: h.operations,
-      resolveCredential: () => Promise.resolve(undefined),
-    })
-
-    await expect(tinyService.parseDocument(
-      session('session-tiny-limit'),
-      { file_path: h.file },
-      new AbortController().signal,
-      null,
-    )).rejects.toMatchObject({ failure: { code: 'RESULT_TOO_LARGE' } })
-  })
-
-  it('verifies end-to-end service projection to render output consistency without silent slice', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    h.provider.markdown = '# Full Story\n' + 'Paragraph here.\n'.repeat(150)
-
-    const parsed = asResult(await h.service.parseDocument(
-      session('session-consistency'),
-      { file_path: h.file },
-      new AbortController().signal,
-      null,
-    ))
-
-    const rendered = renderResult(parsed)
-    const text = rendered[0]?.text ?? ''
-    expect(text.length).toBeLessThanOrEqual(h.config.output.maxInlineChars)
-    expect(text).not.toContain('[Output truncated to limit]')
-    expect(text).toContain('cursor:')
-    expect(text).not.toContain('read_offset_line')
-    expect(parsed.content_status).toBe('partial')
-  })
-
-  it('omits repeated toc on partial reads and provides it on demand', async () => {
-    const h = await harness()
-    h.provider.complete = true
-    const mdWithHeadings = [
-      '# Document Title',
-      'Introduction paragraph.',
-      '## Chapter 1: Foundations',
-      'Paragraph 1. '.repeat(100),
-      '## Chapter 2: Methods',
-      'Paragraph 2. '.repeat(100),
-      '### Section 2.1: Details',
-      'Paragraph 3. '.repeat(100),
-    ].join('\n')
-    h.provider.markdown = mdWithHeadings
-
-    const parsed = asResult(await h.service.parseDocument(
-      session('session-toc-partial'),
-      { file_path: h.file },
-      new AbortController().signal,
-      null,
-    ))
-
-    expect(parsed.state).toBe('completed')
-    expect(parsed.content_status).toBe('partial')
-    expect(parsed.toc).toBeUndefined()
-    const outline = await h.service.parseDocument(session('session-toc-partial'), { file_path: h.file, focus: 'toc' }, new AbortController().signal, null)
-    expect(outline.markdown_content).toContain('Document Title')
-    expect(outline.markdown_content).toContain('Chapter 1: Foundations')
-    expect(outline.markdown_content).toContain('Chapter 2: Methods')
-    expect(outline.markdown_content).toContain('Section 2.1: Details')
-
-    const rendered = renderResult(parsed)
-    const text = rendered[0]?.text ?? ''
-    expect(text).not.toContain('Document Outline:')
-    const outlineText = renderResult(outline)[0]?.text ?? ''
-    expect(outlineText).toContain('- Document Title (line 1)')
-    expect(outlineText).toContain('  - Chapter 1: Foundations (line 3)')
-    expect(outlineText).toContain('  - Chapter 2: Methods (line 5)')
-    expect(outlineText).toContain('    - Section 2.1: Details (line 7)')
-    expect(text).not.toContain('starting from the given line offset')
-  })
-
-  describe('formatTocMarkdown', () => {
-    it('formats empty headings with or without page range note', () => {
-      expect(formatTocMarkdown([])).toBe('*(No headings detected in document outline)*')
-      expect(formatTocMarkdown(undefined)).toBe('*(No headings detected in document outline)*')
-      expect(formatTocMarkdown([], { pageRange: '3-5' })).toBe('*(No headings found in pages: 3-5)*')
-    })
-
-    it('formats headings with level indentation and page or line numbers', () => {
-      const headings: DocumentHeading[] = [
-        { level: 1, title: 'Introduction', page: 1 },
-        { level: 2, title: 'Background', page: 2 },
-        { level: 3, title: 'Details' },
-      ]
-      const md = formatTocMarkdown(headings)
-      expect(md).toBe([
-        '# Document Outline',
-        '',
-        '- Introduction (Page 1)',
-        '  - Background (Page 2)',
-        '    - Details',
-      ].join('\n'))
-    })
-  })
-
-  describe('focus: toc behavior in parseDocument', () => {
-    it('returns outline-only content when focus is toc on content_list source', async () => {
-      const h = await harness()
-      h.provider.complete = true
-      const contentList = [
-        { type: 'title', text: 'Overview', text_level: 1, page_idx: 0 },
-        { type: 'text', text: 'Some long paragraph text that should not appear in toc-only view.', page_idx: 0 },
-        { type: 'text', text: 'Section 1', text_level: 2, page_idx: 1 },
-        { type: 'image', path: 'images/fig1.png', page_idx: 1 },
-        { type: 'text', text: 'Section 2', text_level: 2, page_idx: 2 },
-      ]
-      h.provider.extraArtifactsByFileName.set('input.pdf', [
-        { kind: 'content-list', content: JSON.stringify(contentList) },
-        { kind: 'images', content: 'fake-png-content' },
-      ])
-      h.provider.markdown = '# Overview\nSome text\n## Section 1\n## Section 2'
-
-      const parsed = asResult(await h.service.parseDocument(
-        session('session-focus-toc'),
-        { file_path: h.file, focus: 'toc' },
-        new AbortController().signal,
-        null,
-      ))
-
-      expect(parsed.state).toBe('completed')
-      expect(parsed.content_status).toBe('complete')
-      expect(parsed.cursor).toBeNull()
-      expect(isJsonValue(parsed)).toBe(true)
-      expect(snapshotJsonValue(parsed)).toBeDefined()
-      expect('pages' in parsed).toBe(false)
-      expect(parsed.markdown_content).toContain('# Document Outline')
-      expect(parsed.markdown_content).toContain('- Overview (Page 1)')
-      expect(parsed.markdown_content).toContain('  - Section 1 (Page 2)')
-      expect(parsed.markdown_content).toContain('  - Section 2 (Page 3)')
-      expect(parsed.markdown_content).not.toContain('Some long paragraph text')
-      expect(parsed.ordered_images).toBeUndefined()
-      expect(parsed.toc).toBeUndefined()
-      expect(parsed.summary?.toc).toBeUndefined()
-
-      const rendered = renderResult(parsed)
-      const renderedText = rendered[0]?.text ?? ''
-      expect(renderedText).toContain('# Document Outline')
-      expect(renderedText).toContain('- Overview (Page 1)')
-      expect(renderedText).not.toContain('Some long paragraph text')
-    })
-
-    it('filters outline by pages when both pages and focus: toc are specified', async () => {
-      const h = await harness()
-      h.provider.complete = true
-      const contentList = [
-        { type: 'title', text: 'Chapter 1', text_level: 1, page_idx: 0 },
-        { type: 'text', text: 'Section 1.1', text_level: 2, page_idx: 1 },
-        { type: 'title', text: 'Chapter 2', text_level: 1, page_idx: 2 },
-      ]
-      h.provider.extraArtifactsByFileName.set('input.pdf', [
-        { kind: 'content-list', content: JSON.stringify(contentList) },
-      ])
-
-      const parsed = asResult(await h.service.parseDocument(
-        session('session-focus-toc-pages'),
-        { file_path: h.file, pages: '2', focus: 'toc' },
-        new AbortController().signal,
-        null,
-      ))
-
-      expect(parsed.markdown_content).toContain('# Document Outline')
-      expect(parsed.markdown_content).toContain('  - Section 1.1 (Page 2)')
-      expect(parsed.markdown_content).not.toContain('Chapter 1 (Page 1)')
-      expect(parsed.markdown_content).not.toContain('Chapter 2 (Page 3)')
-      expect(parsed.toc).toBeUndefined()
-    })
-
-    it('combines outline and text when multiple focus items are given', async () => {
-      const h = await harness()
-      h.provider.complete = true
-      const contentList = [
-        { type: 'title', text: 'Chapter 1', text_level: 1, page_idx: 0 },
-        { type: 'text', text: 'Content of chapter 1.', page_idx: 0 },
-      ]
-      h.provider.extraArtifactsByFileName.set('input.pdf', [
-        { kind: 'content-list', content: JSON.stringify(contentList) },
-      ])
-
-      const parsed = asResult(await h.service.parseDocument(
-        session('session-focus-multi'),
-        { file_path: h.file, focus: ['toc', 'text'] },
-        new AbortController().signal,
-        null,
-      ))
-
-      expect(parsed.markdown_content).toContain('# Document Outline')
-      expect(parsed.markdown_content).toContain('- Chapter 1 (Page 1)')
-      expect(parsed.markdown_content).toContain('Content of chapter 1.')
-    })
-
-    it('extracts outline in markdown fallback mode when focus is toc', async () => {
-      const h = await harness()
-      h.provider.complete = true
-      h.provider.markdown = '# Fallback Title\nSome body text\n## Sub Heading\nMore body'
-
-      const parsed = asResult(await h.service.parseDocument(
-        session('session-focus-fallback'),
-        { file_path: h.file, focus: 'toc' },
-        new AbortController().signal,
-        null,
-      ))
-
-      expect(parsed.markdown_content).toContain('# Document Outline')
-      expect(parsed.markdown_content).toContain('- Fallback Title (line 1)')
-      expect(parsed.markdown_content).toContain('  - Sub Heading (line 3)')
-      expect(parsed.markdown_content).not.toContain('Some body text')
-    })
-
-    it('rejects typed text filtering when Markdown has no content-list mapping', async () => {
-      const h = await harness()
-      h.provider.complete = true
-      h.provider.markdown = '# Doc\n| A | B |\n|---|---|\n| 1 | 2 |'
-      await expect(h.service.parseDocument(session('session-focus-text-fallback'), { file_path: h.file, focus: 'text' }, new AbortController().signal, null)).rejects.toThrow('[SELECTION_UNAVAILABLE]')
-    })
-
-    it('filters images by pages and only returns images located on the specified page', async () => {
-      const h = await harness()
-      h.provider.complete = true
-      const contentList = [
-        { type: 'text', text: 'Page 1 intro.', page_idx: 0 },
-        { type: 'image', path: 'images/page1.png', caption: 'Figure 1 on Page 1', page_idx: 0 },
-        { type: 'text', text: 'Page 2 content.', page_idx: 1 },
-        { type: 'image', path: 'images/page2.png', caption: 'Figure 2 on Page 2', page_idx: 1 },
-        { type: 'text', text: 'Page 3 content without images.', page_idx: 2 },
-      ]
-      h.provider.extraArtifactsByFileName.set('input.pdf', [
-        { kind: 'content-list', content: JSON.stringify(contentList) },
-        { kind: 'images', content: 'fake-png-data' },
-      ])
-
-      // 1. Reading page 2 only returns Figure 2 on Page 2
-      const page2Result = asResult(await h.service.parseDocument(
-        session('session-p2-img'),
-        { file_path: h.file, pages: '2' },
-        new AbortController().signal,
-        null,
-      ))
-      expect(page2Result.ordered_images).toHaveLength(1)
-      expect(page2Result.ordered_images![0]?.status).toBe('unavailable')
-      expect(page2Result.ordered_images![0]?.page).toBe(2)
-      expect(page2Result.ordered_images![0]?.caption).toBe('Figure 2 on Page 2')
-      expect(page2Result.markdown_content).toContain('Figure 2 (Page 2) unavailable')
-      expect(page2Result.markdown_content).not.toContain('Figure 1 on Page 1')
-
-      // 2. Reading page 3 only returns zero images
-      const page3Result = asResult(await h.service.parseDocument(
-        session('session-p3-no-img'),
-        { file_path: h.file, pages: '3' },
-        new AbortController().signal,
-        null,
-      ))
-      expect(page3Result.ordered_images).toBeUndefined()
-      expect(page3Result.markdown_content).not.toContain('Attached Image')
-    })
-
-    it('narrows out-of-bounds pages safely and formats status line with page numbers', async () => {
-      const h = await harness()
-      h.provider.complete = true
-      const contentList = [
-        { type: 'text', text: 'Page 1 text content.', page_idx: 0 },
-        { type: 'text', text: 'Page 2 text content.', page_idx: 1 },
-        { type: 'text', text: 'Page 3 text content.', page_idx: 2 },
-        { type: 'image', path: 'images/fig3.png', caption: 'Chart 3', page_idx: 2 },
-      ]
-      h.provider.extraArtifactsByFileName.set('input.pdf', [
-        { kind: 'content-list', content: JSON.stringify(contentList) },
-        { kind: 'images', content: 'fake-png-data' },
-      ])
-
-      h.provider.extraArtifactsByFileName.get('input.pdf')!.push({ kind: 'layout', content: JSON.stringify({ pdf_info: [{ page_idx: 0 }, { page_idx: 1 }, { page_idx: 2 }] }) })
-
-      // 1. Calling pages: '50-60' on a 3-page document is an explicit error reporting valid range
-      await expect(h.service.parseDocument(
-        session('session-oob-pages'),
-        { file_path: h.file, pages: '50-60' },
-        new AbortController().signal,
-        null,
-      )).rejects.toThrow('[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range (valid: 1-3, total pages: 3)')
-
-      // 2. Calling pages: '1-2' on a 3-page document shows Pages: 1-2, Total Pages: 3
-      const inBoundsResult = asResult(await h.service.parseDocument(
-        session('session-in-bounds-pages'),
-        { file_path: h.file, pages: '1-2' },
-        new AbortController().signal,
-        null,
-      ))
-      expect(inBoundsResult.pages).toBe('1-2')
-      expect(isJsonValue(inBoundsResult)).toBe(true)
-      expect(snapshotJsonValue(inBoundsResult)).toBeDefined()
-      expect(inBoundsResult.markdown_content).toContain('Page 1 text content')
-      expect(inBoundsResult.markdown_content).toContain('Page 2 text content')
-      expect(inBoundsResult.markdown_content).not.toContain('Page 3 text content')
-      const inBoundsRendered = renderResult(inBoundsResult)[0]?.text ?? ''
-      expect(inBoundsRendered).toContain('Status: Content complete. Pages: 1-2, Total Pages: 3. Selected parsed text complete across this and preceding chunks; not a guarantee of OCR fidelity or visual coverage.')
-
-      // 3. Calling without pages shows Pages: 1-3, Total Pages: 3
-      const allResult = asResult(await h.service.parseDocument(
-        session('session-all-pages'),
-        { file_path: h.file },
-        new AbortController().signal,
-        null,
-      ))
-      expect(allResult.pages).toBeUndefined()
-      expect('pages' in allResult).toBe(false)
-      expect(isJsonValue(allResult)).toBe(true)
-      expect(snapshotJsonValue(allResult)).toBeDefined()
-      const allRendered = renderResult(allResult)[0]?.text ?? ''
-      expect(allRendered).toContain('Status: Content complete. Pages: 1-3, Total Pages: 3. Selected parsed text complete across this and preceding chunks; not a guarantee of OCR fidelity or visual coverage.')
-    })
+  it('resumes a published result even when caching is disabled for new requests', async () => {
+    const h = await readerHarness()
+    h.provider.contentList = [{ type: 'text', page_idx: 0, text: 'Block for cacheEnabled false test. ' + 'fill '.repeat(2500) }]
+    const initial = await h.read()
+    expect(initial.content_status).toBe('partial')
+    h.configure({ cacheEnabled: false })
+    const next = await h.read({ cursor: initial.cursor })
+    expect(next.markdown_content!.length).toBeGreaterThan(0)
+    expect(h.provider.submitCount).toBe(1)
   })
 })
 
-describe('feedback-driven scoped evidence reading', () => {
-  async function reader(blocks: Record<string, unknown>[], budget = 12000) {
-    const h = await harness()
-    h.provider.complete = true
-    Object.assign(h.config.output, { maxInlineChars: budget })
-    h.provider.extraArtifactsByFileName.set('input.pdf', [{ kind: 'content-list', content: JSON.stringify(blocks) }])
-    const read = async (args: Record<string, unknown> = {}) => asResult(await h.service.parseDocument(session('quality'), { file_path: h.file, ...args }, new AbortController().signal, null))
-    return { h, read }
-  }
+describe('outline and page scoping', () => {
+  const outlineBlocks: ContentListBlock[] = [
+    { type: 'title', text: 'Overview', text_level: 1, page_idx: 0 },
+    { type: 'text', text: 'Some long paragraph text that should not appear in toc-only view.', page_idx: 0 },
+    { type: 'text', text: 'Section 1', text_level: 2, page_idx: 1 },
+    { type: 'image', path: 'images/fig1.png', page_idx: 1 },
+    { type: 'text', text: 'Section 2', text_level: 2, page_idx: 2 },
+  ]
 
+  it('omits the repeated toc on partial reads and provides it on demand', async () => {
+    const h = await readerHarness({ output: { maxInlineChars: 2048 } })
+    h.provider.markdown = ['# Document Title', 'Intro.', '## Chapter 1', 'Paragraph 1. '.repeat(100), '### Section 1.1', 'Paragraph 2. '.repeat(100)].join('\n')
+    const parsed = await h.read()
+    expect(parsed.content_status).toBe('partial')
+    expect(parsed.toc).toBeUndefined()
+    const outline = await h.read({ focus: 'toc' })
+    expect(outline.markdown_content).toBe(formatTocMarkdown(extractMarkdownHeadings(h.provider.markdown)))
+  })
+
+  it('returns an outline-only projection from the content list', async () => {
+    const h = await readerHarness()
+    h.provider.contentList = outlineBlocks
+    const view = await h.read({ focus: 'toc' })
+    expect(view).toMatchObject({ content_status: 'complete', cursor: null })
+    expect(view.markdown_content).toContain('- Overview (Page 1)')
+    expect(view.markdown_content).toContain('  - Section 1 (Page 2)')
+    expect(view.markdown_content).toContain('  - Section 2 (Page 3)')
+    expect(view.markdown_content).not.toContain('Some long paragraph text')
+    expect(view.ordered_images).toBeUndefined()
+    expect(view.toc).toBeUndefined()
+    expect(view).not.toHaveProperty('pages')
+  })
+
+  it('filters the outline by pages and combines it with text when requested', async () => {
+    const h = await readerHarness()
+    h.provider.contentList = outlineBlocks
+    const page2 = await h.read({ pages: '2', focus: 'toc' })
+    expect(page2.markdown_content).toContain('  - Section 1 (Page 2)')
+    expect(page2.markdown_content).not.toMatch(/Overview|Section 2/)
+    const combined = await h.read({ pages: '1', focus: ['toc', 'text'] })
+    expect(combined.markdown_content).toContain('- Overview (Page 1)')
+    expect(combined.markdown_content).toContain('Some long paragraph text')
+  })
+
+  it('extracts the outline from Markdown when there is no content list', async () => {
+    const h = await readerHarness()
+    h.provider.markdown = '# Fallback Title\nSome body text\n## Sub Heading\nMore body'
+    const view = await h.read({ focus: 'toc' })
+    expect(view.markdown_content).toContain('- Fallback Title (line 1)')
+    expect(view.markdown_content).toContain('  - Sub Heading (line 3)')
+    expect(view.markdown_content).not.toContain('Some body text')
+  })
+
+  it.each([{ focus: 'text' as const }, { pages: '1' }, { query: 'Doc' }])('rejects typed selection %o when Markdown has no content-list mapping', async args => {
+    const h = await readerHarness()
+    h.provider.markdown = '# Doc\n| A | B |\n|---|---|\n| 1 | 2 |'
+    await expect(h.read(args)).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST', message: expect.stringContaining('[SELECTION_UNAVAILABLE]') } })
+  })
+
+  it('lists only images located on the selected pages', async () => {
+    const h = await readerHarness()
+    h.provider.contentList = [
+      { type: 'text', text: 'Page 1 intro.', page_idx: 0 },
+      { type: 'image', path: 'images/page1.png', caption: 'Figure 1 on Page 1', page_idx: 0 },
+      { type: 'image', path: 'images/page2.png', caption: 'Figure 2 on Page 2', page_idx: 1 },
+      { type: 'text', text: 'Page 3 content without images.', page_idx: 2 },
+    ]
+    const page2 = await h.read({ pages: '2' })
+    expect(page2.ordered_images).toEqual([expect.objectContaining({ status: 'unavailable', page: 2, caption: 'Figure 2 on Page 2' })])
+    expect(page2.markdown_content).not.toContain('Figure 1 on Page 1')
+    expect((await h.read({ pages: '3' })).ordered_images).toBeUndefined()
+  })
+
+  it('reports layout page bounds instead of silently narrowing out-of-range pages', async () => {
+    const h = await readerHarness()
+    h.provider.contentList = [0, 1, 2].map(page_idx => ({ type: 'text', text: 'Page ' + String(page_idx + 1) + ' text content.', page_idx }))
+    h.provider.extras = [{ kind: 'layout', content: JSON.stringify({ pdf_info: [{ page_idx: 0 }, { page_idx: 1 }, { page_idx: 2 }] }) }]
+    await expect(h.read({ pages: '50-60' })).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST', message: expect.stringMatching(/^\[PAGE_OUT_OF_RANGE\].*valid: 1-3/) } })
+    const inBounds = await h.read({ pages: '1-2' })
+    expect(inBounds).toMatchObject({ pages: '1-2', content_status: 'complete', summary: { page_count: 3, page_count_source: 'layout' } })
+    expect(inBounds.markdown_content).toContain('Page 2 text content')
+    expect(inBounds.markdown_content).not.toContain('Page 3 text content')
+    const all = await h.read()
+    expect(all).not.toHaveProperty('pages')
+    expect(all.summary).toMatchObject({ page_count: 3, page_count_source: 'layout' })
+  })
+})
+
+describe('scoped evidence diagnostics and budgets', () => {
   it('scopes diagnostics to TOC, table, query and exact blocks without renumbering', async () => {
-    const { read } = await reader([
+    const h = await readerHarness()
+    h.provider.contentList = [
       { type: 'text', text: 'Methods', text_level: 1, page_idx: 0 },
       { type: 'unknown-widget', text: 'unsupported but retained', page_idx: 0 },
       { type: 'table', table_body: '<table><tr><td>42</td></tr></table>', page_idx: 0 },
       { type: 'text', text: '其中， 表示可训练参数', page_idx: 1 },
-    ])
-    expect((await read({ focus: 'toc' })).diagnostics ?? []).toEqual([])
-    expect((await read({ focus: 'table', pages: 1 })).diagnostics?.filter(d => d.scope === 'chunk') ?? []).toEqual([])
-    const query = await read({ query: '其中' })
-    expect(query.diagnostics).toHaveLength(1)
-    expect(query.diagnostics![0]).toMatchObject({ code: 'DOCUMENT_INDEX_POSSIBLE_TEXT_GAP', scope: 'chunk', block_id: query.result_id + ':b4', page: 2 })
-    const exact = await read({ block_id: query.result_id + ':b4' })
-    expect(exact.diagnostics).toEqual(query.diagnostics)
-    expect((await read({ block_id: query.result_id + ':b2' })).diagnostics?.[0]?.code).toBe('DOCUMENT_INDEX_UNKNOWN_BLOCK_TYPE')
+    ]
+    expect((await h.read({ focus: 'toc' })).diagnostics ?? []).toEqual([])
+    expect((await h.read({ focus: 'table', pages: 1 })).diagnostics?.filter(d => d.scope === 'chunk') ?? []).toEqual([])
+    const query = await h.read({ query: '其中' })
+    expect(query.diagnostics).toEqual([expect.objectContaining({ code: 'DOCUMENT_INDEX_POSSIBLE_TEXT_GAP', scope: 'chunk', block_id: query.result_id + ':b4', page: 2 })])
+    expect((await h.read({ block_id: query.result_id + ':b4' })).diagnostics).toEqual(query.diagnostics)
+    expect((await h.read({ block_id: query.result_id + ':b2' })).diagnostics?.[0]?.code).toBe('DOCUMENT_INDEX_UNKNOWN_BLOCK_TYPE')
   })
 
   it('returns all reference entries and finds a later list item without reparsing', async () => {
-    const references = Array.from({ length: 15 }, (_, index) => '[' + (index + 1) + '] Reference author ' + (index + 1))
-    const { h, read } = await reader([{ type: 'list', sub_type: 'ref_text', list_items: references, page_idx: 16 }])
-    const first = await read()
+    const h = await readerHarness()
+    const references = Array.from({ length: 15 }, (_, index) => '[' + String(index + 1) + '] Reference author ' + String(index + 1))
+    h.provider.contentList = [{ type: 'list', sub_type: 'ref_text', list_items: references, page_idx: 16 }]
+    const first = await h.read()
     for (const reference of references) expect(first.markdown_content).toContain(reference)
     expect(first.diagnostics ?? []).toEqual([])
-    const found = await read({ query: 'author 15' })
+    const found = await h.read({ query: 'author 15' })
     expect(found.markdown_content).toContain(first.result_id + ':b1')
     expect(found.markdown_content).toContain('author 15')
     expect(h.provider.submitCount).toBe(1)
   })
 
-  it('never rewrites suspect mathematics and makes verification explicitly advisory', async () => {
+  it('never rewrites suspect mathematics and reports provenance separately from reader versions', async () => {
+    const h = await readerHarness()
     const formula = String.raw`$$ P  Q \equiv \lnot P \times Q \tag{7} $$`
-    const { read } = await reader([{ type: 'equation', text: formula, page_idx: 6 }])
-    const result = await read()
+    h.provider.contentList = [{ type: 'equation', text: formula, page_idx: 6 }]
+    const result = await h.read()
     expect(result.markdown_content).toContain(formula)
     expect(result.verification_hints).toEqual([{ reason: 'formula', block_id: result.result_id + ':b1', page: 7, view: 'page' }])
     expect(result.diagnostics ?? []).toEqual([])
-    expect(formatResultProse(result)).toContain('advisory, not a detected error')
-    expect(result.provenance).toMatchObject({ provider: 'self-hosted-legacy-v2', model: defaultMinerUConfig().defaults.model, upstream_version: null, index_version: 2, reader_version: 3 })
+    expect(result.provenance).toMatchObject({
+      provider: h.provider.id, model: h.config.defaults.model, upstream_version: null,
+      index_version: DOCUMENT_INDEX_VERSION, reader_version: READ_CURSOR_VERSION,
+    })
   })
 
-  it('emits only current chunk diagnostics and avoids replaying scope notices', async () => {
-    const { read } = await reader(Array.from({ length: 15 }, (_, index) => ({ type: 'unknown-widget', text: 'Block ' + index + ' ' + 'x'.repeat(1700), page_idx: 0 })))
-    let view = await read({ pages: 1, inline_images: false })
+  it('adds original-page hints for every accepted top-level equation kind', async () => {
+    const h = await readerHarness()
+    const blocks = ['equation', 'Equation', 'interline_equation', 'INLINE_EQUATION'].map(type => ({ type, content: 'x', page_idx: 0 }))
+    h.provider.contentList = blocks
+    const view = await h.read()
+    expect(view.verification_hints?.map(hint => hint.block_id)).toEqual(blocks.map((_, index) => view.result_id + ':b' + String(index + 1)))
+  })
+
+  it('emits only delivered-chunk diagnostics on continuations and never replays scope notices', async () => {
+    const h = await readerHarness()
+    h.provider.contentList = Array.from({ length: 15 }, (_, index) => ({ type: 'unknown-widget', text: 'Block ' + String(index) + ' ' + 'x'.repeat(1700), page_idx: 0 }))
+    let view = await h.read({ pages: 1, inline_images: false })
     expect(view.provenance).toBeDefined()
     expect(view.diagnostics?.some(d => d.scope === 'selection')).toBe(true)
     for (let count = 0; count < 20; count++) {
@@ -1340,7 +516,7 @@ describe('feedback-driven scoped evidence reading', () => {
         expect(view.markdown_content?.includes('[' + diagnostic.block_id) || view.continuation_block?.block_id === diagnostic.block_id).toBe(true)
       }
       if (!view.cursor) break
-      view = await read({ cursor: view.cursor })
+      view = await h.read({ cursor: view.cursor })
       expect(view.provenance).toBeUndefined()
       expect(view.diagnostics?.some(d => d.scope !== 'chunk') ?? false).toBe(false)
       expect(view.warnings?.some(warning => warning.includes('PAGE_COUNT_LOWER_BOUND')) ?? false).toBe(false)
@@ -1348,56 +524,81 @@ describe('feedback-driven scoped evidence reading', () => {
     expect(view.content_status).toBe('complete')
   })
 
+  it('preserves initial selection notices when one block has many diagnostics', async () => {
+    const h = await readerHarness()
+    h.provider.contentList = [{ type: 'list', list_items: ['[1] Valid', ...Array.from({ length: 20 }, () => ({ unsupported: true }))], page_idx: 0 }]
+    const view = await h.read({ pages: 1 })
+    expect(view.diagnostics?.[0]).toMatchObject({ scope: 'selection', code: 'PAGE_COUNT_LOWER_BOUND' })
+    expect(view.diagnostics?.some(diagnostic => diagnostic.scope === 'chunk')).toBe(true)
+    expect(view.metadata_shortened).toContain('diagnostics')
+    expect(view.diagnostics!.length).toBeLessThanOrEqual(6)
+  })
+
   it('makes progress under the minimum budget with explicit metadata degradation', async () => {
-    const { read } = await reader([{ type: 'unknown-widget', text: '其中， 表示可训练参数 ' + 'x'.repeat(1600), page_idx: 0 }], 1024)
-    let view = await read()
+    const h = await readerHarness({ output: { maxInlineChars: 1024 } })
+    h.provider.contentList = [{ type: 'unknown-widget', text: '其中， 表示可训练参数 ' + 'x'.repeat(1600), page_idx: 0 }]
+    let view = await h.read()
     expect(view.metadata_shortened?.length).toBeGreaterThan(0)
     for (let rounds = 0; view.cursor && rounds < 40; rounds++) {
       expect(JSON.stringify(view).length).toBeLessThanOrEqual(1024)
-      expect(formatResultProse(view).length).toBeLessThanOrEqual(1024)
+      expect(renderedText(view).length).toBeLessThanOrEqual(1024)
       expect(view.markdown_content!.length).toBeGreaterThan(0)
-      view = await read({ cursor: view.cursor })
+      view = await h.read({ cursor: view.cursor })
     }
     expect(view.content_status).toBe('complete')
   })
+
+  it('compacts optional metadata for artifact-only reads under a small budget', async () => {
+    const h = await readerHarness({ output: { maxInlineChars: 1024 } })
+    const file = await h.addSource('r'.repeat(180) + '.pdf')
+    h.provider.contentList = [{ type: 'text', text: 'content', page_idx: 0 }]
+    const view = await h.read({ focus: 'artifacts' }, { file })
+    expect(view.content_status).toBe('not_requested')
+    expect(view.metadata_shortened?.length).toBeGreaterThan(0)
+    expect(view.files[0]!.artifacts_truncated).toBe(true)
+    expect(JSON.stringify(view).length).toBeLessThanOrEqual(1024)
+    expect(renderedText(view).length).toBeLessThanOrEqual(1024)
+  })
 })
 
-it('includes original-page hints for all accepted top-level equation kinds', async () => {
-  const h = await harness()
-  h.provider.complete = true
-  Object.assign(h.config.output, { maxInlineChars: 12000 })
-  const blocks = ['equation', 'Equation', 'interline_equation', 'INLINE_EQUATION'].map(type => ({ type, content: 'x', page_idx: 0 }))
-  h.provider.extraArtifactsByFileName.set('input.pdf', [{ kind: 'content-list', content: JSON.stringify(blocks) }])
-  const view = asResult(await h.service.parseDocument(session('formula-types'), { file_path: h.file }, new AbortController().signal, null))
-  expect(view.verification_hints).toHaveLength(4)
-  expect(view.verification_hints?.map(hint => hint.block_id)).toEqual(blocks.map((_, index) => view.result_id + ':b' + (index + 1)))
-})
+describe('projection text helpers', () => {
+  it.each([
+    { name: 'empty text', text: '', expected: [] },
+    { name: 'plain text', text: 'Just plain text\nNo hashes here', expected: [] },
+    {
+      name: 'levels 1-6 with trimmed titles', text: '# Main Title\nIntro\n## Section 1 \n### Sub\n#### H4\n##### H5\n###### H6',
+      expected: [[1, 'Main Title', 1], [2, 'Section 1', 3], [3, 'Sub', 4], [4, 'H4', 5], [5, 'H5', 6], [6, 'H6', 7]],
+    },
+    {
+      name: 'invalid syntax and CRLF', text: '####### Seven\r\n#NoSpace\r\n### \t Tab after hash\r\n###    \r\n# Valid Heading\r\n## Second Heading',
+      expected: [[3, 'Tab after hash', 3], [1, 'Valid Heading', 5], [2, 'Second Heading', 6]],
+    },
+  ] as const)('extracts Markdown headings from $name', ({ text, expected }) => {
+    expect(extractMarkdownHeadings(text)).toEqual(expected.map(([level, title, line]) => ({ level, title, line })))
+  })
 
-it('preserves initial selection notices when one block has many diagnostics', async () => {
-  const h = await harness()
-  h.provider.complete = true
-  Object.assign(h.config.output, { maxInlineChars: 12000 })
-  const block = { type: 'list', list_items: ['[1] Valid', ...Array.from({ length: 20 }, () => ({ unsupported: true }))], page_idx: 0 }
-  h.provider.extraArtifactsByFileName.set('input.pdf', [{ kind: 'content-list', content: JSON.stringify([block]) }])
-  const view = asResult(await h.service.parseDocument(session('scope-priority'), { file_path: h.file, pages: 1 }, new AbortController().signal, null))
-  expect(view.diagnostics?.[0]).toMatchObject({ scope: 'selection', code: 'PAGE_COUNT_LOWER_BOUND' })
-  expect(view.diagnostics?.some(diagnostic => diagnostic.scope === 'chunk')).toBe(true)
-  expect(view.metadata_shortened).toContain('diagnostics')
-  expect(view.diagnostics!.length).toBeLessThanOrEqual(6)
-})
+  it('keeps every heading without a summary cap', () => {
+    const text = Array.from({ length: 50 }, (_, index) => '#'.repeat(index % 3 + 1) + ' Title ' + String(index)).join('\n')
+    expect(extractMarkdownHeadings(text)).toHaveLength(50)
+  })
 
-it('compacts optional metadata for artifact-only reads under a small budget', async () => {
-  const h = await harness()
-  h.provider.complete = true
-  Object.assign(h.config.output, { maxInlineChars: 1024 })
-  const name = 'r'.repeat(180) + '.pdf'
-  const file = join(h.root, name)
-  await writeFile(file, '%PDF-1.4 long-name artifact fixture')
-  h.provider.extraArtifactsByFileName.set(name, [{ kind: 'content-list', content: JSON.stringify([{ type: 'text', text: 'content', page_idx: 0 }]) }])
-  const view = asResult(await h.service.parseDocument(session('small-artifacts'), { file_path: file, focus: 'artifacts' }, new AbortController().signal, null))
-  expect(view.content_status).toBe('not_requested')
-  expect(view.metadata_shortened?.length).toBeGreaterThan(0)
-  expect(view.files[0]!.artifacts_truncated).toBe(true)
-  expect(JSON.stringify(view).length).toBeLessThanOrEqual(1024)
-  expect(formatResultProse(view).length).toBeLessThanOrEqual(1024)
+  it('formats outline Markdown with level indentation and page or line coordinates', () => {
+    const headings: DocumentHeading[] = [{ level: 1, title: 'Introduction', page: 1 }, { level: 2, title: 'Background', line: 4 }, { level: 3, title: 'Details' }]
+    expect(formatTocMarkdown(headings)).toBe('# Document Outline\n\n- Introduction (Page 1)\n  - Background (line 4)\n    - Details')
+    expect(formatTocMarkdown([])).not.toContain('- ')
+    expect(formatTocMarkdown([], { pageRange: '3-5' })).toContain('3-5')
+  })
+
+  it.each([
+    { text: 'First line\nSecond line\nThird line', max: 22, expected: 'First line\n' },
+    { text: 'Paragraph 1\n\nParagraph 2\n\nParagraph 3', max: 16, expected: 'Paragraph 1\n\n' },
+    { text: 'Paragraph 1\n\nParagraph 2\n\nParagraph 3', max: 25, expected: 'Paragraph 1\n\nParagraph 2\n' },
+    { text: '第一段中文\n第二段中文内容更长一些\n第三段', max: 16, expected: '第一段中文\n' },
+  ])('truncates at a clean boundary within $max characters', ({ text, max, expected }) => {
+    expect(truncateAtCleanBoundary(text, max)).toMatchObject({ truncated: true, text: expected })
+  })
+
+  it('never slices through a surrogate pair', () => {
+    expect(safeStringSlice('A🚀B', 2)).toBe('A')
+  })
 })

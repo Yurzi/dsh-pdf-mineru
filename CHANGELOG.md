@@ -1,5 +1,38 @@
 # Changelog
 
+All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## Unreleased
+
+### Added
+
+- Show a localized title, description and icon for the plugin on the DSH Plugins page and in market indexes (`locale/en.json`, `locale/zh.json`, `assets/icon.svg`).
+- Revision-aware settings saves: the settings page now detects configuration changed by another window or process since it was loaded, refuses to overwrite it (`mineru/conflict`), and asks you to reload.
+- Background jobs record the tool call that started them, so native and `run_code` calls are attributed correctly in DSH.
+
+### Changed
+
+- Require DSH `>=0.2.1-rc.2 <0.3.0-0`. Compatibility is decided by `engines.dsh` alone; DSH runtime peers use the same range. Upgrade in place with **Update** on the Plugins page, or `dsh plugin remove` followed by `dsh plugin add`.
+- A relative `file_path` now resolves against the session's current working directory, so it follows `working_directory` changes. The path is resolved once per call; `async_parse_pdf` pins it at submission. `attachment_id` is unaffected.
+- Background job IDs are issued by DSH (for example `mineru-3f9c…`) instead of a sequential `mineru-N`; treat them as opaque.
+- Settings and storage maintenance RPC now require the DSH owner principal in addition to a loopback Host. Destructive maintenance still needs a preview and explicit confirmation.
+- A credential stored in DSH now takes precedence over an environment variable of the same name; the plugin reads `process.env` directly only on hosts without a credential service.
+- Redesign the settings page into two tabs, "Service & parsing" and "Storage", built from DSH primitives: human-readable Provider names, an inline connection test, durations in seconds/hours, a save bar that appears only with unsaved changes, and preview-then-confirm dialogs for cache clearing and quarantine cleanup.
+- `read_pdf` presentation metadata is now a compact summary (IDs, source, status and counts) instead of a copy of the result, which keeps nested `run_code` call logs small. The tool result itself is unchanged.
+- Restructure the documentation: user configuration and storage operations move to `docs/configuration.md`, contributor workflow and release steps to `CONTRIBUTING.md`.
+
+### Removed
+
+- The separate garbage-collection preview in storage maintenance. The cache-clear dry run is the single preview, and its confirmation token authorizes the deletion.
+- Generated `lib/` output is no longer committed to git (the npm package still ships the built bundles and PDF.js worker); build locally before a `link:` install. TypeScript declarations (`lib/types`) are no longer published.
+- The public `MinerUService` and `parseReadInput` exports, replaced by `ParseService`, `ReaderService` and `parseReadArguments` for offline smoke scripts.
+- The private `smoke:reader-cache` script, which depended on a fixture that was never distributed.
+
+### Fixed
+
+- A relative `file_path` no longer selects a same-named file in the session's original directory after the working directory changes.
+- CI now runs lint, typecheck (including tests), build and tests on every push and pull request; the publish workflow verifies that the tag matches the package version and builds before testing.
+
 ## 0.2.0
 
 ### Added

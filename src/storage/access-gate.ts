@@ -34,7 +34,7 @@ function errnoCode(error: unknown): string | undefined {
 
 /** Classify unique owner directories. Foreign and unverifiable owners fail closed. */
 export async function listUseRecords(paths: StoragePaths): Promise<readonly ClassifiedUseRecord[]> {
-  const usersDir = join(paths.root, '.lock', 'users')
+  const usersDir = paths.lockUsersDir()
   const records: ClassifiedUseRecord[] = []
   try {
     const directory = await opendir(usersDir)
@@ -63,41 +63,31 @@ export async function listUseRecords(paths: StoragePaths): Promise<readonly Clas
 export class StorageAccessGate {
   private activeReaders = 0
   private exclusive = false
-  private readonly paths: StoragePaths | undefined
-  private readonly lock: ProcessLock | undefined
+  private readonly paths: StoragePaths
+  private readonly lock: ProcessLock
 
-  constructor(options?: StorageAccessGateOptions) {
-    this.paths = options?.paths
-    this.lock = options?.lock
+  constructor(options: StorageAccessGateOptions) {
+    this.paths = options.paths
+    this.lock = options.lock
   }
 
   get activeReaderCount(): number { return this.activeReaders }
 
+  /** Covers the actual reader or producer I/O lifetime. */
   async runShared<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-    return await this.runUse(operation, signal)
-  }
-
-  /** Producer leases use the same owner protocol and cover the full producer lifetime. */
-  async runProducer<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-    return await this.runUse(operation, signal)
-  }
-
-  private async runUse<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     signal?.throwIfAborted()
     if (this.exclusive) throwMinerU('STORAGE_LOCKED', 'MinerU storage maintenance is in progress')
     this.activeReaders++
     let ownerId: string | undefined
     try {
-      if (this.paths !== undefined && this.lock !== undefined) {
-        await this.lock.initialize(signal)
-        ownerId = await this.lock.withLock(async scope => {
-          this.lock!.assertScope(scope)
-          if (this.exclusive) throwMinerU('STORAGE_LOCKED', 'MinerU storage maintenance is in progress')
-          const id = createStorageOwnerId('u')
-          await mkdir(join(this.paths!.root, '.lock', 'users', id), { mode: 0o700 })
-          return id
-        }, signal)
-      }
+      await this.lock.initialize(signal)
+      ownerId = await this.lock.withLock(async scope => {
+        this.lock.assertScope(scope)
+        if (this.exclusive) throwMinerU('STORAGE_LOCKED', 'MinerU storage maintenance is in progress')
+        const id = createStorageOwnerId('u')
+        await mkdir(join(this.paths.lockUsersDir(), id), { mode: 0o700 })
+        return id
+      }, signal)
       signal?.throwIfAborted()
       // Never race operation against signal: the record covers actual I/O lifetime.
       return await operation()
@@ -105,8 +95,8 @@ export class StorageAccessGate {
       try {
         // This unique directory can only belong to this invocation. Direct
         // removal cannot admit maintenance early because the operation is done.
-        if (ownerId !== undefined && this.paths !== undefined) {
-          await rm(join(this.paths.root, '.lock', 'users', ownerId), { recursive: true, force: true })
+        if (ownerId !== undefined) {
+          await rm(join(this.paths.lockUsersDir(), ownerId), { recursive: true, force: true })
         }
       } finally {
         this.activeReaders--
@@ -117,9 +107,6 @@ export class StorageAccessGate {
   /** Fail fast, then recheck and prune confirmed-dead records under the scoped mutex. */
   async runMaintenance<T>(operation: (scope: ProcessLockScope) => Promise<T>, signal?: AbortSignal): Promise<T> {
     signal?.throwIfAborted()
-    if (this.lock === undefined || this.paths === undefined) {
-      throw new TypeError('Cross-process storage maintenance requires { paths, lock }')
-    }
     if (this.exclusive || this.activeReaders > 0) {
       throwMinerU('STORAGE_LOCKED', 'MinerU storage is in use by an active reader or producer')
     }
@@ -127,7 +114,7 @@ export class StorageAccessGate {
     await this.assertNoActiveRecords(false)
 
     return await this.lock.withLock(async scope => {
-      this.lock!.assertScope(scope)
+      this.lock.assertScope(scope)
       if (this.exclusive || this.activeReaders > 0) {
         throwMinerU('STORAGE_LOCKED', 'MinerU storage is in use by an active reader or producer')
       }
@@ -141,30 +128,18 @@ export class StorageAccessGate {
     }, signal)
   }
 
-  /** Local-only compatibility API. Destructive cross-process work uses runMaintenance. */
-  tryAcquireExclusive(): (() => void) | undefined {
-    if (this.exclusive || this.activeReaders > 0) return undefined
-    this.exclusive = true
-    let released = false
-    return () => {
-      if (released) return
-      released = true
-      this.exclusive = false
-    }
-  }
-
   private async assertNoActiveRecords(pruneDead: boolean, scope?: ProcessLockScope): Promise<void> {
-    const records = await listUseRecords(this.paths!)
+    const records = await listUseRecords(this.paths)
     if (pruneDead) {
       if (scope === undefined) throw new TypeError('Use-record pruning requires a process lock scope')
-      this.lock!.assertScope(scope)
+      this.lock.assertScope(scope)
       for (const record of records) {
         if (record.kind === 'dead' && storageOwnerState(record.id) === 'dead') {
-          await rm(join(this.paths!.root, '.lock', 'users', record.id), { recursive: true, force: true })
+          await rm(join(this.paths.lockUsersDir(), record.id), { recursive: true, force: true })
         }
       }
     }
-    const remaining = pruneDead ? await listUseRecords(this.paths!) : records
+    const remaining = pruneDead ? await listUseRecords(this.paths) : records
     if (remaining.some(record => record.kind !== 'dead')) {
       throwMinerU('STORAGE_LOCKED', 'MinerU storage is in use or its owner cannot be safely verified')
     }

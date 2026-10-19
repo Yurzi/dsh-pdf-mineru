@@ -1,125 +1,94 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { Context } from '@deepseek-ai/cordis'
-import { JobId } from '@deepseek-ai/dsh-jobs'
-import { AttachmentId, type FileAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import { createUserMessage, type Message } from '@deepseek-ai/dsh-llm'
-import type { JobRegistry } from '@deepseek-ai/dsh-jobs'
-import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
-import type { MinerUService, ResultView } from '../src/service/mineru-service.js'
-import { registerTools } from '../src/tools.js'
-import { cursorForRemainder } from '../src/service/read-cursor.js'
+import { describe, expect, it } from 'vitest'
+import { cursorForRemainder, decodeReadCursor } from '../src/reader/read-cursor.js'
+import { ATTACHMENT_HOST_PATH, FILE_REF, selectQuery, toolHarness, type ToolHarnessOptions } from './support/tool-harness.js'
 
-const ref: FileAttachmentRef = { attachmentId: AttachmentId('sha256:' + 'a'.repeat(64)), name: 'paper.pdf', bytes: 100 }
-const hostPath = '/dsh-owned/paper.pdf'
-const cleanups: Array<() => Promise<void>> = []
-afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup() })
+// Attachment selectors and the effective working directory both end in one absolute source path.
+const harness = (options: ToolHarnessOptions = {}) => toolHarness({ imageModel: true, files: [FILE_REF], ...options })
+const sources = [['read_pdf', {}], ['read_pdf', { view: 'page', pages: 2 }], ['async_parse_pdf', {}]] as const
 
-function harness(options: { missingStore?: boolean; missingPath?: boolean } = {}) {
-  let messages: readonly Message[] = [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'file', attachment: ref }] })]
-  const session = { id: 'attachment-tools', header: { id: 'attachment-tools', cwd: '/workspace' }, deriveMessages: () => messages }
-  const exec = { callId: 'attachment-call', name: 'read_pdf', arguments: {}, signal: new AbortController().signal, agent: { options: { provider: 'mock', model: 'vision' }, session } } as unknown as ToolRunContext
-  const result: ResultView = { state: 'completed', source: 'cache', cache_hit: true, result_id: 'mr_attachment', files: [{ file_id: 'mf_attachment', name: 'paper.pdf', artifacts: [] }], content_status: 'complete', cursor: null, output_limit_chars: 12000 }
-  const parseDocument = vi.fn(async () => result)
-  const ensureParsed = vi.fn(async () => ({ ...result, content_status: 'not_requested' as const }))
-  const previewPage = vi.fn(async () => ({ name: 'paper.pdf', page: 2, page_count: 3, sha256: 'a'.repeat(64), renderer: 'pdfjs' as const, data: new Uint8Array([1]), media_type: 'image/png' as const, result_id: 'mr_page_attachment_2', file_id: 'mf_attachment', output_limit_chars: 12000 }))
-  const store = { fileHostPath: vi.fn(() => options.missingPath ? undefined : hostPath), saveImage: vi.fn(async () => ({ attachmentId: AttachmentId('sha256:' + 'b'.repeat(64)), name: 'page-2.png', mediaType: 'image/png', bytes: 1, width: 10, height: 10 })) }
-  const jobSpecs: Array<Parameters<JobRegistry['start']>[0]> = []
-  const start = vi.fn((spec: Parameters<JobRegistry['start']>[0]) => { jobSpecs.push(spec); return 'mineru-1' })
-  const tools = new Map<string, ToolDefinition>()
-  const ctx = { tools: { register: (tool: ToolDefinition) => { tools.set(tool.name, tool); return () => undefined } }, get: (name: string) => {
-    if (name === 'attachments') return options.missingStore ? undefined : store
-    if (name === 'jobs') return { start }
-    if (name === 'llm') return { resolveModelInfo: async () => ({ inputModalities: ['text', 'image'] }) }
-    return undefined
-  } } as unknown as Context
-  cleanups.push(registerTools(ctx, () => ({ parseDocument, ensureParsed, previewPage }) as unknown as MinerUService))
-  return { tools, exec, session, parseDocument, ensureParsed, previewPage, store, start, jobSpecs, clearSurface: () => { messages = [] } }
-}
+describe('attachment_id source selection', () => {
+  it.each([
+    [{ focus: 'toc' }, selectQuery({ focus: new Set(['toc']) })],
+    [{ pages: [2, 3], query: '  equation  ', inline_images: false, poll_timeout_ms: 1234 }, selectQuery({ pages: new Set([2, 3]), target: { kind: 'query', text: 'equation' } }, { inlineImages: false, pollTimeoutMs: 1234 })],
+    [{ block_id: 'mr_fixture:b1' }, selectQuery({ target: { kind: 'block', blockId: 'mr_fixture:b1' } })],
+  ] as const)('maps the visible reference to its host path for %j', async (selection, query) => {
+    const h = await harness()
+    await h.read({ attachment_id: 'sha256:aaaaaaaa', ...selection })
+    expect(h.reader.readContent).toHaveBeenCalledExactlyOnceWith(ATTACHMENT_HOST_PATH, query, expect.anything(), expect.any(Function), expect.any(AbortSignal))
+    expect(h.fileHostPath).toHaveBeenCalledExactlyOnceWith(FILE_REF)
+  })
 
-describe('attachment input through real compiled tools', () => {
-  it('normalizes content, query and block selections into the unchanged path service input', async () => {
-    const h = harness()
-    for (const selection of [{ focus: 'toc' }, { query: 'equation' }, { block_id: 'mr_attachment:b1' }]) {
-      await h.tools.get('read_pdf')!.execute({ attachment_id: 'sha256:aaaaaaaa', ...selection }, h.exec)
-      expect(h.parseDocument).toHaveBeenLastCalledWith(h.session, { file_path: hostPath, inline_images: true, ...selection }, h.exec.signal, undefined)
+  it('keeps cursor intent on attachment continuations', async () => {
+    const h = await harness()
+    const cursor = cursorForRemainder('mr_fixture', undefined, new Set(['all']), 4, { inline_images: false })
+    await h.read({ attachment_id: String(FILE_REF.attachmentId), cursor })
+    expect(h.reader.readContent).toHaveBeenLastCalledWith(ATTACHMENT_HOST_PATH, { kind: 'continue', inlineImages: false, cursor: decodeReadCursor(cursor) }, expect.anything(), expect.any(Function), expect.any(AbortSignal))
+  })
+
+  it('routes attachment page views only to the local page reader', async () => {
+    const h = await harness()
+    await h.read({ attachment_id: 'aaaaaaaa', view: 'page', pages: 2, expected_sha256: 'c'.repeat(64) })
+    expect(h.reader.viewPage).toHaveBeenCalledWith(ATTACHMENT_HOST_PATH, { kind: 'page', page: 2, expectedSha256: 'c'.repeat(64) }, expect.anything(), expect.any(Function), expect.any(AbortSignal))
+    expect(h.reader.readContent).not.toHaveBeenCalled()
+    expect(h.ctx.jobs.list(h.session.id)).toEqual([])
+  })
+
+  it('maps before job registration and summarizes the host path under the session owner', async () => {
+    const h = await harness()
+    const id = await h.submit({ attachment_id: 'aaaaaaaa' })
+    await h.ctx.jobs.wait(id, 1000, h.session.id)
+    expect(h.ctx.jobs.get(id, h.session.id)).toMatchObject({ status: 'completed', label: 'Parse paper.pdf with MinerU' })
+    expect(h.reader.summarize).toHaveBeenCalledWith(ATTACHMENT_HOST_PATH, expect.anything(), expect.any(AbortSignal), expect.any(Function))
+  })
+
+  it.each(['missing store', 'missing host path'] as const)('fails with UNSUPPORTED_OPTION before reading or registering a job: %s', async mode => {
+    const h = await harness(mode === 'missing store' ? { attachments: false } : {})
+    h.fileHostPath.mockReturnValue(undefined)
+    for (const [name, extra] of sources) {
+      await expect(h.tool(name).execute({ attachment_id: 'aaaaaaaa', ...extra }, h.exec())).rejects.toMatchObject({ failure: { code: 'UNSUPPORTED_OPTION' } })
     }
-    expect(h.previewPage).not.toHaveBeenCalled()
-    expect(h.start).not.toHaveBeenCalled()
+    expect(h.reader.readContent).not.toHaveBeenCalled()
+    expect(h.reader.viewPage).not.toHaveBeenCalled()
+    expect(h.ctx.jobs.list(h.session.id)).toEqual([])
   })
 
-  it('preserves content page selection, timeout and explicit presentation options', async () => {
-    const h = harness()
-    await h.tools.get('read_pdf')!.execute({ attachment_id: 'aaaaaaaa', pages: [2, 3], focus: 'text', query: '  equation  ', inline_images: false, poll_timeout_ms: 1234 }, h.exec)
-    expect(h.parseDocument).toHaveBeenCalledWith(h.session, { file_path: hostPath, pages: [2, 3], focus: 'text', query: 'equation', inline_images: false }, h.exec.signal, 1234)
+  it('rejects references absent from the session surface without starting a job', async () => {
+    const h = await harness({ files: [] })
+    await expect(h.submit({ attachment_id: 'aaaaaaaa' })).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
+    expect(h.fileHostPath).not.toHaveBeenCalled()
+    expect(h.ctx.jobs.list(h.session.id)).toEqual([])
   })
 
-  it('preserves cursor and inherited/overridden inline intent without exposing attachment_id to the service', async () => {
-    const h = harness()
-    const cursor = cursorForRemainder('mr_attachment', undefined, new Set(['all']), 4, { inline_images: false })
-    const read = h.tools.get('read_pdf')!
-    await read.execute({ attachment_id: String(ref.attachmentId), cursor }, h.exec)
-    expect(h.parseDocument).toHaveBeenLastCalledWith(h.session, { file_path: hostPath, inline_images: false, cursor }, h.exec.signal, undefined)
-    await read.execute({ attachment_id: String(ref.attachmentId), cursor, inline_images: true }, h.exec)
-    expect(h.parseDocument).toHaveBeenLastCalledWith(h.session, { file_path: hostPath, inline_images: true, cursor }, h.exec.signal, undefined)
-    for (const extra of [{ pages: 1 }, { focus: 'text' }, { query: 'x' }, { block_id: 'mr_attachment:b1' }]) {
-      await expect(read.execute({ attachment_id: 'aaaaaaaa', cursor, ...extra }, h.exec)).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
+  it('never consults the working directory for host-owned attachment paths', async () => {
+    const h = await harness()
+    h.ensure.mockRejectedValue(new Error('directory unavailable'))
+    for (const [name, extra] of sources) await h.tool(name).execute({ attachment_id: 'aaaaaaaa', ...extra }, h.exec())
+    expect(h.ensure).not.toHaveBeenCalled()
+  })
+})
+
+describe('file_path against the effective working directory', () => {
+  it.each(['content', 'page', 'async'] as const)('resolves relative paths under the directory current at the call (%s)', async mode => {
+    const h = await harness()
+    h.setDirectory('/workspace/new-directory')
+    if (mode === 'async') {
+      const id = await h.submit({ file_path: 'paper.pdf' })
+      h.setDirectory('/workspace/later')
+      await h.ctx.jobs.wait(id, 1000, h.session.id)
+    } else {
+      await h.read({ file_path: 'paper.pdf', ...(mode === 'page' ? { view: 'page', pages: 2 } : {}) })
     }
-    expect(h.parseDocument).toHaveBeenCalledTimes(2)
+    const calls = mode === 'async' ? h.reader.summarize.mock.calls : mode === 'page' ? h.reader.viewPage.mock.calls : h.reader.readContent.mock.calls
+    expect(calls[0]?.[0]).toBe('/workspace/new-directory/paper.pdf')
+    expect(h.ensure).toHaveBeenCalledOnce()
   })
 
-  it('routes page attachments through only the existing local preview', async () => {
-    const h = harness()
-    const value = await h.tools.get('read_pdf')!.execute({ attachment_id: 'aaaaaaaa', view: 'page', pages: 2, expected_sha256: 'c'.repeat(64) }, h.exec)
-    expect(h.previewPage).toHaveBeenCalledWith(h.session, { file_path: hostPath, page: 2, expectedSha256: 'c'.repeat(64) }, h.exec.signal)
-    expect(h.parseDocument).not.toHaveBeenCalled()
-    expect(h.start).not.toHaveBeenCalled()
-    expect(value).toMatchObject({ view: 'page', renderer: 'pdfjs', source: 'local', cursor: null })
-    for (const extra of [{ pages: [1, 2] }, { focus: 'image' }, { inline_images: false }]) {
-      await expect(h.tools.get('read_pdf')!.execute({ attachment_id: 'aaaaaaaa', view: 'page', pages: 2, ...extra }, h.exec)).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
-    }
-    expect(h.previewPage).toHaveBeenCalledOnce()
-  })
-
-  it('maps before native job registration and preserves the live SessionId owner and path job semantics', async () => {
-    const h = harness()
-    expect(await h.tools.get('async_parse_pdf')!.execute({ attachment_id: 'aaaaaaaa' }, h.exec)).toEqual({ job_id: 'mineru-1', state: 'running' })
-    expect(h.jobSpecs[0]!.owner).toBe(h.exec.agent?.session.id)
-    expect(h.jobSpecs[0]!.label).toBe('Parse paper.pdf with MinerU')
-    const hooks = h.jobSpecs[0]!.run({ id: JobId('mineru-1'), append: vi.fn(), updateProgress: vi.fn() })
-    expect(await hooks.done).toMatchObject({ status: 'completed' })
-    expect(h.ensureParsed).toHaveBeenCalledWith(h.session, { file_path: hostPath }, expect.any(AbortSignal), expect.any(Function))
-    expect(hooks).not.toHaveProperty('readOutput')
-    expect(h.store.fileHostPath).toHaveBeenCalledOnce()
-  })
-
-  it.each([{ missingStore: true }, { missingPath: true }])('fails without parsing or starting a job when capability is unavailable: %j', async options => {
-    const h = harness(options)
-    for (const [name, extra] of [['read_pdf', {}], ['read_pdf', { view: 'page', pages: 1 }], ['async_parse_pdf', {}]] as const) {
-      await expect(h.tools.get(name)!.execute({ attachment_id: 'aaaaaaaa', ...extra }, h.exec)).rejects.toMatchObject({ failure: { code: 'UNSUPPORTED_OPTION' } })
-    }
-    expect(h.parseDocument).not.toHaveBeenCalled()
-    expect(h.previewPage).not.toHaveBeenCalled()
-    expect(h.start).not.toHaveBeenCalled()
-  })
-
-  it('rejects absent references and cancellation before source mapping or jobs', async () => {
-    const h = harness()
-    h.clearSurface()
-    await expect(h.tools.get('async_parse_pdf')!.execute({ attachment_id: 'aaaaaaaa' }, h.exec)).rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
-    const controller = new AbortController()
-    controller.abort(new Error('cancelled fixture'))
-    for (const tool of h.tools.values()) {
-      await expect(tool.execute({ attachment_id: 'aaaaaaaa' }, { ...h.exec, signal: controller.signal })).rejects.toThrow('cancelled fixture')
-    }
-    expect(h.store.fileHostPath).not.toHaveBeenCalled()
-    expect(h.start).not.toHaveBeenCalled()
-  })
-
-  it('keeps paths functional without the attachment service or visible file references', async () => {
-    const h = harness({ missingStore: true })
-    h.clearSurface()
-    await h.tools.get('read_pdf')!.execute({ file_path: 'relative.pdf' }, h.exec)
-    expect(h.parseDocument).toHaveBeenCalledWith(h.session, { file_path: 'relative.pdf', inline_images: true }, h.exec.signal, undefined)
-    expect(h.store.fileHostPath).not.toHaveBeenCalled()
+  it.each(['read_pdf', 'async_parse_pdf'] as const)('fails closed when the directory cannot be ensured (%s)', async name => {
+    const h = await harness()
+    const reason = new Error('directory unavailable')
+    h.ensure.mockRejectedValue(reason)
+    await expect(h.tool(name).execute({ file_path: 'paper.pdf' }, h.exec())).rejects.toBe(reason)
+    expect(h.reader.readContent).not.toHaveBeenCalled()
+    expect(h.ctx.jobs.list(h.session.id)).toEqual([])
   })
 })

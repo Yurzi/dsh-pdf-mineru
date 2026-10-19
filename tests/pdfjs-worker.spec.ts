@@ -2,39 +2,13 @@ import { spawn } from 'node:child_process'
 import { mkdtemp, readFile, rm, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { buildPdfjsArgs } from '../src/service/pdfjs-backend.js'
+import { describe, expect, it, onTestFinished } from 'vitest'
+import { buildPdfjsArgs } from '../src/reader/page/pdfjs-backend.js'
 
 interface WorkerResult {
   readonly exitCode: number | null
   readonly stdout: Buffer
   readonly stderr: Buffer
-}
-
-function makePdf(mediaBox = '0 0 200 100', rotate?: number): Buffer {
-  const stream = 'BT /F1 20 Tf 20 50 Td (offline PDF.js fixture) Tj ET'
-  const pageOptions = rotate === undefined ? '' : ' /Rotate ' + String(rotate)
-  const objects = [
-    '<< /Type /Catalog /Pages 2 0 R >>',
-    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-    '<< /Type /Page /Parent 2 0 R /MediaBox [' + mediaBox + ']' + pageOptions
-      + ' /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
-    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
-    '<< /Length ' + String(Buffer.byteLength(stream)) + ' >>\nstream\n' + stream + '\nendstream',
-  ]
-  let body = '%PDF-1.7\n% fixture\n'
-  const offsets = [0]
-  for (let index = 0; index < objects.length; index += 1) {
-    offsets.push(Buffer.byteLength(body))
-    body += String(index + 1) + ' 0 obj\n' + objects[index] + '\nendobj\n'
-  }
-  const xrefOffset = Buffer.byteLength(body)
-  body += 'xref\n0 ' + String(objects.length + 1) + '\n'
-  body += '0000000000 65535 f \n'
-  for (const offset of offsets.slice(1)) body += String(offset).padStart(10, '0') + ' 00000 n \n'
-  body += 'trailer\n<< /Size ' + String(objects.length + 1) + ' /Root 1 0 R >>\n'
-  body += 'startxref\n' + String(xrefOffset) + '\n%%EOF\n'
-  return Buffer.from(body)
 }
 
 function assemblePdf(objects: readonly string[]): Buffer {
@@ -50,6 +24,19 @@ function assemblePdf(objects: readonly string[]): Buffer {
   body += 'trailer\n<< /Size ' + String(objects.length + 1) + ' /Root 1 0 R >>\n'
   body += 'startxref\n' + String(xrefOffset) + '\n%%EOF\n'
   return Buffer.from(body)
+}
+
+function makePdf(mediaBox = '0 0 200 100', rotate?: number): Buffer {
+  const stream = 'BT /F1 20 Tf 20 50 Td (offline PDF.js fixture) Tj ET'
+  const pageOptions = rotate === undefined ? '' : ' /Rotate ' + String(rotate)
+  return assemblePdf([
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [' + mediaBox + ']' + pageOptions
+      + ' /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    '<< /Length ' + String(Buffer.byteLength(stream)) + ' >>\nstream\n' + stream + '\nendstream',
+  ])
 }
 
 function makeInteractivePdf(): Buffer {
@@ -103,21 +90,16 @@ function runWorker(args: readonly string[]): Promise<WorkerResult> {
   })
 }
 
-describe('PDF.js page worker', () => {
-  let root: string
-  let snapshotPath: string
-  let outputPath: string
+/** A private per-test directory, so the subprocess-bound tests can run concurrently. */
+async function workerDir() {
+  const root = await mkdtemp(join(tmpdir(), 'mineru-pdfjs-worker-test-'))
+  onTestFinished(() => rm(root, { recursive: true, force: true }))
+  return { root, snapshotPath: join(root, 'source.pdf'), outputPath: join(root, 'page.png') }
+}
 
-  beforeEach(async () => {
-    root = await mkdtemp(join(tmpdir(), 'mineru-pdfjs-worker-test-'))
-    snapshotPath = join(root, 'source.pdf')
-    outputPath = join(root, 'page.png')
-  })
+const silentExit = (exitCode: number): WorkerResult => ({ exitCode, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) })
 
-  afterEach(async () => {
-    await rm(root, { recursive: true, force: true })
-  })
-
+describe.concurrent('PDF.js page worker', () => {
   it('builds fixed Node arguments with the four-field worker protocol last', () => {
     const args = buildPdfjsArgs('/private/snapshot.pdf', '/private/page.png', 7, 12345)
     expect(args.slice(0, 3)).toEqual([
@@ -128,7 +110,8 @@ describe('PDF.js page worker', () => {
     expect(args).toHaveLength(8)
   })
 
-  it('renders a real one-page PDF offline with controlled stdout only', async () => {
+  it('renders a real one-page PDF offline with controlled stdout only', async ({ expect }) => {
+    const { snapshotPath, outputPath } = await workerDir()
     const source = makePdf()
     await writeFile(snapshotPath, source)
     const result = await runWorker(buildPdfjsArgs(snapshotPath, outputPath, 1, source.byteLength))
@@ -143,7 +126,8 @@ describe('PDF.js page worker', () => {
     expect(png.byteLength).toBeLessThanOrEqual(8 * 1024 * 1024)
   })
 
-  it('honors page rotation before computing the bounded render scale', async () => {
+  it('honors page rotation before computing the bounded render scale', async ({ expect }) => {
+    const { snapshotPath, outputPath } = await workerDir()
     const source = makePdf('0 0 200 100', 90)
     await writeFile(snapshotPath, source)
     const result = await runWorker(buildPdfjsArgs(snapshotPath, outputPath, 1, source.byteLength))
@@ -154,34 +138,37 @@ describe('PDF.js page worker', () => {
     expect([png.readUInt32BE(16), png.readUInt32BE(20)]).toEqual([800, 1600])
   })
 
-  it('uses exit 21 without diagnostics for invalid PDFs and page ranges', async () => {
+  it('uses exit 21 without diagnostics for invalid PDFs and page ranges', async ({ expect }) => {
+    const { snapshotPath, outputPath } = await workerDir()
     await writeFile(snapshotPath, 'not a PDF at a private path')
     let result = await runWorker(buildPdfjsArgs(snapshotPath, outputPath, 1, 1024))
-    expect(result).toEqual({ exitCode: 21, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) })
+    expect(result).toEqual(silentExit(21))
 
     const source = makePdf()
     await writeFile(snapshotPath, source)
     result = await runWorker(buildPdfjsArgs(snapshotPath, outputPath, 2, source.byteLength))
-    expect(result).toEqual({ exitCode: 21, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) })
+    expect(result).toEqual(silentExit(21))
   })
 
-  it('rejects input and raw page resource limits before Canvas allocation', async () => {
+  it('rejects input and raw page resource limits before Canvas allocation', async ({ expect }) => {
+    const { snapshotPath, outputPath } = await workerDir()
     let source = makePdf()
     await writeFile(snapshotPath, source)
     let result = await runWorker(buildPdfjsArgs(snapshotPath, outputPath, 1, source.byteLength - 1))
-    expect(result).toEqual({ exitCode: 22, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) })
+    expect(result).toEqual(silentExit(22))
 
     await truncate(snapshotPath, 200 * 1024 * 1024 + 1)
     result = await runWorker(buildPdfjsArgs(snapshotPath, outputPath, 1, 201 * 1024 * 1024))
-    expect(result).toEqual({ exitCode: 22, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) })
+    expect(result).toEqual(silentExit(22))
 
     source = makePdf('0 0 1000001 10')
     await writeFile(snapshotPath, source)
     result = await runWorker(buildPdfjsArgs(snapshotPath, outputPath, 1, source.byteLength))
-    expect(result).toEqual({ exitCode: 22, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) })
+    expect(result).toEqual(silentExit(22))
   })
 
-  it('renders annotation appearances without executing actions or external URIs', async () => {
+  it('renders annotation appearances without executing actions or external URIs', async ({ expect }) => {
+    const { root, snapshotPath, outputPath } = await workerDir()
     const plain = makePdf()
     await writeFile(snapshotPath, plain)
     let result = await runWorker(buildPdfjsArgs(snapshotPath, outputPath, 1, plain.byteLength))
@@ -197,18 +184,20 @@ describe('PDF.js page worker', () => {
     expect(await readFile(interactiveOutput)).not.toEqual(plainPng)
   })
 
-  it('maps oversized embedded image resources to exit 22', async () => {
+  it('maps oversized embedded image resources to exit 22', async ({ expect }) => {
+    const { snapshotPath, outputPath } = await workerDir()
     const source = makeOversizedImagePdf()
     await writeFile(snapshotPath, source)
     const result = await runWorker(buildPdfjsArgs(snapshotPath, outputPath, 1, source.byteLength))
-    expect(result).toEqual({ exitCode: 22, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) })
+    expect(result).toEqual(silentExit(22))
   })
 
-  it('uses exit 23 for output failures without exposing paths', async () => {
+  it('uses exit 23 for output failures without exposing paths', async ({ expect }) => {
+    const { snapshotPath, outputPath } = await workerDir()
     const source = makePdf()
     await writeFile(snapshotPath, source)
     await writeFile(outputPath, 'pre-existing')
     const result = await runWorker(buildPdfjsArgs(snapshotPath, outputPath, 1, source.byteLength))
-    expect(result).toEqual({ exitCode: 23, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) })
+    expect(result).toEqual(silentExit(23))
   })
 })

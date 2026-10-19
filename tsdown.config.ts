@@ -1,5 +1,5 @@
 import { defineConfig, type UserConfig } from 'tsdown'
-import { cssModulesPlugin, CLIENT_EXTERNALS, CLIENT_ID } from './src/css-modules.ts'
+import { cssModulesPlugin, CLIENT_EXTERNALS, CLIENT_ID } from './build/css-modules.ts'
 
 const host: UserConfig = {
   name: CLIENT_ID,
@@ -11,6 +11,8 @@ const host: UserConfig = {
   fixedExtension: false,
   dts: false,
   clean: false,
+  // The PDF.js worker runs as a separate Node process and must stay unbundled.
+  copy: [{ from: 'src/reader/page/pdfjs-worker.mjs', to: 'lib' }],
   deps: {
     neverBundle: [/^@deepseek-ai\//, /^node:/, /^pdfjs-dist(?:\/|$)/, /^@napi-rs\/canvas(?:\/|$)/],
     alwaysBundle: (id: string) => !id.startsWith('@deepseek-ai/') && !id.startsWith('node:') && !id.startsWith('pdfjs-dist') && !id.startsWith('@napi-rs/canvas'),

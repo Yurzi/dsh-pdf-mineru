@@ -1,592 +1,160 @@
-/**
- * rpc.spec.ts — Unit tests for MinerU RPC handlers, config migration, draft probe, and client UI helpers.
- */
-
 import { describe, expect, it, vi } from 'vitest'
-
-vi.mock('react/jsx-dev-runtime', () => ({
-  jsxDEV: () => null,
-  jsxsDEV: () => null,
-  Fragment: () => null,
-}))
-
-vi.mock('react', () => ({
-  useState: vi.fn((init: unknown) => [typeof init === 'function' ? (init as () => unknown)() : init, vi.fn()]),
-  useEffect: vi.fn(),
-  useCallback: vi.fn((fn: unknown) => fn),
-}))
-import type { Context } from '@deepseek-ai/cordis'
 import { rpcErrorSchema } from '@deepseek-ai/dsh-client-connection'
+import { defaultMinerUConfig } from '../src/config/parse.js'
+import type { ProbeView } from '../src/contracts/probe.js'
+import type { StorageStatistics } from '../src/contracts/maintenance.js'
+import { RPC_ENDPOINTS } from '../src/contracts/rpc.js'
+import { failure, MinerUError, type MinerUErrorCode } from '../src/domain/errors.js'
+import { mapRpcError } from '../src/rpc.js'
+import { cacheClearReport, cleanupReport, integrityReport, nonOwnerPeer, rpcHarness } from './support/rpc-harness.js'
 
-// Transport trust and lifecycle are exercised against real 0.2.0-rc.2 in host-compatibility.spec.ts.
-vi.mock('../src/loopback-rpc.js', () => ({
-  registerLoopbackRpc: (ctx: Context, channel: string, handler: RpcHandler) => ctx.connection.rpc.handle(channel, handler),
-}))
-import { defaultMinerUConfig, type MinerUConfig, type OfficialV4Config, type SelfHostedLegacyV2Config } from '../src/config.js'
-import { asProviderConfigId } from '../src/domain/ids.js'
-import { failure, MinerUError } from '../src/domain/errors.js'
-import { mapRpcError, registerRpc, RPC_CHANNEL, type MineruRpcDeps, type RpcResult } from '../src/rpc.js'
-import type { ProbeView } from '../src/service/mineru-service.js'
-import {
-  activateProvider,
-  clearCredential,
-  credentialReference,
-  describeCredential,
-  ensureProviderProfiles,
-  normalizeProviderDefaults,
-  patchActiveProvider,
-  storeCredential,
-  type CredentialClient,
-} from '../src/client/SettingsPage.js'
-import { formatBytes } from '../src/client/StorageOperations.js'
-import { apply as applyClient, inject as clientInject } from '../src/client/index.js'
+const invalidArgument = { ok: false, error: { code: 'mineru/invalid-argument' } }
 
-type RpcHandler = (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<RpcResult<unknown>>
-
-interface MockContext {
-  connection: {
-    rpc: {
-      handle: ReturnType<typeof vi.fn>
-    }
-  }
-  logger: {
-    info: ReturnType<typeof vi.fn>
-  }
-}
-
-function createMockContext(): { ctx: Context; getHandler: () => RpcHandler; getHandle: () => ReturnType<typeof vi.fn> } {
-  let capturedHandler!: RpcHandler
-
-  const handleMock = vi.fn((channel: string, handler: RpcHandler) => {
-    expect(channel).toBe(RPC_CHANNEL)
-    capturedHandler = handler
-    return async () => undefined
-  })
-
-  const ctx = {
-    connection: {
-      rpc: {
-        handle: handleMock,
-      },
-    },
-    logger: {
-      info: vi.fn(),
-    },
-  } as unknown as Context
-
-  return {
-    ctx,
-    getHandler: () => capturedHandler,
-    getHandle: () => handleMock,
-  }
-}
-
-function maintenanceDeps(): Pick<MineruRpcDeps, 'maintenance'> {
-  return {
-    maintenance: {
-      getStatistics: vi.fn(),
-      scanIntegrity: vi.fn(),
-      listQuarantine: vi.fn(),
-      cleanupQuarantine: vi.fn(),
-      gcDryRun: vi.fn(),
-      clearCache: vi.fn(),
-    } as unknown as MineruRpcDeps['maintenance'],
-  }
-}
-
-describe('MinerU RPC (registerRpc)', () => {
-  it('registers on /dsh-pdf-mineru-api using the 0.2.0-rc.2 two-argument RPC contract', () => {
-    expect(RPC_CHANNEL).toBe('/dsh-pdf-mineru-api')
-    const { ctx, getHandle } = createMockContext()
-    const deps: MineruRpcDeps = {
-      ...maintenanceDeps(),
-      getConfig: vi.fn(() => defaultMinerUConfig()),
-      setConfig: vi.fn(async c => c as MinerUConfig),
-      probe: vi.fn(async () => ({
-        available: true,
-        provider: 'self-hosted-legacy-v2' as const,
-        authentication: 'valid' as const,
-        protocol_version: '2.0',
-      })),
-    }
-
-    registerRpc(ctx, deps)
-    expect(getHandle()).toHaveBeenCalledWith(RPC_CHANNEL, expect.any(Function))
-  })
-
-  it('handles mineru/config.get by returning current MinerUConfig', async () => {
-    const { ctx, getHandler } = createMockContext()
-    const config = defaultMinerUConfig()
-    const deps: MineruRpcDeps = {
-      ...maintenanceDeps(),
-      getConfig: vi.fn(() => config),
-      setConfig: vi.fn(async c => c as MinerUConfig),
-      probe: vi.fn(async () => ({} as ProbeView)),
-    }
-
-    registerRpc(ctx, deps)
-    const handler = getHandler()
-
-    const res = await handler('mineru/config.get', {}, new AbortController().signal)
-    expect(res).toEqual({
-      ok: true,
-      value: { config },
+describe('MinerU RPC authorization', () => {
+  it.each([...Object.values(RPC_ENDPOINTS), 'mineru/unknown'])('rejects a non-owner %s before parsing or dependencies', async endpoint => {
+    const h = rpcHarness()
+    const payload = new Proxy({}, { get() { throw new Error('payload must not be read') } })
+    expect(await h.call(endpoint, payload, nonOwnerPeer())).toEqual({
+      ok: false, error: { code: 'mineru/forbidden', message: 'Owner access required', details: {} },
     })
-    expect(deps.getConfig).toHaveBeenCalledTimes(1)
-  })
-
-  it('handles mineru/config.set with validation, migration, and persistence', async () => {
-    const { ctx, getHandler } = createMockContext()
-    let storedConfig = defaultMinerUConfig()
-    const deps: MineruRpcDeps = {
-      ...maintenanceDeps(),
-      getConfig: vi.fn(() => storedConfig),
-      setConfig: vi.fn(async (c: unknown) => {
-        storedConfig = c as MinerUConfig
-        return storedConfig
-      }),
-      probe: vi.fn(async () => ({} as ProbeView)),
-    }
-
-    registerRpc(ctx, deps)
-    const handler = getHandler()
-
-    // 1. Valid modern config patch
-    const patchPayload = {
-      config: {
-        ...storedConfig,
-        output: { maxInlineChars: 50000, maxInlineImages: 6 },
-      },
-    }
-    const res1 = await handler('mineru/config.set', patchPayload, new AbortController().signal)
-    expect(res1.ok).toBe(true)
-    if (res1.ok) {
-      expect((res1.value as { config: MinerUConfig }).config.output.maxInlineChars).toBe(50000)
-    }
-    expect(deps.setConfig).toHaveBeenCalledTimes(1)
-
-    // 2. Removed flat config and malformed payloads fail without persistence
-    const flat = await handler('mineru/config.set', { config: {
-      baseURL: 'http://custom-host:18000', defaultBackend: 'vlm-engine',
-    } }, new AbortController().signal)
-    expect(flat).toMatchObject({ ok: false, error: { code: 'mineru/invalid-argument' } })
-
-    // 3. Invalid or missing config returns failure without persisting defaults
-    const invalidRes = await handler('mineru/config.set', { config: { ...storedConfig, activeProvider: 'invalid-id' } }, new AbortController().signal)
-    expect(invalidRes.ok).toBe(false)
-    const callsBeforeMissingConfig = vi.mocked(deps.setConfig).mock.calls.length
-    for (const payload of [{}, [], { config: undefined }, { config: null }]) {
-      const missingRes = await handler('mineru/config.set', payload, new AbortController().signal)
-      expect(missingRes).toMatchObject({ ok: false, error: { code: 'mineru/invalid-argument' } })
-    }
-    expect(deps.setConfig).toHaveBeenCalledTimes(callsBeforeMissingConfig)
-  })
-
-  it('handles mineru/probe with unsaved draft provider without calling setConfig', async () => {
-    const { ctx, getHandler } = createMockContext()
-    const probeMock = vi.fn(async (draft?: unknown, signal?: AbortSignal): Promise<ProbeView> => {
-      expect(signal).toBeDefined()
-      const d = draft as { baseURL?: string } | undefined
-      return {
-        available: d?.baseURL !== 'http://bad-host',
-        provider: 'official-v4',
-        authentication: 'valid',
-        protocol_version: '4.0',
-        server_version: '4.1.0',
-        queue: { queued: 2, processing: 1, max_concurrent: 4 },
-      }
-    })
-
-    const setConfigMock = vi.fn()
-    const deps: MineruRpcDeps = {
-      ...maintenanceDeps(),
-      getConfig: vi.fn(() => defaultMinerUConfig()),
-      setConfig: setConfigMock,
-      probe: probeMock,
-    }
-
-    registerRpc(ctx, deps)
-    const handler = getHandler()
-
-    const draftProvider = {
-      id: asProviderConfigId('mp_draft'),
-      type: 'official-v4',
-      baseURL: 'https://mineru.net/api/v4',
-      apiKeyEnv: 'TEST_KEY',
-      models: ['pipeline', 'vlm'],
-      configuredVersion: 'v4',
-    }
-
-    const controller = new AbortController()
-    const res = await handler('mineru/probe', { provider: draftProvider }, controller.signal)
-
-    expect(res.ok).toBe(true)
-    if (res.ok) {
-      const view = res.value as ProbeView
-      expect(view.available).toBe(true)
-      expect(view.provider).toBe('official-v4')
-      expect(view.server_version).toBe('4.1.0')
-      expect(view.queue?.queued).toBe(2)
-    }
-
-    // Probing a draft MUST NOT persist/call setConfig. Malformed payloads fail before probing.
-    expect(setConfigMock).not.toHaveBeenCalled()
-    const malformed = await handler('mineru/probe', 'not-an-object', controller.signal)
-    expect(malformed).toMatchObject({ ok: false, error: { code: 'mineru/invalid-argument' } })
-    expect(probeMock).toHaveBeenCalledTimes(1)
-  })
-
-  it('exposes bounded read-only storage statistics and GC preview endpoints', async () => {
-    const { ctx, getHandler } = createMockContext()
-    const stats = { generatedAt: 1, publishedResults: { byteUsage: 10, logicalEntryCount: 1 } }
-    const preview = { generatedAt: 2, dryRun: true, eligible: true, candidateCount: 1, candidateBytes: 10 }
-    const maintenance = {
-      getStatistics: vi.fn(async () => stats),
-      scanIntegrity: vi.fn(),
-      listQuarantine: vi.fn(),
-      cleanupQuarantine: vi.fn(),
-      gcDryRun: vi.fn(async () => preview),
-    }
-    const deps: MineruRpcDeps = {
-      getConfig: vi.fn(() => defaultMinerUConfig()), setConfig: vi.fn(), probe: vi.fn(),
-      maintenance: maintenance as unknown as MineruRpcDeps['maintenance'],
-    }
-    registerRpc(ctx, deps)
-    const handler = getHandler()
-    const signal = new AbortController().signal
-
-    expect(await handler('mineru/storage.stats', {}, signal)).toEqual({ ok: true, value: stats })
-    expect(await handler('mineru/storage.gc.preview', { result_limit: 20, candidate_limit: 5 }, signal))
-      .toEqual({ ok: true, value: preview })
-    expect(maintenance.getStatistics).toHaveBeenCalledWith(signal)
-    expect(maintenance.gcDryRun).toHaveBeenCalledWith(expect.objectContaining({
-      resultLimit: 20, candidateLimit: 5, signal,
-    }))
-  })
-
-  it('requires explicit confirmation for destructive maintenance operations', async () => {
-    const { ctx, getHandler } = createMockContext()
-    const cleanup = { generatedAt: 1, dryRun: false, requestedCount: 1, deletedCount: 1, deletedBytes: 10 }
-    const cacheClear = { generatedAt: 1, dryRun: true, eligible: true, confirmationToken: 'preview-token', plannedCount: 2, deletedCount: 0, deletedBytes: 0 }
-    const scan = { generatedAt: 1, readOnly: false, isolateInvalid: true, quarantinedCount: 1, scan: { scanned: 1 } }
-    const maintenance = {
-      getStatistics: vi.fn(),
-      scanIntegrity: vi.fn(async () => scan),
-      listQuarantine: vi.fn(),
-      cleanupQuarantine: vi.fn(async () => cleanup),
-      gcDryRun: vi.fn(),
-      clearCache: vi.fn(async () => cacheClear),
-    }
-    const deps: MineruRpcDeps = {
-      getConfig: vi.fn(() => defaultMinerUConfig()), setConfig: vi.fn(), probe: vi.fn(),
-      maintenance: maintenance as unknown as MineruRpcDeps['maintenance'],
-    }
-    registerRpc(ctx, deps)
-    const handler = getHandler()
-    const signal = new AbortController().signal
-
-    const refusedCleanup = await handler(
-      'mineru/storage.quarantine.cleanup', { entry_ids: ['entry_1'], dry_run: false }, signal,
-    )
-    expect(refusedCleanup).toMatchObject({ ok: false, error: { code: 'mineru/invalid-argument' } })
-    expect(maintenance.cleanupQuarantine).not.toHaveBeenCalled()
-
-    const acceptedCleanup = await handler(
-      'mineru/storage.quarantine.cleanup', { entry_ids: ['entry_1'], dry_run: false, confirm: true }, signal,
-    )
-    expect(acceptedCleanup).toEqual({ ok: true, value: cleanup })
-    expect(maintenance.cleanupQuarantine).toHaveBeenCalledWith({ entryIds: ['entry_1'], dryRun: false, signal })
-
-    const refusedCacheClear = await handler(
-      'mineru/storage.cache.clear', { dry_run: false, confirm: true }, signal,
-    )
-    expect(refusedCacheClear).toMatchObject({ ok: false, error: { code: 'mineru/invalid-argument' } })
-    expect(maintenance.clearCache).not.toHaveBeenCalled()
-
-    const previewCacheClear = await handler(
-      'mineru/storage.cache.clear', { dry_run: true, result_limit: 50, diagnostic_limit: 10 }, signal,
-    )
-    expect(previewCacheClear).toEqual({ ok: true, value: cacheClear })
-    expect(maintenance.clearCache).toHaveBeenLastCalledWith({
-      resultLimit: 50, diagnosticLimit: 10, dryRun: true, signal,
-    })
-
-    const acceptedCacheClear = await handler(
-      'mineru/storage.cache.clear', {
-        dry_run: false, confirm: true, confirmation_token: 'preview-token',
-      }, signal,
-    )
-    expect(acceptedCacheClear).toEqual({ ok: true, value: cacheClear })
-    expect(maintenance.clearCache).toHaveBeenLastCalledWith({
-      resultLimit: undefined, diagnosticLimit: undefined, dryRun: false,
-      confirmationToken: 'preview-token', signal,
-    })
-
-    const refusedIsolation = await handler(
-      'mineru/storage.integrity.scan', { isolate_invalid: true }, signal,
-    )
-    expect(refusedIsolation).toMatchObject({ ok: false, error: { code: 'mineru/invalid-argument' } })
-    const acceptedIsolation = await handler(
-      'mineru/storage.integrity.scan', { isolate_invalid: true, confirm: true }, signal,
-    )
-    expect(acceptedIsolation).toEqual({ ok: true, value: scan })
-  })
-
-  it('sanitizes error diagnostics in probe failure and does not leak credentials', async () => {
-    const { ctx, getHandler } = createMockContext()
-    const deps: MineruRpcDeps = {
-      ...maintenanceDeps(),
-      getConfig: vi.fn(() => defaultMinerUConfig()),
-      setConfig: vi.fn(),
-      probe: vi.fn(async () => {
-        throw new Error('Connection failed: Bearer secret_token_12345 to https://user:p%40ss@secret.host/token/path?token=abc#fragment')
-      }),
-    }
-
-    registerRpc(ctx, deps)
-    const handler = getHandler()
-
-    const res = await handler('mineru/probe', {}, new AbortController().signal)
-    expect(res.ok).toBe(false)
-    if (!res.ok) {
-      expect(res.error.message).toContain('Bearer [REDACTED]')
-      for (const secret of ['secret_token_12345', 'user', 'p%40ss', '/token/path', 'token=abc', 'fragment']) {
-        expect(res.error.message).not.toContain(secret)
-      }
+    for (const dependency of [h.deps.settings.current, h.deps.settings.save, h.deps.probe, ...Object.values(h.deps.maintenance)]) {
+      expect(dependency).not.toHaveBeenCalled()
     }
   })
 
-  it('returns mineru/not-found for unknown RPC endpoints', async () => {
-    const { ctx, getHandler } = createMockContext()
-    const deps: MineruRpcDeps = {
-      ...maintenanceDeps(),
-      getConfig: vi.fn(() => defaultMinerUConfig()),
-      setConfig: vi.fn(),
-      probe: vi.fn(),
-    }
-
-    registerRpc(ctx, deps)
-    const handler = getHandler()
-
-    const res = await handler('mineru/unknown_action', {}, new AbortController().signal)
-    expect(res.ok).toBe(false)
-    if (!res.ok) {
-      expect(res.error.code).toBe('mineru/not-found')
-    }
-  })
-
-  it('maps MinerUError to allowlisted safe actionable error codes', async () => {
-    const { ctx, getHandler } = createMockContext()
-    const deps: MineruRpcDeps = {
-      ...maintenanceDeps(),
-      getConfig: vi.fn(() => defaultMinerUConfig()),
-      setConfig: vi.fn(),
-      probe: vi.fn(async () => {
-        throw new MinerUError(failure('STORAGE_LOCKED', 'Storage directory is currently locked by another process'))
-      }),
-    }
-
-    registerRpc(ctx, deps)
-    const handler = getHandler()
-
-    const res = await handler('mineru/probe', {}, new AbortController().signal)
-    expect(res.ok).toBe(false)
-    if (!res.ok) expect(rpcErrorSchema.safeParse(res.error).success).toBe(true)
-    expect(res).toEqual({
-      ok: false,
-      error: {
-        code: 'mineru/storage-locked',
-        message: 'Storage directory is currently locked by another process',
-        details: {},
-      },
-    })
-  })
-
-  it('verifies mapRpcError covers key MinerU error codes and sanitizes output', () => {
-    expect(mapRpcError(new MinerUError(failure('CREDENTIAL_MISSING', 'API key required')))).toEqual({
-      code: 'mineru/credential-missing',
-      message: 'API key required',
-    })
-    expect(mapRpcError(new MinerUError(failure('AUTHENTICATION_FAILED', 'Bearer token_secret_123 invalid')))).toEqual({
-      code: 'mineru/auth-failed',
-      message: 'Bearer [REDACTED] invalid',
-    })
-    expect(mapRpcError(new MinerUError(failure('PROVIDER_RATE_LIMITED', 'Rate limit exceeded')))).toEqual({
-      code: 'mineru/provider-rate-limited',
-      message: 'Rate limit exceeded',
-    })
-    expect(mapRpcError(new MinerUError(failure('STORAGE_LOCKED', 'Lock contention')))).toEqual({
-      code: 'mineru/storage-locked',
-      message: 'Lock contention',
-    })
-    expect(mapRpcError(new TypeError('bad argument'))).toEqual({
-      code: 'mineru/invalid-argument',
-      message: 'bad argument',
-    })
-    const abortErr = new Error('aborted')
-    abortErr.name = 'AbortError'
-    expect(mapRpcError(abortErr)).toEqual({
-      code: 'mineru/cancelled',
-      message: 'aborted',
-    })
+  it.each(['mineru/unknown_action', 'mineru/storage.gc.preview', 'toString', '__proto__'])('returns mineru/not-found for %s', async endpoint => {
+    expect(await rpcHarness().call(endpoint)).toMatchObject({ ok: false, error: { code: 'mineru/not-found' } })
   })
 })
 
-describe('Client UI Pure Helpers (SettingsPage)', () => {
-  function clientContext() {
-    const rpc = { call: vi.fn() }
-    const credentials = { describe: vi.fn(), set: vi.fn(), unset: vi.fn() }
-    const register = vi.fn(() => vi.fn())
-    const slotInject = vi.fn((_slot: string, factory: () => unknown) => factory())
-    const ctx = {
-      effect: (factory: () => unknown) => { factory(); return vi.fn() },
-      get: (name: string) => name === 'connection' ? { rpc } : undefined,
-      locale: {
-        register: vi.fn(() => vi.fn()),
-      },
-      remote: { credentials },
-      slots: { inject: slotInject, register },
-    } as never
-    return { ctx, rpc, credentials, register, slotInject }
-  }
-
-  it('registers a package-keyed bundle page for MinerU configuration and operations', () => {
-    const { ctx, rpc, credentials, register, slotInject } = clientContext()
-    expect(clientInject).toEqual(['slots', 'locale', 'connection', 'remote', 'remote.credentials'])
-    applyClient(ctx)
-
-    expect(slotInject).toHaveBeenCalledExactlyOnceWith('plugins.bundle.config', expect.any(Function))
-    expect(register).toHaveBeenCalledOnce()
-    const [options] = register.mock.calls[0]!
-    expect(options).toMatchObject({
-      name: 'plugins.bundle.config', key: 'dsh-pdf-mineru', locale: 'dsh-pdf-mineru',
-    })
-    expect(options).not.toHaveProperty('id')
-    expect(options).not.toHaveProperty('label')
-    expect(options).not.toHaveProperty('order')
-    expect(options.inject()).toEqual({ rpc, credentials })
-  })
-
-  it('uses the Harness credential API without exposing stored values', async () => {
-    const describe = vi.fn(async () => ({
-      ok: true as const,
-      value: { MINERU_API_KEY: { configured: true, source: 'file', writable: true } },
-    }))
-    const set = vi.fn(async () => ({ ok: true as const, value: undefined }))
-    const unset = vi.fn(async () => ({ ok: true as const, value: undefined }))
-    const credentials = { describe, set, unset } as CredentialClient
-
-    const view = await describeCredential(credentials, 'MINERU_API_KEY')
-    expect(view).toEqual({ configured: true, source: 'file', writable: true })
-    expect(view).not.toHaveProperty('value')
-    expect(describe).toHaveBeenCalledWith(['MINERU_API_KEY'])
-
-    await storeCredential(credentials, 'MINERU_API_KEY', '  secret-mineru-key  ')
-    expect(set).toHaveBeenCalledWith('MINERU_API_KEY', 'secret-mineru-key')
-
-    await clearCredential(credentials, 'MINERU_API_KEY')
-    expect(unset).toHaveBeenCalledWith('MINERU_API_KEY')
-  })
-
-  it('rejects blank or Host-rejected credential writes and keeps references separate', async () => {
-    const base = defaultMinerUConfig()
-    expect(credentialReference(base.providers[0])).toBe('MINERU_API_KEY')
-    expect(credentialReference({ ...base.providers[0]!, apiKeyEnv: undefined })).toBeUndefined()
-
-    const set = vi.fn(async () => ({
-      ok: false as const,
-      error: { code: 'credential/rejected', message: 'credential is shadowed by a read-only source' },
-    }))
-    const credentials = {
-      describe: vi.fn(),
-      set,
-      unset: vi.fn(),
-    } as unknown as CredentialClient
-
-    await expect(storeCredential(credentials, 'MINERU_API_KEY', '   ')).rejects.toThrow(/must not be empty/)
-    expect(set).not.toHaveBeenCalled()
-    await expect(storeCredential(credentials, 'MINERU_API_KEY', 'new-secret')).rejects.toThrow(/read-only source/)
-  })
-
-  it('formats storage byte counters without unsafe or shifting values', () => {
-    expect(formatBytes(0)).toBe('0 B')
-    expect(formatBytes(1024)).toBe('1.00 KiB')
-    expect(formatBytes(10 * 1024 * 1024)).toBe('10.0 MiB')
-    expect(formatBytes(Number.MAX_SAFE_INTEGER, true)).toMatch(/^>= /)
-    expect(formatBytes(-1)).toBe('N/A')
-  })
-
-  it('completes legacy single-provider drafts and preserves both profiles across switching', () => {
-    const base = defaultMinerUConfig()
-    const selfHosted: SelfHostedLegacyV2Config = {
-      id: asProviderConfigId('mp_primary'),
-      type: 'self-hosted-legacy-v2',
-      baseURL: 'http://gpu-server:18000',
-      apiKeyEnv: 'LOCAL_KEY',
-      modelMap: { pipeline: 'pipeline', vlm: 'hybrid-engine' },
-      allowInsecureHttp: true,
-      configuredVersion: 'v2.1',
-    }
-    const legacySingle = { ...base, activeProvider: selfHosted.id, providers: [selfHosted] }
-
-    const completed = ensureProviderProfiles(legacySingle)
-    expect(completed.providers).toHaveLength(3)
-    expect(completed.providers[0]).toEqual(selfHosted)
-    const official = completed.providers.find(provider => provider.type === 'official-v4')
-    expect(official).toMatchObject({
-      id: 'mp_official',
-      baseURL: 'https://mineru.net/api/v4',
-      models: ['pipeline', 'vlm'],
-    })
-
-    const officialActive = activateProvider(completed, official!.id)
-    const officialEdited = patchActiveProvider(officialActive, {
-      baseURL: 'https://gateway.example/api/v4',
-      models: ['vlm'],
-    })
-    const backToSelfHosted = activateProvider(officialEdited, selfHosted.id)
-
-    expect(backToSelfHosted.providers.find(provider => provider.id === selfHosted.id)).toEqual(selfHosted)
-    expect(backToSelfHosted.providers.find(provider => provider.id === official!.id)).toMatchObject({
-      baseURL: 'https://gateway.example/api/v4',
-      models: ['vlm'],
-    })
-  })
-
-  it('uses a unique ID when completing a legacy profile with a colliding canonical ID', () => {
-    const base = defaultMinerUConfig()
-    const official = { ...base.providers[1]!, id: asProviderConfigId('mp_self_hosted') } as OfficialV4Config
-    const completed = ensureProviderProfiles({ ...base, activeProvider: official.id, providers: [official] })
-
-    expect(completed.providers.map(provider => provider.id)).toEqual(['mp_self_hosted', 'mp_self_hosted_2', 'mp_self_hosted_v1'])
-    expect(completed.providers.map(provider => provider.type)).toEqual(['official-v4', 'self-hosted-legacy-v2', 'self-hosted-v1'])
-  })
-
-  it('normalizes defaults to the active official provider capabilities', () => {
-    const base = defaultMinerUConfig()
-    const provider: OfficialV4Config = {
-      id: asProviderConfigId('mp_official'), type: 'official-v4',
-      baseURL: 'https://mineru.net/api/v4', apiKeyEnv: 'TOKEN',
-      models: ['vlm'], configuredVersion: 'v4',
-    }
-    const invalidDraft = {
-      ...base, activeProvider: provider.id, providers: [provider],
-      defaults: { ...base.defaults, model: 'pipeline' as const, parseMethod: 'txt' as const },
-    }
-    expect(normalizeProviderDefaults(invalidDraft, provider).defaults).toMatchObject({
-      model: 'vlm', parseMethod: 'auto', ocr: false,
-    })
-  })
-
-  it('patchActiveProvider updates the active provider in config.providers', () => {
+describe('MinerU RPC configuration', () => {
+  it('returns the current configuration with its settings revision', async () => {
     const config = defaultMinerUConfig()
-    const updated = patchActiveProvider(config, {
-      baseURL: 'https://new-endpoint.internal:8443',
-    })
-
-    expect(updated.providers[0]?.baseURL).toBe('https://new-endpoint.internal:8443')
-    expect(updated.activeProvider).toBe(config.activeProvider)
+    const h = rpcHarness({ settings: { current: vi.fn(() => ({ config, revision: 3 })) } })
+    expect(await h.call('mineru/config.get')).toEqual({ ok: true, value: { config, revision: 3 } })
   })
 
+  it('forwards config and expected revision unchanged and maps validation and conflict failures', async () => {
+    const config = defaultMinerUConfig()
+    const save = vi.fn(async () => ({ config, revision: 5 }))
+    const h = rpcHarness({ settings: { save } })
+    const raw = { schemaVersion: 2, historical: true }
+    expect(await h.call('mineru/config.set', { config: raw })).toEqual({ ok: true, value: { config, revision: 5 } })
+    expect(save).toHaveBeenLastCalledWith(raw, undefined)
+    expect(await h.call('mineru/config.set', { config: raw, expected_revision: 0 })).toMatchObject({ ok: true })
+    expect(save).toHaveBeenLastCalledWith(raw, 0)
+    save.mockRejectedValueOnce(new TypeError('invalid configuration'))
+    expect(await h.call('mineru/config.set', { config: raw })).toMatchObject(invalidArgument)
+    save.mockRejectedValueOnce(new MinerUError(failure('SETTINGS_CONFLICT', 'MinerU settings changed since they were read')))
+    expect(await h.call('mineru/config.set', { config: raw, expected_revision: 4 })).toMatchObject({ ok: false, error: { code: 'mineru/conflict' } })
+  })
 
+  it.each([
+    {}, [], 'config', { config: undefined }, { config: null },
+    ...[-1, 1.5, '4', null, Number.MAX_SAFE_INTEGER + 1].map(expected_revision => ({ config: {}, expected_revision })),
+  ])('rejects malformed config.set payload %j before persistence', async payload => {
+    const h = rpcHarness()
+    expect(await h.call('mineru/config.set', payload)).toMatchObject(invalidArgument)
+    expect(h.deps.settings.save).not.toHaveBeenCalled()
+  })
+
+  it('probes an unsaved draft provider without saving settings', async () => {
+    const view: ProbeView = { available: true, provider: 'official-v4', authentication: 'valid', protocol_version: '4.0' }
+    const h = rpcHarness({ probe: vi.fn(async () => view) })
+    const draft = { id: 'mp_draft', type: 'official-v4', baseURL: 'https://mineru.net/api/v4', apiKeyEnv: 'TEST_KEY' }
+    expect(await h.call('mineru/probe', { provider: draft })).toEqual({ ok: true, value: view })
+    expect(h.deps.probe).toHaveBeenCalledExactlyOnceWith(draft, h.signal)
+    expect(await h.call('mineru/probe', 'not-an-object')).toMatchObject(invalidArgument)
+    expect(h.deps.probe).toHaveBeenCalledOnce()
+    expect(h.deps.settings.save).not.toHaveBeenCalled()
+  })
 })
+
+describe('MinerU RPC maintenance', () => {
+  it('exposes read-only storage statistics with the caller signal', async () => {
+    const h = rpcHarness()
+    const full: StorageStatistics = { generatedAt: 1, publishedResults: area(), staging: area(), quarantine: area() }
+    h.deps.maintenance.getStatistics.mockResolvedValue(full)
+    expect(await h.call('mineru/storage.stats')).toEqual({ ok: true, value: full })
+    expect(h.deps.maintenance.getStatistics).toHaveBeenCalledWith(h.signal)
+  })
+
+  it.each([
+    ['mineru/storage.quarantine.cleanup', { entry_ids: ['entry_1'], dry_run: false }, 'cleanupQuarantine'],
+    ['mineru/storage.quarantine.cleanup', { entry_ids: 'entry_1', dry_run: true, confirm: true }, 'cleanupQuarantine'],
+    ['mineru/storage.cache.clear', { dry_run: false, confirmation_token: 'preview-token' }, 'clearCache'],
+    ['mineru/storage.cache.clear', { dry_run: false, confirm: true }, 'clearCache'],
+    ['mineru/storage.cache.clear', { dry_run: false, confirm: true, confirmation_token: '' }, 'clearCache'],
+    ['mineru/storage.cache.clear', { dry_run: 'false', confirm: true, confirmation_token: 'preview-token' }, 'clearCache'],
+    ['mineru/storage.integrity.scan', { isolate_invalid: true }, 'scanIntegrity'],
+    ['mineru/storage.integrity.scan', { isolate_invalid: true, confirm: 'yes' }, 'scanIntegrity'],
+    ['mineru/storage.integrity.scan', { result_limit: 0 }, 'scanIntegrity'],
+  ] as const)('refuses %s %j without explicit confirmation or valid arguments', async (endpoint, payload, method) => {
+    const h = rpcHarness()
+    expect(await h.call(endpoint, payload)).toMatchObject(invalidArgument)
+    expect(h.deps.maintenance[method]).not.toHaveBeenCalled()
+  })
+
+  it('forwards confirmed destructive maintenance with explicit options', async () => {
+    const h = rpcHarness()
+    const cleanup = cleanupReport()
+    const preview = cacheClearReport()
+    const isolation = integrityReport()
+    h.deps.maintenance.cleanupQuarantine.mockResolvedValue(cleanup)
+    h.deps.maintenance.clearCache.mockResolvedValue(preview)
+    h.deps.maintenance.scanIntegrity.mockResolvedValue(isolation)
+    const signal = h.signal
+
+    expect(await h.call('mineru/storage.quarantine.cleanup', { entry_ids: ['entry_1'], dry_run: false, confirm: true })).toEqual({ ok: true, value: cleanup })
+    expect(h.deps.maintenance.cleanupQuarantine).toHaveBeenCalledWith({ entryIds: ['entry_1'], dryRun: false, signal })
+    expect(await h.call('mineru/storage.cache.clear', { result_limit: 50, diagnostic_limit: 10 })).toEqual({ ok: true, value: preview })
+    expect(h.deps.maintenance.clearCache).toHaveBeenLastCalledWith({ resultLimit: 50, diagnosticLimit: 10, dryRun: true, signal })
+    expect(await h.call('mineru/storage.cache.clear', { dry_run: false, confirm: true, confirmation_token: 'preview-token' })).toMatchObject({ ok: true })
+    expect(h.deps.maintenance.clearCache).toHaveBeenLastCalledWith({
+      resultLimit: undefined, diagnosticLimit: undefined, dryRun: false, confirmationToken: 'preview-token', signal,
+    })
+    expect(await h.call('mineru/storage.integrity.scan', { isolate_invalid: true, confirm: true })).toEqual({ ok: true, value: isolation })
+    expect(h.deps.maintenance.scanIntegrity).toHaveBeenCalledWith({ resultLimit: undefined, diagnosticLimit: undefined, isolateInvalid: true, signal })
+  })
+})
+
+describe('MinerU RPC error mapping', () => {
+  it('returns schema-valid allowlisted errors and redacts probe failures', async () => {
+    const h = rpcHarness({ probe: vi.fn(async () => {
+      throw new Error('Connection failed: Bearer secret_token_12345 to https://user:p%40ss@secret.host/token/path?token=abc#fragment')
+    }) })
+    const result = await h.call('mineru/probe')
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(rpcErrorSchema.safeParse(result.error).success).toBe(true)
+    expect(result.error).toMatchObject({ code: 'mineru/internal', message: expect.stringContaining('Bearer [REDACTED]') })
+    for (const secret of ['secret_token_12345', 'user', 'p%40ss', '/token/path', 'token=abc', 'fragment']) {
+      expect(result.error.message).not.toContain(secret)
+    }
+    h.deps.probe.mockRejectedValueOnce(new MinerUError(failure('STORAGE_LOCKED', 'Storage is locked')))
+    expect(await h.call('mineru/probe')).toEqual({ ok: false, error: { code: 'mineru/storage-locked', message: 'Storage is locked', details: {} } })
+  })
+
+  it.each<[MinerUErrorCode, string]>([
+    ['CREDENTIAL_MISSING', 'mineru/credential-missing'],
+    ['AUTHENTICATION_FAILED', 'mineru/auth-failed'],
+    ['PROVIDER_RATE_LIMITED', 'mineru/provider-rate-limited'],
+    ['STORAGE_LOCKED', 'mineru/storage-locked'],
+    ['SETTINGS_CONFLICT', 'mineru/conflict'],
+    ['CANCELLED', 'mineru/cancelled'],
+  ])('maps %s to %s', (code, rpcCode) => {
+    expect(mapRpcError(new MinerUError(failure(code, 'message')))).toEqual({ code: rpcCode, message: 'message' })
+  })
+
+  it('maps TypeError and AbortError and redacts their messages', () => {
+    expect(mapRpcError(new TypeError('bad Bearer token_secret_123'))).toEqual({ code: 'mineru/invalid-argument', message: 'bad Bearer [REDACTED]' })
+    expect(mapRpcError(new DOMException('aborted', 'AbortError'))).toEqual({ code: 'mineru/cancelled', message: 'aborted' })
+  })
+})
+
+function area(): StorageStatistics['staging'] {
+  return {
+    byteUsage: 0, logicalEntryCount: 0, regularFileCount: 0, directoryCount: 0, skippedSymlinkCount: 0,
+    unexpectedEntryCount: 0, unreadableEntryCount: 0, depthLimitCount: 0, truncated: false, complete: true,
+  }
+}

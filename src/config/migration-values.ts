@@ -1,12 +1,11 @@
-import { asProviderConfigId } from '../domain/ids.js'
-import { defaultProviderConfig, type MinerUConfig, type ProviderConfig } from './pure.js'
+import { PROVIDER_TYPES, asProviderConfigId } from '../domain/ids.js'
+import { defaultProviderConfig, type MinerUConfig, type ProviderConfig } from './model.js'
+import { PROVIDER_FIELDS, parseCanonical, parseProvider } from './parse.js'
 
 /** Repairs values only while loading known historical versions. It never persists or resolves credentials. */
 export function repairLegacyConfigValues(
   input: Record<string, unknown>,
   fallback: MinerUConfig,
-  parseProvider: (value: unknown) => ProviderConfig,
-  parseCanonical: (value: Record<string, unknown>, fallback: MinerUConfig) => MinerUConfig,
 ): { input: Record<string, unknown>; defaultedFields: readonly string[] } {
   const repaired = new Set<string>()
   const object = (value: unknown, path: string): Record<string, unknown> => {
@@ -26,7 +25,7 @@ export function repairLegacyConfigValues(
     const raw = object(value, path)
     const oldType = raw.type === 'self-hosted-v2'
     const type = oldType ? 'self-hosted-legacy-v2'
-      : typeof raw.type === 'string' && ['self-hosted-v1','self-hosted-legacy-v2','official-v4'].includes(raw.type) ? raw.type as ProviderConfig['type'] : 'self-hosted-legacy-v2'
+      : typeof raw.type === 'string' && (PROVIDER_TYPES as readonly string[]).includes(raw.type) ? raw.type as ProviderConfig['type'] : 'self-hosted-legacy-v2'
     if (type !== raw.type && !oldType) repaired.add(path + '.type')
     const defaults = defaultProviderConfig(type)
     const rawId = validId(raw.id)
@@ -44,7 +43,7 @@ export function repairLegacyConfigValues(
       if (typeof raw.allowInsecureHttp !== 'boolean') repaired.add(path + '.allowInsecureHttp')
       provider = {...provider, allowInsecureHttp, baseURL: allowInsecureHttp ? provider.baseURL : provider.baseURL.replace(/^http:/u, 'https:'), apiKeyEnv: undefined}
     }
-    const allowed = new Set([...Object.keys(provider), 'configuredVersion', 'apiKeyEnv', ...(type === 'self-hosted-v1' || oldType ? ['tier'] : [])])
+    const allowed = oldType ? new Set([...PROVIDER_FIELDS[type], 'tier']) : PROVIDER_FIELDS[type]
     for (const key of Object.keys(raw)) {
       if (!allowed.has(key)) throw new TypeError(path + ' contains unsupported property ' + key)
     }

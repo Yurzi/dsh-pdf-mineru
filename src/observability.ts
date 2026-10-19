@@ -1,15 +1,13 @@
-import type { MinerUErrorCode, MinerUProviderId } from './domain/errors.js'
-import type { ProviderRetryOperation } from './providers/retry.js'
+import type { MinerUErrorCode } from './domain/errors.js'
+import type { MinerUProviderId } from './domain/ids.js'
+import type { ProviderRetryOperation } from './providers/http/retry.js'
 
 export type MinerUDiagnosticLevel = 'debug' | 'info' | 'warn' | 'error'
 
 export type MinerUDiagnosticPhase =
-  | 'job-created'
   | 'cache-hit'
-  | 'shared-operation'
   | 'uploading'
   | 'provider-accepted'
-  | 'processing'
   | 'collecting'
   | 'published'
   | 'provider-retry'
@@ -19,7 +17,6 @@ export interface MinerUDiagnosticEvent {
   readonly level: MinerUDiagnosticLevel
   readonly phase: MinerUDiagnosticPhase
   readonly provider?: MinerUProviderId
-  readonly jobId?: string
   readonly operationId?: string
   readonly providerOperation?: ProviderRetryOperation
   readonly durationMs?: number

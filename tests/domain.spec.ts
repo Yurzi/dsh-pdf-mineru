@@ -1,232 +1,136 @@
-import { mkdtemp, rm, writeFile, utimes } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { utimes, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
-import { asCacheKey, asSessionId, createFileId } from '../src/domain/ids.js'
-import { MinerUError, sanitizeDiagnostic } from '../src/domain/errors.js'
-import { CANONICAL_PARSE_REQUEST_SCHEMA_VERSION, narrowPageSelection, normalizeFocusSelection, normalizePageSelection, type CanonicalParseRequest, type ParseDefaults, type ParseRequestInput } from '../src/domain/request.js'
+import { describe, expect, it } from 'vitest'
+import { asCacheKey, asFileId, asOperationId, asProviderConfigId, asResultId, createFileId } from '../src/domain/ids.js'
+import { sanitizeDiagnostic } from '../src/domain/errors.js'
+import type { CanonicalParseRequest, ParseDefaults } from '../src/domain/request.js'
+import { narrowPageSelection, normalizeFocusSelection, normalizePageSelection } from '../src/domain/selection.js'
 import { canonicalJson, computeCacheKey } from '../src/domain/cache-key.js'
-import { formatPageOutOfRangeMessage } from '../src/service/result-presenter.js'
-import { RequestNormalizer, assertSourcesUnchanged, normalizePages } from '../src/service/request-normalizer.js'
+import { formatPageOutOfRangeMessage } from '../src/reader/selection.js'
+import { assertSourcesUnchanged, canonicalParseRequest, prepareSource } from '../src/source/prepared-source.js'
+import { sampleRequest, tempRoot } from './support/storage-fixtures.js'
 
-const roots: string[] = []
-afterEach(async () => {
-  await Promise.all(roots.splice(0).map(path => rm(path, { recursive: true, force: true })))
-})
+const defaults: ParseDefaults = { model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true }
 
-const defaults: ParseDefaults = {
-  model: 'pipeline',
-  ocr: false,
-  parseMethod: 'auto',
-  language: 'ch',
-  formula: true,
-  table: true,
-}
-
-async function fixture(name = 'document.pdf', contents = '%PDF-1.4 fixture'): Promise<{ root: string; path: string }> {
-  const root = await mkdtemp(join(tmpdir(), 'mineru-domain-'))
-  roots.push(root)
-  const path = join(root, name)
-  await writeFile(path, contents)
-  return { root, path }
+async function preparedFixture() {
+  const root = await tempRoot('mineru-domain-')
+  const path = join(root, 'document.pdf')
+  await writeFile(path, '%PDF-1.4 fixture')
+  const source = await prepareSource(path, Number.MAX_SAFE_INTEGER, new AbortController().signal)
+  return { root, path, source, request: canonicalParseRequest(defaults, source) }
 }
 
 describe('request normalization', () => {
-  it('sorts and merges one-based page ranges', () => {
-    expect(normalizePages('15, 3-5,1-3,10-14')).toBe('1-5,10-15')
-    expect(() => normalizePages('0-2')).toThrow(MinerUError)
-    expect(() => normalizePages('3-2')).toThrow(MinerUError)
-  })
-
-  it('applies defaults and strips local paths from the canonical request', async () => {
-    const { root, path } = await fixture()
-    const normalizer = new RequestNormalizer({ defaults, cwd: root })
-    const prepared = await normalizer.normalize({ file_path: path }, new AbortController().signal)
-    expect(prepared.request.semantics).toEqual({
-      model: 'pipeline', ocr: false, parseMethod: 'auto', language: 'ch', formula: true, table: true,
-    })
-    expect(prepared.request.requiredArtifacts).toEqual(['markdown', 'layout', 'model-output', 'content-list', 'images'])
-    expect(prepared.sources[0]?.path).toBe(path)
-    expect(JSON.stringify(prepared.request)).not.toContain(root)
-  })
-
-  it('normalizes modern request fields and artifact selection', async () => {
-    const { path } = await fixture()
-    const normalizer = new RequestNormalizer({ defaults })
-    const prepared = await normalizer.normalize({
-      file_path: path, model: 'vlm', ocr: true, language: 'en', pages: '1-5',
-      artifacts: ['markdown', 'content-list', 'images'],
-    }, new AbortController().signal)
-    expect(prepared.request.semantics).toMatchObject({
-      model: 'vlm', ocr: true, parseMethod: 'ocr', language: 'en', pages: '1-5',
-    })
-    expect(prepared.request.requiredArtifacts).toEqual(['markdown', 'content-list', 'images'])
-  })
-
-
-  it('accepts single file_path and normalizes to canonical request file', async () => {
-    const { path } = await fixture()
-    const normalizer = new RequestNormalizer({ defaults })
-    const prepared = await normalizer.normalize({ file_path: path }, new AbortController().signal)
-    expect(prepared.request.files).toHaveLength(1)
-    expect(prepared.sources[0]?.path).toBe(path)
-  })
-
-  it('normalizes page selection for various input formats', () => {
-    expect(normalizePageSelection(3)).toEqual(new Set([3]))
-    expect(normalizePageSelection([1, 2, 5])).toEqual(new Set([1, 2, 5]))
-    expect(normalizePageSelection('1-3, 5')).toEqual(new Set([1, 2, 3, 5]))
-    expect(normalizePageSelection(undefined)).toBeUndefined()
-  })
-
-  it('narrows page selection safely to legal document page bounds', () => {
-    expect(narrowPageSelection(undefined, 50)).toEqual({ pagesSet: undefined, pagesLabel: '1-50', outOfRange: [], fullyOutOfRange: false })
-    expect(narrowPageSelection(undefined, 1)).toEqual({ pagesSet: undefined, pagesLabel: '1', outOfRange: [], fullyOutOfRange: false })
-    expect(narrowPageSelection(new Set([3]), 50)).toEqual({ pagesSet: new Set([3]), pagesLabel: '3', outOfRange: [], fullyOutOfRange: false })
-    expect(narrowPageSelection(new Set([1, 2, 3]), 50)).toEqual({ pagesSet: new Set([1, 2, 3]), pagesLabel: '1-3', outOfRange: [], fullyOutOfRange: false })
-    expect(narrowPageSelection(new Set([48, 49, 50, 51, 52]), 50)).toEqual({
-      pagesSet: new Set([48, 49, 50]),
-      pagesLabel: '48-50',
-      outOfRange: [51, 52],
-      fullyOutOfRange: false,
-    })
-    expect(narrowPageSelection(new Set([99, 100]), 50)).toEqual({
-      pagesSet: new Set(),
-      pagesLabel: '',
-      outOfRange: [99, 100],
-      fullyOutOfRange: true,
-    })
-    expect(narrowPageSelection(new Set([50, 60]), 3)).toMatchObject({ pagesSet: new Set(), pagesLabel: '', fullyOutOfRange: true, outOfRange: [50, 60] })
-    expect(narrowPageSelection(new Set([2, 60]), 3)).toMatchObject({ pagesSet: new Set([2]), pagesLabel: '2', fullyOutOfRange: false, outOfRange: [60] })
-  })
-
-  it('formats model-facing out-of-range error message with valid page range', () => {
-    expect(formatPageOutOfRangeMessage(3)).toBe(
-      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range (valid: 1-3, total pages: 3)'
-    )
-    expect(formatPageOutOfRangeMessage(1)).toBe(
-      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range (valid: 1, total pages: 1)'
-    )
-    expect(formatPageOutOfRangeMessage(50)).toBe(
-      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range (valid: 1-50, total pages: 50)'
-    )
-    expect(formatPageOutOfRangeMessage(undefined)).toBe(
-      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range'
-    )
-    expect(formatPageOutOfRangeMessage(0)).toBe(
-      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range'
-    )
-    expect(formatPageOutOfRangeMessage(-5)).toBe(
-      '[PAGE_OUT_OF_RANGE] Requested pages are outside the document page range'
-    )
-  })
-
-
-  it('normalizes focus selection for single and array formats', () => {
-    expect(normalizeFocusSelection('table')).toEqual(new Set(['table']))
-    expect(normalizeFocusSelection(['text', 'image'])).toEqual(new Set(['text', 'image']))
-    expect(normalizeFocusSelection('toc')).toEqual(new Set(['toc']))
-    expect(normalizeFocusSelection('outline')).toEqual(new Set(['toc']))
-    expect(normalizeFocusSelection(['text', 'toc'])).toEqual(new Set(['text', 'toc']))
-    expect(normalizeFocusSelection(['text', 'outline'])).toEqual(new Set(['text', 'toc']))
-    expect(normalizeFocusSelection('artifacts')).toEqual(new Set(['artifacts']))
-    expect(normalizeFocusSelection('artifact')).toEqual(new Set(['artifacts']))
-    expect(normalizeFocusSelection(['text', 'artifacts'])).toEqual(new Set(['text', 'artifacts']))
-    expect(normalizeFocusSelection(undefined)).toEqual(new Set(['all']))
-    expect(() => normalizeFocusSelection('invalid')).toThrowError('Invalid focus option: invalid')
-  })
-
-  it('rejects every removed request alias at the service boundary', async () => {
-    const { path } = await fixture()
-    const normalizer = new RequestNormalizer({ defaults })
-    const aliases: Record<string, unknown> = {
-      backend: 'pipeline', parse_method: 'ocr', lang_list: ['en'],
-      formula_enable: true, table_enable: true, return_middle_json: true,
-      return_model_output: true, return_content_list: true, return_images: true,
-      start_page_id: 0, end_page_id: 1,
-    }
-    for (const [key, value] of Object.entries(aliases)) {
-      const input = { file_path: path, [key]: value } as unknown as ParseRequestInput
-      await expect(normalizer.normalize(input, new AbortController().signal))
-        .rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
-    }
+  it('applies defaults and keeps the local path only on the ephemeral prepared source', async () => {
+    const { root, path, source, request } = await preparedFixture()
+    expect(request.semantics).toEqual(defaults)
+    expect(request.requiredArtifacts).toEqual(['markdown', 'layout', 'model-output', 'content-list', 'images'])
+    expect(request.files).toHaveLength(1)
+    expect(source.path).toBe(path)
+    expect(JSON.stringify(request)).not.toContain(root)
   })
 
   it('detects a file changed after hashing and before upload', async () => {
-    const { path } = await fixture()
-    const normalizer = new RequestNormalizer({ defaults })
-    const prepared = await normalizer.normalize({ file_path: path }, new AbortController().signal)
+    const { path, source } = await preparedFixture()
     await writeFile(path, '%PDF-1.4 changed')
-    const now = new Date(Date.now() + 2000)
-    await utimes(path, now, now)
-    await expect(assertSourcesUnchanged(prepared.sources, new AbortController().signal))
+    const later = new Date(Date.now() + 2000)
+    await utimes(path, later, later)
+    await expect(assertSourcesUnchanged([source], new AbortController().signal))
       .rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
   })
 })
 
-describe('cache key', () => {
-  function request(language = 'é'): CanonicalParseRequest {
-    const sha = 'a'.repeat(64)
-    return {
-      schemaVersion: CANONICAL_PARSE_REQUEST_SCHEMA_VERSION,
-      files: [{ fileId: createFileId(sha), name: 'x.pdf', bytes: 4, sha256: sha }],
-      semantics: { model: 'pipeline', ocr: false, parseMethod: 'auto', language, formula: true, table: true },
-      requiredArtifacts: ['markdown'],
-    }
-  }
-
-  it('is stable across canonically equivalent Unicode', () => {
-    const composed = request('é')
-    const decomposed = request('é')
-    expect(computeCacheKey(composed, composed.files[0]!, 'provider:v1'))
-      .toBe(computeCacheKey(decomposed, decomposed.files[0]!, 'provider:v1'))
+describe('page and focus selection', () => {
+  it.each([
+    [3, [3]], [[1, 2, 5], [1, 2, 5]], ['1-3, 5', [1, 2, 3, 5]],
+  ] as const)('normalizes page selection %j', (input, pages) => {
+    expect(normalizePageSelection(input)).toEqual(new Set(pages))
   })
 
-  it('isolates provider, artifact, semantics, and schema versions', () => {
+  it.each([
+    [undefined, 50, { pagesSet: undefined, pagesLabel: '1-50', outOfRange: [], fullyOutOfRange: false }],
+    [undefined, 1, { pagesSet: undefined, pagesLabel: '1', outOfRange: [], fullyOutOfRange: false }],
+    [[1, 2, 3], 50, { pagesSet: new Set([1, 2, 3]), pagesLabel: '1-3', outOfRange: [], fullyOutOfRange: false }],
+    [[48, 49, 50, 51, 52], 50, { pagesSet: new Set([48, 49, 50]), pagesLabel: '48-50', outOfRange: [51, 52], fullyOutOfRange: false }],
+    [[2, 60], 3, { pagesSet: new Set([2]), pagesLabel: '2', outOfRange: [60], fullyOutOfRange: false }],
+    [[99, 100], 50, { pagesSet: new Set(), pagesLabel: '', outOfRange: [99, 100], fullyOutOfRange: true }],
+  ] as const)('narrows %j to the legal bounds of a %i-page document', (pages, total, expected) => {
+    expect(narrowPageSelection(pages === undefined ? undefined : new Set(pages), total)).toEqual(expected)
+  })
+
+  it('names the valid range in page-out-of-range errors only when the page count is known', () => {
+    expect(formatPageOutOfRangeMessage(3)).toMatch(/^\[PAGE_OUT_OF_RANGE\].*valid: 1-3, total pages: 3/)
+    for (const unknown of [undefined, 0, -5]) expect(formatPageOutOfRangeMessage(unknown)).not.toContain('valid:')
+  })
+
+  it('normalizes focus values and rejects unknown ones', () => {
+    expect(normalizeFocusSelection(undefined)).toEqual(new Set(['all']))
+    expect(normalizeFocusSelection('table')).toEqual(new Set(['table']))
+    expect(normalizeFocusSelection(['text', 'toc', 'artifacts'])).toEqual(new Set(['text', 'toc', 'artifacts']))
+    expect(() => normalizeFocusSelection('invalid')).toThrow(/invalid/)
+  })
+})
+
+describe('cache key', () => {
+  const request = (language = 'é'): CanonicalParseRequest => ({
+    ...sampleRequest(), files: [{ fileId: createFileId('a'.repeat(64)), name: 'x.pdf', bytes: 4, sha256: 'a'.repeat(64) }],
+    semantics: { ...defaults, language },
+  })
+
+  it('is stable across canonically equivalent Unicode', () => {
+    const composed = request('\u00e9')
+    const decomposed = request('e\u0301')
+    expect(computeCacheKey(composed, composed.files[0]!, 'provider:v1')).toBe(computeCacheKey(decomposed, decomposed.files[0]!, 'provider:v1'))
+  })
+
+  it('isolates provider, artifact, semantics and schema versions', () => {
     const base = request()
-    const initial = computeCacheKey(base, base.files[0]!, 'provider:v1')
-    expect(computeCacheKey(base, base.files[0]!, 'provider:v2')).not.toBe(initial)
-    expect(computeCacheKey({ ...base, requiredArtifacts: ['markdown', 'layout'] }, base.files[0]!, 'provider:v1')).not.toBe(initial)
-    expect(computeCacheKey({ ...base, semantics: { ...base.semantics, table: false } }, base.files[0]!, 'provider:v1')).not.toBe(initial)
-    expect(computeCacheKey(base, base.files[0]!, 'provider:v1', { cacheKey: 2 })).not.toBe(initial)
-    expect(computeCacheKey(base, base.files[0]!, 'provider:v1', { result: 2 })).not.toBe(initial)
+    const file = base.files[0]!
+    const keys = [
+      computeCacheKey(base, file, 'provider:v1'),
+      computeCacheKey(base, file, 'provider:v2'),
+      computeCacheKey({ ...base, requiredArtifacts: ['markdown', 'layout'] }, file, 'provider:v1'),
+      computeCacheKey({ ...base, semantics: { ...base.semantics, table: false } }, file, 'provider:v1'),
+      computeCacheKey(base, file, 'provider:v1', { cacheKey: 2 }),
+      computeCacheKey(base, file, 'provider:v1', { result: 2 }),
+    ]
+    expect(new Set(keys).size).toBe(keys.length)
   })
 
   it.each([
     ['auto', 'b2d5313dacfb974770f45a4e0dbbc87b7c5188e0c06a8a106810316f1dbb93b4'],
     ['txt', '247a4fd5e650ddd14ffafdd216f7248e59d11898c0d417c7f48900d9d75b1bea'],
-  ] as const)('preserves the %s golden cache key in the renamed legacy namespace', (method, expected) => {
+  ] as const)('preserves the existing %s cache key in the legacy namespace', (parseMethod, expected) => {
     const file = { fileId: createFileId('a'.repeat(64)), name: 'fixture.pdf', bytes: 10, sha256: 'a'.repeat(64) }
-    const req: CanonicalParseRequest = {
-      schemaVersion: 1, files: [file], requiredArtifacts: ['markdown'],
-      semantics: { model: 'pipeline', ocr: false, parseMethod: method, language: 'ch', formula: true, table: true },
-    }
+    const req: CanonicalParseRequest = { schemaVersion: 1, files: [file], requiredArtifacts: ['markdown'], semantics: { ...defaults, parseMethod } }
     expect(computeCacheKey(req, file, 'self-hosted-legacy-v2:golden')).toBe(expected)
   })
 
-  it('preserves NFC normalization, sorted keys and negative zero', () => {
+  it('canonicalizes NFC, key order and negative zero, and keeps prototype-like own keys', () => {
     expect(canonicalJson({ z: -0, a: 'e\u0301' })).toBe('{"a":"é","z":0}')
-    expect(canonicalJson({ a: 'é', z: 0 })).toBe(canonicalJson({ z: -0, a: 'e\u0301' }))
-  })
-
-  it('accepts own properties that resemble Object.prototype without dropping them', () => {
     const value: unknown = JSON.parse('{"__proto__":{"safe":true},"constructor":1,"toString":2}')
     expect(canonicalJson(value)).toBe('{"__proto__":{"safe":true},"constructor":1,"toString":2}')
     expect(Object.prototype).not.toHaveProperty('safe')
   })
 
-  it('still rejects ambiguous normalized keys and non-JSON values', () => {
-    expect(() => canonicalJson({ 'é': 1, 'e\u0301': 2 })).toThrow('collision')
-    expect(() => canonicalJson({ value: undefined })).toThrow('undefined')
-    expect(() => canonicalJson(Infinity)).toThrow('non-finite')
+  it.each([
+    [{ 'é': 1, 'e\u0301': 2 }, /collision/], [{ value: undefined }, /undefined/], [Infinity, /non-finite/],
+  ])('rejects ambiguous or non-JSON input %#', (value, error) => {
+    expect(() => canonicalJson(value)).toThrow(error)
   })
-
 })
 
 describe('identifier and diagnostic safety', () => {
-  it('rejects unsafe path identifiers and malformed cache keys', () => {
-    expect(() => asSessionId('../other')).toThrow()
-    expect(() => asCacheKey('not-a-digest')).toThrow()
+  it.each([
+    ['cache key', () => asCacheKey('not-a-digest')],
+    ['cache key casing', () => asCacheKey('A'.repeat(64))],
+    ['result id prefix', () => asResultId('mf_0123')],
+    ['file id traversal', () => asFileId('mf_../escape')],
+    ['provider config separator', () => asProviderConfigId('mp_a/b')],
+    ['operation id prefix', () => asOperationId('op_123')],
+    ['file id from bad digest', () => createFileId('xyz')],
+  ])('rejects an unsafe %s', (_label, build) => {
+    expect(build).toThrow(TypeError)
   })
 
   it('redacts bearer credentials and all secret-bearing URL components', () => {

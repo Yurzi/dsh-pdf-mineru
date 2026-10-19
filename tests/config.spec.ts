@@ -1,186 +1,76 @@
 import { describe, expect, it } from 'vitest'
-import {
-  defaultMinerUConfig,
-  defaultProviderConfig,
-  effectiveParseDefaults,
-  detectBloatedSettingsOps,
-  parseConfig,
-  parseConfigWithMigration,
-  providerById,
-  pruneConfigToDiff,
-} from '../src/config.js'
+import { isVolatile } from '@deepseek-ai/cosmokit'
+import { defaultProviderConfig, providerById, type MinerUConfig } from '../src/config/model.js'
+import { defaultMinerUConfig, parseConfig } from '../src/config/parse.js'
+import { Config } from '../src/config/schema.js'
 import { asProviderConfigId } from '../src/domain/ids.js'
 
-describe('MinerU config parsing and validation', () => {
-  it('creates three independent profiles in legacy, official, V1 order', () => {
-    const config = defaultMinerUConfig()
-    expect(config.schemaVersion).toBe(3)
-    expect(config.activeProvider).toBe('mp_self_hosted')
-    expect(config.providers).toHaveLength(3)
-    expect(config.providers[0]).toMatchObject({ id: 'mp_self_hosted', type: 'self-hosted-legacy-v2', allowInsecureHttp: true })
-    expect(config.providers[1]).toMatchObject({
-      id: 'mp_official', type: 'official-v4', baseURL: 'https://mineru.net/api/v4', models: ['pipeline', 'vlm'],
+type Patch = Record<string, unknown>
+const base = (): MinerUConfig => defaultMinerUConfig()
+const legacy = defaultProviderConfig('self-hosted-legacy-v2')
+const official = defaultProviderConfig('official-v4')
+const v1 = defaultProviderConfig('self-hosted-v1')
+/** One-provider configuration whose active profile is the given provider. */
+const only = (provider: Patch, extra: Patch = {}): Patch => ({ activeProvider: provider.id, providers: [provider], ...extra })
+const officialWith = (defaults: Patch, provider: Patch = {}): Patch =>
+  only({ id: 'mp_official', type: 'official-v4', apiKeyEnv: 'TOKEN', ...provider }, { defaults })
+
+describe('MinerU config defaults', () => {
+  it('creates three independent profiles in legacy, official, V1 order with bounded defaults', () => {
+    const config = base()
+    expect(config).toMatchObject({
+      schemaVersion: 3, activeProvider: 'mp_self_hosted',
+      defaults: { model: 'pipeline', parseMethod: 'auto', ocr: false },
+      retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 10000 },
+      output: { maxInlineChars: 12000, maxInlineImages: 6 },
+      storage: { retainSources: false },
     })
+    expect(config.providers.map(provider => provider.type)).toEqual(['self-hosted-legacy-v2', 'official-v4', 'self-hosted-v1'])
+    expect(config.providers[1]).toMatchObject({ baseURL: 'https://mineru.net/api/v4', models: ['pipeline', 'vlm'] })
     expect(config.providers[2]).toEqual({
       id: 'mp_self_hosted_v1', type: 'self-hosted-v1', baseURL: 'http://localhost:8000',
       apiKeyEnv: 'MINERU_API_KEY', allowInsecureHttp: true, ocrMode: 'auto',
     })
-    expect(config.providers[0]).not.toHaveProperty('tier')
-    expect(config.providers[0]).not.toHaveProperty('ocrMode')
-    expect(config.defaults).toMatchObject({ model: 'pipeline', parseMethod: 'auto', ocr: false })
-    expect(config.retry).toEqual({ maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 10000 })
-    expect(config.output).toEqual({ maxInlineChars: 12000, maxInlineImages: 6 })
     expect(config.storage.storageRoot).toMatch(/[\\/]cache[\\/]pdf-mineru$/)
-    expect(config.storage.retainSources).toBe(false)
+    expect(parseConfig(config)).toEqual(config)
+  })
+})
+
+describe('MinerU config domain validation', () => {
+  it.each<[string, () => unknown, RegExp]>([
+    ['inline image budget below range', () => ({ ...base(), output: { ...base().output, maxInlineImages: -1 } }), /output.maxInlineImages/],
+    ['inline image budget above range', () => ({ ...base(), output: { ...base().output, maxInlineImages: 101 } }), /output.maxInlineImages/],
+    ['fractional inline image budget', () => ({ ...base(), output: { ...base().output, maxInlineImages: 1.5 } }), /output.maxInlineImages/],
+    ['future schemaVersion', () => ({ ...base(), schemaVersion: 4 }), /unsupported schemaVersion/],
+    ['zero schemaVersion', () => ({ ...base(), schemaVersion: 0 }), /unsupported schemaVersion/],
+    ['string schemaVersion', () => ({ ...base(), schemaVersion: '3' }), /unsupported schemaVersion/],
+    ['removed flat fields', () => ({ baseURL: 'http://mineru.local:18000/', apiKeyEnv: 'KEY', defaultBackend: 'hybrid-engine' }), /config contains unsupported property baseURL/],
+    ['unknown provider property', () => ({ ...base(), providers: [{ ...legacy, unknownProviderKey: 'abc' }] }), /provider contains unsupported property unknownProviderKey/],
+    ['unknown modelMap property', () => only({ ...legacy, modelMap: { ...legacy.modelMap, extraModel: 'x' } }), /modelMap contains unsupported property extraModel/],
+    ['retained sources', () => ({ ...base(), storage: { ...base().storage, retainSources: true } }), /storage.retainSources must be false/],
+    ['string retainSources', () => ({ ...base(), storage: { ...base().storage, retainSources: 'false' } }), /storage.retainSources must be false/],
+    ['too many retry attempts', () => ({ ...base(), retry: { maxAttempts: 11, baseDelayMs: 500, maxDelayMs: 10000 } }), /retry.maxAttempts/],
+    ['retry base delay above max delay', () => ({ ...base(), retry: { maxAttempts: 3, baseDelayMs: 2000, maxDelayMs: 1000 } }), /cannot exceed/],
+    ['duplicate identities across types', () => ({ activeProvider: legacy.id, providers: [legacy, { ...v1, id: legacy.id }] }), /unique/],
+    ['duplicate official identities', () => ({ activeProvider: 'mp_dup', providers: [{ id: 'mp_dup', type: 'official-v4' }, { id: 'mp_dup', type: 'official-v4' }] }), /unique/],
+    ['official plain HTTP', () => only({ ...official, baseURL: 'http://mineru.example/v4' }), /HTTPS/],
+    ['official model outside its models list', () => officialWith({ model: 'vlm', parseMethod: 'auto', ocr: false }, { models: ['pipeline'] }), /does not support defaults.model/],
+    ['official txt parse method', () => officialWith({ model: 'pipeline', parseMethod: 'txt', ocr: false }), /cannot use txt/],
+    ['txt parse method with OCR', () => officialWith({ parseMethod: 'txt', ocr: true }), /conflicts/],
+    ['auto parse method with OCR', () => officialWith({ parseMethod: 'auto', ocr: true }), /conflicts/],
+    ...(['fastest', '', 'STANDARD', 1, null, false] as const).map(tier =>
+      ['V1 tier ' + JSON.stringify(tier), () => only({ ...v1, tier }), /provider.tier/] as [string, () => unknown, RegExp]),
+    ...(['', 'text', 'OCR', false, 1, null] as const).map(ocrMode =>
+      ['V1 ocrMode ' + JSON.stringify(ocrMode), () => only({ ...v1, ocrMode }), /provider.ocrMode/] as [string, () => unknown, RegExp]),
+    ...([undefined, null, 1, '', 'unknown', ['self', 'hosted'].join('-')] as const).map(type =>
+      ['provider type ' + JSON.stringify(type), () => ({ ...base(), providers: [{ ...legacy, type }] }), /provider.type/] as [string, () => unknown, RegExp]),
+  ])('rejects %s', (_label, value, error) => {
+    expect(() => parseConfig(value())).toThrow(error)
   })
 
-  it('round-trips the canonical default configuration', () => {
-    const base = defaultMinerUConfig()
-    expect(parseConfig(base)).toEqual(base)
-  })
-
-  it('defaults and validates the inline image budget', () => {
-    const base = defaultMinerUConfig()
-    expect(parseConfig({ ...base, output: { maxInlineChars: 200000 } }).output.maxInlineImages).toBe(6)
-    expect(parseConfig({ ...base, output: { ...base.output, maxInlineImages: 0 } }).output.maxInlineImages).toBe(0)
-    expect(parseConfig({ ...base, output: { ...base.output, maxInlineImages: 100 } }).output.maxInlineImages).toBe(100)
-    expect(() => parseConfig({ ...base, output: { ...base.output, maxInlineImages: -1 } })).toThrow(/output.maxInlineImages/)
-    expect(() => parseConfig({ ...base, output: { ...base.output, maxInlineImages: 101 } })).toThrow(/output.maxInlineImages/)
-    expect(() => parseConfig({ ...base, output: { ...base.output, maxInlineImages: 1.5 } })).toThrow(/output.maxInlineImages/)
-  })
-
-  it('rejects unsupported schemaVersion and accepts the current schemaVersion', () => {
-    const base = defaultMinerUConfig()
-    expect(parseConfig({ ...base, schemaVersion: 3 }).schemaVersion).toBe(3)
-    expect(() => parseConfig({ ...base, schemaVersion: 4 })).toThrow(/unsupported schemaVersion/)
-    expect(() => parseConfig({ ...base, schemaVersion: 0 })).toThrow(/unsupported schemaVersion/)
-    expect(() => parseConfig({ ...base, schemaVersion: '1' as unknown as number })).toThrow(/unsupported schemaVersion/)
-  })
-
-  it('migrates bounded Provider-based v1 settings without mutating the input', () => {
-    const base = defaultMinerUConfig()
-    const legacy = {
-      ...base,
-      schemaVersion: 1,
-      defaults: { ...base.defaults, artifacts: ['markdown', 'layout'] },
-      limits: { ...base.limits, maxFilesPerRequest: 4 },
-    }
-
-    const parsed = parseConfigWithMigration(legacy)
-    expect(parsed.migrated).toBe(true)
-    expect(parsed.migratedFrom).toBe(1)
-    expect(parsed.config.schemaVersion).toBe(3)
-    expect(parsed.config.defaults).not.toHaveProperty('artifacts')
-    expect(parsed.config.limits).not.toHaveProperty('maxFilesPerRequest')
-    expect(legacy.defaults.artifacts).toEqual(['markdown', 'layout'])
-    expect(legacy.limits.maxFilesPerRequest).toBe(4)
-  })
-
-  it('repairs obsolete schema-1 values but keeps current-version unknown fields strict', () => {
-    const base = defaultMinerUConfig()
-    const parsed = parseConfigWithMigration({...base,schemaVersion:1,
-      defaults:{...base.defaults,artifacts:['unknown']},limits:{...base.limits,maxFilesPerRequest:0}})
-    expect(parsed.config.defaults).not.toHaveProperty('artifacts')
-    expect(parsed.config.limits).not.toHaveProperty('maxFilesPerRequest')
-    expect(parsed.defaultedFields).toEqual(expect.arrayContaining(['defaults.artifacts','limits.maxFilesPerRequest']))
-    expect(() => parseConfig({...base,defaults:{...base.defaults,artifacts:['markdown']}})).toThrow(/unsupported property artifacts/)
-    expect(parseConfigWithMigration({...base,defaults:{...base.defaults,artifacts:['markdown']}}).config.defaults).not.toHaveProperty('artifacts')
-    const merged = parseConfigWithMigration({...base,schemaVersion:2,defaults:{...base.defaults,artifacts:['markdown']}})
-    expect(merged.migratedFrom).toBe(2)
-    expect(merged.config.defaults).not.toHaveProperty('artifacts')
-  })
-
-  it('rejects removed flat configuration fields', () => {
-    expect(() => parseConfig({
-      baseURL: 'http://mineru.local:18000/',
-      apiKeyEnv: 'CUSTOM_MINERU_KEY',
-      defaultBackend: 'hybrid-engine',
-    })).toThrow(/config contains unsupported property baseURL/)
-  })
-
-  it('rejects unknown nested properties with clear paths', () => {
-    const base = defaultMinerUConfig()
-
-    expect(() => parseConfig({
-      ...base,
-      defaults: { ...base.defaults, unknownProp: 'bad' },
-    })).toThrow(/defaults contains unsupported property unknownProp/)
-
-    expect(() => parseConfig({
-      ...base,
-      storage: { ...base.storage, unknownStorageKey: true },
-    })).toThrow(/storage contains unsupported property unknownStorageKey/)
-
-    expect(() => parseConfig({
-      ...base,
-      polling: { ...base.polling, extraPolling: 123 },
-    })).toThrow(/polling contains unsupported property extraPolling/)
-
-    expect(() => parseConfig({
-      ...base,
-      retry: { ...base.retry, extraRetry: 10 },
-    })).toThrow(/retry contains unsupported property extraRetry/)
-
-    expect(() => parseConfig({
-      ...base,
-      output: { ...base.output, extraOutput: 999 },
-    })).toThrow(/output contains unsupported property extraOutput/)
-
-    expect(() => parseConfig({
-      ...base,
-      limits: { ...base.limits, extraLimit: 12345 },
-    })).toThrow(/limits contains unsupported property extraLimit/)
-
-    expect(() => parseConfig({
-      ...base,
-      providers: [
-        { ...base.providers[0]!, unknownProviderKey: 'abc' },
-        base.providers[1]!,
-      ],
-    })).toThrow(/provider contains unsupported property unknownProviderKey/)
-
-    const selfHosted = base.providers[0]! as import('../src/config/pure.js').SelfHostedLegacyV2Config
-    expect(() => parseConfig({
-      ...base,
-      providers: [
-        { ...selfHosted, modelMap: { ...selfHosted.modelMap, extraModel: 'something' } },
-        base.providers[1]!,
-      ],
-    })).toThrow(/modelMap contains unsupported property extraModel/)
-  })
-
-  it('accepts all four V1 tiers, leaves the default tier absent, and rejects invalid tiers', () => {
-    const provider = defaultProviderConfig('self-hosted-v1')
-    const withTier = (tier: unknown) => parseConfig({
-      activeProvider: provider.id,
-      providers: [{ ...provider, tier }],
-    }).providers[0]
-
-    expect(withTier(undefined)).not.toHaveProperty('tier')
-    for (const tier of ['flash', 'basic', 'standard', 'advanced']) {
-      expect(withTier(tier)).toMatchObject({ type: 'self-hosted-v1', tier })
-    }
-    for (const tier of ['fastest', '', 'STANDARD', 1, null, false]) {
-      expect(() => withTier(tier)).toThrow(/provider.tier/)
-    }
-  })
-
-  it('defaults V1 OCR mode independently of shared defaults and validates all three modes', () => {
-    for (const ocrMode of [undefined, 'auto', 'txt', 'ocr']) {
-      const config = parseConfig({
-        activeProvider: 'mp_v1',
-        providers: [{ id: 'mp_v1', type: 'self-hosted-v1', allowInsecureHttp: true, ocrMode }],
-        defaults: { model: 'vlm', language: 'en', parseMethod: 'ocr', ocr: true, formula: true, table: true },
-      })
-      expect(config.providers[0]).toMatchObject({ baseURL: 'http://localhost:8000', ocrMode: ocrMode ?? 'auto' })
-      expect(config.providers[0]).not.toHaveProperty('modelMap')
-      expect(config.providers[0]).not.toHaveProperty('tier')
-      expect(config.defaults).toEqual({ model: 'vlm', language: 'en', parseMethod: 'ocr', ocr: true, formula: true, table: true })
-    }
-    for (const ocrMode of ['', 'text', 'OCR', false, 1, null]) {
-      const provider = defaultProviderConfig('self-hosted-v1')
-      expect(() => parseConfig({ activeProvider: provider.id, providers: [{ ...provider, ocrMode }] })).toThrow(/provider.ocrMode/)
-    }
+  it.each(['defaults', 'storage', 'polling', 'retry', 'output', 'limits'] as const)('rejects unknown %s properties with their path', section => {
+    expect(() => parseConfig({ ...base(), [section]: { ...base()[section], extraField: 1 } }))
+      .toThrow(new RegExp(section + ' contains unsupported property extraField'))
   })
 
   it.each([
@@ -197,399 +87,115 @@ describe('MinerU config parsing and validation', () => {
     ['official-v4', 'allowInsecureHttp', true],
   ] as const)('strictly rejects %s cross-type field %s even when undefined', (type, field, value) => {
     const provider = defaultProviderConfig(type)
-    for (const invalidValue of [value, undefined]) {
-      expect(() => parseConfig({
-        activeProvider: provider.id,
-        providers: [{ ...provider, [field]: invalidValue }],
-      })).toThrow('provider contains unsupported property ' + field)
+    for (const invalid of [value, undefined]) {
+      expect(() => parseConfig(only({ ...provider, [field]: invalid }))).toThrow('provider contains unsupported property ' + field)
     }
   })
 
-  it.each([undefined, null, 1, '', 'unknown', ['self', 'hosted'].join('-')])(
-    'rejects invalid or removed provider type %s without guessing a protocol', type => {
-      const base = defaultMinerUConfig()
-      const value = { ...base, providers: [{ ...base.providers[0], type }] }
-      expect(() => parseConfig(value)).toThrow(/provider.type/)
-      expect(() => parseConfigWithMigration(value)).toThrow(/provider.type/)
-      expect(parseConfigWithMigration({ ...value, schemaVersion: 1 }).config.providers[0]?.type).toBe('self-hosted-legacy-v2')
-    },
-  )
-
-  it.each(['self-hosted-v1', 'self-hosted-legacy-v2'] as const)(
-    'requires explicit HTTP opt-in for %s and rejects unsafe URL components', type => {
-      const provider = defaultProviderConfig(type)
-      const parse = (patch: Record<string, unknown>) => parseConfig({
-        activeProvider: provider.id, providers: [{ ...provider, ...patch }],
-      }).providers[0]
-      expect(() => parse({ allowInsecureHttp: false })).toThrow(/HTTPS/)
-      expect(() => parse({ allowInsecureHttp: undefined })).toThrow(/HTTPS/)
-      expect(parse({ allowInsecureHttp: true })).toMatchObject({ baseURL: provider.baseURL })
-      expect(parse({ baseURL: 'https://mineru.example/api/', allowInsecureHttp: false })).toMatchObject({ baseURL: 'https://mineru.example/api' })
-      for (const baseURL of [
-        'https://user:password@mineru.example', 'https://mineru.example?token=secret',
-        'https://mineru.example#fragment', 'ftp://mineru.example', 'file:///tmp/mineru',
-      ]) expect(() => parse({ baseURL, allowInsecureHttp: true })).toThrow()
-      expect(() => parse({ allowInsecureHttp: 'true' })).toThrow(/allowInsecureHttp/)
-    },
-  )
-
-  it('rejects duplicate identities across different provider types', () => {
-    const legacy = defaultProviderConfig('self-hosted-legacy-v2')
-    const v1 = defaultProviderConfig('self-hosted-v1')
-    expect(() => parseConfig({
-      activeProvider: legacy.id, providers: [legacy, { ...v1, id: legacy.id }],
-    })).toThrow(/unique/)
+  it.each(['self-hosted-v1', 'self-hosted-legacy-v2'] as const)('requires explicit HTTP opt-in for %s and rejects unsafe URL components', type => {
+    const provider = defaultProviderConfig(type)
+    const parse = (patch: Patch) => parseConfig(only({ ...provider, ...patch })).providers[0]
+    expect(() => parse({ allowInsecureHttp: false })).toThrow(/HTTPS/)
+    expect(() => parse({ allowInsecureHttp: undefined })).toThrow(/HTTPS/)
+    expect(() => parse({ allowInsecureHttp: 'true' })).toThrow(/allowInsecureHttp/)
+    expect(parse({ allowInsecureHttp: true })).toMatchObject({ baseURL: provider.baseURL })
+    expect(parse({ baseURL: 'https://mineru.example/api/', allowInsecureHttp: false })).toMatchObject({ baseURL: 'https://mineru.example/api' })
+    for (const baseURL of [
+      'https://user:password@mineru.example', 'https://mineru.example?token=secret',
+      'https://mineru.example#fragment', 'ftp://mineru.example', 'file:///tmp/mineru', 'not a url', '',
+    ]) expect(() => parse({ baseURL, allowInsecureHttp: true })).toThrow()
   })
+})
 
-  it('uses V1-only internal cache placeholders without mutating shared defaults', () => {
-    const defaults = Object.freeze({ model: 'vlm' as const, language: 'ja', formula: true, table: true, parseMethod: 'ocr' as const, ocr: true })
-    const provider = defaultProviderConfig('self-hosted-v1')
-    if (provider.type !== 'self-hosted-v1') throw new Error('Expected V1 profile')
-    for (const ocrMode of ['auto', 'txt', 'ocr'] as const) {
-      expect(effectiveParseDefaults(defaults, { ...provider, ocrMode })).toEqual({
-        model: 'pipeline', language: 'auto', formula: false, table: false,
-        parseMethod: ocrMode, ocr: ocrMode === 'ocr',
-      })
-    }
-    // These sentinels describe cache identity, not upstream formula/table switches.
-    expect(defaults).toEqual({ model: 'vlm', language: 'ja', formula: true, table: true, parseMethod: 'ocr', ocr: true })
-    for (const type of ['self-hosted-legacy-v2', 'official-v4'] as const) {
-      expect(effectiveParseDefaults(defaults, defaultProviderConfig(type))).toBe(defaults)
+describe('MinerU config normalization', () => {
+  it('defaults and bounds the inline image budget', () => {
+    expect(parseConfig({ ...base(), output: { maxInlineChars: 200000 } }).output.maxInlineImages).toBe(6)
+    for (const maxInlineImages of [0, 100]) {
+      expect(parseConfig({ ...base(), output: { ...base().output, maxInlineImages } }).output.maxInlineImages).toBe(maxInlineImages)
     }
   })
 
-  it('enforces explicit retainSources: false contract', () => {
-    const base = defaultMinerUConfig()
-    expect(parseConfig({
-      ...base,
-      storage: { ...base.storage, retainSources: false },
-    }).storage.retainSources).toBe(false)
-
-    expect(() => parseConfig({
-      ...base,
-      storage: { ...base.storage, retainSources: true as unknown as false },
-    })).toThrow(/storage.retainSources must be false/)
-
-    expect(() => parseConfig({
-      ...base,
-      storage: { ...base.storage, retainSources: 'false' as unknown as false },
-    })).toThrow(/storage.retainSources must be false/)
+  it('accepts all V1 tiers and OCR modes independently of shared defaults', () => {
+    const shared = { model: 'vlm', language: 'en', parseMethod: 'ocr', ocr: true, formula: true, table: true }
+    expect(parseConfig(only({ ...v1 })).providers[0]).not.toHaveProperty('tier')
+    for (const tier of ['flash', 'basic', 'standard', 'advanced']) {
+      expect(parseConfig(only({ ...v1, tier })).providers[0]).toMatchObject({ type: 'self-hosted-v1', tier })
+    }
+    for (const ocrMode of [undefined, 'auto', 'txt', 'ocr']) {
+      const config = parseConfig(only({ id: 'mp_v1', type: 'self-hosted-v1', allowInsecureHttp: true, ocrMode }, { defaults: shared }))
+      expect(config.providers[0]).toEqual({ id: 'mp_v1', type: 'self-hosted-v1', baseURL: 'http://localhost:8000', allowInsecureHttp: true, ocrMode: ocrMode ?? 'auto' })
+      expect(config.defaults).toEqual(shared)
+    }
   })
 
-  it('accepts an official-v4 discriminated provider config', () => {
+  it('fills official-v4 profile defaults and infers OCR/parseMethod truthfully', () => {
     const id = asProviderConfigId('mp_official')
-    const config = parseConfig({
-      activeProvider: id,
-      providers: [{ id, type: 'official-v4', apiKeyEnv: 'MINERU_CLOUD_TOKEN', models: ['pipeline', 'vlm'] }],
-      defaults: { model: 'vlm', parseMethod: 'ocr', ocr: true },
-    })
+    const config = parseConfig(officialWith({ model: 'vlm', parseMethod: 'ocr', ocr: true }, { apiKeyEnv: 'MINERU_CLOUD_TOKEN', models: ['pipeline', 'vlm'] }))
     expect(providerById(config, id)).toEqual({
-      id,
-      type: 'official-v4',
-      baseURL: 'https://mineru.net/api/v4',
-      apiKeyEnv: 'MINERU_CLOUD_TOKEN',
-      models: ['pipeline', 'vlm'],
-      configuredVersion: 'v4',
+      id, type: 'official-v4', baseURL: 'https://mineru.net/api/v4', apiKeyEnv: 'MINERU_CLOUD_TOKEN', models: ['pipeline', 'vlm'], configuredVersion: 'v4',
     })
-    expect(config.defaults).toMatchObject({ model: 'vlm', parseMethod: 'ocr', ocr: true })
+    expect(parseConfig(officialWith({ ocr: true })).defaults).toMatchObject({ ocr: true, parseMethod: 'ocr' })
+    expect(parseConfig(officialWith({ parseMethod: 'ocr' })).defaults).toMatchObject({ ocr: true, parseMethod: 'ocr' })
   })
 
-  it('rejects duplicate provider identities and unsafe official URLs', () => {
-    const id = asProviderConfigId('mp_duplicate')
-    expect(() => parseConfig({
-      activeProvider: id,
-      providers: [
-        { id, type: 'official-v4', apiKeyEnv: 'TOKEN' },
-        { id, type: 'official-v4', apiKeyEnv: 'TOKEN' },
-      ],
-    })).toThrow(/unique/)
-    expect(() => parseConfig({
-      activeProvider: id,
-      providers: [{ id, type: 'official-v4', baseURL: 'http://mineru.example/v4', apiKeyEnv: 'TOKEN' }],
-    })).toThrow(/HTTPS/)
-  })
-
-  it('rejects active official defaults that the provider cannot express', () => {
-    const id = asProviderConfigId('mp_official')
-    expect(() => parseConfig({
-      activeProvider: id,
-      providers: [{ id, type: 'official-v4', apiKeyEnv: 'TOKEN', models: ['pipeline'] }],
-      defaults: { model: 'vlm', parseMethod: 'auto', ocr: false },
-    })).toThrow(/does not support defaults.model/)
-    expect(() => parseConfig({
-      activeProvider: id,
-      providers: [{ id, type: 'official-v4', apiKeyEnv: 'TOKEN' }],
-      defaults: { model: 'pipeline', parseMethod: 'txt', ocr: false },
-    })).toThrow(/cannot use txt/)
-  })
-
-  it('resolves parseMethod and ocr truthfully and detects conflicts', () => {
-    const id = asProviderConfigId('mp_official')
-    // conflict: parseMethod is txt, but ocr is true
-    expect(() => parseConfig({
-      activeProvider: id,
-      providers: [{ id, type: 'official-v4', apiKeyEnv: 'TOKEN' }],
-      defaults: { parseMethod: 'txt', ocr: true },
-    })).toThrow(/conflicts/)
-
-    // conflict: parseMethod is auto, but ocr is true
-    expect(() => parseConfig({
-      activeProvider: id,
-      providers: [{ id, type: 'official-v4', apiKeyEnv: 'TOKEN' }],
-      defaults: { parseMethod: 'auto', ocr: true },
-    })).toThrow(/conflicts/)
-
-    // ocr: true without parseMethod infers parseMethod: 'ocr'
-    const ocrInferred = parseConfig({
-      activeProvider: id,
-      providers: [{ id, type: 'official-v4', apiKeyEnv: 'TOKEN' }],
-      defaults: { ocr: true },
-    })
-    expect(ocrInferred.defaults.ocr).toBe(true)
-    expect(ocrInferred.defaults.parseMethod).toBe('ocr')
-
-    // parseMethod: 'ocr' without ocr infers ocr: true
-    const methodOcr = parseConfig({
-      activeProvider: id,
-      providers: [{ id, type: 'official-v4', apiKeyEnv: 'TOKEN' }],
-      defaults: { parseMethod: 'ocr' },
-    })
-    expect(methodOcr.defaults.ocr).toBe(true)
-    expect(methodOcr.defaults.parseMethod).toBe('ocr')
-  })
-
-  it('fills retry defaults for 0.0.1 configs and validates bounded delays', () => {
-    const base = defaultMinerUConfig()
-    const olderCanonical = { ...base, retry: undefined }
-    expect(parseConfig(olderCanonical).retry).toEqual(base.retry)
-
-    expect(() => parseConfig({
-      ...base,
-      retry: { maxAttempts: 11, baseDelayMs: 500, maxDelayMs: 10000 },
-    })).toThrow(/retry.maxAttempts/)
-    expect(() => parseConfig({
-      ...base,
-      retry: { maxAttempts: 3, baseDelayMs: 2000, maxDelayMs: 1000 },
-    })).toThrow(/cannot exceed/)
-  })
-})
-describe('pruneConfigToDiff', () => {
-  it('returns an empty object for a completely default config', () => {
-    const base = defaultMinerUConfig()
-    expect(pruneConfigToDiff(base, base)).toEqual({})
-    expect(pruneConfigToDiff(base)).toEqual({})
-  })
-
-  it('includes only activeProvider when only activeProvider is modified', () => {
-    const base = defaultMinerUConfig()
-    const next = { ...base, activeProvider: asProviderConfigId('mp_official') }
-    expect(pruneConfigToDiff(next, base)).toEqual({
-      schemaVersion: 3,
-      activeProvider: 'mp_official',
-    })
-  })
-
-  it('includes entire defaults when only defaults are modified', () => {
-    const base = defaultMinerUConfig()
-    const next = { ...base, defaults: { ...base.defaults, model: 'vlm' as const } }
-    expect(pruneConfigToDiff(next, base)).toEqual({
-      schemaVersion: 3,
-      defaults: next.defaults,
-    })
-  })
-
-  it('prunes partial modification in output and omits unchanged properties', () => {
-    const base = defaultMinerUConfig()
-    const next = { ...base, output: { ...base.output, maxInlineImages: 10 } }
-    expect(pruneConfigToDiff(next, base)).toEqual({
-      schemaVersion: 3,
-      output: { maxInlineImages: 10 },
-    })
-  })
-
-  it('prunes partial modification in retry and omits unchanged properties', () => {
-    const base = defaultMinerUConfig()
-    const next = { ...base, retry: { ...base.retry, maxAttempts: 5 } }
-    expect(pruneConfigToDiff(next, base)).toEqual({
-      schemaVersion: 3,
-      retry: { maxAttempts: 5 },
-    })
-  })
-
-  it('prunes partial modifications across storage, polling, and limits', () => {
-    const base = defaultMinerUConfig()
-    const next = {
-      ...base,
-      storage: { ...base.storage, stagingTtlMs: 12345 },
-      polling: { ...base.polling, pollIntervalMs: 1500 },
-      limits: { ...base.limits, maxFileBytes: 100 * 1024 * 1024 },
-    }
-    expect(pruneConfigToDiff(next, base)).toEqual({
-      schemaVersion: 3,
-      storage: { stagingTtlMs: 12345 },
-      polling: { pollIntervalMs: 1500 },
-      limits: { maxFileBytes: 100 * 1024 * 1024 },
-    })
-  })
-
-  it('retains providers array when providers are modified', () => {
-    const base = defaultMinerUConfig()
-    const modifiedProvider = {
-      ...base.providers[0]!,
-      baseURL: 'http://localhost:19000',
-    }
-    const next = {
-      ...base,
-      providers: [modifiedProvider, base.providers[1]!],
-    }
-    expect(pruneConfigToDiff(next, base)).toEqual({
-      schemaVersion: 3,
-      providers: next.providers,
-    })
-  })
-
-  it('omits providers array when providers are unchanged', () => {
-    const base = defaultMinerUConfig()
-    const next = { ...base, output: { ...base.output, maxInlineImages: 8 } }
-    const pruned = pruneConfigToDiff(next, base)
-    expect(pruned).not.toHaveProperty('providers')
-    expect(pruned).toEqual({
-      schemaVersion: 3,
-      output: { maxInlineImages: 8 },
-    })
-  })
-
-  it('resolves back to the original next config when merging base with the pruned diff', () => {
-    const base = defaultMinerUConfig()
-    const next = {
-      ...base,
-      activeProvider: asProviderConfigId('mp_official'),
-      defaults: { ...base.defaults, model: 'vlm' as const, ocr: true, parseMethod: 'ocr' as const },
-      output: { ...base.output, maxInlineImages: 10 },
-      retry: { ...base.retry, maxAttempts: 5 },
-      polling: { ...base.polling, pollIntervalMs: 3000 },
-      storage: { ...base.storage, stagingTtlMs: 12 * 60 * 60 * 1000 },
-      limits: { ...base.limits, maxFileBytes: 50 * 1024 * 1024 },
-    }
-
-    const pruned = pruneConfigToDiff(next, base)
-
-    // Simulate DSH mergeLayers: plain objects shallow-merged, arrays and primitives replaced wholesale
-    const merged = {
-      ...base,
-      ...pruned,
-      storage: { ...base.storage, ...(pruned.storage as object | undefined) },
-      polling: { ...base.polling, ...(pruned.polling as object | undefined) },
-      retry: { ...base.retry, ...(pruned.retry as object | undefined) },
-      output: { ...base.output, ...(pruned.output as object | undefined) },
-      limits: { ...base.limits, ...(pruned.limits as object | undefined) },
-    }
-
-    const resolved = parseConfig(merged)
-    expect(resolved).toEqual(next)
+  it('fills omitted retry settings with defaults', () => {
+    expect(parseConfig({ ...base(), retry: undefined }).retry).toEqual(base().retry)
   })
 })
 
-describe('detectBloatedSettingsOps', () => {
-  it('detects bloated settings ops for completely bloated defaults and unsets schemaVersion', () => {
-    const base = defaultMinerUConfig()
-    const bloatedUserSection: Record<string, unknown> = {
-      schemaVersion: base.schemaVersion,
-      activeProvider: base.activeProvider,
-      providers: base.providers,
-      defaults: base.defaults,
-      storage: base.storage,
-      polling: base.polling,
-      retry: base.retry,
-      output: base.output,
-      limits: base.limits,
-    }
-    const ops = detectBloatedSettingsOps(bloatedUserSection, base)
-    expect(ops).toEqual([
-      { op: 'unset', path: ['limits'] },
-      { op: 'unset', path: ['polling'] },
-      { op: 'unset', path: ['retry'] },
-      { op: 'unset', path: ['storage'] },
-      { op: 'unset', path: ['output'] },
-      { op: 'unset', path: ['defaults'] },
-      { op: 'unset', path: ['providers'] },
-      { op: 'unset', path: ['activeProvider'] },
-      { op: 'unset', path: ['schemaVersion'] },
-    ])
+describe('Standard Schema parity', () => {
+  const snapshot = (value: unknown): unknown => {
+    if (isVolatile(value)) return snapshot(value.get())
+    if (Array.isArray(value)) return value.map(snapshot)
+    if (typeof value === 'object' && value !== null) return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, snapshot(child)]))
+    return value
+  }
+  const unauthenticated: Patch = { ...legacy }
+  delete unauthenticated.apiKeyEnv
+  delete unauthenticated.configuredVersion
+  const v1Variants = [undefined, 'flash', 'basic', 'standard', 'advanced'].flatMap(tier => [undefined, 'auto', 'txt', 'ocr'].map(ocrMode =>
+    only({ id: 'mp_v1', type: 'self-hosted-v1', allowInsecureHttp: true, tier, ocrMode },
+      { defaults: { model: 'vlm', language: 'ja', formula: true, table: true, parseMethod: 'txt', ocr: false } })))
+
+  it.each<[string, unknown]>([
+    ['default configuration', base()],
+    ...base().providers.map(provider => ['single ' + provider.type + ' profile', { ...base(), activeProvider: provider.id, providers: [provider] }] as [string, unknown]),
+    ['unauthenticated legacy profile', { ...base(), providers: [unauthenticated] }],
+    ...v1Variants.map((value, index) => ['V1 tier/ocrMode variant ' + String(index), value] as [string, unknown]),
+  ])('accepts %s with the same canonical value as the domain parser', async (_label, value) => {
+    const validated = await Config['~standard'].validate(value)
+    expect(validated.issues).toBeUndefined()
+    if (validated.issues) throw new Error('Expected accepted configuration')
+    expect(parseConfig(snapshot(validated.value))).toEqual(parseConfig(value))
   })
 
-  it('unsets bloated sections while preserving custom activeProvider and output.maxInlineImages', () => {
-    const base = defaultMinerUConfig()
-    const userSection: Record<string, unknown> = {
-      schemaVersion: base.schemaVersion,
-      activeProvider: 'mp_official',
-      providers: base.providers,
-      defaults: base.defaults,
-      limits: base.limits,
-      polling: base.polling,
-      retry: base.retry,
-      output: {
-        maxInlineChars: base.output.maxInlineChars,
-        maxInlineImages: 10,
-      },
-    }
-    const ops = detectBloatedSettingsOps(userSection, base)
-    expect(ops).toEqual([
-      { op: 'unset', path: ['limits'] },
-      { op: 'unset', path: ['polling'] },
-      { op: 'unset', path: ['retry'] },
-      { op: 'unset', path: ['output', 'maxInlineChars'] },
-      { op: 'unset', path: ['defaults'] },
-      { op: 'unset', path: ['providers'] },
-    ])
-    expect(ops.some(op => op.path[0] === 'activeProvider')).toBe(false)
-    expect(ops.some(op => op.path[0] === 'output' && op.path[1] === 'maxInlineImages')).toBe(false)
-    expect(ops.some(op => op.path[0] === 'schemaVersion')).toBe(false)
+  it.each<[string, Patch]>([
+    ['legacy tier', { ...legacy, tier: 'standard' }], ['legacy ocrMode', { ...legacy, ocrMode: 'auto' }],
+    ['legacy undefined tier', { ...legacy, tier: undefined }], ['legacy undefined ocrMode', { ...legacy, ocrMode: undefined }],
+    ['legacy models', { ...legacy, models: ['pipeline'] }],
+    ['V1 modelMap', { ...v1, modelMap: { pipeline: 'pipeline', vlm: 'vlm-engine' } }], ['V1 undefined modelMap', { ...v1, modelMap: undefined }],
+    ['V1 models', { ...v1, models: ['pipeline'] }], ['V1 invalid tier', { ...v1, tier: 'fastest' }], ['V1 invalid ocrMode', { ...v1, ocrMode: 'text' }],
+    ['V1 parseMethod', { ...v1, parseMethod: 'txt' }], ['V1 ocr', { ...v1, ocr: true }],
+    ['official tier', { ...official, tier: 'standard' }], ['official ocrMode', { ...official, ocrMode: 'auto' }],
+    ['official modelMap', { ...official, modelMap: {} }], ['official HTTP opt-in', { ...official, allowInsecureHttp: true }],
+    ['official plain HTTP', { ...official, baseURL: 'http://mineru.example' }],
+    ['legacy without HTTP opt-in', { ...legacy, allowInsecureHttp: false }], ['V1 without HTTP opt-in', { ...v1, allowInsecureHttp: false }],
+    ['V1 URL credentials', { ...v1, baseURL: 'https://user:secret@mineru.example' }], ['V1 URL query', { ...v1, baseURL: 'https://mineru.example?token=secret' }],
+    ...[undefined, null, 1, '', 'unsupported', ['self', 'hosted'].join('-')].map(type => ['provider type ' + JSON.stringify(type), { ...v1, type }] as [string, Patch]),
+  ])('rejects %s at both boundaries', async (_label, provider) => {
+    const value = { ...base(), ...only(provider) }
+    expect(() => parseConfig(value)).toThrow()
+    const validated = await Config['~standard'].validate(value)
+    expect(validated.issues?.length).toBeGreaterThan(0)
+    expect(validated).not.toHaveProperty('value')
   })
 
-  it('produces 0 ops for a clean sparse user section', () => {
-    const base = defaultMinerUConfig()
-    const sparse = { activeProvider: 'mp_official' }
-    const ops = detectBloatedSettingsOps(sparse, base)
-    expect(ops).toEqual([])
-  })
-
-  it('unsets only default sub-keys when a sub-section is partially customized', () => {
-    const base = defaultMinerUConfig()
-    const userSection: Record<string, unknown> = {
-      storage: {
-        storageRoot: '/custom/storage/root',
-        cacheEnabled: base.storage.cacheEnabled,
-        retainSources: base.storage.retainSources,
-        stagingTtlMs: base.storage.stagingTtlMs,
-      },
-    }
-    const ops = detectBloatedSettingsOps(userSection, base)
-    expect(ops).toEqual([
-      { op: 'unset', path: ['storage', 'cacheEnabled'] },
-      { op: 'unset', path: ['storage', 'retainSources'] },
-      { op: 'unset', path: ['storage', 'stagingTtlMs'] },
-    ])
-    expect(ops.some(op => op.path[0] === 'storage' && op.path[1] === 'storageRoot')).toBe(false)
-    expect(ops.some(op => op.path[0] === 'schemaVersion')).toBe(false)
-  })
-
-  it('does not unset defaults or individual default fields if defaults are customized', () => {
-    const base = defaultMinerUConfig()
-    const userSection: Record<string, unknown> = {
-      defaults: {
-        ...base.defaults,
-        model: 'vlm',
-      },
-    }
-    const ops = detectBloatedSettingsOps(userSection, base)
-    expect(ops).toEqual([])
-  })
-
-  it('returns empty array for non-object or null input', () => {
-    expect(detectBloatedSettingsOps(null as unknown as Record<string, unknown>)).toEqual([])
-    expect(detectBloatedSettingsOps(undefined as unknown as Record<string, unknown>)).toEqual([])
-    expect(detectBloatedSettingsOps('invalid' as unknown as Record<string, unknown>)).toEqual([])
-    expect(detectBloatedSettingsOps([] as unknown as Record<string, unknown>)).toEqual([])
+  it.each<[string, unknown]>([
+    ['duplicate identities', { ...base(), providers: [legacy, { ...v1, id: legacy.id }] }],
+    ['future schemaVersion', { ...base(), schemaVersion: 4 }],
+    ['retained sources', { ...base(), storage: { ...base().storage, retainSources: true } }],
+  ])('rejects %s at both boundaries', async (_label, value) => {
+    expect(() => parseConfig(value)).toThrow()
+    expect((await Config['~standard'].validate(value)).issues?.length).toBeGreaterThan(0)
   })
 })

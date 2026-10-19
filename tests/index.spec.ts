@@ -1,407 +1,186 @@
-import { mkdtemp, rm, stat } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import type { CredentialProvider } from '@deepseek-ai/dsh-credentials'
+import { stat } from 'node:fs/promises'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
-import { isVolatile } from '@deepseek-ai/cosmokit'
 import type { ConnectionRpcHandler } from '@deepseek-ai/dsh-client-connection'
-import { defaultMinerUConfig, defaultProviderConfig, parseConfig, parseConfigWithMigration } from '../src/config.js'
-import { ProcessLock, ResultRepository } from '../src/storage/index.js'
+import type { MinerUConfig } from '../src/config/model.js'
+import { defaultMinerUConfig } from '../src/config/parse.js'
+import { apply, inject, name } from '../src/index.js'
+import { credentialResolver } from '../src/plugin/credentials.js'
+import { SharedOperationRegistry } from '../src/service/shared-operations.js'
+import { ResultRepository } from '../src/storage/result-repository.js'
+import { ownerPeer } from './support/rpc-harness.js'
+import { tempRoot } from './support/storage-fixtures.js'
 
 vi.mock('@deepseek-ai/dsh-tools', () => ({ defineTool: (definition: unknown) => definition }))
-// The real scoped transport, trust fence, and route lifecycle have integration coverage.
+// The real scoped transport, trust fence, and route lifecycle are covered by host-compatibility.spec.ts.
 vi.mock('../src/loopback-rpc.js', () => ({
   registerLoopbackRpc: (ctx: Context, channel: string, handler: ConnectionRpcHandler) => ctx.connection.rpc.handle(channel, handler),
 }))
 
-const roots: string[] = []
-afterEach(async () => {
-  await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })))
-})
-
-interface FakeRuntime {
-  readonly ctx: Context
-  readonly definitions: unknown[]
-  readonly effects: Array<() => void | Promise<void>>
-  readonly rpc: {
-    registered?: boolean
-    disposeCount: number
-    handler?: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>
-  }
-  readonly settingsReplace: ReturnType<typeof vi.fn>
-  readonly settingsMutate: ReturnType<typeof vi.fn>
-  readonly configureSettings: ReturnType<typeof vi.fn>
+async function storedConfig(): Promise<MinerUConfig> {
+  const base = defaultMinerUConfig()
+  return { ...base, storage: { ...base.storage, storageRoot: join(await tempRoot('mineru-index-'), 'store') } }
 }
 
-function fakeContext(
-  config: ReturnType<typeof defaultMinerUConfig>,
-  failToolRegistration = false,
-): FakeRuntime {
-  const definitions: unknown[] = []
-  const effects: Array<() => void | Promise<void>> = []
-  const rpc: FakeRuntime['rpc'] = { registered: false, disposeCount: 0 }
+/** Minimal Cordis surface used by apply(); the real Loader composition lives in settings-compatibility.spec.ts. */
+function fakeContext(config: MinerUConfig) {
+  const order: string[] = []
+  const effects: Array<() => unknown> = []
+  let inactive = false
+  let rpc: ConnectionRpcHandler | undefined
+  let rpcDisposals = 0
+  const guard = () => { if (inactive) throw new Error('cannot create effect on inactive context') }
   const settingsReplace = vi.fn(async (_namespace: string, section: object) => {
-    const next = section as Record<string, unknown>
-    Object.assign(config, next, { storage: { ...config.storage, ...next.storage as object } })
+    Object.assign(config, section, { storage: { ...config.storage, ...(section as Partial<MinerUConfig>).storage } })
   })
-  const settingsMutate = vi.fn(async () => undefined)
-  const configureSettings = vi.fn(() => () => undefined)
-  const settings = { configure: configureSettings, replace: settingsReplace, mutate: settingsMutate }
+  const settings = { configure: vi.fn(() => () => undefined), replace: settingsReplace, describe: () => [{ ns: 'mineru-custom', revision: 0 }] }
   const value = {
     fiber: { entry: { options: { id: 'mineru-custom' } } },
     tools: {
-      register: (definition: unknown) => {
-        if (failToolRegistration) throw new Error('simulated tool registration failure')
-        definitions.push(definition)
-        return () => undefined
+      register: (definition: { name: string }) => {
+        guard()
+        order.push('register ' + definition.name)
+        return () => { order.push('dispose ' + definition.name) }
       },
-      schemas: () => [],
     },
     connection: {
       rpc: {
-        handle: (
-          _channel: string,
-          handler: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>,
-        ) => {
-          rpc.registered = true
-          rpc.handler = handler
-          return () => { rpc.disposeCount++ }
+        handle: (_channel: string, handler: ConnectionRpcHandler) => {
+          rpc = handler
+          return () => { rpcDisposals++ }
         },
       },
     },
-    get: (name: string) => name === 'settings' ? settings : undefined,
+    get: (service: string) => service === 'settings' ? settings : undefined,
     effect: (factory: () => unknown) => {
+      guard()
       const cleanup = factory()
-      if (typeof cleanup === 'function') effects.push(cleanup as () => void | Promise<void>)
+      if (typeof cleanup === 'function') effects.push(cleanup as () => unknown)
       return () => undefined
     },
-    on: () => () => undefined,
     inject: (_deps: string[], callback: (ctx: unknown) => unknown) => {
-      const res = callback(value)
-      if (typeof res === 'function') effects.push(res as () => void | Promise<void>)
+      guard()
+      const cleanup = callback(value)
+      if (typeof cleanup === 'function') effects.push(cleanup as () => unknown)
       return () => undefined
     },
     logger: { info: () => undefined, warn: () => undefined, error: () => undefined, debug: () => undefined },
   }
-  return { ctx: value as unknown as Context, definitions, effects, rpc, settingsReplace, settingsMutate, configureSettings }
-}
-
-function cancellableContext(config: ReturnType<typeof defaultMinerUConfig>): FakeRuntime & { disposeContext(): Promise<void> } {
-  const runtime = fakeContext(config)
-  let disposed = false
-  const context = runtime.ctx as unknown as {
-    readonly tools: { register(definition: unknown): () => void }
-    inject(services: readonly string[], callback: (ctx: Context) => unknown): unknown
-    effect(factory: () => unknown, label?: string): () => void
-  }
-  const register = context.tools.register
-  context.tools.register = definition => {
-    if (disposed) throw new Error('cannot create effect on inactive context')
-    return register(definition)
-  }
-  const inject = context.inject
-  context.inject = (services, callback) => {
-    if (disposed) throw new Error('cannot create effect on inactive context')
-    return inject(services, callback)
-  }
-  const effect = context.effect
-  context.effect = (factory, label) => {
-    if (disposed) throw new Error('cannot create effect on inactive context')
-    return effect(factory, label)
-  }
   return {
-    ...runtime,
+    // Fixture boundary: apply() needs only the members above, not a full Cordis Context.
+    ctx: value as unknown as Context,
+    order, settingsReplace,
+    rpcDisposals: () => rpcDisposals,
+    call: async (endpoint: string, payload: unknown = {}) => {
+      if (rpc === undefined) throw new Error('RPC was not registered')
+      return await rpc(endpoint, payload, new AbortController().signal, ownerPeer())
+    },
+    /** Mirror Cordis fiber disposal: invalidate first, then run effect cleanups. */
     disposeContext: async () => {
-      disposed = true
-      await Promise.all(runtime.effects.map(effect => effect()))
+      inactive = true
+      for (const cleanup of effects.splice(0).reverse()) await cleanup()
     },
   }
 }
 
 describe('plugin composition lifecycle', () => {
-  it('cancels before initialization resumes into an inactive Cordis fiber', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'mineru-index-cancel-lock-'))
-    roots.push(root)
-    const base = defaultMinerUConfig()
-    const config = { ...base, storage: { ...base.storage, storageRoot: join(root, 'store') } }
-    let releaseCleanup!: () => void
-    let cleanupStarted!: () => void
-    const cleanupGate = new Promise<void>(resolve => { releaseCleanup = resolve })
-    const cleanupSeen = new Promise<void>(resolve => { cleanupStarted = resolve })
-    const cleanup = vi.spyOn(ResultRepository.prototype, 'cleanupStaging').mockImplementation(async function (_ttl, _active, signal) {
-      cleanupStarted()
-      await cleanupGate
-      signal?.throwIfAborted()
-      return 0
-    })
-    const runtime = cancellableContext(config)
-    const applying = (await import('../src/index.js')).apply(runtime.ctx, config)
-    await cleanupSeen
-    await runtime.disposeContext()
-    releaseCleanup()
-
-    await expect(applying).resolves.toEqual(expect.any(Function))
-    expect(runtime.definitions).toHaveLength(0)
-    cleanup.mockRestore()
-  })
-
-  it('cancels while staging cleanup is pending and shuts down operations', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'mineru-index-cancel-cleanup-'))
-    roots.push(root)
-    const base = defaultMinerUConfig()
-    const config = { ...base, storage: { ...base.storage, storageRoot: join(root, 'store') } }
-    let releaseCleanup!: () => void
-    let cleanupStarted!: () => void
-    const cleanupGate = new Promise<void>(resolve => { releaseCleanup = resolve })
-    const cleanupSeen = new Promise<void>(resolve => { cleanupStarted = resolve })
-    const cleanup = vi.spyOn(ResultRepository.prototype, 'cleanupStaging').mockImplementation(async function (_ttl, _active, signal) {
-      cleanupStarted()
-      await cleanupGate
-      signal?.throwIfAborted()
-      return 0
-    })
-    const runtime = cancellableContext(config)
-    const applying = (await import('../src/index.js')).apply(runtime.ctx, config)
-    await cleanupSeen
-    await runtime.disposeContext()
-    releaseCleanup()
-
-    await expect(applying).resolves.toEqual(expect.any(Function))
-    expect(runtime.definitions).toHaveLength(0)
-    cleanup.mockRestore()
-  })
-
-  it('registers two tools and loopback RPC upon startup', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'mineru-index-'))
-    roots.push(root)
-    const base = defaultMinerUConfig()
-    const config = { ...base, storage: { ...base.storage, storageRoot: join(root, 'store') } }
-    const runtime = fakeContext(config)
-    const { apply, name } = await import('../src/index.js')
+  it('declares its package identity and required services', () => {
     expect(name).toBe('dsh-pdf-mineru')
-    const dispose = await apply(runtime.ctx, config)
-    expect(runtime.definitions).toHaveLength(2)
-    expect(runtime.rpc.registered).toBe(true)
-    expect(await stat(config.storage.storageRoot)).toBeDefined()
-    expect(runtime.effects.length).toBeGreaterThan(0)
-
-    const otherRoot = join(root, 'other-store')
-    const changed = { ...config, storage: { ...config.storage, storageRoot: otherRoot } }
-    const response = await runtime.rpc.handler?.(
-      'mineru/config.set', { config: changed }, new AbortController().signal,
-    ) as { ok: boolean; error?: { code: string } }
-    expect(response).toMatchObject({ ok: false })
-
-    for (const eff of runtime.effects) await eff()
-    await dispose()
-    expect(runtime.rpc.disposeCount).toBe(1)
+    expect(inject).toEqual(expect.arrayContaining(['tools', 'jobs', 'settings', 'workingDirectory']))
   })
 
-  it('uses Loader configuration and saves live fields to its actual entry id', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'mineru-index-settings-'))
-    roots.push(root)
-    const base = defaultMinerUConfig()
-    const entryConfig = { ...base, storage: { ...base.storage, storageRoot: join(root, 'new-default') } }
-    const storedConfig = {
-      ...base,
-      storage: { ...base.storage, storageRoot: join(root, 'persisted-user-root') },
-      output: { maxInlineChars: 123456 },
-    }
-    const runtime = fakeContext(storedConfig as typeof base)
-    const { apply, inject } = await import('../src/index.js')
-
-    expect(inject).toContain('settings')
-    const dispose = await apply(runtime.ctx, storedConfig)
-    expect(await stat(storedConfig.storage.storageRoot)).toBeDefined()
-    await expect(stat(entryConfig.storage.storageRoot)).rejects.toThrow()
-    expect(await runtime.rpc.handler?.('mineru/config.get', {}, new AbortController().signal))
-      .toMatchObject({ ok: true, value: { config: { output: { maxInlineChars: 123456, maxInlineImages: 6 } } } })
-
-    const next = { ...storedConfig, output: { maxInlineChars: 234567, maxInlineImages: 9 } }
-    const response = await runtime.rpc.handler?.(
-      'mineru/config.set', { config: next }, new AbortController().signal,
-    ) as { ok: boolean; value?: { config: typeof next } }
-    expect(response).toMatchObject({ ok: true, value: { config: next } })
-    expect(runtime.settingsReplace).toHaveBeenCalledOnce()
-    expect(runtime.settingsReplace).toHaveBeenCalledWith('mineru-custom', {
-      schemaVersion: 3, activeProvider: next.activeProvider, providers: next.providers,
-      defaults: next.defaults, polling: next.polling, retry: next.retry, output: next.output,
-      storage: { cacheEnabled: next.storage.cacheEnabled, stagingTtlMs: next.storage.stagingTtlMs },
+  it('aborts startup when the fiber is disposed during staging cleanup and never resumes into it', async () => {
+    const config = await storedConfig()
+    let release!: () => void
+    let started!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const seen = new Promise<void>(resolve => { started = resolve })
+    vi.spyOn(ResultRepository.prototype, 'cleanupStaging').mockImplementation(async (_ttl, _active, signal) => {
+      started()
+      await gate
+      signal?.throwIfAborted()
+      return 0
     })
-
-    const changedLimits = { ...next, limits: { ...next.limits, maxZipEntryBytes: next.limits.maxZipEntryBytes + 1 } }
-    const rejected = await runtime.rpc.handler?.(
-      'mineru/config.set', { config: changedLimits }, new AbortController().signal,
-    )
-    expect(rejected).toMatchObject({
-      ok: false,
-      error: { code: 'mineru/invalid-argument', message: expect.stringContaining('requires a MinerU plugin restart') },
-    })
-    expect(runtime.settingsReplace).toHaveBeenCalledOnce()
-    expect(await runtime.rpc.handler?.('mineru/config.get', {}, new AbortController().signal))
-      .toMatchObject({ ok: true, value: { config: next } })
-
-    await dispose()
-  })
-
-  it('normalizes Provider-based v1 configuration without writing during activation', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'mineru-index-migration-'))
-    roots.push(root)
-    const base = defaultMinerUConfig()
-    const entryConfig = { ...base, storage: { ...base.storage, storageRoot: join(root, 'new-default') } }
-    const legacyStored = {
-      ...base,
-      schemaVersion: 1,
-      defaults: { ...base.defaults, artifacts: ['markdown', 'content-list'] },
-      limits: { ...base.limits, maxFilesPerRequest: 2 },
-      storage: { ...base.storage, storageRoot: join(root, 'persisted-user-root') },
-    }
-    const expected = parseConfigWithMigration(legacyStored).config
-    const runtime = fakeContext(legacyStored as typeof base)
-    const { apply } = await import('../src/index.js')
-
-    const dispose = await apply(runtime.ctx, legacyStored)
-
-    expect(await stat(expected.storage.storageRoot)).toBeDefined()
-    expect(runtime.settingsReplace).not.toHaveBeenCalled()
-    expect(runtime.settingsMutate).not.toHaveBeenCalled()
-    expect(await runtime.rpc.handler?.('mineru/config.get', {}, new AbortController().signal))
-      .toMatchObject({ ok: true, value: { config: expected } })
-
-    await dispose()
-  })
-
-  it('keeps provider schema branches discriminated by type', async () => {
-    const { Config } = await import('../src/index.js')
-    const validate = Config as unknown as (value: unknown) => Record<string, unknown>
-    const base = defaultMinerUConfig()
-    const parsed = validate(base) as unknown as { providers: { get(): typeof base.providers } }
-
-    expect(parsed.providers.get()).toHaveLength(3)
-    expect(parsed.providers.get()[1]).toEqual(base.providers[1])
-    expect(parsed.providers.get()[1]).not.toHaveProperty('modelMap')
-    const unauthenticated = { ...base.providers[0] } as Record<string, unknown>
-    delete unauthenticated.apiKeyEnv
-    delete unauthenticated.configuredVersion
-    expect(() => validate({ ...base, providers: [unauthenticated] })).not.toThrow()
-    expect(() => validate({ ...base, schemaVersion: 1 })).not.toThrow()
-    expect(() => validate({ ...base, schemaVersion: 4 })).toThrow()
-    expect(() => validate({ ...base, storage: { ...base.storage, retainSources: true } })).toThrow()
-    expect(() => validate({
-      ...base,
-      providers: [{ ...base.providers[0], type: 'unsupported-provider' }],
-    })).toThrow()
-
-    const withTier = validate({
-      ...base,
-      providers: [...base.providers.slice(0, 2), { ...base.providers[2], tier: 'standard', ocrMode: 'txt' }],
-    }) as unknown as { providers: { get(): typeof base.providers } }
-    expect(withTier.providers.get()[2]).toMatchObject({ type: 'self-hosted-v1', tier: 'standard', ocrMode: 'txt' })
-    expect(withTier.providers.get()[2]).not.toHaveProperty('modelMap')
-    expect(withTier.providers.get()[0]).not.toHaveProperty('tier')
-    expect(() => validate({
-      ...base,
-      providers: [...base.providers.slice(0, 2), { ...base.providers[2], tier: 'fastest' }],
-    })).toThrow()
-  })
-
-  it('accepts the same three-provider values at Standard Schema and domain boundaries', async () => {
-    const { Config } = await import('../src/index.js')
-    const snapshot = (value: unknown): unknown => {
-      if (isVolatile(value)) return snapshot(value.get())
-      if (Array.isArray(value)) return value.map(snapshot)
-      if (typeof value === 'object' && value !== null) {
-        return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, snapshot(child)]))
-      }
-      return value
-    }
-    const base = defaultMinerUConfig()
-    const values: unknown[] = [base]
-    for (const provider of base.providers) {
-      values.push({ ...base, activeProvider: provider.id, providers: [provider] })
-    }
-    for (const tier of [undefined, 'flash', 'basic', 'standard', 'advanced']) {
-      for (const ocrMode of [undefined, 'auto', 'txt', 'ocr']) {
-        values.push({
-          activeProvider: 'mp_v1',
-          providers: [{ id: 'mp_v1', type: 'self-hosted-v1', allowInsecureHttp: true, tier, ocrMode }],
-          defaults: { model: 'vlm', language: 'ja', formula: true, table: true, parseMethod: 'txt', ocr: false },
-        })
-      }
-    }
-    for (const value of values) {
-      const expected = parseConfig(value)
-      const validated = await Config['~standard'].validate(value)
-      expect(validated.issues).toBeUndefined()
-      if (validated.issues) throw new Error('Expected accepted configuration')
-      expect(parseConfig(snapshot(validated.value))).toEqual(expected)
-    }
-  })
-
-  it('rejects cross-type fields, removed types and unsafe HTTP consistently at Standard Schema', async () => {
-    const { Config } = await import('../src/index.js')
-    const base = defaultMinerUConfig()
-    const legacy = defaultProviderConfig('self-hosted-legacy-v2')
-    const official = defaultProviderConfig('official-v4')
-    const v1 = defaultProviderConfig('self-hosted-v1')
-    const invalidProviders: unknown[] = [
-      { ...legacy, tier: 'standard' }, { ...legacy, ocrMode: 'auto' },
-      { ...legacy, tier: undefined }, { ...legacy, ocrMode: undefined },
-      { ...legacy, models: ['pipeline'] },
-      { ...v1, modelMap: { pipeline: 'pipeline', vlm: 'vlm-engine' } },
-      { ...v1, modelMap: undefined }, { ...v1, models: ['pipeline'] },
-      { ...v1, tier: 'fastest' }, { ...v1, ocrMode: 'text' },
-      { ...v1, parseMethod: 'txt' }, { ...v1, ocr: true },
-      { ...official, tier: 'standard' }, { ...official, ocrMode: 'auto' },
-      { ...official, modelMap: {} }, { ...official, allowInsecureHttp: true },
-      { ...official, baseURL: 'http://mineru.example' },
-      { ...legacy, allowInsecureHttp: false }, { ...v1, allowInsecureHttp: false },
-      { ...v1, baseURL: 'https://user:secret@mineru.example' },
-      { ...v1, baseURL: 'https://mineru.example?token=secret' },
-      ...[undefined, null, 1, '', 'unsupported', ['self', 'hosted'].join('-')]
-        .map(type => ({ ...v1, type })),
-    ]
-    const values = invalidProviders.map(provider => ({ ...base, providers: [provider], activeProvider: (provider as { id: string }).id }))
-    values.push({ ...base, providers: [legacy, { ...v1, id: legacy.id }] })
-    for (const value of values) {
-      expect(() => parseConfig(value)).toThrow()
-      const validated = await Config['~standard'].validate(value)
-      expect(validated.issues?.length).toBeGreaterThan(0)
-      expect(validated).not.toHaveProperty('value')
-    }
-  })
-
-  it('allows multiple concurrent plugin instances on the same storageRoot without throwing STORAGE_LOCKED', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'mineru-concurrent-'))
-    roots.push(root)
-    const base = defaultMinerUConfig()
-    const config = { ...base, storage: { ...base.storage, storageRoot: join(root, 'store') } }
-    const runtime1 = fakeContext(config)
-    const runtime2 = fakeContext(config)
-    const { apply } = await import('../src/index.js')
-    const dispose1 = await apply(runtime1.ctx, config)
-    const dispose2 = await apply(runtime2.ctx, config)
-    expect(runtime1.definitions).toHaveLength(2)
-    expect(runtime2.definitions).toHaveLength(2)
-    await dispose1()
-    await dispose2()
-  })
-
-  it('does not change runtime configuration when persistence fails', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'mineru-index-save-fail-'))
-    roots.push(root)
-    const base = defaultMinerUConfig()
-    const config = { ...base, storage: { ...base.storage, storageRoot: join(root, 'store') } }
     const runtime = fakeContext(config)
-    runtime.settingsReplace.mockRejectedValueOnce(new Error('write failed'))
-    const { apply } = await import('../src/index.js')
-    const dispose = await apply(runtime.ctx, config)
-    const response = await runtime.rpc.handler?.('mineru/config.set', {
-      config: { ...config, output: { ...config.output, maxInlineImages: 9 } },
-    }, new AbortController().signal)
-    expect(response).toMatchObject({ ok: false })
-    expect(await runtime.rpc.handler?.('mineru/config.get', {}, new AbortController().signal))
-      .toMatchObject({ ok: true, value: { config } })
+    const applying = apply(runtime.ctx, config)
+    await seen
+    await runtime.disposeContext()
+    release()
+    const dispose = await applying
     await dispose()
+    expect(runtime.order).toEqual([])
+  })
+
+  it('registers both tools and RPC, then disposes tools before shutting down shared producers', async () => {
+    const config = await storedConfig()
+    const runtime = fakeContext(config)
+    const shutdown = vi.spyOn(SharedOperationRegistry.prototype, 'shutdown').mockImplementation(async () => { runtime.order.push('shutdown operations') })
+    const dispose = await apply(runtime.ctx, config)
+    expect(await stat(config.storage.storageRoot)).toBeDefined()
+    expect(runtime.order).toEqual(['register async_parse_pdf', 'register read_pdf'])
+    expect(await runtime.call('mineru/config.get')).toMatchObject({ ok: true, value: { config, revision: 0 } })
+
+    await runtime.disposeContext()
+    await dispose() // idempotent after the lifecycle effect already ran
+    expect(runtime.order.slice(2)).toEqual(['dispose async_parse_pdf', 'dispose read_pdf', 'shutdown operations'])
+    expect(shutdown).toHaveBeenCalledOnce()
+    expect(runtime.rpcDisposals()).toBe(1)
+  })
+
+  it.each([
+    ['storageRoot', (config: MinerUConfig) => ({ ...config, storage: { ...config.storage, storageRoot: config.storage.storageRoot + '-other' } })],
+    ['limits', (config: MinerUConfig) => ({ ...config, limits: { ...config.limits, maxZipEntryBytes: config.limits.maxZipEntryBytes + 1 } })],
+  ])('refuses runtime %s changes without persisting', async (_field, change) => {
+    const config = await storedConfig()
+    const runtime = fakeContext(config)
+    const dispose = await apply(runtime.ctx, config)
+    expect(await runtime.call('mineru/config.set', { config: change(config) })).toMatchObject({ ok: false, error: { code: 'mineru/invalid-argument' } })
+    expect(runtime.settingsReplace).not.toHaveBeenCalled()
+    await dispose()
+  })
+
+  it('saves complete live values to the actual entry id and keeps runtime config when persistence fails', async () => {
+    const config = await storedConfig()
+    const runtime = fakeContext(config)
+    const dispose = await apply(runtime.ctx, config)
+    const before = structuredClone(config)
+    runtime.settingsReplace.mockRejectedValueOnce(new Error('write failed'))
+    const next = { ...config, output: { ...config.output, maxInlineImages: 9 } }
+    expect(await runtime.call('mineru/config.set', { config: next })).toMatchObject({ ok: false })
+    expect(await runtime.call('mineru/config.get')).toMatchObject({ ok: true, value: { config: before } })
+    expect(await runtime.call('mineru/config.set', { config: next })).toMatchObject({ ok: true, value: { config: next } })
+    const { limits: _limits, storage, ...live } = next
+    expect(runtime.settingsReplace).toHaveBeenLastCalledWith('mineru-custom', {
+      ...live, storage: { cacheEnabled: storage.cacheEnabled, stagingTtlMs: storage.stagingTtlMs },
+    }, undefined)
+    await dispose()
+  })
+
+  it('allows concurrent plugin instances on the same storageRoot', async () => {
+    const config = await storedConfig()
+    const first = fakeContext(config)
+    const second = fakeContext(config)
+    const disposers = [await apply(first.ctx, config), await apply(second.ctx, config)]
+    expect(second.order).toEqual(['register async_parse_pdf', 'register read_pdf'])
+    for (const dispose of disposers) await dispose()
+  })
+})
+
+describe('credential service precedence', () => {
+  it.each([
+    { mounted: true, stored: 'stored-secret', expected: 'stored-secret' },
+    { mounted: true, stored: undefined, expected: undefined },
+    { mounted: false, stored: undefined, expected: 'environment-secret' },
+  ])('resolves once and falls back to process.env only without a service: %j', async ({ mounted, stored, expected }) => {
+    const credentials = {
+      resolve: vi.fn(async () => stored === undefined ? undefined : ({ value: stored, source: 'file' as const })),
+    } satisfies Pick<CredentialProvider, 'resolve'>
+    // Fixture boundary: credentialResolver reads only ctx.get('credentials').
+    const ctx = { get: (service: string) => service === 'credentials' && mounted ? credentials : undefined } as unknown as Context
+    vi.stubEnv('MINERU_API_KEY', 'environment-secret')
+    await expect(credentialResolver(ctx)('MINERU_API_KEY', new AbortController().signal)).resolves.toBe(expected)
+    expect(credentials.resolve).toHaveBeenCalledTimes(mounted ? 1 : 0)
   })
 })
