@@ -77,7 +77,7 @@ loopback RPC -> settings persistence / ParseService.probe / StorageMaintenanceSe
 
 - TypeScript ESM relative imports include `.js`; the PDF.js worker is a standalone `.mjs` copied by the build.
 - Every object in a tool schema declares `additionalProperties`.
-- Run `pnpm run check` and `git diff --check`; run `pnpm run verify:gui` when the client changes.
+- Run `pnpm run check` and `git diff --check`; run `pnpm run test:e2e` when the client, packaging or the DSH baseline changes ([details](CONTRIBUTING.md#end-to-end-tests)).
 
 ## Documentation maintenance
 

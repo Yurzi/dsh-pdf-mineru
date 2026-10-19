@@ -9,6 +9,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - Show a localized title, description and icon for the plugin on the DSH Plugins page and in market indexes (`locale/en.json`, `locale/zh.json`, `assets/icon.svg`).
 - Revision-aware settings saves: the settings page now detects configuration changed by another window or process since it was loaded, refuses to overwrite it (`mineru/conflict`), and asks you to reload.
 - Background jobs record the tool call that started them, so native and `run_code` calls are attributed correctly in DSH.
+- End-to-end tests (`pnpm run test:e2e`, run locally) against an isolated install of the DSH release named by the `engines.dsh` lower bound: the packed plugin is installed with `dsh plugin add` and checked in the composed `web` profile (bundle defaults, production dependencies, tool registration, PDF.js page rendering from the installed package), and the settings page is driven in a real `dsh web` with headless Chromium (owner RPC, saves, revision conflicts, credential storage, connection test, cache maintenance).
 
 ### Changed
 
@@ -27,6 +28,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - Generated `lib/` output is no longer committed to git (the npm package still ships the built bundles and PDF.js worker); build locally before a `link:` install. TypeScript declarations (`lib/types`) are no longer published.
 - The public `MinerUService` and `parseReadInput` exports, replaced by `ParseService`, `ReaderService` and `parseReadArguments` for offline smoke scripts.
 - The private `smoke:reader-cache` script, which depended on a fixture that was never distributed.
+- The `verify:gui` script, which injected the client bundle into an already running DSH Web with browser-side fixtures, and the manual packed-artifact smoke (`scripts/smoke-reader-package.mjs`); `pnpm run test:e2e` covers both against a real, isolated DSH.
 
 ### Fixed
 

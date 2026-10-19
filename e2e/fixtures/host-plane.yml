@@ -1,0 +1,15 @@
+# Overlay for the in-process host boot: drop the rows that serve the browser
+# GUI, so the boot binds no port (the default 3080 may be in use). Row ids
+# checked against `dsh --profile web --dump-config` for the DSH under test.
+# The plugin's admin RPC needs connection + webServer and is covered by the
+# GUI suite against a real `dsh web`.
+- id: web-startup
+  disabled: true
+- id: webserver
+  disabled: true
+- id: web-runtime
+  disabled: true
+- id: connection
+  disabled: true
+- id: modules
+  disabled: true

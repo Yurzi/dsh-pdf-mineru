@@ -3,5 +3,5 @@
   "categories": { "correctness": "error" },
   "options": { "reportUnusedDisableDirectives": "warn" },
   "env": { "builtin": true },
-  "ignorePatterns": ["lib/**", "node_modules/**", ".pnpm-store/**", ".vitest-cache/**"]
+  "ignorePatterns": ["lib/**", "node_modules/**", ".pnpm-store/**", ".vitest-cache/**", ".e2e/**"]
 }

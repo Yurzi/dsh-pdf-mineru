@@ -2,6 +2,7 @@ node_modules/
 lib/
 .pnpm-store/
 .vitest-cache/
+.e2e/
 coverage/
 *.tgz
 *.tsbuildinfo

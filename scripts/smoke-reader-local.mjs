@@ -5,7 +5,7 @@
  * Local build:
  *   pnpm run smoke:reader-local -- <pdf> [page=1] [.vitest-cache/evidence]
  *     [--backend=auto|pdfjs] [--expect-renderer=poppler|pdfjs]
- * Packed build (normally driven by smoke-reader-package.mjs after pack/install):
+ * Another built package or entry file (the installed package is covered by pnpm run test:e2e):
  *   node scripts/smoke-reader-local.mjs <pdf> [page=1]
  *     --plugin=/path/to/unpacked/package [--backend=pdfjs]
  *
