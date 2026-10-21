@@ -2,6 +2,7 @@ import type { ClientConnectionRpc } from '@deepseek-ai/dsh-client-connection/cli
 import type { ProviderConfig } from '../config/model.js'
 import type { ProbeView } from '../contracts/probe.js'
 import { callRpc, clearCredential, errorMessage, storeCredential, type CredentialClient } from './helpers.js'
+import type { Translate } from './locales.js'
 import { isDirty, pendingKeys, savePayload, type SettingsAction, type SettingsState } from './settings-state.js'
 
 /** A credential-affecting mutation: Save may store keys, Remove clears one. */
@@ -83,6 +84,46 @@ export function probeKey(provider: ProviderConfig | undefined, credentialVersion
 /** A result counts only for the identity it was launched with; any other draft or generation reads idle. */
 export function currentProbe(result: ProbeResult | undefined, key: string): ProbeState {
   return result?.key === key ? result.state : { kind: 'idle' }
+}
+
+/** A connection test passes only when the service is available and did not reject the key. */
+export function probeHealthy(view: ProbeView): boolean {
+  return view.available && (view.authentication === 'valid' || view.authentication === 'not-configured')
+}
+
+/** How a connection test reads: a state dot, a headline and detail lines. */
+export interface ProbeStatus {
+  readonly dot: 'ongoing' | 'error' | 'warning' | 'done'
+  readonly text: string
+  readonly details: readonly string[]
+}
+
+/**
+ * Describes a connection test. A failed check keeps the server's sanitized diagnostic as its detail,
+ * so an upstream code such as `engine_dead` or `invalid_api_key` stays visible.
+ */
+export function describeProbe(state: ProbeState, t: Translate): ProbeStatus | undefined {
+  switch (state.kind) {
+    case 'idle': return undefined
+    case 'testing': return { dot: 'ongoing', text: t('action.testing'), details: [] }
+    case 'failed': return { dot: 'error', text: t('probe.failed', { message: state.message }), details: [] }
+    case 'done': {
+      const { view } = state
+      if (!probeHealthy(view)) {
+        const diagnostic = view.diagnostics?.trim()
+        return {
+          dot: 'warning',
+          text: t(view.authentication === 'invalid' ? 'probe.authInvalid' : 'probe.unavailable'),
+          details: diagnostic ? [diagnostic] : [],
+        }
+      }
+      const details = [
+        view.server_version === undefined ? '' : t('probe.version', { version: view.server_version }),
+        view.available_tiers === undefined || view.available_tiers.length === 0 ? '' : t('probe.tiers', { tiers: view.available_tiers.join(', ') }),
+      ].filter(Boolean)
+      return { dot: 'done', text: t('probe.ok'), details }
+    }
+  }
 }
 
 /**

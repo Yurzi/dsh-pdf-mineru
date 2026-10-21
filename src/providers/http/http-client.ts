@@ -38,77 +38,122 @@ export function resolveProviderUrl(baseUrl: URL | string, path: string): string 
   return `${parsed.origin}${basePath}${normalizedPath}`
 }
 
+/** A diagnostic parsed from an upstream error body or error object. */
+export interface UpstreamErrorDetail {
+  /** Human-readable diagnostic; a MinerU V1 error leads with its upstream code. */
+  readonly message?: string
+  /** Machine-readable upstream code, kept only when it is a plain token. */
+  readonly code?: string
+}
+
+const UPSTREAM_CODE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
+}
+
 /**
- * Extracts human-readable error messages from an API response body.
- * Inspects JSON fields detail, message, error, msg (prioritizing msg for official-v4, detail for self-hosted),
- * or falls back to truncated raw text for non-JSON bodies.
+ * Describes a MinerU 4.x V1 error object `{ type, code, message, param }`. API servers and Routers use
+ * it for HTTP error bodies (under `error`) and for per-file job errors. The code leads the diagnostic
+ * because it names the cause (`engine_dead`, `quality_tier_unavailable`, `file_not_found`) more
+ * precisely than the HTTP status. `fallbackMessage` stands in for a missing message.
  */
-export function extractErrorMessage(bodyText: string, provider?: MinerUProviderId): string | undefined {
-  let parsedError: string | undefined
+export function describeV1Error(value: unknown, fallbackMessage?: string): UpstreamErrorDetail | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  const code = nonEmptyString(record.code)
+  const text = nonEmptyString(record.message) ?? (code === undefined ? undefined : nonEmptyString(fallbackMessage))
+  if (code === undefined && text === undefined) return undefined
+  const param = nonEmptyString(record.param)
+  const message = [code, text].filter((part): part is string => part !== undefined).join(': ')
+    + (param === undefined ? '' : ` (param: ${param})`)
+  return { message, ...(code !== undefined && UPSTREAM_CODE_PATTERN.test(code) ? { code } : {}) }
+}
+
+/** Keeps an upstream code as `providerCode` only when it is a plain token carrying none of the secrets. */
+export function safeProviderCode(code: string | undefined, secrets: readonly string[] = []): string | undefined {
+  if (code === undefined || !UPSTREAM_CODE_PATTERN.test(code)) return undefined
+  return sanitizeDiagnostic(code, secrets) === code ? code : undefined
+}
+
+/**
+ * Extracts the diagnostic of an API error response body. A self-hosted V1 body is read as the V1
+ * error envelope first; otherwise the JSON fields detail, message, error and msg are inspected
+ * (msg first for official-v4, detail first for self-hosted). Non-JSON bodies fall back to their
+ * truncated raw text.
+ */
+export function extractErrorDetail(bodyText: string, provider?: MinerUProviderId): UpstreamErrorDetail {
+  let parsed: unknown
   try {
-    const parsed: unknown = JSON.parse(bodyText)
-    if (typeof parsed === 'object' && parsed !== null) {
-      const json = parsed as Record<string, unknown>
-      if (provider === 'official-v4') {
-        if (typeof json.msg === 'string') parsedError = json.msg
-        else if (typeof json.message === 'string') parsedError = json.message
-        else if (typeof json.detail === 'string') parsedError = json.detail
-        else if (typeof json.error === 'string') parsedError = json.error
-      } else {
-        if (typeof json.detail === 'string') parsedError = json.detail
-        else if (typeof json.message === 'string') parsedError = json.message
-        else if (typeof json.error === 'string') parsedError = json.error
-        else if (typeof json.msg === 'string') parsedError = json.msg
-      }
-    }
+    parsed = JSON.parse(bodyText)
   } catch {
-    parsedError = bodyText.slice(0, 500)
+    const raw = bodyText.slice(0, 500)
+    return raw === '' ? {} : { message: raw }
   }
-  return parsedError
+  if (typeof parsed !== 'object' || parsed === null) return {}
+  const json = parsed as Record<string, unknown>
+  if (provider === 'self-hosted-v1') {
+    const envelope = describeV1Error(json.error)
+    if (envelope !== undefined) return envelope
+  }
+  const fields = provider === 'official-v4' ? ['msg', 'message', 'detail', 'error'] : ['detail', 'message', 'error', 'msg']
+  for (const field of fields) {
+    const value = json[field]
+    if (typeof value === 'string') return { message: value }
+  }
+  return {}
+}
+
+/** The diagnostic text of an API error response body; see {@link extractErrorDetail}. */
+export function extractErrorMessage(bodyText: string, provider?: MinerUProviderId): string | undefined {
+  return extractErrorDetail(bodyText, provider).message
 }
 
 /**
  * Maps HTTP error status codes to typed MinerUError instances with provider-specific diagnostic phrasing.
+ * `providerCode` records the upstream error code when the body carried one.
  */
 export function createHttpStatusError(
   provider: MinerUProviderId,
   status: number,
   diagnostic: string,
   retryAfterMs?: number,
+  providerCode?: string,
 ): MinerUError {
   const options = { http: { status, retryAfterMs } }
+  const details = { provider, ...(providerCode === undefined ? {} : { providerCode }) }
   let err: MinerUError
   if (provider === 'official-v4') {
     if (status === 401 || status === 403) {
-      err = new MinerUError(failure('AUTHENTICATION_FAILED', `Official MinerU authentication failed (${String(status)})${diagnostic}`, false, { provider }), options)
+      err = new MinerUError(failure('AUTHENTICATION_FAILED', `Official MinerU authentication failed (${String(status)})${diagnostic}`, false, details), options)
     } else if (status === 404) {
-      err = new MinerUError(failure('JOB_NOT_FOUND', `Official MinerU resource not found (${String(status)})${diagnostic}`, false, { provider }), options)
+      err = new MinerUError(failure('JOB_NOT_FOUND', `Official MinerU resource not found (${String(status)})${diagnostic}`, false, details), options)
     } else if (status === 413) {
-      err = new MinerUError(failure('FILE_TOO_LARGE', `File exceeds size limit (${String(status)})${diagnostic}`, false, { provider }), options)
+      err = new MinerUError(failure('FILE_TOO_LARGE', `File exceeds size limit (${String(status)})${diagnostic}`, false, details), options)
     } else if (status === 429) {
-      err = new MinerUError(failure('PROVIDER_RATE_LIMITED', `Official MinerU rate limit exceeded (${String(status)})${diagnostic}`, true, { provider }), options)
+      err = new MinerUError(failure('PROVIDER_RATE_LIMITED', `Official MinerU rate limit exceeded (${String(status)})${diagnostic}`, true, details), options)
     } else if (status === 408) {
-      err = new MinerUError(failure('PROVIDER_UNAVAILABLE', `Official MinerU request timeout (${String(status)})${diagnostic}`, true, { provider }), options)
+      err = new MinerUError(failure('PROVIDER_UNAVAILABLE', `Official MinerU request timeout (${String(status)})${diagnostic}`, true, details), options)
     } else if (status >= 500) {
-      err = new MinerUError(failure('PROVIDER_UNAVAILABLE', `Official MinerU server error (${String(status)})${diagnostic}`, true, { provider }), options)
+      err = new MinerUError(failure('PROVIDER_UNAVAILABLE', `Official MinerU server error (${String(status)})${diagnostic}`, true, details), options)
     } else {
-      err = new MinerUError(failure('REMOTE_PARSE_FAILED', `Official MinerU returned status ${String(status)}${diagnostic}`, false, { provider }), options)
+      err = new MinerUError(failure('REMOTE_PARSE_FAILED', `Official MinerU returned status ${String(status)}${diagnostic}`, false, details), options)
     }
   } else {
     if (status === 401 || status === 403) {
-      err = new MinerUError(failure('AUTHENTICATION_FAILED', `Authentication failed (${String(status)})${diagnostic}`, false, { provider }), options)
+      err = new MinerUError(failure('AUTHENTICATION_FAILED', `Authentication failed (${String(status)})${diagnostic}`, false, details), options)
     } else if (status === 404) {
-      err = new MinerUError(failure('JOB_NOT_FOUND', `Resource not found (${String(status)})${diagnostic}`, false, { provider }), options)
+      err = new MinerUError(failure('JOB_NOT_FOUND', `Resource not found (${String(status)})${diagnostic}`, false, details), options)
     } else if (status === 413) {
-      err = new MinerUError(failure('FILE_TOO_LARGE', `Uploaded file is too large (${String(status)})${diagnostic}`, false, { provider }), options)
+      err = new MinerUError(failure('FILE_TOO_LARGE', `Uploaded file is too large (${String(status)})${diagnostic}`, false, details), options)
     } else if (status === 429) {
-      err = new MinerUError(failure('PROVIDER_RATE_LIMITED', `Provider rate limit exceeded (${String(status)})${diagnostic}`, true, { provider }), options)
+      err = new MinerUError(failure('PROVIDER_RATE_LIMITED', `Provider rate limit exceeded (${String(status)})${diagnostic}`, true, details), options)
     } else if (status === 408) {
-      err = new MinerUError(failure('PROVIDER_UNAVAILABLE', `MinerU server request timeout (${String(status)})${diagnostic}`, true, { provider }), options)
+      err = new MinerUError(failure('PROVIDER_UNAVAILABLE', `MinerU server request timeout (${String(status)})${diagnostic}`, true, details), options)
     } else if (status >= 500) {
-      err = new MinerUError(failure('PROVIDER_UNAVAILABLE', `MinerU server error (${String(status)})${diagnostic}`, true, { provider }), options)
+      err = new MinerUError(failure('PROVIDER_UNAVAILABLE', `MinerU server error (${String(status)})${diagnostic}`, true, details), options)
     } else {
-      err = new MinerUError(failure('REMOTE_PARSE_FAILED', `MinerU returned unexpected status ${String(status)}${diagnostic}`, false, { provider }), options)
+      err = new MinerUError(failure('REMOTE_PARSE_FAILED', `MinerU returned unexpected status ${String(status)}${diagnostic}`, false, details), options)
     }
   }
   return err
@@ -203,12 +248,13 @@ export class ProviderHttpClient {
             }
           }
 
-          const parsedError = extractErrorMessage(errorBody, this.provider)
-          const diagnostic = parsedError
-            ? `: ${sanitizeDiagnostic(parsedError, [reqContext.credential ?? ''])}`
+          const secrets = [reqContext.credential ?? '']
+          const detail = extractErrorDetail(errorBody, this.provider)
+          const diagnostic = detail.message
+            ? `: ${sanitizeDiagnostic(detail.message, secrets)}`
             : ''
           const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'))
-          throw createHttpStatusError(this.provider, status, diagnostic, retryAfterMs)
+          throw createHttpStatusError(this.provider, status, diagnostic, retryAfterMs, safeProviderCode(detail.code, secrets))
         }
 
         const contentType = response.headers.get('content-type') ?? ''

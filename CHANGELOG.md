@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- Self-hosted MinerU 4.x (V1) failures now carry the server's error code and message instead of only the HTTP status, for example `engine_dead`, `invalid_api_key`, `quality_tier_unavailable`, `upload_not_found` or `file_not_found`. This covers API requests, byte uploads, result downloads and per-file job errors (`parse_failed`, `engine_dead`, a Router's `upstream_job_lost`). The code is also kept as the failure's `providerCode`; credentials stay redacted and the status-to-error mapping, including retryability, is unchanged.
+- A failed connection test shows the server's diagnostic next to "Service unavailable" or "API key was rejected".
+
+### Changed
+
+- Self-hosted V1 test fixtures and scenarios follow MinerU 4.0.12 responses: Middle JSON 2.0, caption anchors in structured content, versioned virtual-model tiers, latched engine failures, expired uploads and outputs, and Router job loss. No configuration change is needed.
+
 ## 0.2.1
 
 ### Added

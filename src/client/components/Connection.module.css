@@ -81,6 +81,7 @@
 
 .probeDetail {
   color: var(--dsw-alias-label-tertiary);
+  overflow-wrap: anywhere;
 }
 
 .probeDetail::before {

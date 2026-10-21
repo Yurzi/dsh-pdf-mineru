@@ -4,7 +4,7 @@ import type { PreparedSourceFile } from '../../domain/request.js'
 import { MinerUError, failure, sanitizeDiagnostic } from '../../domain/errors.js'
 import { assertSourcesUnchanged } from '../../source/prepared-source.js'
 import type { ProviderCallContext } from '../contract.js'
-import type { ProviderHttpClient } from '../http/http-client.js'
+import { extractErrorDetail, safeProviderCode, type ProviderHttpClient } from '../http/http-client.js'
 import { executeWithRetry, isRetryableHttpStatus, parseRetryAfter, readBoundedResponseText } from '../http/retry.js'
 
 const EXTENSION_MIME_TYPES: Readonly<Record<string, string>> = {
@@ -35,7 +35,12 @@ export interface SelfHostedV1UploadResponse {
   readonly file?: { readonly id?: string } | null
 }
 
-function uploadFailed(message: string, retryable = false, details: { fileId?: MinerUFileId } = {}, http?: MinerUError['http']): MinerUError {
+function uploadFailed(
+  message: string,
+  retryable = false,
+  details: { readonly fileId?: MinerUFileId; readonly providerCode?: string } = {},
+  http?: MinerUError['http'],
+): MinerUError {
   return new MinerUError(failure('UPLOAD_FAILED', message, retryable, { provider: 'self-hosted-v1', ...details }), { http })
 }
 
@@ -201,10 +206,16 @@ export class SelfHostedV1Uploader {
             } catch {
               if (response.body) { try { await response.body.cancel() } catch {} }
             }
+            // Same-origin targets answer with the V1 error envelope (for example an expired session's
+            // `upload_not_found`); any other body, such as a presigned target's, is kept as bounded raw text.
+            const secrets = [context.credential ?? '']
+            const detail = extractErrorDetail(errorBody, 'self-hosted-v1')
+            const providerCode = safeProviderCode(detail.code, secrets)
+            const diagnostic = detail.message || errorBody
             const error = uploadFailed(
-              `Upload failed with HTTP status ${String(response.status)}${errorBody === '' ? '' : `: ${sanitizeDiagnostic(errorBody, [context.credential ?? ''])}`}`,
+              `Upload failed with HTTP status ${String(response.status)}${diagnostic === '' ? '' : `: ${sanitizeDiagnostic(diagnostic, secrets)}`}`,
               isRetryableHttpStatus(response.status),
-              { fileId: source.fileId },
+              { fileId: source.fileId, ...(providerCode === undefined ? {} : { providerCode }) },
               { status: response.status, retryAfterMs: parseRetryAfter(response.headers.get('retry-after')) },
             )
             throw error

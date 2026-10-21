@@ -18,7 +18,7 @@ import {
   toggleOfficialModel,
   type CredentialClient,
 } from '../src/client/helpers.js'
-import { en, zh } from '../src/client/locales.js'
+import { en, zh, type Translate } from '../src/client/locales.js'
 import {
   cacheClearConfirmRequest,
   cacheClearPreviewRequest,
@@ -29,6 +29,7 @@ import {
 } from '../src/client/maintenance.js'
 import {
   currentProbe,
+  describeProbe,
   probeKey,
   removeCredential,
   runProbe,
@@ -290,6 +291,20 @@ describe('credential races', () => {
     responses[1]!.resolve(connected)
     await inFlight
     expect(currentProbe(result, probeKey(provider, 2))).toEqual({ kind: 'idle' })
+  })
+
+  it('shows the server diagnostic of a failed connection test, including its upstream code', () => {
+    const t: Translate = (key, params = {}) => Object.entries(params).reduce<string>((text, [name, value]) => text.replace(`{${name}}`, String(value)), en[key])
+    const view = { available: false, provider: 'self-hosted-v1', authentication: 'unknown', protocol_version: 'v1' } as const
+    expect(describeProbe({ kind: 'done', view: { ...view, diagnostics: 'MinerU server error (503): engine_dead: CUDA error' } }, t)).toEqual({
+      dot: 'warning', text: en['probe.unavailable'], details: ['MinerU server error (503): engine_dead: CUDA error'],
+    })
+    expect(describeProbe({ kind: 'done', view: { ...view, authentication: 'invalid', diagnostics: 'Authentication failed (401): invalid_api_key: Invalid or missing API key' } }, t))
+      .toMatchObject({ text: en['probe.authInvalid'], details: ['Authentication failed (401): invalid_api_key: Invalid or missing API key'] })
+    expect(describeProbe({ kind: 'done', view: { ...view, diagnostics: '  ' } }, t)).toMatchObject({ details: [] })
+    expect(describeProbe({ kind: 'done', view: { ...view, available: true, authentication: 'valid', server_version: '4.0.12', available_tiers: ['flash', 'standard'] } }, t))
+      .toEqual({ dot: 'done', text: en['probe.ok'], details: [t('probe.version', { version: '4.0.12' }), t('probe.tiers', { tiers: 'flash, standard' })] })
+    expect(describeProbe({ kind: 'idle' }, t)).toBeUndefined()
   })
 })
 

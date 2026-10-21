@@ -133,7 +133,7 @@ worker 的加固：快照硬上限 200 MiB（同时受更小的配置上限约�
 
 三种 Provider 由配置显式选择，不自动探测或降级：
 
-- **self-hosted-v1**（4.x）：先 `GET /v1/health` 和 `/v1/tiers` 确认支持 zip、file_id 和所配档位，再创建上传、PUT 字节、完成上传、创建解析任务、轮询并下载结果。只接收 `tier` 和 `ocrMode`。结果中的 Markdown、middle/structured JSON、模型输出和图片归一到现有产物形状；`provenance.model` 为 `null`。不依赖服务器重启后可能失效的资源 ID。
+- **self-hosted-v1**（4.x）：先 `GET /v1/health` 和 `/v1/tiers` 确认支持 zip、file_id 和所配档位，再创建上传、PUT 字节、完成上传、创建解析任务、轮询并下载结果。只接收 `tier` 和 `ocrMode`。结果中的 Markdown、middle/structured JSON、模型输出和图片归一到现有产物形状；`provenance.model` 为 `null`。不依赖服务器重启后可能失效的资源 ID。HTTP 错误体和单文件任务错误都按 V1 的 `{ type, code, message, param }` 读取：诊断以上游 code 开头，合法的 code 记入 `providerCode`，状态码到错误类型和可重试性的映射不变。
 - **self-hosted-legacy-v2**（3.x）：只使用 `/health`、multipart `/tasks` 和结果端点，接收 `modelMap` 与共享解析默认值。
 - **official-v4**：官方批量上传 URL 分配、裸 PUT、状态轮询和 ZIP 下载，按 data_id 映射。
 

@@ -14,6 +14,10 @@
  * `images/*`). Collection therefore reuses the shared bounded ZIP extractor and only
  * canonicalizes the two documents whose MinerU 4.x shape differs from the plugin's
  * canonical artifact shape (layout page list and structured content).
+ *
+ * API servers and Routers report errors as `{ "error": { type, code, message, param } }` and
+ * per-file job errors with the same object; diagnostics lead with that code and keep it as the
+ * failure's `providerCode`.
  */
 
 import { createHash } from 'node:crypto'
@@ -27,12 +31,19 @@ import { SELF_HOSTED_TIERS, type SelfHostedV1Config } from '../../config/model.j
 import type { CanonicalParseRequest, PreparedSourceFile } from '../../domain/request.js'
 import {
   MinerUError,
+  type MinerUFailure,
   failure,
   sanitizeDiagnostic,
   toMinerUFailure,
 } from '../../domain/errors.js'
 import { assertSourcesUnchanged } from '../../source/prepared-source.js'
-import { ProviderHttpClient, resolveProviderUrl } from '../http/http-client.js'
+import {
+  ProviderHttpClient,
+  describeV1Error,
+  extractErrorDetail,
+  resolveProviderUrl,
+  safeProviderCode,
+} from '../http/http-client.js'
 import { extractSafeZip } from '../http/safe-zip.js'
 import {
   type MinerUProvider,
@@ -55,6 +66,7 @@ import {
   executeWithRetry,
   isRetryableHttpStatus,
   parseRetryAfter,
+  readBoundedResponseText,
 } from '../http/retry.js'
 
 /** The only output format the plugin consumes; it carries every canonical artifact. */
@@ -80,7 +92,13 @@ export interface SelfHostedV1JobFile {
   readonly page_range?: string
   readonly status?: string
   readonly output_files?: Readonly<Record<string, SelfHostedV1OutputFileRef | null>> | null
-  readonly error?: { readonly code?: string | null; readonly message?: string } | null
+  /** V1 error object, for example `engine_dead`, `parse_failed` or a Router's `upstream_job_lost`. */
+  readonly error?: {
+    readonly type?: string | null
+    readonly code?: string | null
+    readonly message?: string | null
+    readonly param?: string | null
+  } | null
 }
 
 export interface SelfHostedV1JobResponse {
@@ -93,6 +111,26 @@ export interface SelfHostedV1JobResponse {
 interface SelfHostedV1AdapterOptions {
   readonly client: ProviderHttpClient
   readonly baseUrl: URL
+}
+
+/** Upper bound for reading the error body of a failed result download. */
+const DOWNLOAD_ERROR_BODY_BYTES = 2048
+
+/**
+ * Per-file failure carrying the upstream V1 error code and message. A job failed by a latched engine
+ * (`engine_dead`) or lost by a Router worker (`upstream_job_lost`) is told apart from a document the
+ * engine could not parse (`parse_failed`).
+ */
+function remoteFileFailure(jobFile: SelfHostedV1JobFile, fileId: MinerUFileId, credential: string | undefined): MinerUFailure {
+  const secrets = [credential ?? '']
+  const detail = describeV1Error(jobFile.error, 'Remote document extraction failed')
+  const providerCode = safeProviderCode(detail?.code, secrets)
+  return failure(
+    'REMOTE_PARSE_FAILED',
+    sanitizeDiagnostic(detail?.message ?? 'Remote document extraction failed', secrets),
+    false,
+    { provider: 'self-hosted-v1', fileId, ...(providerCode === undefined ? {} : { providerCode }) },
+  )
 }
 
 function archiveInvalid(message: string, fileId?: MinerUFileId): MinerUError {
@@ -409,12 +447,7 @@ export class SelfHostedV1Provider implements MinerUProvider {
           fileId: file.fileId,
           name: file.name,
           artifacts: [],
-          failure: failure(
-            'REMOTE_PARSE_FAILED',
-            sanitizeDiagnostic(jobFile.error?.message ?? 'Remote document extraction failed', [context.credential ?? '']),
-            false,
-            { provider: 'self-hosted-v1', fileId: file.fileId },
-          ),
+          failure: remoteFileFailure(jobFile, file.fileId, context.credential),
         })
         continue
       }
@@ -506,16 +539,7 @@ export class SelfHostedV1Provider implements MinerUProvider {
         fileId: file.fileId,
         state: fileState,
         rawState: typeof jobFile.status === 'string' ? jobFile.status : undefined,
-        ...(fileState === 'failed'
-          ? {
-              failure: failure(
-                'REMOTE_PARSE_FAILED',
-                sanitizeDiagnostic(jobFile.error?.message ?? 'Remote document extraction failed', [context.credential ?? '']),
-                false,
-                { provider: 'self-hosted-v1', fileId: file.fileId },
-              ),
-            }
-          : {}),
+        ...(fileState === 'failed' ? { failure: remoteFileFailure(jobFile, file.fileId, context.credential) } : {}),
       })
 
       if (fileState !== 'completed' && fileState !== 'failed') hasNonTerminal = true
@@ -578,9 +602,23 @@ export class SelfHostedV1Provider implements MinerUProvider {
           }
 
           if (response.status !== 200) {
-            if (response.body) { try { await response.body.cancel() } catch {} }
+            let errorBody = ''
+            try {
+              errorBody = await readBoundedResponseText(response, DOWNLOAD_ERROR_BODY_BYTES, controller.signal)
+            } catch {
+              if (response.body) { try { await response.body.cancel() } catch {} }
+            }
+            // An output removed by server-side retention answers `file_not_found`; keep that code.
+            const secrets = [context.credential ?? '']
+            const detail = extractErrorDetail(errorBody, 'self-hosted-v1')
+            const providerCode = safeProviderCode(detail.code, secrets)
             const error = new MinerUError(
-              failure('RESULT_DOWNLOAD_FAILED', `Failed to download result archive, HTTP status ${String(response.status)}`, isRetryableHttpStatus(response.status), { provider: 'self-hosted-v1' }),
+              failure(
+                'RESULT_DOWNLOAD_FAILED',
+                `Failed to download result archive, HTTP status ${String(response.status)}${detail.message ? `: ${sanitizeDiagnostic(detail.message, secrets)}` : ''}`,
+                isRetryableHttpStatus(response.status),
+                { provider: 'self-hosted-v1', ...(providerCode === undefined ? {} : { providerCode }) },
+              ),
               { http: { status: response.status, retryAfterMs: parseRetryAfter(response.headers.get('retry-after')) } },
             )
             throw error

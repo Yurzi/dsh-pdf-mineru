@@ -25,6 +25,8 @@
 
 测试只确认 API 可访问以及服务声明的能力：4.x V1 会显示部署支持的档位、产物格式和来源类型。测试通过不代表解析效果已经验证。
 
+测试未通过时，状态后会显示服务返回的诊断。4.x V1 的诊断以服务端错误码开头，例如 `engine_dead`（推理引擎出现致命错误）、`invalid_api_key`（API Key 无效）或 Router 的 `upstream_unavailable`（没有健康的后端）。解析失败的错误信息也带有同样的错误码。
+
 ### 访问限制
 
 设置页背后的配置读写、连接测试和存储维护接口有两道限制：
@@ -59,6 +61,7 @@
 - 不提供 URL / inline 来源、回调、服务端取消、HTML/DOCX 产物选择等上游功能。
 - 输入类型仍限于 PDF、常见图片和 doc/docx/ppt/pptx/xls/xlsx；原页核对只支持 PDF。
 - `read_pdf` 的 `pages` 是对已解析结果按物理页筛选，不是上游的 page_range 语法。
+- 服务端会在任务结束后按保留期回收任务和产物（`MINERU_API_RETENTION_SECONDS`，默认 24 小时，`0` 关闭）。插件在任务完成时立即下载结果并发布到自己的缓存，不依赖服务端继续保留；下载时出现 `file_not_found` 通常说明保留期设得过短，或服务在任务完成后重启过。
 
 ## 凭据
 
@@ -106,7 +109,7 @@ providers:
     apiKeyEnv: MINERU_API_KEY
     tier: standard              # 可省略，由服务端选择；不是具体模型名
     ocrMode: auto               # auto / txt / ocr
-    configuredVersion: '4.0.10' # 原地升级服务或模型后修改
+    configuredVersion: '4.0.12' # 原地升级服务或模型后修改
 ```
 
 自部署 3.x（旧版）：
