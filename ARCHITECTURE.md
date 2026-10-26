@@ -92,14 +92,14 @@ loopback RPC → settings persistence / ParseService.probe / StorageMaintenanceS
 
 `reader/page/page-renderer` 不调用 Provider、不上传、不依赖解析缓存。它在受 `limits.maxFileBytes` 约束的前提下为源文件建立私有临时快照并计算 SHA-256，`expected_sha256` 不匹配则在渲染前拒绝；完成、失败或取消后都清理临时文件。
 
-- 先执行 Poppler（`pdfinfo`、`pdftoppm`）。所有渲染子进程都不经 shell，环境只保留 `PATH` 和固定的 C 语言区域设置，不继承 `NODE_OPTIONS` 等用户变量。只有执行环境错误（ENOENT、EACCES、EPERM、ENOEXEC、ENOSYS）才归为渲染器不可用并切换到 PDF.js；文档错误、越界、摘要不匹配、取消、超限和超时都不切换。
+- 先执行 Poppler（`pdfinfo`、`pdftoppm`）。所有渲染子进程都不经 shell，环境只保留 `PATH`、固定的 C 语言区域设置和 `TZ=UTC`，不继承 `NODE_OPTIONS` 等用户变量。`pdfinfo` 输出只读取 ASCII 的 `Pages:` 行且必须唯一；其他字段按字节透明处理，Windows 按系统代码页输出的日期或时区名不会导致失败。只有执行环境错误（ENOENT、EACCES、EPERM、ENOEXEC、ENOSYS）才归为渲染器不可用并切换到 PDF.js；文档错误、越界、摘要不匹配、取消、超限和超时都不切换。
 - 两个后端共享同一份快照、同一个并发槽和同一个截止时间：同进程最多 2 个并发渲染，从排队到渲染结束共 45 秒（单调时钟）。
 - 输出：长边不超过 1600 px（保持纵横比），PNG 不超过 8 MiB；读取 PNG 前后复核大小和身份，检查尺寸、块结构、CRC 和 IEND 后才交给附件层。子进程 stdout/stderr 和输出文件增长都有上限。
 - 能力检测就是实际执行：不单独探测、不缓存永久不可用、文本阅读不触发探测。
 
-PDF.js 后端在独立 Node 子进程中运行 `pdfjs-worker.mjs`：用 `process.execPath` 启动、参数固定，带 `--disallow-code-generation-from-strings` 和 512 MiB old-space 上限。进程协议：成功退出码 0 并输出唯一的 `{page_count}` JSON；20 表示依赖或资源不可用，21 文档或页面错误，22 资源超限，23 其他错误。父进程不把子进程输出或原始异常透传给模型。
+PDF.js 后端在独立 Node 子进程中运行 `pdfjs-worker.mjs`：用 `process.execPath` 启动、参数固定，带 `--disallow-code-generation-from-strings` 和 512 MiB old-space 上限。进程协议：成功退出码 0 并输出唯一的 `{page_count}` JSON；20 表示依赖或资源不可用，21 文档或页面错误，22 资源超限，23 其他错误（包括 `getDocument` 同步拒绝的参数错误，不归为文档错误）。父进程不把子进程输出或原始异常透传给模型。
 
-worker 的加固：快照硬上限 200 MiB（同时受更小的配置上限约束）；原始页边不超过 1,000,000 pt；每张 Canvas 不超过 3,200,000 像素，活动 Canvas 合计不超过 12,800,000 像素，超限则失败而不是静默丢图。不导入 PDF 脚本沙箱，不执行 OpenAction、JavaScript 或 URI 动作，关闭 XFA 和系统字体；字体、CMap、WASM 只按包目录以 `O_NOFOLLOW` 读取（固定类型和扩展名，单个不超过 16 MiB）；网络模块在 worker 内被禁用。PDF.js 的严格 operator-list 路径可能吞掉超大图像异常，worker 用容错路径并捕获固定的 `maxImageSize` 警告来返回资源错误；升级 PDF.js 时必须用真实 fixture 重新验证这一点。
+worker 的加固：快照硬上限 200 MiB（同时受更小的配置上限约束）；原始页边不超过 1,000,000 pt；每张 Canvas 不超过 3,200,000 像素，活动 Canvas 合计不超过 12,800,000 像素，超限则失败而不是静默丢图。不导入 PDF 脚本沙箱，不执行 OpenAction、JavaScript 或 URI 动作，关闭 XFA 和系统字体；字体、CMap、WASM 只按包目录以 `O_NOFOLLOW` 读取（固定类型和扩展名，单个不超过 16 MiB；传给 PDF.js 的资源 URL 是以 `/` 结尾的 `file:` URL，仅用于通过参数校验，从不被抓取）；网络模块在 worker 内被禁用。PDF.js 的严格 operator-list 路径可能吞掉超大图像异常，worker 用容错路径并捕获固定的 `maxImageSize` 警告来返回资源错误；升级 PDF.js 时必须用真实 fixture 重新验证这一点。
 
 打包：`pdfjs-dist` 与 `@napi-rs/canvas` 是固定版本的生产依赖，不打进 host 或 client bundle；tsdown 把 worker 原样复制到 `lib/pdfjs-worker.mjs`，`package.json` 的 `files` 必须保留它。Canvas 平台二进制来自其 optionalDependencies，只在子进程选用 PDF.js 时加载。
 

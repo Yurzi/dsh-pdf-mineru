@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## Unreleased
 
@@ -8,6 +8,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 - Self-hosted MinerU 4.x (V1) failures now carry the server's error code and message instead of only the HTTP status, for example `engine_dead`, `invalid_api_key`, `quality_tier_unavailable`, `upload_not_found` or `file_not_found`. This covers API requests, byte uploads, result downloads and per-file job errors (`parse_failed`, `engine_dead`, a Router's `upstream_job_lost`). The code is also kept as the failure's `providerCode`; credentials stay redacted and the status-to-error mapping, including retryability, is unchanged.
 - A failed connection test shows the server's diagnostic next to "Service unavailable" or "API key was rejected".
+- Original-page view (`read_pdf` with `view: "page"`) works on Windows with a non-English system locale ([#5](https://github.com/Yurzi/dsh-pdf-mineru/issues/5)). Poppler printed the `CreationDate` time-zone name in the system code page, so `pdfinfo` output was rejected as invalid UTF-8 and every dated PDF failed. Only the `Pages:` line is now read, and renderers run with `TZ=UTC`.
+- The PDF.js page renderer no longer fails on Windows: its resource URLs ended with `\` instead of the `/` PDF.js requires. Such configuration faults are now reported as renderer failures instead of an invalid PDF.
 
 ### Changed
 

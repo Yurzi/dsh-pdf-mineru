@@ -8,8 +8,9 @@ import http2 from 'node:http2'
 import https from 'node:https'
 import { createRequire } from 'node:module'
 import net from 'node:net'
-import { dirname, join, sep } from 'node:path'
+import { dirname, join } from 'node:path'
 import tls from 'node:tls'
+import { pathToFileURL } from 'node:url'
 
 const EXIT_UNAVAILABLE = 20
 const EXIT_INVALID_PDF = 21
@@ -109,25 +110,39 @@ async function assertDirectory(path) {
   if (!info.isDirectory()) throw new Error('resource unavailable')
 }
 
+/**
+ * PDF.js requires its resource URL parameters to end with "/" on every
+ * platform; native directory paths end with "\\" on Windows. The bounded
+ * BinaryDataFactory reads from the native directories, so these URLs only
+ * satisfy PDF.js parameter validation and are never fetched.
+ */
+function resourceDirectoryUrl(directory) {
+  const href = pathToFileURL(directory).href
+  return href.endsWith('/') ? href : href + '/'
+}
+
 async function loadDependencies() {
   try {
     const require = createRequire(import.meta.url)
     const packageRoot = dirname(require.resolve('pdfjs-dist/package.json'))
-    const resources = {
-      cMapUrl: join(packageRoot, 'cmaps') + sep,
-      iccUrl: join(packageRoot, 'iccs') + sep,
-      standardFontDataUrl: join(packageRoot, 'standard_fonts') + sep,
-      wasmUrl: join(packageRoot, 'wasm') + sep,
+    const resourceDirs = {
+      cMapUrl: join(packageRoot, 'cmaps'),
+      iccUrl: join(packageRoot, 'iccs'),
+      standardFontDataUrl: join(packageRoot, 'standard_fonts'),
+      wasmUrl: join(packageRoot, 'wasm'),
     }
+    const resourceUrls = Object.fromEntries(
+      Object.entries(resourceDirs).map(([kind, directory]) => [kind, resourceDirectoryUrl(directory)]),
+    )
 
-    await Promise.all(Object.values(resources).map(assertDirectory))
+    await Promise.all(Object.values(resourceDirs).map(assertDirectory))
     await Promise.all([
-      access(join(resources.cMapUrl, 'Adobe-CNS1-UCS2.bcmap'), constants.R_OK),
-      access(join(resources.iccUrl, 'CGATS001Compat-v2-micro.icc'), constants.R_OK),
-      access(join(resources.standardFontDataUrl, 'LiberationSans-Regular.ttf'), constants.R_OK),
-      access(join(resources.wasmUrl, 'jbig2.wasm'), constants.R_OK),
-      access(join(resources.wasmUrl, 'openjpeg.wasm'), constants.R_OK),
-      access(join(resources.wasmUrl, 'qcms_bg.wasm'), constants.R_OK),
+      access(join(resourceDirs.cMapUrl, 'Adobe-CNS1-UCS2.bcmap'), constants.R_OK),
+      access(join(resourceDirs.iccUrl, 'CGATS001Compat-v2-micro.icc'), constants.R_OK),
+      access(join(resourceDirs.standardFontDataUrl, 'LiberationSans-Regular.ttf'), constants.R_OK),
+      access(join(resourceDirs.wasmUrl, 'jbig2.wasm'), constants.R_OK),
+      access(join(resourceDirs.wasmUrl, 'openjpeg.wasm'), constants.R_OK),
+      access(join(resourceDirs.wasmUrl, 'qcms_bg.wasm'), constants.R_OK),
       access(join(packageRoot, 'legacy', 'build', 'pdf.worker.mjs'), constants.R_OK),
     ])
 
@@ -144,7 +159,8 @@ async function loadDependencies() {
     return {
       createCanvas: canvasModule.createCanvas,
       pdfjs,
-      resourceUrls: resources,
+      resourceDirs,
+      resourceUrls,
     }
   } catch {
     fail(EXIT_UNAVAILABLE)
@@ -329,6 +345,8 @@ function isImageLimitFailure(error) {
 async function loadDocument(pdfjs, CanvasFactory, BinaryDataFactory, resourceState, resourceUrls, data) {
   let loadingTask
   try {
+    // getDocument validates its parameters synchronously. A throw here is a
+    // worker/dependency configuration fault, never evidence of an invalid PDF.
     loadingTask = pdfjs.getDocument({
       data,
       cMapUrl: resourceUrls.cMapUrl,
@@ -356,6 +374,10 @@ async function loadDocument(pdfjs, CanvasFactory, BinaryDataFactory, resourceSta
       // stable maxImageSize signal and emits no diagnostic text.
       verbosity: pdfjs.VerbosityLevel.WARNINGS,
     })
+  } catch {
+    fail(EXIT_FAILURE)
+  }
+  try {
     return { document: await loadingTask.promise, loadingTask }
   } catch {
     if (loadingTask) {
@@ -368,11 +390,11 @@ async function loadDocument(pdfjs, CanvasFactory, BinaryDataFactory, resourceSta
 
 async function render() {
   const { snapshotPath, outputPath, pageNumber, maxFileBytes } = parseArguments()
-  const { createCanvas, pdfjs, resourceUrls } = await loadDependencies()
+  const { createCanvas, pdfjs, resourceDirs, resourceUrls } = await loadDependencies()
   const data = await readSnapshot(snapshotPath, maxFileBytes)
   const CanvasFactory = makeCanvasFactory(createCanvas)
   const resourceState = { unavailable: false, invalidRequest: false }
-  const BinaryDataFactory = makeBinaryDataFactory(resourceUrls, resourceState)
+  const BinaryDataFactory = makeBinaryDataFactory(resourceDirs, resourceState)
   const loaded = await loadDocument(
     pdfjs, CanvasFactory, BinaryDataFactory, resourceState, resourceUrls, data,
   )

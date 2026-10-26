@@ -154,6 +154,15 @@ function killChild(child: ChildProcess): void {
   }
 }
 
+/**
+ * Allow-listed renderer environment. `TZ=UTC` keeps Poppler's localized time-zone
+ * names (printed in the system code page on Windows, which ignores LC_ALL) out of
+ * pdfinfo date fields; no other host variable is inherited besides PATH.
+ */
+export function rendererEnvironment(path: string | undefined = process.env.PATH): Record<string, string> {
+  return { PATH: path ?? '', LANG: 'C', LC_ALL: 'C', TZ: 'UTC' }
+}
+
 /** Spawn a fixed local renderer command without a shell; settle only after child close/reaping. */
 export const runPdfPageProcess: PdfPageProcessRunner = request => new Promise((resolvePromise, rejectPromise) => {
   request.signal.throwIfAborted()
@@ -161,7 +170,7 @@ export const runPdfPageProcess: PdfPageProcessRunner = request => new Promise((r
   try {
     child = spawn(request.command === 'pdfjs' ? process.execPath : request.command, [...request.args], {
       cwd: request.cwd,
-      env: { PATH: process.env.PATH ?? '', LANG: 'C', LC_ALL: 'C' },
+      env: rendererEnvironment(),
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
@@ -400,13 +409,13 @@ function parsePdfjsPageCount(result: PdfPageProcessResult): number {
   return parsed.page_count
 }
 
-function parsePageCount(stdout: Uint8Array): number {
-  let text: string
-  try {
-    text = new TextDecoder('utf-8', { fatal: true }).decode(stdout)
-  } catch (error) {
-    throw invalid('pdfinfo returned invalid UTF-8 output', error)
-  }
+/**
+ * Only the ASCII `Pages:` line is consumed. Latin-1 maps every byte to one
+ * character and cannot fail, so unrelated fields in a local code page (for
+ * example a CreationDate time-zone name on non-English Windows) are inert.
+ */
+export function parsePageCount(stdout: Uint8Array): number {
+  const text = Buffer.from(stdout.buffer, stdout.byteOffset, stdout.byteLength).toString('latin1')
   const matches = [...text.matchAll(/^Pages:\s+([1-9][0-9]{0,6})\s*$/gm)]
   if (matches.length !== 1) throw invalid('pdfinfo did not return one valid physical page count')
   const pages = Number(matches[0]![1])

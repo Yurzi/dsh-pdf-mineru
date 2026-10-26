@@ -7,6 +7,8 @@ import {
   MAX_RENDERED_PNG_BYTES,
   PDF_PAGE_MAX_LONG_EDGE,
   createPdfPageRenderer,
+  parsePageCount,
+  rendererEnvironment,
   type PdfPageProcessRequest,
   type PdfPageProcessRunner,
 } from '../src/reader/page/page-renderer.js'
@@ -68,6 +70,41 @@ describe('renderPdfPage with Poppler', () => {
       .rejects.toMatchObject({ failure: { code: 'INVALID_REQUEST' } })
     expect(runner).toHaveBeenCalledTimes(1)
     await fx.expectOnly()
+  })
+
+  it('reads the page count when unrelated pdfinfo fields use a local code page', async () => {
+    // Poppler on zh-CN Windows prints the CreationDate time-zone name (中国标准时间)
+    // in GBK regardless of LC_ALL or -enc UTF-8, with CRLF line endings.
+    const gbkTimeZone = Buffer.from([0xD6, 0xD0, 0xB9, 0xFA, 0xB1, 0xEA, 0xD7, 0xBC, 0xCA, 0xB1, 0xBC, 0xE4])
+    const stdout = Buffer.concat([
+      Buffer.from('Title:           Attention Is All You Need\r\nCreationDate:    Thu Apr 11 05:11:43 2024 '),
+      gbkTimeZone,
+      Buffer.from('\r\nPages:           15\r\nPage size:       612 x 792 pts (letter)\r\n'),
+    ])
+    expect(parsePageCount(stdout)).toBe(15)
+
+    const runner: PdfPageProcessRunner = async request => {
+      if (request.command === 'pdfinfo') return processResult(stdout)
+      await writeBackendPng(request, testPng(800, 1000))
+      return processResult()
+    }
+    const rendered = await createPdfPageRenderer({ runProcess: runner, temporaryRoot: fx.root })(fx.input({ page: 8 }))
+    expect(rendered).toMatchObject({ renderer: 'poppler', page: 8, page_count: 15 })
+    await fx.expectOnly()
+  })
+
+  it('still requires exactly one physical page-count line', () => {
+    const injected = Buffer.concat([
+      Buffer.from('Title:           x\nPages:           99\n'),
+      Buffer.from([0xFF, 0xFE]),
+      Buffer.from('\nPages:           3\n'),
+    ])
+    expect(() => parsePageCount(injected)).toThrow(expect.objectContaining({ failure: expect.objectContaining({ code: 'INVALID_REQUEST' }) }))
+    expect(() => parsePageCount(Buffer.from([0xD6, 0xD0, 0x0A]))).toThrow(expect.objectContaining({ failure: expect.objectContaining({ code: 'INVALID_REQUEST' }) }))
+  })
+
+  it('spawns renderers with an allow-listed UTC environment', () => {
+    expect(rendererEnvironment('/usr/bin')).toEqual({ PATH: '/usr/bin', LANG: 'C', LC_ALL: 'C', TZ: 'UTC' })
   })
 
   it('rejects process output beyond the declared capture bound', async () => {

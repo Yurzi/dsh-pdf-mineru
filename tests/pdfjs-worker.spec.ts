@@ -138,6 +138,24 @@ describe.concurrent('PDF.js page worker', () => {
     expect([png.readUInt32BE(16), png.readUInt32BE(20)]).toEqual([800, 1600])
   })
 
+  it('passes slash-terminated resource URLs to PDF.js under a backslash path separator', async ({ expect }) => {
+    // Simulate Windows' path.sep: PDF.js rejects resource URLs that do not end with "/",
+    // which previously surfaced as an invalid-PDF exit for every document.
+    const windowsSeparator = 'data:text/javascript,' + encodeURIComponent([
+      "import path from 'node:path'",
+      "import { syncBuiltinESMExports } from 'node:module'",
+      "path.sep = '\\\\'",
+      'syncBuiltinESMExports()',
+    ].join('\n'))
+    const { snapshotPath, outputPath } = await workerDir()
+    const source = makePdf()
+    await writeFile(snapshotPath, source)
+    const result = await runWorker(['--import', windowsSeparator, ...buildPdfjsArgs(snapshotPath, outputPath, 1, source.byteLength)])
+
+    expect(result).toMatchObject({ exitCode: 0, stderr: Buffer.alloc(0) })
+    expect(result.stdout.toString()).toBe('{"page_count":1}')
+  })
+
   it('uses exit 21 without diagnostics for invalid PDFs and page ranges', async ({ expect }) => {
     const { snapshotPath, outputPath } = await workerDir()
     await writeFile(snapshotPath, 'not a PDF at a private path')
