@@ -70,6 +70,7 @@ if (!file || !Number.isSafeInteger(page) || page < 1 || positional.length > 3
   const config = plugin.parseConfig({ ...defaults, storage: { ...defaults.storage, storageRoot: root } })
   let attachmentBytes
   const ctx = {
+    fiber: { effectiveConfig: config },
     workingDirectory: { ensure: async () => process.cwd() },
     tools: { register(definition) { definitions.push(definition); return noop }, schemas() { return [] } },
     get(name) {

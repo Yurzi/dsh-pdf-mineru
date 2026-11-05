@@ -1,4 +1,5 @@
-import { jsonSchemaToTs, renderToolsSdkPy, ToolArgsError, validateJsonSchemaValue, type JsonSchemaNode } from '@deepseek-ai/dsh-tools'
+import { jsonSchemaToTs, renderToolsSdkPy } from '@deepseek-ai/dsh-tool-executor-ptc'
+import { ToolArgsError, validateJsonSchemaValue, type JsonSchemaNode } from '@deepseek-ai/dsh-tools'
 import { describe, expect, it } from 'vitest'
 import { toolHarness } from './support/tool-harness.js'
 import { resultView } from './support/views.js'

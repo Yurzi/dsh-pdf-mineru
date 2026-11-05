@@ -11,6 +11,8 @@ import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session/types'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
+import * as PtcToolExecutor from '@deepseek-ai/dsh-tool-executor-ptc'
 import ToolRuntime, { RUN_CODE_NAME, type ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import WorkingDirectoryService from '@deepseek-ai/dsh-working-directory'
 import { describe, expect, it } from 'vitest'
@@ -20,14 +22,14 @@ import { testAgent } from './support/tool-harness.js'
 
 /**
  * Real-composition tier (DSH docs/testing.md): the app-boot Loader mounts the published Settings,
- * SystemPrompt, SessionProjections, ToolRuntime (with its run_code PTC dispatch bridge), AgentRegistry,
- * LocalJobRegistry and WorkingDirectoryService beside the plugin. MinerU HTTP never runs: a result is
- * pre-published into the plugin's storage root, so every read is a cache hit.
+ * SystemPrompt, SessionProjections, ToolRuntime, the native executor, AgentRegistry, LocalJobRegistry
+ * and WorkingDirectoryService beside the plugin. PTC agents mount their own executor and runtime.
+ * MinerU HTTP never runs: a result is pre-published into the plugin's storage root, so every read is a cache hit.
  *
  * Stand-ins for packages that are not installed as devDependencies:
  * - fs: dsh-fs-local is absent; WorkingDirectoryService needs only resolve/stat/processPath.
  * - ptcRuntime: dsh-ptc-runtime-node is absent; an in-process function-body evaluator implements the
- *   published PtcRuntime Service Definition. Bindings, scheduling and ptc-dispatch events are ToolRuntime's.
+ *   published PtcRuntime Service Definition. Bindings, scheduling and ptc-dispatch events are the PTC executor's.
  */
 class InProcessPtcRuntime extends PtcRuntime {
   readonly language = 'typescript'
@@ -65,11 +67,11 @@ async function composedHost() {
     services: [
       { id: 'system-prompt', name: 'systemPrompt', plugin: SystemPrompt },
       { id: 'session-projections', name: 'sessionProjections', plugin: SessionProjectionRegistry },
-      { id: 'tools', name: 'tools', plugin: ToolRuntime, config: { mode: 'native' } },
+      { id: 'tools', name: 'tools', plugin: ToolRuntime },
+      { id: 'tool-executor-native', name: 'toolExecutorNative', plugin: NativeToolExecutor },
       { id: 'agents', name: 'agents', plugin: AgentRegistry },
       { id: 'jobs', name: 'jobs', plugin: LocalJobRegistry, config: {} },
       { id: 'working-directory', name: 'workingDirectory', plugin: WorkingDirectoryService, config: { defaultDirectory: '/' } },
-      { id: 'ptc-runtime', name: 'ptcRuntime', plugin: InProcessPtcRuntime },
     ],
     configure: async (config, home) => {
       project = join(home, 'project')
@@ -96,13 +98,25 @@ async function composedHost() {
     const agent = testAgent(owner.ctx, session)
     await ctx.agents.register(agent)
     if (mode === 'ptc') {
-      await ctx.plugin(Object.assign((inner: Context) => { createScope(inner, agent).ctx.tools.presentAs('ptc') }, { inject: ['tools', 'systemPrompt'] }))
+      await owner.ctx.plugin(Object.assign(async (inner: Context) => {
+        const scoped = createScope(inner, agent).ctx
+        await scoped.plugin(InProcessPtcRuntime)
+        await scoped.plugin(PtcToolExecutor, {})
+      }, { inject: ['tools', 'systemPrompt'] }))
     }
     return agent
   }
   let calls = 0
-  const execute = (agent: Agent, name: string, args: Record<string, unknown>): Promise<ToolExecutionResult> =>
-    ctx.tools.execute({ callId: ToolCallId('composition-' + String(++calls)), name, arguments: args, agent, signal: new AbortController().signal })
+  const execute = async (agent: Agent, name: string, args: Record<string, unknown>): Promise<ToolExecutionResult> => {
+    const callId = ToolCallId('composition-' + String(++calls))
+    const batch = await ctx.tools.execute({
+      calls: [{ type: 'tool-call', id: callId, name, arguments: JSON.stringify(args) }],
+      agent, signal: new AbortController().signal,
+    })
+    expect(batch.results).toHaveLength(1)
+    expect(batch.results[0]!.callId).toBe(callId)
+    return batch.results[0]!.result
+  }
   return { ...host, published: () => published, project: () => project, mint, execute }
 }
 
@@ -139,6 +153,7 @@ describe('real composition with DSH tools, jobs and working directory', () => {
     const coded = await host.mint('composition-ptc', 'ptc')
     for (const agent of [native, coded]) await host.ctx.workingDirectory.set(agent, 'sub')
 
+    // Run the native sibling after mounting PTC: an agent-local executor must not replace the deployment default.
     const direct = await host.execute(native, 'read_pdf', { file_path: 'paper.pdf' })
     expect(direct.isError).toBe(false)
     const denied = await host.execute(coded, 'read_pdf', { file_path: 'paper.pdf' })

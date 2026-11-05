@@ -11,8 +11,8 @@
 <p>
   <a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin"></a>
   <a href="https://www.npmjs.com/package/dsh-pdf-mineru"><img src="https://img.shields.io/npm/v/dsh-pdf-mineru?style=flat-square&amp;label=npm&amp;color=CB3837" alt="npm version"></a>
-  <a href="./package.json"><img src="https://img.shields.io/badge/Node.js-%5E22.19.0%20%7C%7C%20%3E%3D24-339933?style=flat-square&amp;logo=nodedotjs&amp;logoColor=white" alt="Node.js ^22.19.0 || >=24"></a>
-  <a href="./package.json"><img src="https://img.shields.io/badge/DSH-%3E%3D0.2.1--rc.2%20%3C0.3.0--0-111827?style=flat-square" alt="DSH >=0.2.1-rc.2 <0.3.0-0"></a>
+  <a href="./package.json"><img src="https://img.shields.io/badge/Node.js-%3E%3D24.9.0-339933?style=flat-square&amp;logo=nodedotjs&amp;logoColor=white" alt="Node.js >=24.9.0"></a>
+  <a href="./package.json"><img src="https://img.shields.io/badge/DSH-%3E%3D0.2.2--rc.1%20%3C0.3.0--0-111827?style=flat-square" alt="DSH >=0.2.2-rc.1 <0.3.0-0"></a>
   <img src="https://img.shields.io/badge/MinerU-Official%20v4%20%7C%20Self--hosted%204.x%20V1%20%7C%203.x%20legacy-2563EB?style=flat-square" alt="MinerU Official v4, Self-hosted 4.x V1, 3.x legacy">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-2EA44F?style=flat-square" alt="MIT License"></a>
 </p>
@@ -33,8 +33,8 @@
 
 ### 环境要求
 
-- DeepSeek Harness：版本范围以 [package.json](./package.json) 的 `engines.dsh` 为准（当前为 `>=0.2.1-rc.2 <0.3.0-0`）。
-- Node.js `^22.19.0 || >=24.0.0`。
+- DeepSeek Harness：版本范围以 [package.json](./package.json) 的 `engines.dsh` 为准（当前为 `>=0.2.2-rc.1 <0.3.0-0`）。
+- Node.js `>=24.9.0`。
 - 设置页需要 DSH Web；没有 Web 服务的宿主仍可使用两个模型工具，配置直接写在 profile 中。
 
 ### 安装

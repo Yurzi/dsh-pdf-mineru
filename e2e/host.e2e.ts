@@ -100,13 +100,18 @@ describe('host plane', () => {
     try {
       const path = process.env.PATH
       process.env.PATH = emptyPath // no pdftoppm on PATH: the renderer must fall back to PDF.js
-      const result = await host.ctx.tools.execute({
-        callId: 'mineru-e2e-page' as ToolCallId,
-        name: 'read_pdf',
-        arguments: { file_path: 'page.pdf', pages: 1, view: 'page' },
+      const callId = 'mineru-e2e-page' as ToolCallId
+      const batch = await host.ctx.tools.execute({
+        calls: [{
+          type: 'tool-call', id: callId, name: 'read_pdf',
+          arguments: JSON.stringify({ file_path: 'page.pdf', pages: 1, view: 'page' }),
+        }],
         agent: handle.agent,
         signal: AbortSignal.timeout(60_000),
       }).finally(() => { process.env.PATH = path })
+      expect(batch.results).toHaveLength(1)
+      expect(batch.results[0]!.callId).toBe(callId)
+      const result = batch.results[0]!.result
       expect(result.error).toBeUndefined()
       expect(result.value).toMatchObject({ view: 'page', source: 'local', renderer: 'pdfjs', summary: { page_count: 1, page_count_source: 'pdfjs' } })
       const image = result.content.find(block => block.type === 'image')

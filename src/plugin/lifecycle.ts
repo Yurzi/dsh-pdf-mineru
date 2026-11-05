@@ -25,8 +25,8 @@ function isInactiveContextError(error: unknown): boolean {
 }
 
 /** Build the plugin graph; disposal stops tools first, then shared producers. */
-export async function apply(ctx: Context, entryConfig: unknown = {}): Promise<() => Promise<void>> {
-  const runtimeConfig = () => readRuntimeConfig(ctx, entryConfig)
+export async function apply(ctx: Context, _entryConfig: unknown = {}): Promise<() => Promise<void>> {
+  const runtimeConfig = () => readRuntimeConfig(ctx)
   const initialConfig = runtimeConfig()
   let toolDisposer: (() => Promise<void>) | undefined
   let operations: SharedOperationRegistry | undefined

@@ -24,6 +24,8 @@ export interface LoaderFixtureOptions {
   readonly plugin?: MinerUPluginModule
   /** Provide a fake connection/webServer so the RPC handler is captured (default true). */
   readonly transport?: boolean
+  /** Supply raw expression-bearing input while retaining the canonical config for assertions. */
+  readonly rawConfig?: (config: ReturnType<typeof defaultMinerUConfig>) => unknown
   /** Extra Loader builtins inserted before the MinerU entry, in order (real composition). */
   readonly services?: readonly { readonly id: string; readonly name: string; readonly plugin: Plugin; readonly config?: unknown }[]
   /** Replace the default host stand-ins (tools, workingDirectory, jobs) with real services. */
@@ -64,7 +66,7 @@ export async function loaderFixture(options: LoaderFixtureOptions = {}) {
     { id: 'config-editor', name: 'cordis:editor' },
     { id: 'settings', name: 'cordis:settings' },
     ...services.map(service => ({ id: service.id, name: 'cordis:' + service.name, ...(service.config === undefined ? {} : { config: service.config }) })),
-    { id: 'mineru-custom', name: 'cordis:mineru', config: sparse ? { schemaVersion: config.schemaVersion, activeProvider: config.activeProvider, providers: config.providers, storage: { storageRoot: config.storage.storageRoot } } : config },
+    { id: 'mineru-custom', name: 'cordis:mineru', config: options.rawConfig ? options.rawConfig(base) : sparse ? { schemaVersion: config.schemaVersion, activeProvider: config.activeProvider, providers: config.providers, storage: { storageRoot: config.storage.storageRoot } } : config },
   ] }]))
   await writeFile(join(dir, 'cordis.yml'), '[]\n')
   if (entryPatch) await writeFile(join(dir, 'cordis.patch.yml'), JSON.stringify([{ id: 'mineru-custom', disabled: false }]))

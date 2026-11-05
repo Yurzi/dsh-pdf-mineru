@@ -98,6 +98,17 @@ export function isolatedEnvironment(): Record<string, string> {
   return env
 }
 
+/** Fail before installing or booting DSH when the test process is below the package's Node baseline. */
+function requireSupportedNode(): void {
+  const minimum = /^>=\s*(\d+)\.(\d+)\.(\d+)$/.exec(manifest.engines.node)
+  if (minimum === null) throw new Error(`engines.node "${manifest.engines.node}" is not a single ">=" lower bound`)
+  const current = process.versions.node.split('-')[0]!.split('.').map(Number)
+  const difference = current.map((part, index) => part - Number(minimum[index + 1])).find(part => part !== 0) ?? 0
+  if (difference < 0 || process.versions.node.includes('-')) {
+    throw new Error(`Node ${process.versions.node} cannot run the e2e suite; engines.node requires ${manifest.engines.node}`)
+  }
+}
+
 const INSTALL_ATTEMPTS = 3
 
 /**
@@ -109,6 +120,7 @@ const INSTALL_ATTEMPTS = 3
  * @returns the install directory.
  */
 export function ensureDsh(): string {
+  requireSupportedNode()
   const install = process.env.DSH_E2E_INSTALL ?? join(workspace, `dsh-${DSH_VERSION}`)
   const pkg = join(install, 'node_modules/@deepseek-ai/dsh/package.json')
   if (!existsSync(pkg)) {

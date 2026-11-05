@@ -37,7 +37,7 @@ function fakeContext(config: MinerUConfig) {
   })
   const settings = { configure: vi.fn(() => () => undefined), replace: settingsReplace, describe: () => [{ ns: 'mineru-custom', revision: 0 }] }
   const value = {
-    fiber: { entry: { options: { id: 'mineru-custom' } } },
+    fiber: { effectiveConfig: config, entry: { options: { id: 'mineru-custom' } } },
     tools: {
       register: (definition: { name: string }) => {
         guard()

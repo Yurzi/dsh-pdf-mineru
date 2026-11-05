@@ -5,6 +5,7 @@ import { JobId } from '@deepseek-ai/dsh-jobs'
 import LocalJobRegistry from '@deepseek-ai/dsh-jobs-local'
 import { createUserMessage, ToolCallId, type LlmRuntime } from '@deepseek-ai/dsh-llm'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import type { ToolDefinition, ToolExecutionToken, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { onTestFinished, vi } from 'vitest'
 import type { MinerUConfig, OutputConfig } from '../../src/config/model.js'
@@ -62,7 +63,7 @@ export const ATTACHMENT_HOST_PATH = '/dsh-owned/paper.pdf'
 
 /**
  * Register both tools through the real defineTool compiler on a real Cordis context with a live
- * Session/AgentRegistry and (by default) the published LocalJobRegistry. Only the reader, working
+ * Session/SessionProjectionRegistry/AgentRegistry and (by default) the published LocalJobRegistry. Only the reader, working
  * directory, attachment store and model resolver are fakes.
  */
 export async function toolHarness(options: ToolHarnessOptions = {}) {
@@ -93,6 +94,7 @@ export async function toolHarness(options: ToolHarnessOptions = {}) {
   const llm: Pick<LlmRuntime, 'resolveModelInfo'> = { resolveModelInfo }
   if (options.imageModel !== undefined) ctx.provide('llm', llm)
 
+  await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(AgentRegistry)
   if (options.jobs !== false) {
     await ctx.plugin(LocalJobRegistry, {})

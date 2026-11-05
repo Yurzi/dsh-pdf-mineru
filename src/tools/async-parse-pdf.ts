@@ -23,7 +23,7 @@ export function parseAsyncArguments(args: unknown): DocumentSource {
 export function asyncParsePdfTool(ctx: Context, deps: ToolDependencies, invocations: Set<BackgroundInvocation>) {
   return defineTool({
     name: 'async_parse_pdf',
-    description: 'Submit PDF document parsing as a native background job. Fully parses the PDF to local cache and returns a structured summary (pages, outline, tables, images) upon completion. Use read_pdf to read specific content or pages on demand.',
+    description: 'Submit PDF document parsing as a native background job and immediately return job_id. Fully parses the PDF to local cache; a structured summary (pages, outline, tables, images) is first delivered in a completion notice or by job_output. Collect with job_output only if the notice omits the result or asks you to collect it; a fully inlined summary may not be returned again. Use read_pdf for content and page evidence. A job_output wait released by user next-step input may return running without cancelling the parse.',
     parameters: asyncParseParameters,
     output: {
       schema: asyncParseOutputSchema,

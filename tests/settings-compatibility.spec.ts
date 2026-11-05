@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises'
+import type { MinerUConfig } from '../src/config/model.js'
 import type { Context } from '@deepseek-ai/cordis'
 import { expect, it, vi } from 'vitest'
 import { loaderFixture } from './support/loader-fixture.js'
@@ -12,6 +13,92 @@ import type { ConnectionRpcHandler } from '@deepseek-ai/dsh-client-connection'
 vi.mock('../src/loopback-rpc.js', () => ({
   registerLoopbackRpc: (ctx: Context, channel: string, handler: ConnectionRpcHandler) => ctx.connection.rpc.handle(channel, handler),
 }))
+
+it('reads evaluated expressions, saves live values without remounting, and restores them after restart', async () => {
+  const host = await loaderFixture({ rawConfig: config => ({
+    ...config,
+    schemaVersion: { __jsExpr: '3' },
+    storage: { ...config.storage, storageRoot: { __jsExpr: JSON.stringify(config.storage.storageRoot) }, cacheEnabled: { __jsExpr: 'false' } },
+    output: { ...config.output, maxInlineImages: { __jsExpr: '4 + 4' } },
+  }) })
+  const fiber = host.entry.fiber!
+  const effective = fiber.effectiveConfig
+  const expected = { ...host.config, storage: { ...host.config.storage, cacheEnabled: false }, output: { ...host.config.output, maxInlineImages: 8 } }
+  expect(fiber.rawConfig).toMatchObject({ schemaVersion: { __jsExpr: '3' }, storage: { cacheEnabled: { __jsExpr: 'false' } } })
+  const resolve = vi.spyOn(fiber, 'resolveConfig')
+  expect(await host.call('mineru/config.get')).toMatchObject({ ok: true, value: { config: expected } })
+  expect(await host.call('mineru/config.get')).toMatchObject({ ok: true, value: { config: expected } })
+  expect(resolve).not.toHaveBeenCalled()
+  resolve.mockRestore()
+  const replace = vi.spyOn(host.ctx.settings, 'replace')
+  const next = { ...expected, output: { ...expected.output, maxInlineImages: 7 } }
+  expect(await host.call('mineru/config.set', { config: next })).toMatchObject({ ok: true, value: { config: next } })
+  expect(replace).toHaveBeenCalledOnce() // Expression syntax is not evidence of a historical document.
+  expect(fiber.effectiveConfig).toBe(effective)
+  expect(host.entry.fiber).toBe(fiber)
+  expect(host.registerTool).toHaveBeenCalledTimes(2)
+  await host.ctx.fiber.dispose()
+  const restored = await host.start()
+  expect(await restored.call('mineru/config.get')).toMatchObject({ ok: true, value: { config: next } })
+})
+
+it('reads the published internal/config transformation instead of otherwise valid raw values', async () => {
+  const transform = vi.fn((config: MinerUConfig) => ({ ...config, output: { ...config.output, maxInlineImages: 8 } }))
+  const host = await loaderFixture({ provide: ctx => {
+    ctx.on('internal/config', (fiber, next) => {
+      const config = next()
+      return fiber.runtime?.name === 'dsh-pdf-mineru' ? transform(config as MinerUConfig) : config
+    })
+  } })
+  const fiber = host.entry.fiber!
+  expect(fiber.rawConfig).toMatchObject({ output: { maxInlineImages: 12 } })
+  expect(transform).toHaveBeenCalled()
+  transform.mockClear()
+  const expected = { ...host.config, output: { ...host.config.output, maxInlineImages: 8 } }
+  expect(await host.call('mineru/config.get')).toMatchObject({ ok: true, value: { config: expected } })
+  expect(await host.call('mineru/config.get')).toMatchObject({ ok: true, value: { config: expected } })
+  expect(transform).not.toHaveBeenCalled()
+})
+
+it.each(['invalid-live-value', 'future-version'] as const)('keeps effective values after Loader retains a rejected %s raw candidate and permits a live repair', async candidate => {
+  const host = await loaderFixture()
+  const fiber = host.entry.fiber!
+  const effective = fiber.effectiveConfig
+  const bad = candidate === 'future-version' ? { ...host.config, schemaVersion: 4, defaults: { ...host.config.defaults, artifacts: ['markdown'] } }
+    : { ...host.config, output: { ...host.config.output, maxInlineImages: 101 } }
+  const before = await readFile(host.profile.patchPath, 'utf8')
+  await host.entry.update({ config: bad })
+  expect(fiber.rawConfig).toEqual(bad)
+  expect(fiber.effectiveConfig).toBe(effective)
+  expect(await host.call('mineru/config.get')).toMatchObject({ ok: true, value: { config: host.config } })
+  expect(await readFile(host.profile.patchPath, 'utf8')).toBe(before)
+  const replace = vi.spyOn(host.ctx.settings, 'replace')
+  const next = { ...host.config, output: { ...host.config.output, maxInlineImages: 7 } }
+  expect(await host.call('mineru/config.set', { config: next })).toMatchObject({ ok: true, value: { config: next } })
+  expect(replace).toHaveBeenCalledOnce() // Unknown future versions must not select the historical full rewrite.
+  expect(fiber.effectiveConfig).toBe(effective)
+  expect(host.entry.fiber).toBe(fiber)
+  expect(host.registerTool).toHaveBeenCalledTimes(2)
+  await host.ctx.fiber.dispose()
+  const restored = await host.start()
+  expect(await restored.call('mineru/config.get')).toMatchObject({ ok: true, value: { config: next } })
+})
+
+it('explicitly canonicalizes a historical expression-bearing entry without validating its raw values as runtime config', async () => {
+  const host = await loaderFixture({ rawConfig: config => ({
+    ...config, schemaVersion: 2,
+    storage: { ...config.storage, retainSources: true, cacheEnabled: { __jsExpr: 'false' } },
+    limits: { ...config.limits, maxFileBytes: 'invalid-old-limit' },
+  }) })
+  const expected = { ...host.config, storage: { ...host.config.storage, cacheEnabled: false } }
+  expect(await host.call('mineru/config.get')).toMatchObject({ ok: true, value: { config: expected } })
+  const next = { ...expected, output: { ...expected.output, maxInlineImages: 7 } }
+  expect(await host.call('mineru/config.set', { config: next })).toMatchObject({ ok: true, value: { config: next } })
+  expect(await readFile(host.profile.patchPath, 'utf8')).not.toContain('invalid-old-limit')
+  await host.ctx.fiber.dispose()
+  const restored = await host.start()
+  expect(await restored.call('mineru/config.get')).toMatchObject({ ok: true, value: { config: next } })
+})
 
 it('activates with native settings, saves by entry id, updates without remount and restores after restart', async () => {
   const host = await loaderFixture()

@@ -4,7 +4,7 @@ This guide covers local setup, tests, end-to-end tests, manual verification, DSH
 
 ## Setup
 
-- Node.js `^22.19.0 || >=24.0.0` and the pnpm version named by `packageManager` in [package.json](package.json).
+- Node.js `>=24.9.0` and the pnpm version named by `packageManager` in [package.json](package.json).
 - `pnpm install` installs into a workspace-local store (`.pnpm-store/`, see [pnpm-workspace.yaml](pnpm-workspace.yaml)). DSH host packages are pinned exactly in `devDependencies` and `autoInstallPeers` is off, so the compiler sees one copy of each.
 - Generated output (`lib/`) is not committed. Run `pnpm run build` before installing the checkout into DSH with `link:` and before any smoke script; `test:e2e` builds for you.
 
@@ -55,7 +55,7 @@ GUI tests restore the effective configuration they change. No test reaches Miner
 
 **Isolation.** Everything a run writes goes to `.e2e/run`, recreated at the start of each run: `DSH_HOME`, `HOME`, `XDG_*`, `TMPDIR`, `DSH_AGENTS_HOME`, `DSH_BUNDLED_SKILL_DIR`, the npm cache and the pnpm store. Inherited `DSH_*`, `MINERU_*`, `DEEPSEEK_*`, `NODE_ENV` and `NODE_OPTIONS` are cleared and telemetry is off; proxy variables pass through. `dsh web` listens on a random free loopback port, and the in-process boot drops the rows that would bind one ([host-plane.yml](e2e/fixtures/host-plane.yml)). A run never reads or writes `~/.dsh`, a running DSH, or port 3080.
 
-**DSH under test.** The lower bound of `engines.dsh`. The CLI, which brings its own Web GUI, is installed with npm into `.e2e/dsh-<version>` on first use and reused afterwards. npm keeps your registry settings but uses `.e2e/npm-cache`, four sockets, extra fetch retries and up to three attempts, because registry connection resets are common for an install of this size; a failure says whether the network was the cause. The in-process boot uses the CLI's building blocks from `@deepseek-ai/dsh-app-boot` rather than a public embedding API; only [support/host.ts](e2e/support/host.ts) touches them.
+**DSH under test.** The exact lower bound of `engines.dsh`, under a Node.js version satisfying `engines.node`. An existing `DSH_E2E_INSTALL` must contain that exact DSH version; it is not an override for testing another release. The CLI, which brings its own Web GUI, is installed with npm into `.e2e/dsh-<version>` on first use and reused afterwards. npm keeps your registry settings but uses `.e2e/npm-cache`, four sockets, extra fetch retries and up to three attempts, because registry connection resets are common for an install of this size; a failure says whether the network was the cause. The in-process boot uses the CLI's building blocks from `@deepseek-ai/dsh-app-boot` rather than a public embedding API; only [support/host.ts](e2e/support/host.ts) touches them.
 
 **Running.**
 
@@ -96,8 +96,8 @@ MINERU_API_KEY=<token> pnpm run smoke:official-v4 -- /absolute/path/sample.pdf
 ## Upgrading the DSH baseline
 
 1. Read the host's upgrade-guide entries (`docs/upgrade-guide/<version>/` in the DeepSeek Harness repository) for every release between the old and new baseline.
-2. In [package.json](package.json): set `engines.dsh` to the new range (it alone decides compatibility), set every `@deepseek-ai/dsh-*` peer to the same range, and pin every `@deepseek-ai/dsh-*` dev dependency to the exact lower bound. Align the `cordis`, `cosmokit` and `schemastery` ranges with the host. The package contract test enforces peers == `engines.dsh` and dev pins == its lower bound.
-3. Run `pnpm install`, then `pnpm run check` and `pnpm run test:e2e`, which installs the new lower bound. If the host changed how the CLI boots a profile, adjust [e2e/support/host.ts](e2e/support/host.ts); check the row ids in [e2e/fixtures/host-plane.yml](e2e/fixtures/host-plane.yml) against `dsh --profile web --dump-config`.
+2. In [package.json](package.json): set `engines.dsh` to the new range (it alone decides compatibility), set every `@deepseek-ai/dsh-*` peer to the same range, and pin every `@deepseek-ai/dsh-*` dev dependency to the exact lower bound, including test-only executors and job-control packages. Align the `cordis`, `cosmokit` and `schemastery` peer ranges and exact development versions, plus the Cordis plugins, with the target tag’s published packages. Match `engines.node`, the setup requirement and both workflow runtimes to the host minimum; the ES2024 build target is independent and need not change. The package contract test enforces the baseline and vendor alignment.
+3. Run `pnpm install --strict-peer-dependencies`, then `pnpm run check` and `pnpm run test:e2e`, which installs the new lower bound. Validate external prerelease matching separately: the DSH compatibility gate includes prereleases, whereas ordinary package-manager semver excludes prereleases of later version tuples even when the host gate would accept them. Do not widen production peers or choose an executor for the plugin merely to silence external-install warnings. If the host changed how the CLI boots a profile, adjust [e2e/support/host.ts](e2e/support/host.ts); check the row ids in [e2e/fixtures/host-plane.yml](e2e/fixtures/host-plane.yml) against `dsh --profile web --dump-config`.
 4. Add a CHANGELOG entry. Prose outside CHANGELOG and the README requirement line must not name DSH versions.
 
 ## Release

@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
+## 0.2.3
+
+### Changed
+
+- Require DSH `>=0.2.2-rc.1 <0.3.0-0` and Node.js `>=24.9.0`; align DSH peers, exact development SDK pins, Cordis vendor packages and CI runtimes with the new baseline.
+- Migrate native/PTC composition and installed-host tests to explicit host executors and the batch tool-execution contract; the plugin still only registers its tools and does not choose the host executor.
+- Clarify that a background parse summary is delivered first either in a completion notification or through `job_output`; an already delivered inline summary need not be returned again. Parsed evidence remains available through `read_pdf`.
+
+### Fixed
+
+- Read the host’s effective configuration rather than raw expression input, preserving host evaluation and rejected-candidate isolation. Explicit saves no longer re-validate raw expressions as runtime values, while preserving the existing historical migration path.
+
 ## 0.2.2
 
 ### Fixed

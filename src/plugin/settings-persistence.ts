@@ -3,7 +3,7 @@ import { isVolatile } from '@deepseek-ai/cosmokit'
 import type {} from '@deepseek-ai/cordis-plugin-loader'
 import type {} from '@deepseek-ai/dsh-config-editor'
 import type { SettingsForms } from '@deepseek-ai/dsh-settings'
-import type { MinerUConfig } from '../config/model.js'
+import { MINERU_CONFIG_SCHEMA_VERSION, type MinerUConfig } from '../config/model.js'
 import { parseConfigWithMigration } from '../config/migrate.js'
 import { MinerUError, failure } from '../domain/errors.js'
 
@@ -28,12 +28,19 @@ function configSnapshot(value: unknown): unknown {
   return value
 }
 
-/**
- * Read the fiber's current Config as well as its volatile values: hosts without
- * HMR may reload the fiber while a settings write is in flight. Migration is in memory only.
- */
-export function readRuntimeConfig(ctx: Context, entryConfig: unknown): MinerUConfig {
-  return parseConfigWithMigration(configSnapshot(ctx.fiber?.config ?? entryConfig)).config
+/** Read only the host-published config, unwrapping its current volatile values. Migration is in memory only. */
+export function readRuntimeConfig(ctx: Context): MinerUConfig {
+  return parseConfigWithMigration(configSnapshot(ctx.fiber.effectiveConfig)).config
+}
+
+/** Inspect historical document markers only: raw values may contain expressions or a rejected candidate. */
+function isHistoricalConfig(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const input = value as Record<string, unknown>
+  if (input.schemaVersion === undefined || input.schemaVersion === 1 || input.schemaVersion === 2) return true
+  if (input.schemaVersion !== MINERU_CONFIG_SCHEMA_VERSION) return false
+  const has = (section: unknown, key: string) => typeof section === 'object' && section !== null && Object.hasOwn(section, key)
+  return has(input.defaults, 'artifacts') || has(input.limits, 'maxFilesPerRequest')
 }
 
 // SettingsForms accepts only volatile fields. Send complete live values: its
@@ -82,15 +89,15 @@ export function createSettingsPersistence(
       const namespace = entry.options.id
       const original = entry.options.config
       try {
-        if (original !== undefined && parseConfigWithMigration(original).migrated) {
+        if (isHistoricalConfig(original)) {
           // Only an explicit user save enters this branch. Settings.replace keeps
           // raw ordinary fields, which may still contain invalid pre-migration values.
           // Persist the entire validated snapshot in one host-owned transaction.
           const editor = ctx.get('configEditor')
           if (editor === undefined) throw new Error('Saving a migrated configuration requires the host ConfigEditor')
-          await editor.edit(entry, current => {
+          await editor.edit(entry, () => {
             if (expectedRevision !== undefined && revision(namespace) !== expectedRevision) throw settingsConflict()
-            validate(parseConfigWithMigration(current).config)
+            validate(read())
             return { ...next }
           })
         } else {

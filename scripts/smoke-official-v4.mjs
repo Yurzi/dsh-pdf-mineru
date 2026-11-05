@@ -78,9 +78,10 @@ async function makeWritable(path) {
   }
 }
 
-function createContext(definitions) {
+function createContext(definitions, config) {
   const discard = () => undefined
   return {
+    fiber: { effectiveConfig: config },
     workingDirectory: { ensure: async () => process.cwd() },
     tools: {
       register(definition) { definitions.push(definition); return discard },
@@ -162,7 +163,7 @@ async function main() {
         operationTimeoutMs: Math.min(3600000, options.timeoutMs + 60000),
       },
     })
-    dispose = await plugin.apply(createContext(definitions), config)
+    dispose = await plugin.apply(createContext(definitions, config), config)
     const tool = definitions.find(definition => definition?.name === 'read_pdf')
     if (tool === undefined || typeof tool.execute !== 'function') throw new Error('read_pdf was not registered')
     const args = {
